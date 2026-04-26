@@ -1844,9 +1844,7 @@ impl<FS: ShimFS> Task<FS> {
         use litebox::platform::AddressSpaceProvider;
 
         let platform = self.global.platform;
-        let as_id = platform
-            .create_address_space()
-            .map_err(|_| Errno::ENOMEM)?;
+        let as_id = platform.create_address_space().map_err(|_| Errno::ENOMEM)?;
         let range = platform
             .address_space_range(as_id)
             .map_err(|_| Errno::ENOMEM)?;

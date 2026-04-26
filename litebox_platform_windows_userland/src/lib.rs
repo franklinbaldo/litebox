@@ -333,6 +333,12 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
+impl litebox::platform::AddressSpaceProvider for WindowsUserland {
+    type AddressSpaceId = u32;
+    const ADDRESS_SPACE_KIND: litebox::platform::AddressSpaceKind =
+        litebox::platform::AddressSpaceKind::SharedMemory;
+}
+
 impl litebox::platform::SignalProvider for WindowsUserland {
     type Signal = litebox_common_linux::signal::Signal;
 

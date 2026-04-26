@@ -534,10 +534,11 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                     return Err(()); // ECHILD — not our child
                 }
                 match inner.processes.get(&target_pid) {
-                    Some(e) if let ProcessState::Exited(status) = e.context.state => {
-                        Some((target_pid, status))
-                    }
-                    _ => None,
+                    Some(e) => match e.context.state {
+                        ProcessState::Exited(status) => Some((target_pid, status)),
+                        ProcessState::Running => None,
+                    },
+                    None => None,
                 }
             }
             -1 => {
