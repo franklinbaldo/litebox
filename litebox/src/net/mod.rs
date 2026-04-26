@@ -875,6 +875,9 @@ where
                 // We attempt to queue it for future closure and then just return.
                 self.queued_for_closure.push(dup_fd);
             }
+            super::fd::CloseResult::ForkDecremented => {
+                // Another process still holds a fork reference. Our close is done.
+            }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
                 else {

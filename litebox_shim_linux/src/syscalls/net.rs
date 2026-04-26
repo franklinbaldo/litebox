@@ -767,11 +767,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                 },
             )
             .map_err(Errno::from);
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            unimplemented!("send signal SIGPIPE on EPIPE");
-        }
+        // Note: SIGPIPE is sent at the Task level (do_sendto/sys_sendmsg)
         ret
     }
 
@@ -1340,7 +1336,7 @@ impl<FS: ShimFS> Task<FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1358,7 +1354,13 @@ impl<FS: ShimFS> Task<FS> {
                     .transpose()?;
                 file.sendto(self, buf, flags, addr)
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = ret {
+            if !flags.contains(SendFlags::NOSIGNAL) {
+                self.raise_sigpipe();
+            }
+        }
+        ret
     }
 
     /// Handle syscall `sendmsg`
@@ -1399,7 +1401,7 @@ impl<FS: ShimFS> Task<FS> {
             .msg_iov
             .to_owned_slice(msg.msg_iovlen)
             .ok_or(Errno::EFAULT)?;
-        self.files.borrow().with_socket(
+        let ret = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
@@ -1440,7 +1442,13 @@ impl<FS: ShimFS> Task<FS> {
                 }
                 Ok(total_sent)
             },
-        )
+        );
+        if let Err(Errno::EPIPE) = ret {
+            if !flags.contains(SendFlags::NOSIGNAL) {
+                self.raise_sigpipe();
+            }
+        }
+        ret
     }
 
     /// Handle syscall `recvfrom`

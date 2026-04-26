@@ -1249,12 +1249,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
                 datagram.sendto(task, timeout, buf, is_nonblocking, addr)
             }
         };
-        if let Err(Errno::EPIPE) = ret
-            && !flags.contains(SendFlags::NOSIGNAL)
-        {
-            // TODO: send SIGPIPE signal
-            unimplemented!("send SIGPIPE on EPIPE");
-        }
+        // Note: SIGPIPE is sent at the Task level (do_sendto/sys_sendmsg)
         ret
     }
 

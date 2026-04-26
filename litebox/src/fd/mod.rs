@@ -50,13 +50,33 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .iter()
             .map(|slot| {
                 slot.as_ref().map(|ind| {
-                    let cloned = IndividualEntry::new(Arc::clone(&ind.x));
+                    let mut cloned = IndividualEntry::new(Arc::clone(&ind.x));
+                    cloned.fork_refcount = 1;
                     cloned.x.read().entry.on_dup();
                     cloned
                 })
             })
             .collect();
         Self { entries }
+    }
+
+    /// Increment the fork reference count for each of the given descriptor slot indices.
+    ///
+    /// This must be called during fork, paired with [`RawDescriptorStorage::clone_for_fork`],
+    /// so that each forked slot index is properly tracked. When a process closes an FD via
+    /// [`Self::remove`], the fork_refcount is decremented; the entry is only truly removed
+    /// when fork_refcount reaches 0.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics only on invariant violation (slot must exist during fork)"
+    )]
+    pub fn increment_fork_refcounts(&mut self, slot_indices: &[usize]) {
+        for &idx in slot_indices {
+            let entry = self.entries[idx]
+                .as_mut()
+                .expect("fork: descriptor slot must exist");
+            entry.fork_refcount += 1;
+        }
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
@@ -130,18 +150,31 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     /// Removes the entry at `fd`, closing out the file descriptor.
     ///
     /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
-    /// have been cleared out).
+    /// have been cleared out) AND no other process holds a fork reference to this slot.
     ///
     /// If the `fd` was already closed out, then (obviously) it does not return an entry.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics only on invariant violation"
+    )]
     pub fn remove<Subsystem: FdEnabledSubsystem>(
         &mut self,
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
-        let Some(old) = self.entries[fd.x.as_usize()?].take() else {
-            unreachable!();
-        };
-        old.x.read().entry.on_close();
+        let idx = fd.x.as_usize()?;
+        let entry = self.entries[idx].as_mut().unwrap();
+        entry.x.read().entry.on_close();
         fd.x.mark_as_closed();
+
+        assert!(entry.fork_refcount > 0);
+        entry.fork_refcount -= 1;
+        if entry.fork_refcount > 0 {
+            // Another process still references this slot — don't remove the entry.
+            return None;
+        }
+
+        // Last fork reference — truly vacate the slot.
+        let old = self.entries[idx].take().unwrap();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
@@ -162,9 +195,19 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
         let idx = fd.x.as_usize()?;
-        let Some(old) = self.entries[idx].take() else {
-            unreachable!();
-        };
+        let entry = self.entries[idx].as_mut().unwrap();
+
+        // If another process holds a fork reference, just decrement and don't truly close.
+        assert!(entry.fork_refcount > 0);
+        if entry.fork_refcount > 1 {
+            entry.x.read().entry.on_close();
+            fd.x.mark_as_closed();
+            entry.fork_refcount -= 1;
+            return Some(CloseResult::ForkDecremented);
+        }
+
+        // fork_refcount == 1: this is the last process. Proceed with normal close logic.
+        let old = self.entries[idx].take().unwrap();
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
@@ -184,7 +227,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         } else {
             old.x.read().entry.on_close();
             fd.x.mark_as_closed();
-            // Shared, so we need to duplicate it.
+            // Shared (via dup), so we need to duplicate it.
             let old = self.entries[idx].replace(old);
             assert!(old.is_none());
             Some(CloseResult::Duplicated(TypedFd {
@@ -215,23 +258,26 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Vec<Subsystem::Entry> {
         // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
         // we have the same number of FDs as matching to the strong-count of a descriptor entry,
+        // AND the slot has fork_refcount == 1 (no other process references it),
         // then it must be the case that we have everything needed to close the entries out.
         let removable_entries: Vec<*const RwLock<_, _>> = {
-            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
+            let mut strong_count_and_count = HashMap::<*const _, (usize, usize, bool)>::new();
             for fd in fds.iter() {
                 let entry = &self.entries[fd.x.as_usize().unwrap()];
                 // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
                 // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
                 // need to expand it out, we'd simply have a `continue` here.
                 let entry = entry.as_ref().unwrap();
-                strong_count_and_count
+                let has_fork_refs = entry.fork_refcount > 1;
+                let record = strong_count_and_count
                     .entry(Arc::as_ptr(&entry.x))
-                    .or_insert((Arc::strong_count(&entry.x), 0))
-                    .1 += 1;
+                    .or_insert((Arc::strong_count(&entry.x), 0, false));
+                record.1 += 1;
+                record.2 |= has_fork_refs;
             }
             strong_count_and_count
                 .into_iter()
-                .filter(|(_ptr, (sc, c))| sc == c)
+                .filter(|(_ptr, (sc, c, has_fork))| sc == c && !has_fork)
                 .map(|(ptr, _)| ptr)
                 .collect()
         };
@@ -569,6 +615,9 @@ pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
     Duplicated(TypedFd<Subsystem>),
     /// The FD was unique but couldn't be closed immediately (e.g., due to pending data)
     Deferred,
+    /// Another process still holds a fork reference to this slot. The fork_refcount
+    /// was decremented and the FD was marked closed; no further action needed.
+    ForkDecremented,
 }
 
 /// Safe(r) conversions between safely-typed file descriptors and unsafely-typed integers.
@@ -705,24 +754,39 @@ impl RawDescriptorStorage {
 
     /// Clone the entire raw descriptor storage for fork.
     ///
-    /// Each slot in the new storage shares the same underlying `OwnedFd`
-    /// (via `Arc::clone`), matching POSIX fork semantics where the child
-    /// inherits copies of the parent's file descriptor table that refer to
-    /// the same open file descriptions.
+    /// Each slot in the new storage gets a **new, independent** `OwnedFd`
+    /// (with the same raw index as the parent's), avoiding shared `AtomicBool`
+    /// poisoning when either process closes the FD independently.
+    ///
+    /// Returns `(cloned_storage, slot_indices)` where `slot_indices` is the
+    /// list of descriptor table slot indices that were cloned. The caller MUST
+    /// call [`Descriptors::increment_fork_refcounts`] with these indices so that
+    /// the descriptor table knows multiple processes reference these slots.
     #[must_use]
-    pub fn clone_for_fork(&self) -> Self {
-        Self {
-            stored_fds: self
-                .stored_fds
-                .iter()
-                .map(|slot| {
-                    slot.as_ref().map(|stored| StoredFd {
-                        x: Arc::clone(&stored.x),
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics only if FD is closed during fork (invariant violation)"
+    )]
+    pub fn clone_for_fork(&self) -> (Self, Vec<usize>) {
+        let mut slot_indices = Vec::new();
+        let stored_fds = self
+            .stored_fds
+            .iter()
+            .map(|slot| {
+                slot.as_ref().map(|stored| {
+                    let raw = stored
+                        .x
+                        .as_usize()
+                        .expect("FD should not be closed during fork");
+                    slot_indices.push(raw);
+                    StoredFd {
+                        x: Arc::new(OwnedFd::new(raw)),
                         subsystem_entry_type_id: stored.subsystem_entry_type_id,
-                    })
+                    }
                 })
-                .collect(),
-        }
+            })
+            .collect();
+        (Self { stored_fds }, slot_indices)
     }
 
     /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
@@ -858,6 +922,9 @@ pub enum MetadataError {
 struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
     x: Arc<RwLock<Platform, DescriptorEntry>>,
     metadata: AnyMap,
+    /// Number of processes referencing this slot (incremented on fork, decremented on close).
+    /// Starts at 1 when created or duplicated. When this reaches 0, the slot is truly vacated.
+    fork_refcount: usize,
 }
 impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
     type Target = Arc<RwLock<Platform, DescriptorEntry>>;
@@ -870,6 +937,7 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
         Self {
             x,
             metadata: AnyMap::new(),
+            fork_refcount: 1,
         }
     }
 }

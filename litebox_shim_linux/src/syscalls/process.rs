@@ -591,12 +591,31 @@ impl<FS: ShimFS> Task<FS> {
                 ExitStatus::Exit(code) => (u32::from(code.cast_unsigned()) & 0xff) << 8,
                 ExitStatus::Signal(sig) => sig.as_i32().cast_unsigned() & 0x7f,
             };
-            let _ = self
-                .global
-                .process_registry
-                .exit_process(process_id, wait_status, |_orphan| {
-                    // TODO: reparent orphans to init
-                });
+            let notification =
+                self.global
+                    .process_registry
+                    .exit_process(process_id, wait_status, |_orphan| {
+                        // TODO: reparent orphans to init
+                    });
+
+            // Deliver SIGCHLD to the parent process.
+            if let Some(notif) = notification {
+                use litebox_common_linux::signal::Signal;
+                let siginfo = super::signal::siginfo_chld(
+                    notif.child_pid.as_u32().cast_signed(),
+                    notif.exit_status,
+                );
+                self.global.send_signal_to_process(
+                    notif.parent_pid.as_u32().cast_signed(),
+                    Signal::SIGCHLD,
+                    siginfo,
+                );
+            }
+        }
+
+        // Deregister the signal mailbox for this process.
+        if self.pid == self.tid {
+            self.global.deregister_signal_mailbox(self.pid);
         }
 
         // If this is a vfork child that never exec'd, signal the parent.
@@ -630,6 +649,9 @@ impl<FS: ShimFS> Task<FS> {
             litebox::process::ProcessId::new(self.pid.cast_unsigned()).ok_or(Errno::ESRCH)?;
 
         loop {
+            // Pick up any cross-process signals (e.g., SIGCHLD from exiting children).
+            self.drain_cross_process_signals();
+
             match self.global.process_registry.try_wait(parent_pid, pid) {
                 Err(()) => {
                     // No matching children at all — ECHILD.
@@ -788,8 +810,11 @@ impl<FS: ShimFS> Task<FS> {
             .next_thread_id
             .fetch_max(child_pid + 1, Ordering::Relaxed);
 
-        // Clone the FD table for the child.
-        let child_files = Arc::new(self.files.borrow().clone_for_fork());
+        // Clone the FD table for the child, incrementing fork_refcounts in the global descriptor table.
+        let child_files = {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            Arc::new(self.files.borrow().clone_for_fork(&mut dt))
+        };
 
         // Capture the parent's guest FS base for the child.
         #[cfg(target_arch = "x86_64")]
@@ -826,10 +851,11 @@ impl<FS: ShimFS> Task<FS> {
             comm: self.comm.clone(),
             fs: RefCell::new((*self.fs.borrow()).clone()),
             files: RefCell::new(child_files),
-            signals: self.signals.clone_for_new_task(),
+            signals: self.signals.clone_for_fork(),
             fork_context: RefCell::new(Some(ForkContext {
                 vfork_done: vfork_done.clone(),
             })),
+            signal_mailbox: self.global.register_signal_mailbox(child_pid),
         };
 
         // Spawn the child as a new host thread.
@@ -1001,6 +1027,7 @@ impl<FS: ShimFS> Task<FS> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                         fork_context: RefCell::new(None),
+                        signal_mailbox: self.signal_mailbox.clone(), // share parent's mailbox
                     },
                 }),
             )

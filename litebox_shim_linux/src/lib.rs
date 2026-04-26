@@ -17,6 +17,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
@@ -207,6 +208,7 @@ impl LinuxShimBuilder {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             process_registry,
+            signal_mailboxes: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         let init_process = Arc::new(ProcessState {
             pm: PageManager::new(&global.litebox),
@@ -269,6 +271,7 @@ impl<FS: ShimFS> LinuxShim<FS> {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                signal_mailbox: self.0.register_signal_mailbox(pid),
             },
         };
 
@@ -1042,6 +1045,65 @@ struct GlobalState<FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<FS>>,
     /// Process registry for tracking parent-child relationships and exit status.
     process_registry: litebox::process::ProcessRegistry<Platform>,
+    /// Cross-process signal mailboxes, keyed by PID.
+    /// Used for delivering signals (e.g., SIGCHLD) between processes.
+    #[allow(clippy::type_complexity)]
+    signal_mailboxes: litebox::sync::Mutex<
+        Platform,
+        alloc::collections::BTreeMap<
+            i32,
+            Arc<
+                litebox::sync::Mutex<
+                    Platform,
+                    VecDeque<(
+                        litebox_common_linux::signal::Signal,
+                        litebox_common_linux::signal::Siginfo,
+                    )>,
+                >,
+            >,
+        >,
+    >,
+}
+
+impl<FS: ShimFS> GlobalState<FS> {
+    /// Register a signal mailbox for a process.
+    fn register_signal_mailbox(
+        &self,
+        pid: i32,
+    ) -> Arc<
+        litebox::sync::Mutex<
+            Platform,
+            VecDeque<(
+                litebox_common_linux::signal::Signal,
+                litebox_common_linux::signal::Siginfo,
+            )>,
+        >,
+    > {
+        let mailbox = Arc::new(litebox::sync::Mutex::new(VecDeque::new()));
+        self.signal_mailboxes.lock().insert(pid, mailbox.clone());
+        mailbox
+    }
+
+    /// Deregister a signal mailbox for a process.
+    fn deregister_signal_mailbox(&self, pid: i32) {
+        self.signal_mailboxes.lock().remove(&pid);
+    }
+
+    /// Send a signal to a process by PID. Returns true if the target mailbox exists.
+    fn send_signal_to_process(
+        &self,
+        target_pid: i32,
+        signal: litebox_common_linux::signal::Signal,
+        siginfo: litebox_common_linux::signal::Siginfo,
+    ) -> bool {
+        let mailboxes = self.signal_mailboxes.lock();
+        if let Some(mailbox) = mailboxes.get(&target_pid) {
+            mailbox.lock().push_back((signal, siginfo));
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Per-process state, shared among threads of the same process.
@@ -1074,6 +1136,16 @@ struct Task<FS: ShimFS> {
     signals: syscalls::signal::SignalState,
     /// Fork context: present on vfork children, used to signal parent on exec/exit.
     fork_context: RefCell<Option<syscalls::process::ForkContext>>,
+    /// Cross-process signal mailbox for this process (shared with GlobalState).
+    signal_mailbox: Arc<
+        litebox::sync::Mutex<
+            Platform,
+            VecDeque<(
+                litebox_common_linux::signal::Signal,
+                litebox_common_linux::signal::Siginfo,
+            )>,
+        >,
+    >,
 }
 
 impl<FS: ShimFS> Drop for Task<FS> {
@@ -1117,6 +1189,7 @@ mod test_utils {
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 fork_context: RefCell::new(None),
+                signal_mailbox: self.register_signal_mailbox(pid),
                 global: self,
             }
         }
@@ -1143,6 +1216,7 @@ mod test_utils {
                 files: self.files.clone(),
                 signals: self.signals.clone_for_new_task(),
                 fork_context: RefCell::new(None),
+                signal_mailbox: self.signal_mailbox.clone(),
             };
             Some(task)
         }

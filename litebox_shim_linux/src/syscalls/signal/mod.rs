@@ -91,6 +91,45 @@ impl SignalState {
         }
     }
 
+    /// Clone signal state for a fork child (new process).
+    ///
+    /// Unlike `clone_for_new_task` (for threads within the same process), fork creates
+    /// a new process that gets:
+    /// - Independent signal handlers (deep-cloned, not shared)
+    /// - Fresh process-wide pending signals (new process, no inherited pending)
+    /// - Parent's blocked signal mask (inherited)
+    /// - Fresh per-thread pending (as with new_task)
+    /// - Fresh altstack
+    pub fn clone_for_fork(&self) -> Self {
+        // Deep-clone handlers: copy the inner data into a new Arc
+        let parent_handlers = self.handlers.borrow();
+        let cloned_handlers_inner = parent_handlers.inner.lock().clone();
+        let new_handlers = Arc::new(SignalHandlers {
+            inner: Mutex::new(cloned_handlers_inner),
+        });
+
+        Self {
+            pending: RefCell::new(PendingSignals::new()),
+            shared_pending: Arc::new(Mutex::new(PendingSignals::new())),
+            blocked: Cell::new(self.blocked.get()),
+            handlers: RefCell::new(new_handlers),
+            altstack: SigAltStack {
+                flags: SsFlags::DISABLE,
+                sp: 0,
+                size: 0,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+            }
+            .into(),
+            last_exception: Cell::new(litebox::shim::ExceptionInfo {
+                exception: litebox::shim::Exception(0),
+                error_code: 0,
+                cr2: 0,
+                kernel_mode: false,
+            }),
+        }
+    }
+
     /// Resets signal state for an `execve` call.
     pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();
@@ -290,6 +329,38 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
         #[cfg(target_arch = "x86_64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
+    }
+}
+
+/// Creates a `Siginfo` for SIGCHLD when a child process exits.
+/// `wait_status` is the wait-encoded status: `(code & 0xff) << 8` for normal exit,
+/// `sig & 0x7f` for signal death.
+pub(crate) fn siginfo_chld(child_pid: i32, wait_status: u32) -> Siginfo {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+
+    // Decode wait_status to determine si_code and si_status
+    let (code, si_status) = if wait_status.trailing_zeros() >= 7 {
+        // Normal exit: status is in bits 15..8
+        (CLD_EXITED, (wait_status >> 8) & 0xff)
+    } else {
+        // Killed by signal: signal number is in bits 6..0
+        (CLD_KILLED, wait_status & 0x7f)
+    };
+
+    // Build sigchld data: { pid: i32, uid: u32, status: i32, utime: i64, stime: i64 }
+    let mut data = SiginfoData::new_zeroed();
+    // Layout: pid at offset 0, uid at offset 4, status at offset 8
+    data.pad[0] = child_pid.cast_unsigned();
+    data.pad[1] = 0; // uid
+    data.pad[2] = si_status;
+    Siginfo {
+        signo: Signal::SIGCHLD.as_i32(),
+        errno: 0,
+        code,
+        #[cfg(target_arch = "x86_64")]
+        __pad: 0,
+        data,
     }
 }
 
@@ -518,10 +589,34 @@ impl<FS: ShimFS> Task<FS> {
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
+            // Signal to self
             self.send_signal(signal, siginfo_kill(signal));
             Ok(0)
+        } else if tid.is_none()
+            && let Some(target_pid) = pid
+        {
+            // Process-directed signal to another process.
+            // pid > 0: send to specific process
+            // pid == 0: send to own process group (TODO: process groups)
+            // pid == -1: send to all processes (TODO)
+            // pid < -1: send to process group |pid| (TODO: process groups)
+            if target_pid > 0 {
+                if self
+                    .global
+                    .send_signal_to_process(target_pid, signal, siginfo_kill(signal))
+                {
+                    Ok(0)
+                } else {
+                    Err(Errno::ESRCH)
+                }
+            } else {
+                log_unsupported!(
+                    "sys_kill with pid={target_pid} (process groups not yet supported)"
+                );
+                Err(Errno::ESRCH)
+            }
         } else {
-            log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
+            log_unsupported!("sys_tgkill with remote pid/tid");
             Err(Errno::ESRCH)
         }
     }
@@ -676,6 +771,23 @@ impl<FS: ShimFS> Task<FS> {
             .push(&self.process().limits, signal, siginfo);
     }
 
+    /// Raise SIGPIPE on the current task (used when write/send gets EPIPE).
+    pub(crate) fn raise_sigpipe(&self) {
+        use zerocopy::FromZeros;
+        let data = SiginfoData::new_zeroed();
+        self.send_signal(
+            Signal::SIGPIPE,
+            Siginfo {
+                signo: Signal::SIGPIPE.as_i32(),
+                errno: 0,
+                code: SI_KERNEL,
+                #[cfg(target_arch = "x86_64")]
+                __pad: 0,
+                data,
+            },
+        );
+    }
+
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
         if self.is_signal_ignored(signal) {
@@ -685,6 +797,16 @@ impl<FS: ShimFS> Task<FS> {
             .shared_pending
             .lock()
             .push(&self.process().limits, signal, siginfo);
+    }
+
+    /// Drain cross-process signals from the mailbox into local shared_pending.
+    /// Call this periodically (e.g., on wait/syscall return) to pick up signals
+    /// from other processes (e.g., SIGCHLD from exiting children).
+    pub(crate) fn drain_cross_process_signals(&self) {
+        let mut mailbox = self.signal_mailbox.lock();
+        while let Some((signal, siginfo)) = mailbox.pop_front() {
+            self.send_shared_signal(signal, siginfo);
+        }
     }
 
     /// Forces a signal to be delivered on next call to `check_for_signals`.
