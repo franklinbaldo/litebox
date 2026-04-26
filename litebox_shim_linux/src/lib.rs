@@ -966,6 +966,15 @@ impl<FS: ShimFS> Task<FS> {
             }
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Setpgid { pid, pgid } => {
+                self.sys_setpgid(pid, pgid)?;
+                Ok(0)
+            }
+            SyscallRequest::Getpgid { pid } => {
+                Ok(self.sys_getpgid(pid)?.reinterpret_as_unsigned() as usize)
+            }
+            SyscallRequest::Getpgrp => Ok(self.sys_getpgrp()?.reinterpret_as_unsigned() as usize),
+            SyscallRequest::Setsid => Ok(self.sys_setsid()?.reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),

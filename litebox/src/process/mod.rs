@@ -44,8 +44,19 @@ pub struct ProcessContext {
     /// Parent process. `None` only for the init process.
     pub parent: Option<ProcessId>,
     pub state: ProcessState,
+    /// Process group ID. Defaults to the process's own PID.
+    pub pgid: ProcessId,
+    /// Session ID. Defaults to the process's own PID for the init process.
+    pub sid: ProcessId,
     /// Child processes.
     children: Vec<ProcessId>,
+}
+
+impl ProcessContext {
+    /// Get the list of child processes.
+    pub fn children(&self) -> &[ProcessId] {
+        &self.children
+    }
 }
 
 /// Whether a process is running or has exited.
@@ -224,6 +235,15 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         let exited_flag = Arc::new(AtomicBool::new(false));
         let exit_observer = Arc::new(ExitSubject::new());
 
+        // Determine pgid and sid: init gets its own, children inherit from parent.
+        let (pgid, sid) = match parent {
+            None => (pid, pid),
+            Some(parent_pid) => {
+                let parent_entry = inner.processes.get(&parent_pid).unwrap();
+                (parent_entry.context.pgid, parent_entry.context.sid)
+            }
+        };
+
         inner.processes.insert(
             pid,
             ProcessEntry {
@@ -231,6 +251,8 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                     id: pid,
                     parent,
                     state: ProcessState::Running,
+                    pgid,
+                    sid,
                     children: Vec::new(),
                 },
                 exit_observer,
@@ -365,6 +387,39 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             parent_entry.context.children.push(child);
         }
         exit_status
+    }
+
+    /// Set the process group ID for a process.
+    /// Returns `Ok(())` on success, `Err(())` if the process does not exist.
+    pub fn set_pgid(&self, id: ProcessId, pgid: ProcessId) -> Result<(), ()> {
+        let mut inner = self.inner.lock();
+        let entry = inner.processes.get_mut(&id).ok_or(())?;
+        entry.context.pgid = pgid;
+        Ok(())
+    }
+
+    /// Create a new session: set both pgid and sid to the process's own PID.
+    /// Returns `Err(())` if the process doesn't exist or is already a process group leader.
+    pub fn setsid(&self, id: ProcessId) -> Result<(), ()> {
+        let mut inner = self.inner.lock();
+        let entry = inner.processes.get_mut(&id).ok_or(())?;
+        if entry.context.pgid == id {
+            return Err(()); // already a process group leader
+        }
+        entry.context.pgid = id;
+        entry.context.sid = id;
+        Ok(())
+    }
+
+    /// Collect all process IDs in the given process group.
+    pub fn pids_in_group(&self, pgid: ProcessId) -> alloc::vec::Vec<ProcessId> {
+        let inner = self.inner.lock();
+        inner
+            .processes
+            .values()
+            .filter(|e| e.context.pgid == pgid && matches!(e.context.state, ProcessState::Running))
+            .map(|e| e.context.id)
+            .collect()
     }
 
     /// Read process context through a closure.

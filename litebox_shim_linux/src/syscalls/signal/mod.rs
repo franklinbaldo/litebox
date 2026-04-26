@@ -609,10 +609,36 @@ impl<FS: ShimFS> Task<FS> {
                 } else {
                     Err(Errno::ESRCH)
                 }
+            } else if target_pid == 0 || target_pid < -1 {
+                // kill(0, sig) -> own process group
+                // kill(-pgid, sig) -> specific process group
+                let pgid_raw = if target_pid == 0 {
+                    // Get own pgid
+                    let my_pid = litebox::process::ProcessId::new(self.pid.cast_unsigned())
+                        .ok_or(Errno::ESRCH)?;
+                    self.global
+                        .process_registry
+                        .with_context(my_pid, |ctx| ctx.pgid)
+                        .ok_or(Errno::ESRCH)?
+                } else {
+                    litebox::process::ProcessId::new((-target_pid).cast_unsigned())
+                        .ok_or(Errno::ESRCH)?
+                };
+                let pids = self.global.process_registry.pids_in_group(pgid_raw);
+                if pids.is_empty() {
+                    return Err(Errno::ESRCH);
+                }
+                for pid in pids {
+                    self.global.send_signal_to_process(
+                        pid.as_u32().cast_signed(),
+                        signal,
+                        siginfo_kill(signal),
+                    );
+                }
+                Ok(0)
             } else {
-                log_unsupported!(
-                    "sys_kill with pid={target_pid} (process groups not yet supported)"
-                );
+                // pid == -1: send to all processes (not supported)
+                log_unsupported!("sys_kill with pid=-1 (broadcast) not yet supported");
                 Err(Errno::ESRCH)
             }
         } else {

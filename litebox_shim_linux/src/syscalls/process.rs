@@ -1501,6 +1501,64 @@ impl<FS: ShimFS> Task<FS> {
         self.ppid
     }
 
+    /// Handle syscall `setpgid`.
+    pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
+        let target_pid = if pid == 0 { self.pid } else { pid };
+        let target_pgid = if pgid == 0 { target_pid } else { pgid };
+        let Some(target) = litebox::process::ProcessId::new(target_pid.cast_unsigned()) else {
+            return Err(Errno::ESRCH);
+        };
+        let Some(pg) = litebox::process::ProcessId::new(target_pgid.cast_unsigned()) else {
+            return Err(Errno::EINVAL);
+        };
+        // POSIX: can only setpgid on self or a child process.
+        let my_pid =
+            litebox::process::ProcessId::new(self.pid.cast_unsigned()).ok_or(Errno::ESRCH)?;
+        if target != my_pid {
+            let is_child = self
+                .global
+                .process_registry
+                .with_context(my_pid, |ctx| ctx.children().contains(&target))
+                .unwrap_or(false);
+            if !is_child {
+                return Err(Errno::ESRCH);
+            }
+        }
+        self.global
+            .process_registry
+            .set_pgid(target, pg)
+            .map_err(|()| Errno::ESRCH)
+    }
+
+    /// Handle syscall `getpgid`.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<i32, Errno> {
+        let target_pid = if pid == 0 { self.pid } else { pid };
+        let Some(target) = litebox::process::ProcessId::new(target_pid.cast_unsigned()) else {
+            return Err(Errno::ESRCH);
+        };
+        self.global
+            .process_registry
+            .with_context(target, |ctx| ctx.pgid.as_u32().cast_signed())
+            .ok_or(Errno::ESRCH)
+    }
+
+    /// Handle syscall `getpgrp` (equivalent to getpgid(0)).
+    pub(crate) fn sys_getpgrp(&self) -> Result<i32, Errno> {
+        self.sys_getpgid(0)
+    }
+
+    /// Handle syscall `setsid`.
+    pub(crate) fn sys_setsid(&self) -> Result<i32, Errno> {
+        let Some(pid) = litebox::process::ProcessId::new(self.pid.cast_unsigned()) else {
+            return Err(Errno::EPERM);
+        };
+        self.global
+            .process_registry
+            .setsid(pid)
+            .map_err(|()| Errno::EPERM)?;
+        Ok(self.pid)
+    }
+
     /// Handle syscall `getuid`.
     pub(crate) fn sys_getuid(&self) -> u32 {
         self.credentials.uid
