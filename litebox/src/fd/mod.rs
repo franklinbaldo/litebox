@@ -587,6 +587,26 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             .metadata
             .insert(metadata)
     }
+
+    /// Returns the indices of all live entries whose per-FD metadata of type `T` satisfies `pred`.
+    ///
+    /// **Important**: These are slot indices into `Descriptors.entries`, NOT raw FD numbers.
+    /// To get raw FD numbers matching metadata, use
+    /// [`RawDescriptorStorage::raw_fds_matching_metadata`] instead.
+    pub fn indices_matching_metadata<T: core::any::Any + Send + Sync>(
+        &self,
+        pred: impl Fn(&T) -> bool,
+    ) -> alloc::vec::Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| {
+                let entry = slot.as_ref()?;
+                let matches = entry.metadata.get::<T>().is_some_and(&pred);
+                matches.then_some(idx)
+            })
+            .collect()
+    }
 }
 
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
@@ -795,6 +815,32 @@ impl RawDescriptorStorage {
             .iter()
             .enumerate()
             .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+    }
+
+    /// Returns raw FD numbers whose corresponding `Descriptors` slot has per-FD metadata
+    /// of type `T` satisfying `pred`.
+    ///
+    /// This resolves the raw FD → slot index mapping correctly, unlike
+    /// [`Descriptors::indices_matching_metadata`] which returns slot indices.
+    pub fn raw_fds_matching_metadata<
+        Platform: RawSyncPrimitivesProvider,
+        T: core::any::Any + Send + Sync,
+    >(
+        &self,
+        descriptors: &Descriptors<Platform>,
+        pred: impl Fn(&T) -> bool,
+    ) -> alloc::vec::Vec<usize> {
+        self.stored_fds
+            .iter()
+            .enumerate()
+            .filter_map(|(raw_fd, slot)| {
+                let stored = slot.as_ref()?;
+                let slot_idx = stored.x.as_usize()?;
+                let entry = descriptors.entries.get(slot_idx)?.as_ref()?;
+                let matches = entry.metadata.get::<T>().is_some_and(&pred);
+                matches.then_some(raw_fd)
+            })
+            .collect()
     }
 }
 
