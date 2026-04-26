@@ -1106,8 +1106,13 @@ impl<FS: ShimFS> GlobalState<FS> {
         signal: litebox_common_linux::signal::Signal,
         siginfo: litebox_common_linux::signal::Siginfo,
     ) -> bool {
-        let mailboxes = self.signal_mailboxes.lock();
-        if let Some(mailbox) = mailboxes.get(&target_pid) {
+        // Clone the Arc and drop the outer lock before acquiring the mailbox
+        // lock to prevent nested lock acquisition (deadlock risk).
+        let mailbox = {
+            let mailboxes = self.signal_mailboxes.lock();
+            mailboxes.get(&target_pid).cloned()
+        };
+        if let Some(mailbox) = mailbox {
             let mut mbox = mailbox.lock();
             // Cap mailbox size to prevent unbounded memory growth.
             const MAX_MAILBOX_SIZE: usize = 256;

@@ -534,14 +534,9 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 if !children.contains(&target_pid) {
                     return Err(()); // ECHILD — not our child
                 }
-                let entry = inner.processes.get(&target_pid);
-                match entry {
-                    Some(e) if matches!(e.context.state, ProcessState::Exited(_)) => {
-                        if let ProcessState::Exited(status) = e.context.state {
-                            Some((target_pid, status))
-                        } else {
-                            None
-                        }
+                match inner.processes.get(&target_pid) {
+                    Some(e) if let ProcessState::Exited(status) = e.context.state => {
+                        Some((target_pid, status))
                     }
                     _ => None,
                 }
@@ -582,7 +577,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             }
             t if t < -1 => {
                 // Wait for any child in process group |t|.
-                let pgid = ProcessId((-t).cast_unsigned());
+                let pgid = ProcessId(t.unsigned_abs());
                 let mut any_match = false;
                 let mut result = None;
                 for &child_pid in &children {
@@ -606,8 +601,15 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
 
         // Reap the child if found
         if let Some((child_pid, _)) = found {
-            // Remove child from registry
-            let _entry = inner.processes.remove(&child_pid);
+            // Remove child from registry. Its children should have been
+            // reparented during exit_process.
+            let entry = inner.processes.remove(&child_pid);
+            debug_assert!(
+                entry
+                    .as_ref()
+                    .map_or(true, |e| e.context.children.is_empty()),
+                "reaped zombie still has children"
+            );
             // Remove from parent's children list
             if let Some(parent) = inner.processes.get_mut(&parent) {
                 parent.context.children.retain(|&c| c != child_pid);

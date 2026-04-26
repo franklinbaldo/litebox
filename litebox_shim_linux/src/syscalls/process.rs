@@ -1947,24 +1947,6 @@ impl<FS: ShimFS> Task<FS> {
 
         self.signals.reset_for_exec();
 
-        // Close FDs marked with FD_CLOEXEC (POSIX requirement).
-        {
-            let files = self.files.borrow();
-            let rds = files.raw_descriptor_store.read();
-            let dt = self.global.litebox.descriptor_table();
-            let cloexec_fds = rds
-                .raw_fds_matching_metadata::<_, litebox_common_linux::FileDescriptorFlags>(
-                    &dt,
-                    |flags| flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC),
-                );
-            drop(dt);
-            drop(rds);
-            drop(files);
-            for raw_fd in cloexec_fds {
-                let _ = self.do_close(raw_fd);
-            }
-        }
-
         // If this is a vfork child, detach to a new address space before
         // releasing memory (so we don't destroy the parent's mappings).
         let vfork_done = self
@@ -1973,7 +1955,14 @@ impl<FS: ShimFS> Task<FS> {
             .take()
             .map(|fc| fc.vfork_done);
         if vfork_done.is_some() {
-            self.detach_to_new_address_space()?;
+            if let Err(e) = self.detach_to_new_address_space() {
+                // Signal the parent before returning error — otherwise parent
+                // hangs forever waiting on vfork_done.
+                if let Some(vd) = vfork_done {
+                    vd.signal();
+                }
+                return Err(e);
+            }
         }
 
         // Don't release reserved mappings.
