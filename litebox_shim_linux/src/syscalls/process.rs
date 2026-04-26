@@ -1889,14 +1889,14 @@ impl<FS: ShimFS> Task<FS> {
             copy_vector(envp, "envp")?
         };
 
-        let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
-
         // PATH resolution: if path doesn't contain '/', search $PATH.
         let path = if !path.contains('/') {
-            self.resolve_path_lookup(&path, &envp_vec)?
+            self.resolve_path_lookup(path, &envp_vec)?
         } else {
-            path
+            alloc::string::String::from(path)
         };
+
+        let (path, argv_vec) = self.resolve_shebang(path, argv_vec)?;
 
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
 

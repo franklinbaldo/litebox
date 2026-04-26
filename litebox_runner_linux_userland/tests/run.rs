@@ -668,3 +668,74 @@ fn test_pipe_fork() {
         "pipe_fork test failed, output: {output_str}"
     );
 }
+
+#[test]
+fn test_kill_signal() {
+    let main_target = common::compile("./tests/multiprocess/kill_test.c", "kill_test", true, false);
+    let helper_target = common::compile_static_pie("./tests/multiprocess/sleeper.c", "sleeper");
+
+    let mut runner = Runner::new(&main_target, "kill_test");
+    runner.with_fs_path(|out_dir| {
+        let guest_helper = out_dir.join("out/sleeper");
+        let success = common::rewrite_with_cache(&helper_target, &guest_helper, &[]);
+        assert!(success, "failed to rewrite sleeper helper");
+    });
+    runner.arg("/out/sleeper");
+    let output = runner.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("kill_test: OK"),
+        "kill_test failed, output: {output_str}"
+    );
+}
+
+#[test]
+fn test_waitpid_wnohang() {
+    let main_target = common::compile(
+        "./tests/multiprocess/wnohang_test.c",
+        "wnohang_test",
+        true,
+        false,
+    );
+    let helper_target =
+        common::compile_static_pie("./tests/multiprocess/exit_with.c", "exit_with_wnohang");
+
+    let mut runner = Runner::new(&main_target, "wnohang_test");
+    runner.with_fs_path(|out_dir| {
+        let guest_helper = out_dir.join("out/exit_with");
+        let success = common::rewrite_with_cache(&helper_target, &guest_helper, &[]);
+        assert!(success, "failed to rewrite exit_with helper");
+    });
+    runner.arg("/out/exit_with");
+    let output = runner.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("wnohang_test: OK"),
+        "wnohang_test failed, output: {output_str}"
+    );
+}
+
+#[test]
+fn test_exec_path_lookup() {
+    let main_target = common::compile(
+        "./tests/multiprocess/path_exec_test.c",
+        "path_exec_test",
+        true,
+        false,
+    );
+    let helper_target =
+        common::compile_static_pie("./tests/multiprocess/exit_with.c", "exit_with_path");
+
+    let mut runner = Runner::new(&main_target, "path_exec_test");
+    runner.with_fs_path(|out_dir| {
+        let guest_helper = out_dir.join("out/exit_with");
+        let success = common::rewrite_with_cache(&helper_target, &guest_helper, &[]);
+        assert!(success, "failed to rewrite exit_with helper");
+    });
+    let output = runner.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("path_exec_test: OK"),
+        "path_exec_test failed, output: {output_str}"
+    );
+}
