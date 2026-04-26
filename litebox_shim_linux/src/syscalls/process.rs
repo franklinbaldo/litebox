@@ -594,8 +594,25 @@ impl<FS: ShimFS> Task<FS> {
             let notification =
                 self.global
                     .process_registry
-                    .exit_process(process_id, wait_status, |_orphan| {
-                        // TODO: reparent orphans to init
+                    .exit_process(process_id, wait_status, |orphan| {
+                        // Reparent orphaned children to init (pid 1).
+                        if let Some(init_pid) = litebox::process::ProcessId::new(1) {
+                            let zombie_status =
+                                self.global.process_registry.reparent(orphan, init_pid);
+                            // If the orphan is already a zombie, notify init with SIGCHLD.
+                            if let Some(exit_status) = zombie_status {
+                                use litebox_common_linux::signal::Signal;
+                                let siginfo = super::signal::siginfo_chld(
+                                    orphan.as_u32().cast_signed(),
+                                    exit_status,
+                                );
+                                self.global.send_signal_to_process(
+                                    1, // init pid
+                                    Signal::SIGCHLD,
+                                    siginfo,
+                                );
+                            }
+                        }
                     });
 
             // Deliver SIGCHLD to the parent process.

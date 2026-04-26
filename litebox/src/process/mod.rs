@@ -330,6 +330,43 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         notification
     }
 
+    /// Reparent a child process to a new parent.
+    ///
+    /// Updates the child's parent field, removes it from the old parent's children list,
+    /// and adds it to the new parent's children list.
+    ///
+    /// Returns `Some(exit_status)` if the child is already a zombie (exited but not reaped),
+    /// so the caller can deliver SIGCHLD to the new parent.
+    pub fn reparent(&self, child: ProcessId, new_parent: ProcessId) -> Option<u32> {
+        let mut inner = self.inner.lock();
+
+        // Read child info first.
+        let (old_parent, exit_status) = {
+            let Some(entry) = inner.processes.get_mut(&child) else {
+                return None;
+            };
+            let old_parent = entry.context.parent.replace(new_parent);
+            let exit_status = match entry.context.state {
+                ProcessState::Exited(status) => Some(status),
+                _ => None,
+            };
+            (old_parent, exit_status)
+        };
+
+        // Remove from old parent's children list.
+        if let Some(old_pid) = old_parent {
+            if let Some(old_entry) = inner.processes.get_mut(&old_pid) {
+                old_entry.context.children.retain(|&c| c != child);
+            }
+        }
+
+        // Add to new parent's children list.
+        if let Some(parent_entry) = inner.processes.get_mut(&new_parent) {
+            parent_entry.context.children.push(child);
+        }
+        exit_status
+    }
+
     /// Read process context through a closure.
     /// Returns `None` if the process does not exist.
     pub fn with_context<R>(
