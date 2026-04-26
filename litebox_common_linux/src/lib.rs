@@ -2146,6 +2146,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         new_value: Platform::RawConstPointer<ItimerVal>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
     },
+    Wait4 {
+        pid: i32,
+        wstatus: Option<Platform::RawMutPointer<i32>>,
+        options: i32,
+        // rusage is ignored for now
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2544,6 +2550,24 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
+            Sysno::vfork => {
+                // vfork is equivalent to clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
+                // with no new stack (child runs on parent's stack).
+                let args = CloneArgs {
+                    flags: CloneFlags::VM | CloneFlags::VFORK,
+                    stack: 0,
+                    parent_tid: 0,
+                    child_tid: 0,
+                    tls: 0,
+                    pidfd: 0,
+                    exit_signal: 17, // SIGCHLD
+                    stack_size: 0,
+                    set_tid: 0,
+                    set_tid_size: 0,
+                    cgroup: 0,
+                };
+                SyscallRequest::Clone { args }
+            }
             Sysno::clone => {
                 let args = CloneArgs {
                     // The upper 32 bits are clone3-specific. The low 8 bits are the exit signal.
@@ -2603,6 +2627,21 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::wait4 => {
+                let pid: i32 = ctx.sys_req_arg(0);
+                let wstatus: Platform::RawMutPointer<i32> = ctx.sys_req_ptr(1);
+                let options: i32 = ctx.sys_req_arg(2);
+                // arg3 is rusage, ignored for now
+                SyscallRequest::Wait4 {
+                    pid,
+                    wstatus: if wstatus.as_usize() == 0 {
+                        None
+                    } else {
+                        Some(wstatus)
+                    },
+                    options,
+                }
+            }
             // Noisy unsupported syscalls.
             Sysno::statx | Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
                 return Err(errno::Errno::ENOSYS);

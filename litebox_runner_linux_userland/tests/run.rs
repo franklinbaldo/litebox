@@ -604,3 +604,67 @@ fn test_shebang() {
         "shebang test failed, output: {output_str}"
     );
 }
+
+// Multi-process tests (fork, pipe, waitpid)
+
+#[test]
+fn test_fork_exec_wait() {
+    // Compile the main test program (static non-PIE, runs as init process).
+    let main_target = common::compile(
+        "./tests/multiprocess/fork_exec_wait.c",
+        "fork_exec_wait",
+        true,
+        false,
+    );
+    // Compile the helper as static-pie so it can load in any VA partition.
+    let helper_target = common::compile_static_pie("./tests/multiprocess/exit_with.c", "exit_with");
+
+    // Build a runner with the helper binary added to the guest filesystem.
+    let mut runner = Runner::new(&main_target, "fork_exec_wait");
+    runner.with_fs_path(|out_dir| {
+        // Rewrite and place the helper binary in the guest filesystem.
+        let guest_helper = out_dir.join("out/exit_with");
+        let success = common::rewrite_with_cache(&helper_target, &guest_helper, &[]);
+        assert!(success, "failed to rewrite exit_with helper");
+    });
+    // Pass the guest path to the helper as an argument.
+    runner.arg("/out/exit_with");
+    let output = runner.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("fork_exec_wait: OK"),
+        "fork_exec_wait test failed, output: {output_str}"
+    );
+}
+
+#[test]
+fn test_pipe_fork() {
+    // Compile main test (static non-PIE, runs as init)
+    let main_target = common::compile("./tests/multiprocess/pipe_fork.c", "pipe_fork", true, false);
+    // Compile helpers as static-pie (loaded in child VA partitions)
+    let echo_target = common::compile_static_pie("./tests/multiprocess/echo_hello.c", "echo_hello");
+    let cat_target = common::compile_static_pie("./tests/multiprocess/cat_stdin.c", "cat_stdin");
+
+    let mut runner = Runner::new(&main_target, "pipe_fork");
+    runner.with_fs_path(|out_dir| {
+        let guest_echo = out_dir.join("out/echo_hello");
+        let success = common::rewrite_with_cache(&echo_target, &guest_echo, &[]);
+        assert!(success, "failed to rewrite echo_hello helper");
+
+        let guest_cat = out_dir.join("out/cat_stdin");
+        let success = common::rewrite_with_cache(&cat_target, &guest_cat, &[]);
+        assert!(success, "failed to rewrite cat_stdin helper");
+    });
+    runner.arg("/out/echo_hello");
+    runner.arg("/out/cat_stdin");
+    let output = runner.output();
+    let output_str = String::from_utf8_lossy(&output);
+    assert!(
+        output_str.contains("hello"),
+        "pipe_fork test failed — expected 'hello' in output, got: {output_str}"
+    );
+    assert!(
+        output_str.contains("pipe_fork: OK"),
+        "pipe_fork test failed, output: {output_str}"
+    );
+}

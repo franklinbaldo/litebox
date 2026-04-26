@@ -76,6 +76,21 @@ impl<FS: ShimFS> FilesState<FS> {
         }
     }
 
+    /// Clone the file descriptor table for fork.
+    ///
+    /// The child gets its own `RawDescriptorStorage` (so close/dup in the
+    /// child does not affect the parent's FD numbering), but the underlying
+    /// open file descriptions are shared via Arc.
+    pub(crate) fn clone_for_fork(&self) -> Self {
+        Self {
+            fs: self.fs.clone(),
+            raw_descriptor_store: litebox::sync::RwLock::new(
+                self.raw_descriptor_store.read().clone_for_fork(),
+            ),
+            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+        }
+    }
+
     pub(crate) fn set_max_fd(&self, max_fd: usize) {
         self.max_fd.store(max_fd, Ordering::Relaxed);
     }
@@ -519,6 +534,11 @@ impl<FS: ShimFS> Task<FS> {
         match rds.fd_consume_raw_integer(raw_fd) {
             Ok(fd) => {
                 drop(rds);
+                // If another process (fork) still holds a reference to this FD,
+                // just drop our reference without closing the underlying entry.
+                if alloc::sync::Arc::strong_count(&fd) > 1 {
+                    return Ok(());
+                }
                 return files.fs.close(&fd).map_err(Errno::from);
             }
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
@@ -530,14 +550,23 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
             drop(rds);
+            if alloc::sync::Arc::strong_count(&fd) > 1 {
+                return Ok(());
+            }
             return self.global.close_socket(&self.wait_cx(), fd);
         }
         if let Ok(fd) = rds.fd_consume_raw_integer(raw_fd) {
             drop(rds);
+            if alloc::sync::Arc::strong_count(&fd) > 1 {
+                return Ok(());
+            }
             return self.global.pipes.close(&fd).map_err(Errno::from);
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::eventfd::EventfdSubsystem>(raw_fd) {
             drop(rds);
+            if alloc::sync::Arc::strong_count(&fd) > 1 {
+                return Ok(());
+            }
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 dt.remove(&fd)
@@ -547,6 +576,9 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<FS>>(raw_fd) {
             drop(rds);
+            if alloc::sync::Arc::strong_count(&fd) > 1 {
+                return Ok(());
+            }
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 dt.remove(&fd)
@@ -556,6 +588,9 @@ impl<FS: ShimFS> Task<FS> {
         }
         if let Ok(fd) = rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<FS>>(raw_fd) {
             drop(rds);
+            if alloc::sync::Arc::strong_count(&fd) > 1 {
+                return Ok(());
+            }
             let entry = {
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 dt.remove(&fd)

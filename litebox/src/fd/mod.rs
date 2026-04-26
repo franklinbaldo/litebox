@@ -36,6 +36,29 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self { entries: vec![] }
     }
 
+    /// Clone the entire descriptor table for fork.
+    ///
+    /// Each entry in the new table shares the same underlying `DescriptorEntry`
+    /// (via `Arc::clone`), matching the semantics of both POSIX fork (shared
+    /// file descriptions) and NT handle inheritance. Per-FD metadata is **not**
+    /// cloned; each slot in the child starts with a fresh `AnyMap`.
+    ///
+    /// Calls `on_dup()` on each entry to notify subsystems of the new reference.
+    pub(crate) fn clone_table(&self) -> Self {
+        let entries = self
+            .entries
+            .iter()
+            .map(|slot| {
+                slot.as_ref().map(|ind| {
+                    let cloned = IndividualEntry::new(Arc::clone(&ind.x));
+                    cloned.x.read().entry.on_dup();
+                    cloned
+                })
+            })
+            .collect();
+        Self { entries }
+    }
+
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     #[expect(
         clippy::missing_panics_doc,
@@ -95,6 +118,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let new_ind_entry = IndividualEntry::new(Arc::clone(
             &self.entries[fd.x.as_usize()?].as_ref().unwrap().x,
         ));
+        new_ind_entry.x.read().entry.on_dup();
         let old = self.entries[idx].replace(new_ind_entry);
         assert!(old.is_none());
         Some(TypedFd {
@@ -116,6 +140,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         let Some(old) = self.entries[fd.x.as_usize()?].take() else {
             unreachable!();
         };
+        old.x.read().entry.on_close();
         fd.x.mark_as_closed();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
@@ -143,6 +168,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
+                old.x.read().entry.on_close();
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
                     .map(RwLock::into_inner)
@@ -156,6 +182,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 Some(CloseResult::Deferred)
             }
         } else {
+            old.x.read().entry.on_close();
             fd.x.mark_as_closed();
             // Shared, so we need to duplicate it.
             let old = self.entries[idx].replace(old);
@@ -676,6 +703,28 @@ impl RawDescriptorStorage {
         self.stored_fds.get(fd).is_some_and(Option::is_some)
     }
 
+    /// Clone the entire raw descriptor storage for fork.
+    ///
+    /// Each slot in the new storage shares the same underlying `OwnedFd`
+    /// (via `Arc::clone`), matching POSIX fork semantics where the child
+    /// inherits copies of the parent's file descriptor table that refer to
+    /// the same open file descriptions.
+    #[must_use]
+    pub fn clone_for_fork(&self) -> Self {
+        Self {
+            stored_fds: self
+                .stored_fds
+                .iter()
+                .map(|slot| {
+                    slot.as_ref().map(|stored| StoredFd {
+                        x: Arc::clone(&stored.x),
+                        subsystem_entry_type_id: stored.subsystem_entry_type_id,
+                    })
+                })
+                .collect(),
+        }
+    }
+
     /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
     pub fn iter_alive(&self) -> impl Iterator<Item = usize> + '_ {
         self.stored_fds
@@ -762,7 +811,29 @@ pub trait FdEnabledSubsystem: Sized {
 }
 
 /// A per-FD entry stored in the descriptor table for a specific [`FdEnabledSubsystem`]
-pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {}
+///
+/// # Hook contract
+///
+/// `on_dup` and `on_close` are called while a read lock is held on the
+/// containing `DescriptorEntry`. Implementations must use interior mutability
+/// (e.g., atomics) and must **not** attempt to acquire a write lock on the
+/// same entry, or deadlock will result.
+///
+/// The initial `insert()` does **not** call `on_dup()`; subsystems should
+/// initialize any reference count to 1 in their constructor.
+pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {
+    /// Called when a new reference to this entry is created (dup, fork).
+    ///
+    /// Subsystems that track reference counts (e.g., pipe write-ends for
+    /// EOF detection) should increment their count here.
+    fn on_dup(&self) {}
+
+    /// Called when a reference to this entry is dropped (close).
+    ///
+    /// This is called for every close, even when other references remain.
+    /// Subsystems should decrement their reference count here.
+    fn on_close(&self) {}
+}
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
 /// [`RawDescriptorStorage::fd_consume_raw_integer`].

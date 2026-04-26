@@ -45,7 +45,7 @@ impl<FS: ShimFS> Task<FS> {
         op: impl FnOnce(MutPtr<u8>) -> Result<usize, MappingError>,
     ) -> Result<MutPtr<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
-            &self.global.pm,
+            &self.process.borrow().pm,
             suggested_addr,
             len,
             prot,
@@ -175,7 +175,7 @@ impl<FS: ShimFS> Task<FS> {
                 // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
                 // `permissions`.
                 unsafe {
-                    self.global.pm.register_existing_mapping(
+                    self.process.borrow().pm.register_existing_mapping(
                         range,
                         permissions,
                         true,
@@ -303,7 +303,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: crate::MutPtr<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
+        litebox_common_linux::mm::sys_munmap(&self.process.borrow().pm, addr, len)
     }
 
     /// Handle syscall `mprotect`
@@ -314,7 +314,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
+        litebox_common_linux::mm::sys_mprotect(&self.process.borrow().pm, addr, len, prot)
     }
 
     #[inline]
@@ -327,7 +327,7 @@ impl<FS: ShimFS> Task<FS> {
         new_addr: usize,
     ) -> Result<crate::MutPtr<u8>, Errno> {
         litebox_common_linux::mm::sys_mremap(
-            &self.global.pm,
+            &self.process.borrow().pm,
             old_addr,
             old_size,
             new_size,
@@ -339,7 +339,7 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: MutPtr<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
+        litebox_common_linux::mm::sys_brk(&self.process.borrow().pm, addr)
     }
 
     /// Handle syscall `madvise`
@@ -350,7 +350,7 @@ impl<FS: ShimFS> Task<FS> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
+        litebox_common_linux::mm::sys_madvise(&self.process.borrow().pm, addr, len, advice)
     }
 }
 

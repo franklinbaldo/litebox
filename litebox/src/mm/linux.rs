@@ -304,30 +304,53 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     pub(super) brk: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
+    /// Minimum valid address for this address space.
+    pub(super) addr_min: usize,
+    /// Maximum valid address (exclusive) for this address space.
+    pub(super) addr_max: usize,
 }
 
 impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
-    /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
+    /// Create a new [`Vmem`] instance using the platform's default address range.
     pub(super) fn new(platform: &'static Platform) -> Self {
+        Self::new_with_range(platform, Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX)
+    }
+
+    /// Create a new [`Vmem`] instance scoped to the given VA range.
+    ///
+    /// Used for multi-process support where each process gets a VA partition.
+    pub(super) fn new_with_range(
+        platform: &'static Platform,
+        range: core::ops::Range<usize>,
+    ) -> Self {
+        assert!(
+            range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN),
+            "Vmem: address range must be aligned to {ALIGN} bytes"
+        );
         let mut vmem = Self {
             vmas: RangeMap::new(),
             brk: 0,
             platform,
+            addr_min: range.start,
+            addr_max: range.end,
         };
         for each in platform.reserved_pages() {
-            assert!(
-                each.start % ALIGN == 0 && each.end % ALIGN == 0,
-                "Vmem: reserved range is not aligned to {ALIGN} bytes"
-            );
-            vmem.vmas.insert(
-                each.start..each.end,
-                VmArea {
-                    flags: VmFlags::empty(),
-                    is_file_backed: false,
-                },
-            );
+            // Only insert reserved pages that fall within our range
+            if each.start >= range.start && each.end <= range.end {
+                assert!(
+                    each.start % ALIGN == 0 && each.end % ALIGN == 0,
+                    "Vmem: reserved range is not aligned to {ALIGN} bytes"
+                );
+                vmem.vmas.insert(
+                    each.start..each.end,
+                    VmArea {
+                        flags: VmFlags::empty(),
+                        is_file_backed: false,
+                    },
+                );
+            }
         }
         vmem
     }
@@ -453,10 +476,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let (start, end) = (suggested_range.start, suggested_range.end);
-        if start < Platform::TASK_ADDR_MIN {
+        if start < self.addr_min {
             return Err(AllocationError::BelowMinAddress);
         }
-        if end > Platform::TASK_ADDR_MAX {
+        if end > self.addr_max {
             return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
@@ -518,8 +541,8 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
-        debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
-        debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
+        debug_assert!(new_start >= self.addr_min);
+        debug_assert!(new_end <= self.addr_max);
         Ok(ret)
     }
 
@@ -890,11 +913,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         fixed_addr: bool,
     ) -> Option<usize> {
         let size = length.as_usize();
-        if size > Platform::TASK_ADDR_MAX {
+        if size > self.addr_max.saturating_sub(self.addr_min) {
             return None;
         }
         if let Some(suggested_address) = suggested_address {
-            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
+            if (self.addr_max - size) < suggested_address.0 {
                 return None;
             }
             if fixed_addr
@@ -912,12 +935,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
         // top down
         // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (
-            Platform::TASK_ADDR_MIN,
-            Platform::TASK_ADDR_MAX - length.as_usize(),
-        );
-        debug_assert!(Platform::TASK_ADDR_MIN % ALIGN == 0);
-        debug_assert!(Platform::TASK_ADDR_MAX % ALIGN == 0);
+        let (low_limit, high_limit) = (self.addr_min, self.addr_max - length.as_usize());
+        debug_assert!(self.addr_min.is_multiple_of(ALIGN));
+        debug_assert!(self.addr_max.is_multiple_of(ALIGN));
         let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
         if last_end <= high_limit {
             return Some(high_limit);

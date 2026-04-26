@@ -7,6 +7,7 @@
 //! trait is merely a collection of subtraits that could be composed independently from various
 //! other crates that implement them upon various types.
 
+pub mod address_space;
 pub mod common_providers;
 pub mod page_mgmt;
 pub mod trivial_providers;
@@ -18,6 +19,7 @@ use either::Either;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+pub use address_space::AddressSpaceProvider;
 pub use page_mgmt::PageManagementProvider;
 
 /// A provider of a platform upon which LiteBox can execute.
@@ -26,7 +28,12 @@ pub use page_mgmt::PageManagementProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + IPInterfaceProvider + TimeProvider + PunchthroughProvider + RawPointerProvider
+    RawMutexProvider
+    + IPInterfaceProvider
+    + TimeProvider
+    + PunchthroughProvider
+    + RawPointerProvider
+    + AddressSpaceProvider
 {
 }
 

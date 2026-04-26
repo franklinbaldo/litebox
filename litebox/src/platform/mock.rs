@@ -340,3 +340,9 @@ unsafe impl ThreadLocalStorageProvider for MockPlatform {
         MOCK_TLS.replace(value)
     }
 }
+
+impl AddressSpaceProvider for MockPlatform {
+    type AddressSpaceId = u32;
+    const ADDRESS_SPACE_KIND: address_space::AddressSpaceKind =
+        address_space::AddressSpaceKind::SharedMemory;
+}

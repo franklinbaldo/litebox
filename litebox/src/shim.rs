@@ -28,6 +28,11 @@ pub trait EnterShim {
     /// FUTURE: use a single per-architecture type for all shims and platforms.
     type ExecutionContext;
 
+    /// The process ID for this thread's process, if multi-process is supported.
+    fn process_id(&self) -> Option<crate::process::ProcessId> {
+        None
+    }
+
     /// Initialize a new thread. Must be called by the platform exactly once
     /// before running the thread in the guest for the first time.
     ///

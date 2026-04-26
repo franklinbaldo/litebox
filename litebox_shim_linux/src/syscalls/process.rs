@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::Cell;
+use core::cell::{Cell, RefCell};
 use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ use litebox::platform::ThreadProvider;
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::platform::{
     PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutex as _,
-    ThreadLocalStorageProvider as _,
+    RawMutexProvider, ThreadLocalStorageProvider as _,
 };
 use litebox::platform::{RawMutPointer as _, TimerHandle, TimerProvider};
 use litebox::sync::Mutex;
@@ -28,6 +28,49 @@ use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, PrctlArg, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
+
+/// One-shot signal from a vfork child to the parent, indicating the child
+/// has called `execve` or `_exit` and the parent may resume.
+///
+/// On userland, all forks are treated as vfork: the parent is suspended
+/// while the child runs in the shared address space. When the child performs
+/// exec (detaching to its own VA partition) or exits, it signals the parent
+/// via this structure.
+pub(crate) struct VforkDone {
+    /// 0 = not done, 1 = done.
+    futex: <Platform as RawMutexProvider>::RawMutex,
+}
+
+impl VforkDone {
+    fn new() -> Self {
+        Self {
+            futex: <Platform as RawMutexProvider>::RawMutex::INIT,
+        }
+    }
+
+    /// Signal that the child is done (called by child on exec or exit).
+    pub(crate) fn signal(&self) {
+        self.futex.underlying_atomic().store(1, Ordering::Release);
+        self.futex.wake_all();
+    }
+
+    /// Block until the child signals done (called by parent after spawning child).
+    fn wait(&self) {
+        loop {
+            if self.futex.underlying_atomic().load(Ordering::Acquire) != 0 {
+                return;
+            }
+            let _ = self.futex.block(0);
+        }
+    }
+}
+
+/// Context carried by a fork child task so that exec and exit know
+/// to signal the parent and (on exec) detach to a new address space.
+pub(crate) struct ForkContext {
+    /// Signaled on exec or exit to wake the parent.
+    pub(crate) vfork_done: Arc<VforkDone>,
+}
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState {
@@ -322,6 +365,12 @@ enum ThreadInitState {
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<MutPtr<i32>>,
     },
+    /// A fork child: starts with parent's register state, return value 0.
+    NewForkChild {
+        /// The guest FS base (TLS pointer) inherited from the parent.
+        #[cfg(target_arch = "x86_64")]
+        guest_fsbase: usize,
+    },
 }
 
 /// Credentials of a process
@@ -500,6 +549,19 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn prepare_for_exit(&mut self) {
         self.thread.detach_from_process();
 
+        // Close all file descriptors when the process leader exits.
+        // Only the process leader (pid == tid) closes FDs, not worker threads
+        // (which share the same FD table and may exit during exec).
+        if self.pid == self.tid {
+            let files = self.files.borrow();
+            let live_fds: alloc::vec::Vec<usize> =
+                files.raw_descriptor_store.read().iter_alive().collect();
+            drop(files);
+            for fd in live_fds {
+                let _ = self.do_close(fd);
+            }
+        }
+
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -515,6 +577,33 @@ impl<FS: ShimFS> Task<FS> {
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list(robust_list);
         }
+
+        // If this is the process leader (pid == tid) and it's exiting,
+        // record the exit in the process registry so waitpid can collect it.
+        // This must happen BEFORE signaling vfork_done, so that the parent
+        // can immediately waitpid after being unblocked.
+        if self.pid == self.tid
+            && let Some(process_id) = litebox::process::ProcessId::new(self.pid.cast_unsigned())
+        {
+            // Get the exit status from the process thread group.
+            let exit_status = self.thread.process.inner.lock().exit_status;
+            let wait_status = match exit_status {
+                ExitStatus::Exit(code) => (u32::from(code.cast_unsigned()) & 0xff) << 8,
+                ExitStatus::Signal(sig) => sig.as_i32().cast_unsigned() & 0x7f,
+            };
+            let _ = self
+                .global
+                .process_registry
+                .exit_process(process_id, wait_status, |_orphan| {
+                    // TODO: reparent orphans to init
+                });
+        }
+
+        // If this is a vfork child that never exec'd, signal the parent.
+        // Done after exit recording so parent's waitpid sees the exit.
+        if let Some(fc) = self.fork_context.borrow_mut().take() {
+            fc.vfork_done.signal();
+        }
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
@@ -526,6 +615,46 @@ impl<FS: ShimFS> Task<FS> {
     pub(crate) fn sys_exit_group(&self, status: i32) {
         // Tear down occurs similarly to `sys_exit`.
         self.exit_group(ExitStatus::Exit(status.truncate()));
+    }
+
+    /// wait4(pid, wstatus, options, rusage) — wait for a child process.
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<MutPtr<i32>>,
+        options: i32,
+    ) -> Result<usize, Errno> {
+        const WNOHANG: i32 = 1;
+
+        let parent_pid =
+            litebox::process::ProcessId::new(self.pid.cast_unsigned()).ok_or(Errno::ESRCH)?;
+
+        loop {
+            match self.global.process_registry.try_wait(parent_pid, pid) {
+                Err(()) => {
+                    // No matching children at all — ECHILD.
+                    return Err(Errno::ECHILD);
+                }
+                Ok(Some((child_pid, status))) => {
+                    // Reaped a child.
+                    if let Some(wstatus) = wstatus {
+                        let _ = wstatus.write_at_offset(0, status.cast_signed());
+                    }
+                    return Ok(child_pid.as_u32() as usize);
+                }
+                Ok(None) => {
+                    // Children exist but none exited yet.
+                    if options & WNOHANG != 0 {
+                        return Ok(0);
+                    }
+                    // Block: sleep briefly and retry. This is a simple poll loop.
+                    // A proper implementation would use ExitSubject observers,
+                    // but for the minimal multi-process support this suffices.
+                    // Block until some child exits.
+                    self.global.process_registry.wait_for_any_child_exit();
+                }
+            }
+        }
     }
 }
 
@@ -577,8 +706,151 @@ impl<FS: ShimFS> Task<FS> {
 
     /// Creates a new thread or process.
     ///
-    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    /// If `CLONE_THREAD` is set, creates a new thread in the current process.
+    /// Otherwise, treats the clone as a fork (vfork semantics: parent is
+    /// suspended until child calls exec or exits).
     fn do_clone(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: &litebox_common_linux::CloneArgs,
+        clone3: bool,
+    ) -> Result<usize, Errno> {
+        let litebox_common_linux::CloneArgs { mut flags, .. } = *args;
+
+        // `CLONE_DETACHED` is ignored but has been reserved for reuse with
+        // `clone3` or in combination with `CLONE_PIDFD`.
+        if !clone3 && !flags.contains(CloneFlags::PIDFD) {
+            flags.remove(CloneFlags::DETACHED);
+        }
+
+        if !flags.contains(CloneFlags::THREAD) {
+            // This is a fork (or vfork). Route to fork path.
+            return self.do_fork(ctx, args);
+        }
+
+        // Thread clone path — requires VM, THREAD, SIGHAND, FILES.
+        self.do_thread_clone(ctx, args, clone3)
+    }
+
+    /// Fork: create a new child process with vfork semantics.
+    ///
+    /// On userland, all forks are treated as vfork: the parent is suspended
+    /// while the child runs in the parent's shared address space. When the
+    /// child calls `execve` (detaching to its own VA partition) or `_exit`,
+    /// the parent is woken.
+    ///
+    /// The child gets:
+    /// - A new PID/TID
+    /// - Its own cloned FD table (close in child doesn't affect parent)
+    /// - The parent's ProcessState (shared memory, shared PageManager)
+    /// - A `ForkContext` so exec/exit can signal the parent
+    fn do_fork(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        args: &litebox_common_linux::CloneArgs,
+    ) -> Result<usize, Errno> {
+        const MAX_SIGNAL_NUMBER: u64 = 64;
+        let litebox_common_linux::CloneArgs {
+            exit_signal,
+            set_tid,
+            set_tid_size,
+            cgroup,
+            ..
+        } = *args;
+
+        if cgroup != 0 {
+            log_unsupported!("fork with cgroup");
+            return Err(Errno::EINVAL);
+        }
+        if set_tid != 0 || set_tid_size != 0 {
+            log_unsupported!("fork with set_tid");
+            return Err(Errno::EINVAL);
+        }
+
+        // Validate exit_signal (typically SIGCHLD for fork).
+        if exit_signal > MAX_SIGNAL_NUMBER {
+            return Err(Errno::EINVAL);
+        }
+
+        // Register the child process in the process registry.
+        let parent_process_id =
+            litebox::process::ProcessId::new(self.pid.cast_unsigned()).expect("parent PID is 0");
+        let child_process_id = self
+            .global
+            .process_registry
+            .create_process(Some(parent_process_id))
+            .map_err(|_| Errno::EAGAIN)?;
+        let child_pid = child_process_id.as_u32().cast_signed();
+
+        // Advance the thread ID counter past the child PID to avoid collisions.
+        let _ = self
+            .global
+            .next_thread_id
+            .fetch_max(child_pid + 1, Ordering::Relaxed);
+
+        // Clone the FD table for the child.
+        let child_files = Arc::new(self.files.borrow().clone_for_fork());
+
+        // Capture the parent's guest FS base for the child.
+        #[cfg(target_arch = "x86_64")]
+        let guest_fsbase = {
+            let punchthrough = litebox_common_linux::PunchthroughSyscall::GetFsBase;
+            let token = self
+                .global
+                .platform
+                .get_punchthrough_token_for(punchthrough)
+                .expect("Failed to get punchthrough token for GET_FS");
+            token.execute().unwrap()
+        };
+
+        // Create the vfork synchronization.
+        let vfork_done = Arc::new(VforkDone::new());
+
+        // Build the child task. The child shares the parent's ProcessState
+        // (and thus PageManager / address space) until it execs.
+        let child_thread = ThreadState::new_process(child_pid);
+        child_thread.init_state.set(ThreadInitState::NewForkChild {
+            #[cfg(target_arch = "x86_64")]
+            guest_fsbase,
+        });
+
+        let child_task = Task {
+            global: self.global.clone(),
+            process: RefCell::new(self.process.borrow().clone()), // shared address space
+            wait_state: crate::wait::WaitState::new(self.global.platform),
+            thread: child_thread,
+            pid: child_pid,
+            ppid: self.pid,
+            tid: child_pid,
+            credentials: self.credentials.clone(),
+            comm: self.comm.clone(),
+            fs: RefCell::new((*self.fs.borrow()).clone()),
+            files: RefCell::new(child_files),
+            signals: self.signals.clone_for_new_task(),
+            fork_context: RefCell::new(Some(ForkContext {
+                vfork_done: vfork_done.clone(),
+            })),
+        };
+
+        // Spawn the child as a new host thread.
+        let r = unsafe {
+            self.global
+                .platform
+                .spawn_thread(ctx, Box::new(NewThreadArgs { task: child_task }))
+        };
+        if let Err(err) = r {
+            litebox_util_log::error!(err:% = err; "failed to spawn fork child");
+            return Err(Errno::ENOMEM);
+        }
+
+        // Parent blocks here until child execs or exits.
+        vfork_done.wait();
+
+        Ok(usize::try_from(child_pid).unwrap())
+    }
+
+    /// Creates a new thread within the current process.
+    fn do_thread_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
@@ -717,6 +989,7 @@ impl<FS: ShimFS> Task<FS> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
+                        process: RefCell::new(self.process.borrow().clone()),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,
@@ -727,6 +1000,7 @@ impl<FS: ShimFS> Task<FS> {
                         fs: fs.into(),
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
+                        fork_context: RefCell::new(None),
                     },
                 }),
             )
@@ -1386,6 +1660,29 @@ impl<FS: ShimFS> Task<FS> {
         Err(Errno::ELOOP)
     }
 
+    /// Detach from the parent's shared address space to a new VA partition.
+    ///
+    /// Called during exec of a vfork child. Creates a new address space via the
+    /// platform, builds a new `ProcessState` with a `PageManager` scoped to that
+    /// partition's VA range, and replaces `self.process`.
+    fn detach_to_new_address_space(&self) {
+        use litebox::platform::AddressSpaceProvider;
+
+        let platform = self.global.platform;
+        let as_id = platform
+            .create_address_space()
+            .expect("failed to create address space for fork child");
+        let range = platform
+            .address_space_range(as_id)
+            .expect("failed to get address space range");
+
+        let new_process = Arc::new(crate::ProcessState {
+            pm: litebox::mm::PageManager::new_with_range(&self.global.litebox, range),
+        });
+
+        *self.process.borrow_mut() = new_process;
+    }
+
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
@@ -1467,15 +1764,32 @@ impl<FS: ShimFS> Task<FS> {
 
         self.signals.reset_for_exec();
 
+        // If this is a vfork child, detach to a new address space before
+        // releasing memory (so we don't destroy the parent's mappings).
+        let vfork_done = self
+            .fork_context
+            .borrow_mut()
+            .take()
+            .map(|fc| fc.vfork_done);
+        if vfork_done.is_some() {
+            self.detach_to_new_address_space();
+        }
+
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
+        unsafe { self.process.borrow().pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         litebox_platform_multiplex::Platform::clear_guest_thread_local_storage();
 
         self.load_program(loader, argv_vec, envp_vec)
             .expect("TODO: terminate the process cleanly");
+
+        // Signal the parent that the vfork child has exec'd and detached.
+        // The parent's address space is intact; it can safely resume.
+        if let Some(vd) = vfork_done {
+            vd.signal();
+        }
 
         self.init_thread_context(ctx);
         Ok(0)
@@ -1573,6 +1887,19 @@ impl<FS: ShimFS> Task<FS> {
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
                     let _ = child_tid_ptr.write_at_offset(0, self.tid);
+                }
+            }
+            ThreadInitState::NewForkChild {
+                #[cfg(target_arch = "x86_64")]
+                guest_fsbase,
+            } => {
+                // Fork child: return 0 from the fork syscall.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    ctx.rax = 0;
+                    // Restore the parent's guest FS base (TLS) on this new host thread.
+                    self.sys_arch_prctl(ArchPrctlArg::SetFs(guest_fsbase))
+                        .expect("failed to set guest fsbase for fork child");
                 }
             }
         }

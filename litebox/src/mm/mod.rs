@@ -46,6 +46,19 @@ where
         Self { vmem }
     }
 
+    /// Create a new `PageManager` scoped to a specific VA range.
+    ///
+    /// Used for multi-process support where each process gets a VA partition.
+    pub fn new_with_range(litebox: &LiteBox<Platform>, range: core::ops::Range<usize>) -> Self {
+        let vmem = RwLock::new(linux::Vmem::new_with_range(litebox.x.platform, range));
+        Self { vmem }
+    }
+
+    /// Returns the minimum address of this process's virtual address range.
+    pub fn addr_min(&self) -> usize {
+        self.vmem.read().addr_min
+    }
+
     /// Create a mapping with the given flags.
     ///
     /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.
@@ -672,15 +685,21 @@ where
         error_code: u64,
     ) -> Result<(), PageFaultError> {
         let fault_addr = fault_addr & !(ALIGN - 1);
-        if !(Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&fault_addr) {
-            return Err(PageFaultError::AccessError("Invalid address"));
+        // Read address bounds from vmem to avoid using Platform constants directly
+        {
+            let vmem = self.vmem.read();
+            if !(vmem.addr_min..vmem.addr_max).contains(&fault_addr) {
+                return Err(PageFaultError::AccessError("Invalid address"));
+            }
         }
 
         let mut vmem = self.vmem.write();
+        let addr_min = vmem.addr_min;
+        let addr_max = vmem.addr_max;
         // Find the range closest to the fault address
         let (start, vma) = {
             let (r, vma) = vmem
-                .overlapping(fault_addr..Platform::TASK_ADDR_MAX)
+                .overlapping(fault_addr..addr_max)
                 .next()
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
@@ -692,7 +711,7 @@ where
             }
 
             if !vmem
-                .overlapping(Platform::TASK_ADDR_MIN..fault_addr)
+                .overlapping(addr_min..fault_addr)
                 .next_back()
                 .is_none_or(|(prev_range, prev_vma)| {
                     // Enforce gap between stack and other preceding non-stack mappings.

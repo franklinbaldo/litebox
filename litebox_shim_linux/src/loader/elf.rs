@@ -72,13 +72,15 @@ impl<FS: ShimFS> litebox_common_linux::loader::MapMemory for ElfFile<'_, FS> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
+        // Compute a hint address within this process's VA partition.
+        let hint = self.task.process.borrow().pm.addr_min() + super::PIE_LOAD_OFFSET;
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
         let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
         let mapping_ptr = self
             .task
             .sys_mmap(
-                super::DEFAULT_LOW_ADDR,
+                hint,
                 mapping_len,
                 litebox_common_linux::ProtFlags::PROT_NONE,
                 litebox_common_linux::MapFlags::MAP_ANONYMOUS
@@ -202,6 +204,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         mut aux: AuxVec,
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
+        let process = self.main.file.task.process.borrow();
 
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self
@@ -220,7 +223,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
             None
         };
 
-        global.pm.set_initial_brk(info.brk);
+        process.pm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -236,7 +239,7 @@ impl<'a, FS: ShimFS> ElfLoader<'a, FS> {
         let sp = unsafe {
             let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
-            global
+            process
                 .pm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?

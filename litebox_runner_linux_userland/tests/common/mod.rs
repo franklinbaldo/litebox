@@ -98,12 +98,28 @@ fn find_rewriter_source_files() -> Vec<PathBuf> {
 
 /// Compile C code into an executable with caching
 pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: bool) -> PathBuf {
+    compile_inner(src_path, unique_name, exec_or_lib, nolibc, false)
+}
+
+pub fn compile_static_pie(src_path: &str, unique_name: &str) -> PathBuf {
+    compile_inner(src_path, unique_name, true, false, true)
+}
+
+fn compile_inner(
+    src_path: &str,
+    unique_name: &str,
+    exec_or_lib: bool,
+    nolibc: bool,
+    static_pie: bool,
+) -> PathBuf {
     let dir_path = std::env::var("OUT_DIR").unwrap();
     let path = std::path::Path::new(dir_path.as_str()).join(unique_name);
     let output = path.to_str().unwrap();
 
     let mut args = vec!["-o", output, src_path];
-    if exec_or_lib {
+    if static_pie {
+        args.extend_from_slice(&["-static-pie", "-fpie"]);
+    } else if exec_or_lib {
         args.push("-static");
     }
     if nolibc {

@@ -13,8 +13,9 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider, Provider, Punchthrough,
-    PunchthroughProvider, PunchthroughToken, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    AddressSpaceProvider, IPInterfaceProvider, ImmediatelyWokenUp, PageManagementProvider,
+    Provider, Punchthrough, PunchthroughProvider, PunchthroughToken, RawMutexProvider,
+    TimeProvider, UnblockedOrTimedOut,
 };
 use litebox_common_linux::PunchthroughSyscall;
 use litebox_common_linux::errno::Errno;
@@ -83,6 +84,12 @@ impl<'a, Host: HostInterface> PunchthroughToken for LinuxPunchthroughToken<'a, H
 }
 
 impl<Host: HostInterface> Provider for LinuxKernel<Host> {}
+
+impl<Host: HostInterface> AddressSpaceProvider for LinuxKernel<Host> {
+    type AddressSpaceId = u32;
+    const ADDRESS_SPACE_KIND: litebox::platform::address_space::AddressSpaceKind =
+        litebox::platform::address_space::AddressSpaceKind::Isolated;
+}
 
 // TODO: implement pointer validation to ensure the pointers are in user space.
 type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::UserConstPtr<

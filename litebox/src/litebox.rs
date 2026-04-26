@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 
 use crate::{
     fd::Descriptors,
+    process::ProcessRegistry,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -65,6 +66,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         crate::sync::lock_tracing::LockTracker::init(platform);
 
         let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
+        let process_registry = ProcessRegistry::new();
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -72,6 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors,
+                process_registry,
             }),
         }
     }
@@ -106,10 +109,16 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
+
+    /// Access the process registry.
+    pub fn process_registry(&self) -> &ProcessRegistry<Platform> {
+        &self.x.process_registry
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
+    process_registry: ProcessRegistry<Platform>,
 }

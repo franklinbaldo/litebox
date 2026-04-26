@@ -380,13 +380,12 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let program = shim.load_program(
-        initial_file_system,
-        platform.init_task(),
-        prog_path,
-        argv,
-        envp,
-    )?;
+    let mut task_params = platform.init_task();
+    // Use deterministic guest PIDs starting from 1 (init process).
+    task_params.pid = 1;
+    task_params.ppid = 0;
+
+    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

@@ -105,6 +105,8 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
+    /// VA partition allocator for multi-process support.
+    va_partitions: VaPartitionAllocator,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -236,6 +238,7 @@ impl LinuxUserland {
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
+            va_partitions: VaPartitionAllocator::new(),
         };
         Box::leak(Box::new(platform))
     }
@@ -415,6 +418,32 @@ impl LinuxUserland {
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
+
+impl litebox::platform::AddressSpaceProvider for LinuxUserland {
+    type AddressSpaceId = u32;
+    const ADDRESS_SPACE_KIND: litebox::platform::address_space::AddressSpaceKind =
+        litebox::platform::address_space::AddressSpaceKind::SharedMemory;
+
+    fn create_address_space(
+        &self,
+    ) -> Result<Self::AddressSpaceId, litebox::platform::address_space::AddressSpaceError> {
+        self.va_partitions.allocate()
+    }
+
+    fn destroy_address_space(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        self.va_partitions.release(id)
+    }
+
+    fn address_space_range(
+        &self,
+        id: Self::AddressSpaceId,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        self.va_partitions.range(id)
+    }
+}
 
 impl litebox::platform::SignalProvider for LinuxUserland {
     type Signal = litebox_common_linux::signal::Signal;
@@ -2269,6 +2298,90 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 
     fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
         unreachable!("host kernel handles page faults for Linux userland")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VA Partition Allocator
+// ---------------------------------------------------------------------------
+
+/// Allocates 1 TiB VA partitions from the 47-bit userland address space.
+///
+/// The usable VA range `0x1_0000..0x7FFF_FFFF_F000` (~128 TiB) is divided
+/// into 1 TiB slots. Slot 0 covers `0x0..0x100_0000_0000` (though only
+/// `0x1_0000..` is usable), slot 1 covers `0x100_0000_0000..0x200_0000_0000`,
+/// and so on. A simple bitmap tracks which slots are allocated.
+struct VaPartitionAllocator {
+    /// Bitmap of allocated partitions. Bit N = partition N is allocated.
+    /// 128 bits covers all 128 possible 1-TiB partitions in 47-bit VA.
+    allocated: std::sync::Mutex<u128>,
+}
+
+impl VaPartitionAllocator {
+    /// Size of each VA partition: 1 TiB.
+    const PARTITION_SIZE: usize = 1 << 40; // 0x100_0000_0000
+    /// Maximum partition index (exclusive). 128 TiB / 1 TiB = 128.
+    const MAX_PARTITIONS: u32 = 128;
+    /// First allocatable partition. Partition 0 is reserved for the init
+    /// process (its range is the platform default `TASK_ADDR_MIN..TASK_ADDR_MAX`).
+    const FIRST_ALLOC: u32 = 1;
+
+    fn new() -> Self {
+        // Mark partition 0 as pre-allocated (init process).
+        Self {
+            allocated: std::sync::Mutex::new(1),
+        }
+    }
+
+    fn allocate(&self) -> Result<u32, litebox::platform::address_space::AddressSpaceError> {
+        let mut bitmap = self.allocated.lock().unwrap();
+        for i in Self::FIRST_ALLOC..Self::MAX_PARTITIONS {
+            if *bitmap & (1u128 << i) == 0 {
+                *bitmap |= 1u128 << i;
+                return Ok(i);
+            }
+        }
+        Err(litebox::platform::address_space::AddressSpaceError::NoSpace)
+    }
+
+    fn release(&self, id: u32) -> Result<(), litebox::platform::address_space::AddressSpaceError> {
+        if !(Self::FIRST_ALLOC..Self::MAX_PARTITIONS).contains(&id) {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        let mut bitmap = self.allocated.lock().unwrap();
+        if *bitmap & (1u128 << id) == 0 {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        *bitmap &= !(1u128 << id);
+        Ok(())
+    }
+
+    fn range(
+        &self,
+        id: u32,
+    ) -> Result<core::ops::Range<usize>, litebox::platform::address_space::AddressSpaceError> {
+        if id >= Self::MAX_PARTITIONS {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        // Verify partition is allocated
+        {
+            let bitmap = self.allocated.lock().unwrap();
+            if *bitmap & (1u128 << id) == 0 {
+                return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+            }
+        }
+        let start = (id as usize) * Self::PARTITION_SIZE;
+        let end = start + Self::PARTITION_SIZE;
+        // Clamp to usable VA space
+        let start = start.max(0x1_0000); // TASK_ADDR_MIN
+        let end = end.min(0x7FFF_FFFF_F000); // TASK_ADDR_MAX
+        // Align to page boundary
+        let start = (start + 0xFFF) & !0xFFF;
+        let end = end & !0xFFF;
+        if start >= end {
+            return Err(litebox::platform::address_space::AddressSpaceError::InvalidId);
+        }
+        Ok(start..end)
     }
 }
 
