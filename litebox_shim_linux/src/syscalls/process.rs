@@ -811,6 +811,19 @@ impl<FS: ShimFS> Task<FS> {
             return Err(Errno::EINVAL);
         }
 
+        // Guard: fork from a multi-threaded process is not supported.
+        {
+            let inner = self.thread.process.inner.lock();
+            if inner.threads.len() > 1 {
+                log_unsupported!(
+                    "fork from multi-threaded process (pid={}, {} threads) is not supported",
+                    self.pid,
+                    inner.threads.len()
+                );
+                return Err(Errno::ENOSYS);
+            }
+        }
+
         // Register the child process in the process registry.
         let parent_process_id =
             litebox::process::ProcessId::new(self.pid.cast_unsigned()).expect("parent PID is 0");
