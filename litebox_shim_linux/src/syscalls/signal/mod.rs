@@ -341,7 +341,7 @@ pub(crate) fn siginfo_chld(child_pid: i32, wait_status: u32) -> Siginfo {
 
     // Decode wait_status: bits 6..0 == 0 means normal exit (status in bits 15..8),
     // otherwise killed by signal (signal number in bits 6..0).
-    let (code, si_status) = if (wait_status & 0x7f) == 0 {
+    let (code, si_status) = if wait_status.trailing_zeros() >= 7 {
         // Normal exit: status is in bits 15..8
         (CLD_EXITED, (wait_status >> 8) & 0xff)
     } else {

@@ -1540,6 +1540,7 @@ impl<FS: ShimFS> Task<FS> {
     }
 
     /// Handle syscall `setpgid`.
+    #[allow(clippy::similar_names)]
     pub(crate) fn sys_setpgid(&self, pid: i32, pgid: i32) -> Result<(), Errno> {
         let target_pid = if pid == 0 { self.pid } else { pid };
         let target_pgid = if pgid == 0 { target_pid } else { pgid };
@@ -1917,10 +1918,10 @@ impl<FS: ShimFS> Task<FS> {
         };
 
         // PATH resolution: if path doesn't contain '/', search $PATH.
-        let path = if !path.contains('/') {
-            self.resolve_path_lookup(path, &envp_vec)?
-        } else {
+        let path = if path.contains('/') {
             alloc::string::String::from(path)
+        } else {
+            self.resolve_path_lookup(path, &envp_vec)?
         };
 
         let (path, argv_vec) = self.resolve_shebang(path, argv_vec)?;
@@ -1954,15 +1955,13 @@ impl<FS: ShimFS> Task<FS> {
             .borrow_mut()
             .take()
             .map(|fc| fc.vfork_done);
-        if vfork_done.is_some() {
-            if let Err(e) = self.detach_to_new_address_space() {
-                // Signal the parent before returning error — otherwise parent
-                // hangs forever waiting on vfork_done.
-                if let Some(vd) = vfork_done {
-                    vd.signal();
-                }
-                return Err(e);
-            }
+        if let Some(ref vd) = vfork_done
+            && let Err(e) = self.detach_to_new_address_space()
+        {
+            // Signal the parent before returning error — otherwise parent
+            // hangs forever waiting on vfork_done.
+            vd.signal();
+            return Err(e);
         }
 
         // Don't release reserved mappings.

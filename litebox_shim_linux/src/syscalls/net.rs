@@ -1355,10 +1355,10 @@ impl<FS: ShimFS> Task<FS> {
                 file.sendto(self, buf, flags, addr)
             },
         );
-        if let Err(Errno::EPIPE) = ret {
-            if !flags.contains(SendFlags::NOSIGNAL) {
-                self.raise_sigpipe();
-            }
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.raise_sigpipe();
         }
         ret
     }
@@ -1443,10 +1443,10 @@ impl<FS: ShimFS> Task<FS> {
                 Ok(total_sent)
             },
         );
-        if let Err(Errno::EPIPE) = ret {
-            if !flags.contains(SendFlags::NOSIGNAL) {
-                self.raise_sigpipe();
-            }
+        if let Err(Errno::EPIPE) = ret
+            && !flags.contains(SendFlags::NOSIGNAL)
+        {
+            self.raise_sigpipe();
         }
         ret
     }

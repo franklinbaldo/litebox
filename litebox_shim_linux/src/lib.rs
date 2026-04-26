@@ -1106,6 +1106,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         signal: litebox_common_linux::signal::Signal,
         siginfo: litebox_common_linux::signal::Siginfo,
     ) -> bool {
+        const MAX_MAILBOX_SIZE: usize = 256;
         // Clone the Arc and drop the outer lock before acquiring the mailbox
         // lock to prevent nested lock acquisition (deadlock risk).
         let mailbox = {
@@ -1115,7 +1116,6 @@ impl<FS: ShimFS> GlobalState<FS> {
         if let Some(mailbox) = mailbox {
             let mut mbox = mailbox.lock();
             // Cap mailbox size to prevent unbounded memory growth.
-            const MAX_MAILBOX_SIZE: usize = 256;
             if mbox.len() >= MAX_MAILBOX_SIZE {
                 mbox.pop_front();
             }
@@ -1134,6 +1134,7 @@ struct ProcessState {
     /// Address space ID for child processes that have exec'd into their own
     /// VA partition. `None` for the init process (which uses the default
     /// platform address space) and for vfork children that haven't exec'd yet.
+    #[allow(dead_code)]
     address_space_id: Option<<Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId>,
 }
 

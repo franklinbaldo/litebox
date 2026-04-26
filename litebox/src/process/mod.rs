@@ -204,6 +204,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     ///
     /// `parent` is the parent process ID. Pass `None` to create the init
     /// process (PID 1). Only one init process is allowed.
+    #[allow(clippy::similar_names)]
     pub fn create_process(
         &self,
         parent: Option<ProcessId>,
@@ -385,22 +386,20 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
 
         // Read child info first.
         let (old_parent, exit_status) = {
-            let Some(entry) = inner.processes.get_mut(&child) else {
-                return None;
-            };
+            let entry = inner.processes.get_mut(&child)?;
             let old_parent = entry.context.parent.replace(new_parent);
             let exit_status = match entry.context.state {
                 ProcessState::Exited(status) => Some(status),
-                _ => None,
+                ProcessState::Running => None,
             };
             (old_parent, exit_status)
         };
 
         // Remove from old parent's children list.
-        if let Some(old_pid) = old_parent {
-            if let Some(old_entry) = inner.processes.get_mut(&old_pid) {
-                old_entry.context.children.retain(|&c| c != child);
-            }
+        if let Some(old_pid) = old_parent
+            && let Some(old_entry) = inner.processes.get_mut(&old_pid)
+        {
+            old_entry.context.children.retain(|&c| c != child);
         }
 
         // Add to new parent's children list.
@@ -605,9 +604,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             // reparented during exit_process.
             let entry = inner.processes.remove(&child_pid);
             debug_assert!(
-                entry
-                    .as_ref()
-                    .map_or(true, |e| e.context.children.is_empty()),
+                entry.as_ref().is_none_or(|e| e.context.children.is_empty()),
                 "reaped zombie still has children"
             );
             // Remove from parent's children list

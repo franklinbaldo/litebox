@@ -101,6 +101,7 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     compile_inner(src_path, unique_name, exec_or_lib, nolibc, false)
 }
 
+#[allow(dead_code)]
 pub fn compile_static_pie(src_path: &str, unique_name: &str) -> PathBuf {
     compile_inner(src_path, unique_name, true, false, true)
 }
