@@ -635,6 +635,15 @@ impl<FS: ShimFS> Task<FS> {
             self.global.deregister_signal_mailbox(self.pid);
         }
 
+        // NOTE: VA partition reclamation is deferred for future work.
+        // We cannot release the partition here because:
+        // 1. The thread is still executing (unwinding through host code)
+        // 2. Guest pages are still mapped in the partition's VA range
+        // 3. Releasing the ID would allow another fork to reuse the same range
+        // With 128 partitions, this is acceptable for the minimal implementation.
+        // Future: move cleanup to zombie reaping (waitpid/remove_process) and
+        // unmap all guest pages before releasing the partition ID.
+
         // If this is a vfork child that never exec'd, signal the parent.
         // Done after exit recording so parent's waitpid sees the exit.
         if let Some(fc) = self.fork_context.borrow_mut().take() {
@@ -896,6 +905,13 @@ impl<FS: ShimFS> Task<FS> {
         };
         if let Err(err) = r {
             litebox_util_log::error!(err:% = err; "failed to spawn fork child");
+            // The child_task was dropped by spawn_thread's failure path, which
+            // triggered prepare_for_exit (closing FDs, recording exit, deregistering
+            // mailbox). Clean up the zombie registry entry so the parent doesn't
+            // see a phantom child from a failed fork.
+            self.global
+                .process_registry
+                .remove_process(child_process_id);
             return Err(Errno::ENOMEM);
         }
 
@@ -1814,22 +1830,24 @@ impl<FS: ShimFS> Task<FS> {
     /// Called during exec of a vfork child. Creates a new address space via the
     /// platform, builds a new `ProcessState` with a `PageManager` scoped to that
     /// partition's VA range, and replaces `self.process`.
-    fn detach_to_new_address_space(&self) {
+    fn detach_to_new_address_space(&self) -> Result<(), Errno> {
         use litebox::platform::AddressSpaceProvider;
 
         let platform = self.global.platform;
         let as_id = platform
             .create_address_space()
-            .expect("failed to create address space for fork child");
+            .map_err(|_| Errno::ENOMEM)?;
         let range = platform
             .address_space_range(as_id)
-            .expect("failed to get address space range");
+            .map_err(|_| Errno::ENOMEM)?;
 
         let new_process = Arc::new(crate::ProcessState {
             pm: litebox::mm::PageManager::new_with_range(&self.global.litebox, range),
+            address_space_id: Some(as_id),
         });
 
         *self.process.borrow_mut() = new_process;
+        Ok(())
     }
 
     /// Handle syscall `execve`.
@@ -1946,7 +1964,7 @@ impl<FS: ShimFS> Task<FS> {
             .take()
             .map(|fc| fc.vfork_done);
         if vfork_done.is_some() {
-            self.detach_to_new_address_space();
+            self.detach_to_new_address_space()?;
         }
 
         // Don't release reserved mappings.

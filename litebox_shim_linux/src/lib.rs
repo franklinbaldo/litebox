@@ -191,7 +191,7 @@ impl LinuxShimBuilder {
     pub fn build<FS: ShimFS>(self) -> LinuxShim<FS> {
         let mut net = Network::new(&self.litebox);
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
-        let process_registry = litebox::process::ProcessRegistry::new();
+        let process_registry = litebox::process::ProcessRegistry::with_max_processes(128);
         // Register the init process (PID 1).
         process_registry
             .create_process(None)
@@ -212,6 +212,7 @@ impl LinuxShimBuilder {
         });
         let init_process = Arc::new(ProcessState {
             pm: PageManager::new(&global.litebox),
+            address_space_id: None,
         });
         LinuxShim(global, init_process)
     }
@@ -1107,7 +1108,13 @@ impl<FS: ShimFS> GlobalState<FS> {
     ) -> bool {
         let mailboxes = self.signal_mailboxes.lock();
         if let Some(mailbox) = mailboxes.get(&target_pid) {
-            mailbox.lock().push_back((signal, siginfo));
+            let mut mbox = mailbox.lock();
+            // Cap mailbox size to prevent unbounded memory growth.
+            const MAX_MAILBOX_SIZE: usize = 256;
+            if mbox.len() >= MAX_MAILBOX_SIZE {
+                mbox.pop_front();
+            }
+            mbox.push_back((signal, siginfo));
             true
         } else {
             false
@@ -1119,6 +1126,10 @@ impl<FS: ShimFS> GlobalState<FS> {
 struct ProcessState {
     /// The page manager for this process's virtual memory / address space.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// Address space ID for child processes that have exec'd into their own
+    /// VA partition. `None` for the init process (which uses the default
+    /// platform address space) and for vfork children that haven't exec'd yet.
+    address_space_id: Option<<Platform as litebox::platform::AddressSpaceProvider>::AddressSpaceId>,
 }
 
 struct Task<FS: ShimFS> {
@@ -1183,6 +1194,7 @@ mod test_utils {
                 thread: syscalls::process::ThreadState::new_process(pid),
                 process: RefCell::new(Arc::new(ProcessState {
                     pm: PageManager::new(&self.litebox),
+                    address_space_id: None,
                 })),
                 pid,
                 ppid: 0,

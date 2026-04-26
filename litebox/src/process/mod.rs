@@ -85,6 +85,10 @@ pub enum CreateProcessError {
     NoSuchParent,
     #[error("a root (init) process already exists")]
     InitAlreadyExists,
+    #[error("too many processes (limit: {0})")]
+    TooManyProcesses(usize),
+    #[error("PID space exhausted")]
+    PidSpaceExhausted,
 }
 
 /// Shared handle for observing a process's exit.
@@ -170,6 +174,8 @@ struct RegistryInner<Platform: RawSyncPrimitivesProvider> {
     /// Counter incremented on every process exit. Used with `exit_event` futex
     /// so that `wait_for_any_child_exit` can block efficiently.
     exit_epoch: u32,
+    /// Maximum number of processes allowed. 0 means unlimited.
+    max_processes: usize,
 }
 
 #[allow(
@@ -181,11 +187,18 @@ struct RegistryInner<Platform: RawSyncPrimitivesProvider> {
 impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
     /// Create a new, empty process registry.
     pub fn new() -> Self {
+        Self::with_max_processes(0)
+    }
+
+    /// Create a new process registry with a maximum process count.
+    /// Pass 0 for unlimited.
+    pub fn with_max_processes(max_processes: usize) -> Self {
         Self {
             inner: Mutex::new(RegistryInner {
                 processes: HashMap::new(),
                 next_pid: 1,
                 exit_epoch: 0,
+                max_processes,
             }),
             exit_event: <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
         }
@@ -217,8 +230,14 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 if !inner.processes.contains_key(&parent_pid) {
                     return Err(CreateProcessError::NoSuchParent);
                 }
+                // Enforce process count limit
+                if inner.max_processes > 0 && inner.processes.len() >= inner.max_processes {
+                    return Err(CreateProcessError::TooManyProcesses(inner.max_processes));
+                }
                 let raw = inner.next_pid;
-                inner.next_pid = raw.checked_add(1).expect("PID space exhausted");
+                inner.next_pid = raw
+                    .checked_add(1)
+                    .ok_or(CreateProcessError::PidSpaceExhausted)?;
                 let pid = ProcessId(raw);
                 // Register as child of parent
                 inner
@@ -312,10 +331,10 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
                 .processes
                 .get_mut(&id)
                 .expect("exit_process: no such process");
-            assert!(
-                matches!(entry.context.state, ProcessState::Running),
-                "exit_process: process already exited"
-            );
+            // Idempotent: if already exited, return None without re-notifying.
+            if matches!(entry.context.state, ProcessState::Exited(_)) {
+                return None;
+            }
             entry.context.state = ProcessState::Exited(status);
             entry.exited_flag.store(true, Ordering::Release);
             exit_observer = Arc::clone(&entry.exit_observer);
@@ -540,30 +559,42 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
             0 => {
                 // Wait for any child in the caller's process group.
                 let caller_pgid = parent_entry.context.pgid;
+                let mut any_match = false;
                 let mut result = None;
                 for &child_pid in &children {
                     if let Some(entry) = inner.processes.get(&child_pid)
                         && entry.context.pgid == caller_pgid
-                        && let ProcessState::Exited(status) = entry.context.state
                     {
-                        result = Some((child_pid, status));
-                        break;
+                        any_match = true;
+                        if let ProcessState::Exited(status) = entry.context.state {
+                            result = Some((child_pid, status));
+                            break;
+                        }
                     }
+                }
+                if !any_match {
+                    return Err(()); // ECHILD — no children in this group
                 }
                 result
             }
             t if t < -1 => {
                 // Wait for any child in process group |t|.
                 let pgid = ProcessId((-t).cast_unsigned());
+                let mut any_match = false;
                 let mut result = None;
                 for &child_pid in &children {
                     if let Some(entry) = inner.processes.get(&child_pid)
                         && entry.context.pgid == pgid
-                        && let ProcessState::Exited(status) = entry.context.state
                     {
-                        result = Some((child_pid, status));
-                        break;
+                        any_match = true;
+                        if let ProcessState::Exited(status) = entry.context.state {
+                            result = Some((child_pid, status));
+                            break;
+                        }
                     }
+                }
+                if !any_match {
+                    return Err(()); // ECHILD — no children in this group
                 }
                 result
             }
