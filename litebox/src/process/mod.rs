@@ -333,10 +333,7 @@ impl<Platform: RawSyncPrimitivesProvider> ProcessRegistry<Platform> {
         let (children, exit_observer, notification);
         {
             let mut inner = self.inner.lock();
-            let entry = inner
-                .processes
-                .get_mut(&id)
-                .expect("exit_process: no such process");
+            let entry = inner.processes.get_mut(&id)?;
             // Idempotent: if already exited, return None without re-notifying.
             if matches!(entry.context.state, ProcessState::Exited(_)) {
                 return None;
