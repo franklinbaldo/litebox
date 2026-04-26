@@ -611,47 +611,78 @@ impl<FS: ShimFS> Task<FS> {
         let iovs: &[IoReadVec<MutPtr<u8>>] = &iovec.to_owned_slice(iovcnt).ok_or(Errno::EFAULT)?;
         let files = self.files.borrow();
         let mut total_read = 0;
-        let mut kernel_buffer = vec![
-            0u8;
-            iovs.iter()
-                .map(|i| i.iov_len)
-                .max()
-                .unwrap_or_default()
-                .min(super::super::MAX_KERNEL_BUF_SIZE)
-        ];
-        for iov in iovs {
-            if iov.iov_len == 0 {
-                continue;
+
+        // Check once whether this FD is a pipe to avoid per-iov lock acquisition.
+        let pipe_fd = {
+            let rds = files.raw_descriptor_store.read();
+            rds.fd_from_raw_integer::<litebox::pipes::Pipes<Platform>>(raw_fd)
+                .ok()
+        };
+
+        if let Some(pipe_fd) = pipe_fd {
+            // Pipe-specific readv path: avoids borrow conflict with kernel_buffer.
+            for iov in iovs {
+                if iov.iov_len == 0 {
+                    continue;
+                }
+                let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+                    return Err(Errno::EINVAL);
+                };
+                let mut pipe_buf = vec![0u8; iov.iov_len.min(super::super::MAX_KERNEL_BUF_SIZE)];
+                let n = self
+                    .global
+                    .pipes
+                    .read(&self.wait_cx(), &pipe_fd, &mut pipe_buf)
+                    .map_err(Errno::from)?;
+                iov.iov_base
+                    .copy_from_slice(0, &pipe_buf[..n])
+                    .ok_or(Errno::EFAULT)?;
+                total_read += n;
+                if n < iov.iov_len {
+                    break;
+                }
             }
-            let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
-                return Err(Errno::EINVAL);
-            };
-            // TODO: The data transfers performed by readv() and writev() are atomic: the data
-            // written by writev() is written as a single block that is not intermingled with
-            // output from writes in other processes
-            let size = files
-                .run_on_raw_fd(
-                    raw_fd,
-                    |fd| {
-                        files
-                            .fs
-                            .read(fd, &mut kernel_buffer, None)
-                            .map_err(Errno::from)
-                    },
-                    |_fd| todo!("net"),
-                    |_fd| todo!("pipes"),
-                    |_fd| todo!("eventfd"),
-                    |_fd| Err(Errno::EINVAL),
-                    |_fd| todo!("unix"),
-                )
-                .flatten()?;
-            iov.iov_base
-                .copy_from_slice(0, &kernel_buffer[..size])
-                .ok_or(Errno::EFAULT)?;
-            total_read += size;
-            if size < iov.iov_len {
-                // Okay to transfer fewer bytes than requested
-                break;
+        } else {
+            let mut kernel_buffer = vec![
+                0u8;
+                iovs.iter()
+                    .map(|i| i.iov_len)
+                    .max()
+                    .unwrap_or_default()
+                    .min(super::super::MAX_KERNEL_BUF_SIZE)
+            ];
+            for iov in iovs {
+                if iov.iov_len == 0 {
+                    continue;
+                }
+                let Ok(_iov_len) = isize::try_from(iov.iov_len) else {
+                    return Err(Errno::EINVAL);
+                };
+                // TODO: The data transfers performed by readv() and writev() are atomic
+                let size = files
+                    .run_on_raw_fd(
+                        raw_fd,
+                        |fd| {
+                            files
+                                .fs
+                                .read(fd, &mut kernel_buffer, None)
+                                .map_err(Errno::from)
+                        },
+                        |_fd| todo!("net"),
+                        |_fd| unreachable!(), // pipes handled above
+                        |_fd| todo!("eventfd"),
+                        |_fd| Err(Errno::EINVAL),
+                        |_fd| todo!("unix"),
+                    )
+                    .flatten()?;
+                iov.iov_base
+                    .copy_from_slice(0, &kernel_buffer[..size])
+                    .ok_or(Errno::EFAULT)?;
+                total_read += size;
+                if size < iov.iov_len {
+                    // Okay to transfer fewer bytes than requested
+                    break;
+                }
             }
         }
         Ok(total_read)
@@ -717,7 +748,14 @@ impl<FS: ShimFS> Task<FS> {
                         )
                     })
                 },
-                |_fd| todo!("pipes"),
+                |fd| {
+                    write_to_iovec(iovs, |buf| {
+                        self.global
+                            .pipes
+                            .write(&self.wait_cx(), fd, buf)
+                            .map_err(Errno::from)
+                    })
+                },
                 |_fd| todo!("eventfd"),
                 |_fd| Err(Errno::EINVAL),
                 |_fd| todo!("unix"),
