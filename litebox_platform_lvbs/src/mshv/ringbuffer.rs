@@ -5,18 +5,17 @@
 
 use core::fmt;
 use spin::{Mutex, Once};
-use x86_64::PhysAddr;
 
 pub struct RingBuffer {
-    rb_pa: PhysAddr,
+    rb_va: *mut u8,
     write_offset: usize,
     size: usize,
 }
 
 impl RingBuffer {
-    pub fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
+    pub fn new(virt_addr: *mut u8, requested_size: usize) -> Self {
         RingBuffer {
-            rb_pa: phys_addr,
+            rb_va: virt_addr,
             write_offset: 0,
             size: requested_size,
         }
@@ -28,7 +27,11 @@ impl RingBuffer {
         if buf.len() >= self.size {
             let single_slice = &buf[(buf.len() - self.size)..];
             unsafe {
-                crate::platform_low().copy_slice_to_vtl0_phys(self.rb_pa, single_slice);
+                let _ = litebox::mm::exception_table::memcpy_fallible(
+                    self.rb_va,
+                    single_slice.as_ptr(),
+                    self.size,
+                );
             }
             self.write_offset = 0;
             return;
@@ -40,24 +43,38 @@ impl RingBuffer {
             let first_slice = &buf[..space_remaining];
             let wraparound_slice = &buf[space_remaining..];
             unsafe {
-                crate::platform_low()
-                    .copy_slice_to_vtl0_phys(self.rb_pa + self.write_offset as u64, first_slice);
-                crate::platform_low().copy_slice_to_vtl0_phys(self.rb_pa, wraparound_slice);
+                let _ = litebox::mm::exception_table::memcpy_fallible(
+                    self.rb_va.add(self.write_offset),
+                    first_slice.as_ptr(),
+                    first_slice.len(),
+                );
+                let _ = litebox::mm::exception_table::memcpy_fallible(
+                    self.rb_va,
+                    wraparound_slice.as_ptr(),
+                    wraparound_slice.len(),
+                );
             }
         } else {
             unsafe {
-                crate::platform_low()
-                    .copy_slice_to_vtl0_phys(self.rb_pa + self.write_offset as u64, buf);
+                let _ = litebox::mm::exception_table::memcpy_fallible(
+                    self.rb_va.add(self.write_offset),
+                    buf.as_ptr(),
+                    buf.len(),
+                );
             }
         }
         self.write_offset = (self.write_offset + buf.len()) % self.size;
     }
 }
 
+// SAFETY: RingBuffer is only accessed through a Mutex, and rb_va is a valid
+// pointer to mapped memory that outlives the RingBuffer.
+unsafe impl Send for RingBuffer {}
+
 static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-pub(crate) fn set_ringbuffer(pa: PhysAddr, size: usize) -> &'static Mutex<RingBuffer> {
+pub(crate) fn set_ringbuffer(va: *mut u8, size: usize) -> &'static Mutex<RingBuffer> {
     RINGBUFFER_ONCE.call_once(|| {
-        let ring_buffer = RingBuffer::new(pa, size);
+        let ring_buffer = RingBuffer::new(va, size);
         Mutex::new(ring_buffer)
     })
 }

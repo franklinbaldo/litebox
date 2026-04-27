@@ -52,7 +52,7 @@ use spin::Once;
 use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
+    structures::paging::{PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::{Certificate, der::Decode};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
@@ -882,15 +882,24 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
 }
 
 fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i64, VsmError> {
-    set_ringbuffer(PhysAddr::new(phys_addr), size);
+    let phys_addr = PhysAddr::new(phys_addr);
     protect_physical_memory_range(
         PhysFrame::range(
-            PhysFrame::containing_address(PhysAddr::new(phys_addr)),
-            PhysFrame::containing_address(PhysAddr::new(phys_addr + (size as u64))),
+            PhysFrame::containing_address(phys_addr),
+            PhysFrame::containing_address(phys_addr + (size as u64)),
         ),
         MemAttr::MEM_ATTR_READ,
     )?;
-    debug_serial_println!("VSM: Ring buffer allocated");
+    if let Ok((page_addr, _)) = crate::platform_low().map_vtl0_phys_range(
+        phys_addr,
+        phys_addr + size.try_into().unwrap(),
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
+    ) {
+        set_ringbuffer(page_addr, size);
+    } else {
+        return Err(VsmError::MapVtl0PhysRangeFailed);
+    }
+    debug_serial_println!("VSM: Ringbuffer initialized");
     Ok(0)
 }
 

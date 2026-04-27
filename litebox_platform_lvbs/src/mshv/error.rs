@@ -128,6 +128,8 @@ pub enum VsmError {
     #[error("discontiguous memory range")]
     DiscontiguousMemoryRange,
 
+    #[error("failed to map VTL0 physical memory range")]
+    MapVtl0PhysRangeFailed,
     // Symbol Table Errors
     #[error("symbol table data empty")]
     SymbolTableEmpty,
@@ -172,6 +174,7 @@ impl From<VsmError> for Errno {
             | VsmError::BootSignalWriteFailed
             | VsmError::CpuOnlineMaskCopyFailed
             | VsmError::HekiPagesCopyFailed
+            | VsmError::MapVtl0PhysRangeFailed
             | VsmError::Vtl0CopyFailed => Errno::EFAULT,
 
             // Not found errors
