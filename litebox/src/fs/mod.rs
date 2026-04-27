@@ -18,6 +18,7 @@ pub mod errors;
 pub mod in_mem;
 pub mod layered;
 pub mod nine_p;
+pub mod resolver;
 pub mod tar_ro;
 
 #[cfg(test)]
