@@ -661,6 +661,7 @@ impl<FS: ShimFS> Task<FS> {
                 newfd,
                 flags,
             } => syscall!(sys_dup(oldfd, newfd, flags)),
+            SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,

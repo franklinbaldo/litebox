@@ -1120,6 +1120,31 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         }
         events
     }
+
+    fn shutdown(&self, how: litebox_common_linux::ShutdownHow) -> Result<(), Errno> {
+        let inner = self.inner.read();
+        match how {
+            litebox_common_linux::ShutdownHow::Read | litebox_common_linux::ShutdownHow::Both => {
+                // TODO: set the recv channel to None to prevent further reads?
+                if let Some(recv_channel) = &inner.recv_channel {
+                    recv_channel.shutdown();
+                    inner.pollee.notify_observers(Events::HUP);
+                }
+            }
+            _ => {}
+        }
+        match how {
+            litebox_common_linux::ShutdownHow::Write | litebox_common_linux::ShutdownHow::Both => {
+                // TODO: set the send channel to None to prevent further writes?
+                if let Some((connected_send_channel, _)) = &inner.connected_send_channel {
+                    connected_send_channel.shutdown();
+                    inner.pollee.notify_observers(Events::ERR);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 enum UnixSocketInner<FS: ShimFS> {
@@ -1426,6 +1451,13 @@ impl<FS: ShimFS> UnixSocket<FS> {
             SocketOptionName::TCP(_) => return Err(Errno::EOPNOTSUPP),
         };
         super::write_to_user(val, optval, len)
+    }
+
+    pub(crate) fn shutdown(&self, how: litebox_common_linux::ShutdownHow) -> Result<(), Errno> {
+        match &self.inner {
+            UnixSocketInner::Stream(_stream) => todo!(),
+            UnixSocketInner::Datagram(datagram) => datagram.shutdown(how),
+        }
     }
 
     super::common_functions_for_file_status!();

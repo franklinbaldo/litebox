@@ -1725,6 +1725,14 @@ pub enum SocketcallType {
     Sendmmsg = 20,
 }
 
+#[repr(i32)]
+#[derive(Debug, IntEnum)]
+pub enum ShutdownHow {
+    Read = 0,
+    Write = 1,
+    Both = 2,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1916,6 +1924,10 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         sockfd: i32,
         msg: Platform::RawMutPointer<UserMsgHdr<Platform>>,
         flags: ReceiveFlags,
+    },
+    Shutdown {
+        sockfd: i32,
+        how: i32,
     },
     Bind {
         sockfd: i32,
@@ -2341,6 +2353,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 newfd: Some(ctx.sys_req_arg(1)),
                 flags: Some(ctx.sys_req_arg(2)),
             },
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::socket => sys_req!(Socket {
                 domain,
                 type_and_flags,

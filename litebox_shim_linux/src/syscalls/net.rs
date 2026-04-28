@@ -1797,6 +1797,26 @@ impl<FS: ShimFS> Task<FS> {
             },
         )
     }
+
+    pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
+        let Ok(sockfd) = u32::try_from(sockfd) else {
+            return Err(Errno::EBADF);
+        };
+        let how = litebox_common_linux::ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+        self.do_shutdown(sockfd, how)
+    }
+    fn do_shutdown(
+        &self,
+        sockfd: u32,
+        how: litebox_common_linux::ShutdownHow,
+    ) -> Result<(), Errno> {
+        self.files.borrow().with_socket(
+            &self.global,
+            sockfd,
+            |fd| todo!(),
+            |file| file.shutdown(how),
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
