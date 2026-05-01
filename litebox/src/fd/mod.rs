@@ -120,7 +120,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Option<Subsystem::Entry> {
         let idx = fd.x.as_usize()?;
         let entry = self.entries[idx].as_mut().unwrap();
-        entry.x.read().entry.on_close();
+        entry.x.read().entry.on_ref_removed();
         fd.x.mark_as_closed();
 
         assert!(entry.process_refcount > 0);
@@ -157,7 +157,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // If another process holds a fork reference, just decrement and don't truly close.
         assert!(entry.process_refcount > 0);
         if entry.process_refcount > 1 {
-            entry.x.read().entry.on_close();
+            entry.x.read().entry.on_ref_removed();
             fd.x.mark_as_closed();
             entry.process_refcount -= 1;
             return Some(CloseResult::SharedDecremented);
@@ -168,7 +168,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         if Arc::strong_count(&old.x) == 1 {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
-                old.x.read().entry.on_close();
+                old.x.read().entry.on_ref_removed();
                 fd.x.mark_as_closed();
                 let entry = Arc::into_inner(old.x)
                     .map(RwLock::into_inner)
@@ -182,7 +182,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
                 Some(CloseResult::Deferred)
             }
         } else {
-            old.x.read().entry.on_close();
+            old.x.read().entry.on_ref_removed();
             fd.x.mark_as_closed();
             // Shared (via dup), so we need to duplicate it.
             let old = self.entries[idx].replace(old);
@@ -890,7 +890,7 @@ pub trait FdEnabledSubsystem: Sized {
 ///
 /// # Hook contract
 ///
-/// `on_ref_added` and `on_close` are called while a read lock is held on the
+/// `on_ref_added` and `on_ref_removed` are called while a read lock is held on the
 /// containing `DescriptorEntry`. Implementations must use interior mutability
 /// (e.g., atomics) and must **not** attempt to acquire a write lock on the
 /// same entry, or deadlock will result.
@@ -904,11 +904,11 @@ pub trait FdEnabledSubsystemEntry: Send + Sync + core::any::Any {
     /// EOF detection) should increment their count here.
     fn on_ref_added(&self) {}
 
-    /// Called when a reference to this entry is dropped (close).
+    /// Called when a reference to this entry is removed (close).
     ///
     /// This is called for every close, even when other references remain.
     /// Subsystems should decrement their reference count here.
-    fn on_close(&self) {}
+    fn on_ref_removed(&self) {}
 }
 
 /// Possible errors from [`RawDescriptorStorage::fd_from_raw_integer`] and
