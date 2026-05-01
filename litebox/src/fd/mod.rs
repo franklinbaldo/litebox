@@ -36,23 +36,35 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self { entries: vec![] }
     }
 
-    /// Increment the process reference count for each of the given descriptor slot indices.
+    /// Clone a [`RawDescriptorStorage`] for a child process, optionally selecting
+    /// which raw FD indices to inherit, and increment the process reference counts
+    /// for all inherited slots.
     ///
-    /// This must be called during child process creation, paired with
-    /// [`RawDescriptorStorage::clone_for_child_selective`], so that each inherited slot index is properly
-    /// tracked. When a process closes an FD via [`Self::remove`], the process_refcount is
-    /// decremented; the entry is only truly removed when process_refcount reaches 0.
+    /// - `inherit = None` — inherit all open FDs (bulk inheritance).
+    /// - `inherit = Some(fds)` — inherit only the listed raw FD indices (selective
+    ///   inheritance). Indices not present in the slice are skipped.
+    /// - `inherit = Some(&[])` — inherit nothing (child gets an empty FD table).
+    ///
+    /// This combines [`RawDescriptorStorage::clone_for_child_selective`] with
+    /// process refcount bookkeeping into a single atomic operation that cannot be
+    /// misused (the caller cannot forget to increment refcounts).
     #[expect(
         clippy::missing_panics_doc,
         reason = "panics only on invariant violation (slot must exist during child creation)"
     )]
-    pub fn increment_process_refcounts(&mut self, slot_indices: &[usize]) {
-        for &idx in slot_indices {
+    pub fn clone_storage_for_child(
+        &mut self,
+        storage: &RawDescriptorStorage,
+        inherit: Option<&[usize]>,
+    ) -> RawDescriptorStorage {
+        let (cloned, slot_indices) = storage.clone_for_child_selective(inherit);
+        for &idx in &slot_indices {
             let entry = self.entries[idx]
                 .as_mut()
                 .expect("child creation: descriptor slot must exist");
             entry.process_refcount += 1;
         }
+        cloned
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
@@ -761,9 +773,10 @@ impl RawDescriptorStorage {
     /// poisoning when either process closes the FD independently.
     ///
     /// Returns `(cloned_storage, slot_indices)` where `slot_indices` is the
-    /// list of descriptor-table slot indices that were inherited. The caller MUST
-    /// call [`Descriptors::increment_process_refcounts`] with these indices so that
-    /// the descriptor table knows multiple processes reference these slots.
+    /// list of descriptor-table slot indices that were inherited.
+    ///
+    /// Prefer using [`Descriptors::clone_storage_for_child`] which combines this
+    /// with refcount bookkeeping into a single operation.
     #[must_use]
     #[expect(
         clippy::missing_panics_doc,
