@@ -583,11 +583,11 @@ impl PollSet {
         let mut register = true;
         cx.wait_until(|| {
             if self.scan_once(global, files, register.then_some(cx.waker())) {
-                return true;
+                return Ok(true);
             }
             // Don't register observers again in the next iteration.
             register = false;
-            false
+            Ok(false)
         })
     }
 

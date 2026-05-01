@@ -74,10 +74,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
                 Err(TryOpError::TryAgain) => {}
                 ret => return ret,
             }
-            match self.wait_until(|| observer.is_ready()) {
-                Ok(()) => {}
-                Err(err) => return Err(TryOpError::WaitError(err)),
-            }
+            self.wait_until(|| Ok::<_, WaitError>(observer.is_ready()))
+                .map_err(TryOpError::WaitError)?;
             // Reset the observer before calling [`try_op`] again so that we
             // don't miss a wakeup.
             observer.reset();
