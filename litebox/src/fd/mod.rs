@@ -45,9 +45,9 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ///   inheritance). Indices not present in the slice are skipped.
     /// - `inherit = Some(&[])` — inherit nothing (child gets an empty FD table).
     ///
-    /// This combines [`RawDescriptorStorage::clone_for_child_selective`] with
-    /// process refcount bookkeeping into a single atomic operation that cannot be
-    /// misused (the caller cannot forget to increment refcounts).
+    /// Each slot in the new storage gets a **new, independent** `OwnedFd`
+    /// (with the same raw index as the parent's), avoiding shared `AtomicBool`
+    /// poisoning when either process closes the FD independently.
     #[expect(
         clippy::missing_panics_doc,
         reason = "panics only on invariant violation (slot must exist during child creation)"
@@ -57,14 +57,28 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         storage: &RawDescriptorStorage,
         inherit: Option<&[usize]>,
     ) -> RawDescriptorStorage {
-        let (cloned, slot_indices) = storage.clone_for_child_selective(inherit);
-        for &idx in &slot_indices {
-            let entry = self.entries[idx]
-                .as_mut()
-                .expect("child creation: descriptor slot must exist");
-            entry.process_refcount += 1;
+        let mut stored_fds = Vec::with_capacity(storage.stored_fds.len());
+        for (fd_index, slot) in storage.stored_fds.iter().enumerate() {
+            let cloned = slot.as_ref().and_then(|stored| {
+                if inherit.is_some_and(|fds| !fds.contains(&fd_index)) {
+                    return None;
+                }
+                let raw = stored
+                    .x
+                    .as_usize()
+                    .expect("FD should not be closed during child creation");
+                let entry = self.entries[raw]
+                    .as_mut()
+                    .expect("child creation: descriptor slot must exist");
+                entry.process_refcount += 1;
+                Some(StoredFd {
+                    x: Arc::new(OwnedFd::new(raw)),
+                    subsystem_entry_type_id: stored.subsystem_entry_type_id,
+                })
+            });
+            stored_fds.push(cloned);
         }
-        cloned
+        RawDescriptorStorage { stored_fds }
     }
 
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
@@ -758,54 +772,6 @@ impl RawDescriptorStorage {
     #[must_use]
     pub fn is_alive(&self, fd: usize) -> bool {
         self.stored_fds.get(fd).is_some_and(Option::is_some)
-    }
-
-    /// Clone this storage for a child process, optionally selecting which raw FD
-    /// indices to inherit.
-    ///
-    /// - `None` — inherit all open FDs (bulk inheritance).
-    /// - `Some(fds)` — inherit only the listed raw FD indices (selective
-    ///   inheritance). FD indices not present in the slice are skipped.
-    /// - `Some(&[])` — inherit nothing (child gets an empty FD table).
-    ///
-    /// Each slot in the new storage gets a **new, independent** `OwnedFd`
-    /// (with the same raw index as the parent's), avoiding shared `AtomicBool`
-    /// poisoning when either process closes the FD independently.
-    ///
-    /// Returns `(cloned_storage, slot_indices)` where `slot_indices` is the
-    /// list of descriptor-table slot indices that were inherited.
-    ///
-    /// Prefer using [`Descriptors::clone_storage_for_child`] which combines this
-    /// with refcount bookkeeping into a single operation.
-    #[must_use]
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics only if FD is closed during child creation (invariant violation)"
-    )]
-    pub fn clone_for_child_selective(&self, inherit: Option<&[usize]>) -> (Self, Vec<usize>) {
-        let mut slot_indices = Vec::new();
-        let stored_fds = self
-            .stored_fds
-            .iter()
-            .enumerate()
-            .map(|(fd_index, slot)| {
-                slot.as_ref().and_then(|stored| {
-                    if inherit.is_some_and(|fds| !fds.contains(&fd_index)) {
-                        return None;
-                    }
-                    let raw = stored
-                        .x
-                        .as_usize()
-                        .expect("FD should not be closed during child creation");
-                    slot_indices.push(raw);
-                    Some(StoredFd {
-                        x: Arc::new(OwnedFd::new(raw)),
-                        subsystem_entry_type_id: stored.subsystem_entry_type_id,
-                    })
-                })
-            })
-            .collect();
-        (Self { stored_fds }, slot_indices)
     }
 
     /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
