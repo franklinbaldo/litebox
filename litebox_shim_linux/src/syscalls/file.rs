@@ -81,16 +81,19 @@ impl<FS: ShimFS> FilesState<FS> {
     /// The child gets its own `RawDescriptorStorage` with independent `OwnedFd`
     /// instances (so close in the child does not poison the parent's FDs).
     /// The underlying open file descriptions are shared via Arc in the global
-    /// descriptor table, tracked by `fork_refcount`.
+    /// descriptor table, tracked by `process_refcount`.
     ///
     /// The caller must provide a mutable reference to the global descriptor table
-    /// so that fork_refcounts can be incremented atomically with the clone.
+    /// so that process_refcounts can be incremented atomically with the clone.
     pub(crate) fn clone_for_fork(
         &self,
         descriptors: &mut litebox::fd::Descriptors<Platform>,
     ) -> Self {
-        let (cloned_rds, slot_indices) = self.raw_descriptor_store.read().clone_for_fork();
-        descriptors.increment_fork_refcounts(&slot_indices);
+        let (cloned_rds, slot_indices) = self
+            .raw_descriptor_store
+            .read()
+            .clone_for_child_selective(None);
+        descriptors.increment_process_refcounts(&slot_indices);
         Self {
             fs: self.fs.clone(),
             raw_descriptor_store: litebox::sync::RwLock::new(cloned_rds),
