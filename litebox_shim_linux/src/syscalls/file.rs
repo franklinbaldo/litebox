@@ -86,8 +86,10 @@ impl<FS: ShimFS> FilesState<FS> {
         &self,
         descriptors: &mut litebox::fd::Descriptors<Platform>,
     ) -> Self {
-        let cloned_rds =
-            descriptors.clone_storage_for_child(&self.raw_descriptor_store.read(), None);
+        let cloned_rds = self
+            .raw_descriptor_store
+            .read()
+            .clone_for_child(descriptors, None);
         Self {
             fs: self.fs.clone(),
             raw_descriptor_store: litebox::sync::RwLock::new(cloned_rds),

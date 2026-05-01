@@ -36,51 +36,6 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self { entries: vec![] }
     }
 
-    /// Clone a [`RawDescriptorStorage`] for a child process, optionally selecting
-    /// which raw FD indices to inherit, and increment the process reference counts
-    /// for all inherited slots.
-    ///
-    /// - `inherit = None` — inherit all open FDs (bulk inheritance).
-    /// - `inherit = Some(fds)` — inherit only the listed raw FD indices (selective
-    ///   inheritance). Indices not present in the slice are skipped.
-    /// - `inherit = Some(&[])` — inherit nothing (child gets an empty FD table).
-    ///
-    /// Each slot in the new storage gets a **new, independent** `OwnedFd`
-    /// (with the same raw index as the parent's), avoiding shared `AtomicBool`
-    /// poisoning when either process closes the FD independently.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panics only on invariant violation (slot must exist during child creation)"
-    )]
-    pub fn clone_storage_for_child(
-        &mut self,
-        storage: &RawDescriptorStorage,
-        inherit: Option<&[usize]>,
-    ) -> RawDescriptorStorage {
-        let mut stored_fds = Vec::with_capacity(storage.stored_fds.len());
-        for (fd_index, slot) in storage.stored_fds.iter().enumerate() {
-            let cloned = slot.as_ref().and_then(|stored| {
-                if inherit.is_some_and(|fds| !fds.contains(&fd_index)) {
-                    return None;
-                }
-                let raw = stored
-                    .x
-                    .as_usize()
-                    .expect("FD should not be closed during child creation");
-                let entry = self.entries[raw]
-                    .as_mut()
-                    .expect("child creation: descriptor slot must exist");
-                entry.process_refcount += 1;
-                Some(StoredFd {
-                    x: Arc::new(OwnedFd::new(raw)),
-                    subsystem_entry_type_id: stored.subsystem_entry_type_id,
-                })
-            });
-            stored_fds.push(cloned);
-        }
-        RawDescriptorStorage { stored_fds }
-    }
-
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     #[expect(
         clippy::missing_panics_doc,
@@ -772,6 +727,52 @@ impl RawDescriptorStorage {
     #[must_use]
     pub fn is_alive(&self, fd: usize) -> bool {
         self.stored_fds.get(fd).is_some_and(Option::is_some)
+    }
+
+    /// Clone this FD table for a child process, optionally selecting which raw FD
+    /// indices to inherit, and increment the process reference counts in the
+    /// provided [`Descriptors`] for all inherited slots.
+    ///
+    /// - `inherit = None` — inherit all open FDs (bulk inheritance).
+    /// - `inherit = Some(fds)` — inherit only the listed raw FD indices (selective
+    ///   inheritance). Indices not present in the slice are skipped.
+    /// - `inherit = Some(&[])` — inherit nothing (child gets an empty FD table).
+    ///
+    /// Each slot in the new storage gets a **new, independent** `OwnedFd`
+    /// (with the same raw index as the parent's), avoiding shared `AtomicBool`
+    /// poisoning when either process closes the FD independently.
+    #[must_use]
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "panics only on invariant violation (slot must exist during child creation)"
+    )]
+    pub fn clone_for_child<Platform: RawSyncPrimitivesProvider>(
+        &self,
+        descriptors: &mut Descriptors<Platform>,
+        inherit: Option<&[usize]>,
+    ) -> Self {
+        let mut stored_fds = Vec::with_capacity(self.stored_fds.len());
+        for (fd_index, slot) in self.stored_fds.iter().enumerate() {
+            let cloned = slot.as_ref().and_then(|stored| {
+                if inherit.is_some_and(|fds| !fds.contains(&fd_index)) {
+                    return None;
+                }
+                let raw = stored
+                    .x
+                    .as_usize()
+                    .expect("FD should not be closed during child creation");
+                let entry = descriptors.entries[raw]
+                    .as_mut()
+                    .expect("child creation: descriptor slot must exist");
+                entry.process_refcount += 1;
+                Some(StoredFd {
+                    x: Arc::new(OwnedFd::new(raw)),
+                    subsystem_entry_type_id: stored.subsystem_entry_type_id,
+                })
+            });
+            stored_fds.push(cloned);
+        }
+        Self { stored_fds }
     }
 
     /// Returns an iterator over raw integer indices that are currently alive (i.e., occupied).
