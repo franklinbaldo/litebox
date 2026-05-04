@@ -262,6 +262,7 @@ impl OpteeShim {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: ta_uuid,
+                ta_svn: 0, // TODO: Initialize from TA binary
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -1349,6 +1350,8 @@ struct Task {
     thread: ThreadState,
     /// TA UUID
     ta_app_id: TeeUuid,
+    /// TA Secure Version Number (SVN)
+    ta_svn: u32,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1519,10 +1522,16 @@ mod test_utils {
     impl GlobalState {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
+            self.new_test_task_with_svn(0)
+        }
+
+        /// Make a new task with the provided TA SVN for testing.
+        pub(crate) fn new_test_task_with_svn(self: Arc<Self>, ta_svn: u32) -> Task {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: TeeUuid::default(),
+                ta_svn,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
