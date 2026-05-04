@@ -13,7 +13,7 @@ use litebox::platform::{
 };
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{
-    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, TeeParamType, TeeResult, TeeUuid, UteeParams,
+    HukSubkeyUsage, TeeParamType, TeeResult, TeeUuid, UteeParams, HUK_SUBKEY_MAX_LEN,
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;

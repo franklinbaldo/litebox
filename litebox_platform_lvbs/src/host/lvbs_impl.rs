@@ -4,8 +4,8 @@
 //! An implementation of [`HostInterface`] for LVBS
 
 use crate::{
-    Errno, HostInterface, arch::ioport::serial_print_string,
-    host::per_cpu_variables::with_per_cpu_variables,
+    arch::ioport::serial_print_string, host::per_cpu_variables::with_per_cpu_variables, Errno,
+    HostInterface,
 };
 use zeroize::Zeroizing;
 
@@ -143,15 +143,18 @@ pub(crate) fn set_platform_root_key(key: &[u8]) {
 impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
     fn derive_key<E>(
         &self,
-        kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
+        shim_kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
         let Some(prk) = PRK_ONCE.get() else {
             return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
         };
-        match kdf {
-            None => Err(litebox::platform::DerivedKeyError::ShimKDFRequired),
-            Some(kdf) => Ok(kdf(prk, params)?),
+        match shim_kdf {
+            None => {
+                // LVBS platform doesn't have its own KDF implementation.
+                Err(litebox::platform::DerivedKeyError::ShimKDFRequired)
+            }
+            Some(shim_kdf) => Ok(shim_kdf(prk, params)?),
         }
     }
 }
