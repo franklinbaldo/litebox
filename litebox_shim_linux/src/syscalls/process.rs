@@ -1471,19 +1471,23 @@ impl<FS: ShimFS> Task<FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: crate::ConstPtr<i8>,
-        argv: crate::ConstPtr<crate::ConstPtr<i8>>,
-        envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+        #[cfg(target_arch = "x86_64")] pathname: crate::ConstPtr<i8>,
+        #[cfg(target_arch = "aarch64")] pathname: crate::ConstPtr<u8>,
+        #[cfg(target_arch = "x86_64")] argv: crate::ConstPtr<crate::ConstPtr<i8>>,
+        #[cfg(target_arch = "aarch64")] argv: crate::ConstPtr<crate::ConstPtr<u8>>,
+        #[cfg(target_arch = "x86_64")] envp: crate::ConstPtr<crate::ConstPtr<i8>>,
+        #[cfg(target_arch = "aarch64")] envp: crate::ConstPtr<crate::ConstPtr<u8>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector(
-            mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+            #[cfg(target_arch = "x86_64")] mut base: crate::ConstPtr<crate::ConstPtr<i8>>,
+            #[cfg(target_arch = "aarch64")] mut base: crate::ConstPtr<crate::ConstPtr<u8>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: crate::ConstPtr<i8> = {
+                let p = {
                     // read pointer-sized entries
                     match base.read_at_offset(0) {
                         Some(ptr) => ptr,

@@ -889,7 +889,6 @@ impl<FS: ShimFS> Task<FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
-            #[cfg(target_arch = "x86_64")]
             SyscallRequest::Newfstatat {
                 dirfd,
                 pathname,
