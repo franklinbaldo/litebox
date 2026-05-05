@@ -41,12 +41,17 @@ const PTA_SYSTEM_DLSYM: u32 = 11;
 const PTA_SYSTEM_GET_TPM_EVENT_LOG: u32 = 12;
 const PTA_SYSTEM_SUPP_PLUGIN_INVOKE: u32 = 13;
 
+// subject to change. This is not an official system PTA command ID.
+const PTA_SYSTEM_DERIVE_TA_SVN_KEY_STACK: u32 = 14;
+
 /// Minimum size of a derived key in bytes.
 const TA_DERIVED_KEY_MIN_SIZE: usize = 16;
 /// Maximum size of a derived key in bytes.
 const TA_DERIVED_KEY_MAX_SIZE: usize = 32;
 /// Maximum size of extra data for key derivation in bytes.
 const TA_DERIVED_EXTRA_DATA_MAX_SIZE: usize = 1024;
+/// Maximum number of keys in SVN key stack.
+const SVN_KEY_STACK_MAX_SIZE: u32 = 4096;
 
 /// `PTA_SYSTEM_*` command ID from `optee_os/lib/libutee/include/pta_system.h`
 #[derive(Clone, Copy, TryFromPrimitive)]
@@ -66,6 +71,7 @@ pub enum PtaSystemCommandId {
     Dlsym = PTA_SYSTEM_DLSYM,
     GetTpmEventLog = PTA_SYSTEM_GET_TPM_EVENT_LOG,
     SuppPluginInvoke = PTA_SYSTEM_SUPP_PLUGIN_INVOKE,
+    DeriveTaSvnKeyStack = PTA_SYSTEM_DERIVE_TA_SVN_KEY_STACK,
 }
 
 /// Checks whether a given TA is a (system) PTA and its parameter is valid.
@@ -98,6 +104,7 @@ impl Task {
         #[allow(clippy::single_match_else)]
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
             PtaSystemCommandId::DeriveTaUniqueKey => self.derive_ta_unique_key(params),
+            PtaSystemCommandId::DeriveTaSvnKeyStack => self.derive_ta_svn_key_stack(params),
             _ => {
                 #[cfg(debug_assertions)]
                 todo!("support other system PTA commands {cmd_id}");
@@ -165,6 +172,122 @@ impl Task {
                 .copy_from_slice(0, &subkey_buf)
                 .ok_or(TeeResult::AccessDenied)
         })
+    }
+
+    /// Derives a stack of unique keys for a TA, one for each possible
+    /// Secure Version Number (SVN) value up to a maximum.
+    ///
+    /// The key derivation follows a two-stage process:
+    /// 1. First stage: KDF(huk, uuid || extra_data) -> base key
+    /// 2. Second stage: Iterate from max SVN down to 0, chaining keys:
+    ///    - Key\[max\] = HMAC(base_key, max)
+    ///    - Key\[n\] = HMAC(Key\[n+1\], n)
+    ///
+    /// Only keys for SVN values <= current TA version are copied to output.
+    fn derive_ta_svn_key_stack(&self, params: &UteeParams) -> Result<(), TeeResult> {
+        use TeeParamType::{MemrefInput, MemrefOutput, None, ValueInput};
+        // Validate parameter types:
+        // [in]  params[0].value.a         Size of each key
+        // [in]  params[0].value.b         Number of keys to derive
+        // [in]  params[1].memref.buffer   Extra data for key derivation
+        // [in]  params[1].memref.size     Extra data size
+        // [out] params[2].memref.buffer   Output buffer for key stack
+        // [out] params[2].memref.size     Buffer size
+        if !params.has_types([ValueInput, MemrefInput, MemrefOutput, None]) {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (key_size_u64, svn_key_stack_size_u64) = params
+            .get_values(0)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let key_size: usize = key_size_u64.truncate();
+        let svn_key_stack_size =
+            u32::try_from(svn_key_stack_size_u64).map_err(|_| TeeResult::BadParameters)?;
+
+        let (extra_data_addr, extra_data_size_u64) = params
+            .get_values(1)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let extra_data_size: usize = extra_data_size_u64.truncate();
+
+        let (key_stack_addr, key_stack_buffer_size_u64) = params
+            .get_values(2)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let key_stack_buffer_size: usize = key_stack_buffer_size_u64.truncate();
+
+        if !(TA_DERIVED_KEY_MIN_SIZE..=TA_DERIVED_KEY_MAX_SIZE).contains(&key_size)
+            || extra_data_size > TA_DERIVED_EXTRA_DATA_MAX_SIZE
+            || svn_key_stack_size > SVN_KEY_STACK_MAX_SIZE
+            || svn_key_stack_size == 0
+            || key_stack_addr == 0
+        {
+            return Err(TeeResult::BadParameters);
+        }
+
+        // Validate TA version is within the key stack bounds
+        let ta_version = self.ta_svn;
+        if ta_version >= svn_key_stack_size {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let required_stack_buffer_size = key_size
+            .checked_mul(ta_version as usize + 1)
+            .ok_or(TeeResult::BadParameters)?;
+        if key_stack_buffer_size < required_stack_buffer_size {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let extra_data_ptr = UserConstPtr::<u8>::from_usize(
+            usize::try_from(extra_data_addr).map_err(|_| TeeResult::BadParameters)?,
+        );
+        let extra_data = extra_data_ptr
+            .to_owned_slice(extra_data_size)
+            .ok_or(TeeResult::BadParameters)?;
+
+        let key_stack_ptr = UserMutPtr::<u8>::from_usize(
+            usize::try_from(key_stack_addr).map_err(|_| TeeResult::BadParameters)?,
+        );
+
+        let uuid_bytes = self.ta_app_id.to_le_bytes();
+        let mut stage_key = Zeroizing::new(vec![0u8; key_size]);
+
+        // Derive keys from max SVN down to 0
+        for svn_idx in (0..svn_key_stack_size).rev() {
+            if svn_idx == svn_key_stack_size - 1 {
+                // First iteration: derive base key = KDF(huk, usage || ta_uuid || extra data)
+                self.huk_subkey_derive(
+                    HukSubkeyUsage::UniqueTa,
+                    &[&uuid_bytes, &extra_data],
+                    &mut stage_key,
+                )?;
+            }
+
+            // Second stage KDF: HMAC(current_key, SVN_index)
+            // Key_v2047 = KDF(KDF(HUK, UUID), 2047)
+            // Key_v2046 = KDF(Key_v2047, 2046)
+            // ...
+            // Key_v001 = KDF(Key_v002, 001)
+            // Key_v000 = KDF(Key_v001, 000)
+            let mut hmac =
+                HmacSha256::new_from_slice(&stage_key).map_err(|_| TeeResult::BadParameters)?;
+            hmac.update(&svn_idx.to_le_bytes());
+
+            let hmac_bytes = hmac.finalize().into_bytes();
+            let derived_key = &hmac_bytes[..key_size];
+
+            // Only copy keys for SVN values <= current TA version to userspace
+            if svn_idx <= ta_version {
+                let offset = svn_idx as usize * key_size;
+                key_stack_ptr
+                    .copy_from_slice(offset, derived_key)
+                    .ok_or(TeeResult::AccessDenied)?;
+            }
+            stage_key.copy_from_slice(derived_key);
+        }
+
+        Ok(())
     }
 
     /// Derive a subkey using HUK and constant data.
