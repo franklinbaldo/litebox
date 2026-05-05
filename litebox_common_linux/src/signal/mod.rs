@@ -3,8 +3,11 @@
 
 //! Linux signal handling definitions.
 
+pub mod aarch64;
 pub mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64::Sigcontext;
 #[cfg(target_arch = "x86_64")]
 use x86_64::Sigcontext;
 
@@ -314,6 +317,7 @@ pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
 pub struct Ucontext {
@@ -322,6 +326,24 @@ pub struct Ucontext {
     pub stack: SigAltStack,
     pub mcontext: Sigcontext,
     pub sigmask: SigSet,
+}
+
+/// On aarch64, the `uc_sigmask` field comes before `uc_mcontext`, and there
+/// is padding to accommodate glibc's 1024-bit sigset_t.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, FromBytes, IntoBytes)]
+#[allow(clippy::pub_underscore_fields)]
+pub struct Ucontext {
+    pub flags: usize,
+    pub link: usize, // *mut Ucontext,
+    pub stack: SigAltStack,
+    pub sigmask: SigSet,
+    /// Padding: glibc uses a 1024-bit sigset_t (128 bytes), kernel uses 64-bit (8 bytes).
+    pub __unused: [u8; 1024 / 8 - core::mem::size_of::<SigSet>()],
+    /// Alignment padding: mcontext (Sigcontext) requires 16-byte alignment.
+    pub __align_pad: [u8; 8],
+    pub mcontext: Sigcontext,
 }
 
 #[repr(C)]

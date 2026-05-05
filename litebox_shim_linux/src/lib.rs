@@ -595,6 +595,13 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Mkdir { pathname, mode } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_mkdir(path, mode))),
+            SyscallRequest::Mkdirat {
+                dirfd,
+                pathname,
+                mode,
+            } => pathname.to_cstring().map_or(Err(Errno::EINVAL), |path| {
+                syscall!(sys_mkdirat(dirfd, path, mode))
+            }),
             SyscallRequest::Chdir { pathname } => pathname
                 .to_cstring()
                 .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
@@ -884,7 +891,6 @@ impl<FS: ShimFS> Task<FS> {
                     .ok_or(Errno::EFAULT)
                     .map(|()| 0)
             }),
-            #[cfg(target_arch = "x86_64")]
             SyscallRequest::Newfstatat {
                 dirfd,
                 pathname,
@@ -892,6 +898,19 @@ impl<FS: ShimFS> Task<FS> {
                 flags,
             } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
                 self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
+                    buf.write_at_offset(0, stat)
+                        .ok_or(Errno::EFAULT)
+                        .map(|()| 0)
+                })
+            }),
+            SyscallRequest::Statx {
+                dirfd,
+                pathname,
+                flags,
+                mask,
+                buf,
+            } => pathname.to_cstring().map_or(Err(Errno::EFAULT), |path| {
+                self.sys_statx(dirfd, path, flags, mask).and_then(|stat| {
                     buf.write_at_offset(0, stat)
                         .ok_or(Errno::EFAULT)
                         .map(|()| 0)

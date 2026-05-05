@@ -18,12 +18,18 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, IoReadVec,
-    IoWriteVec, IoctlArg, TimeParam, errno::Errno,
+    IoWriteVec, IoctlArg, Statx, TimeParam, errno::Errno,
 };
 use litebox_platform_multiplex::Platform;
 
 use crate::{ConstPtr, GlobalState, MutPtr, ShimFS, Task};
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+const STATX_BASIC_STATS: u32 = 0x07ff;
+const STATX_BTIME: u32 = 0x0800;
+const STATX_MNT_ID: u32 = 0x1000;
+const STATX_DIOALIGN: u32 = 0x2000;
+const STATX_ALL: u32 = STATX_BASIC_STATS | STATX_BTIME;
 
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState {
@@ -506,6 +512,27 @@ impl<FS: ShimFS> Task<FS> {
     pub fn sys_mkdir(&self, pathname: impl path::Arg, mode: u32) -> Result<(), Errno> {
         let pathname = self.resolve_path(pathname)?;
         let mode = Mode::from_bits_retain(mode) & !self.get_umask();
+        self.files
+            .borrow()
+            .fs
+            .mkdir(pathname, mode)
+            .map_err(Errno::from)
+    }
+
+    pub fn sys_mkdirat(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        mode: Mode,
+    ) -> Result<(), Errno> {
+        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
+        let pathname = match fs_path {
+            FsPath::Absolute { path } => path,
+            FsPath::Cwd => return Err(Errno::EEXIST),
+            FsPath::Fd(_) | FsPath::FdRelative { .. } => unimplemented!(),
+        };
+        let mode = mode & !self.get_umask();
         self.files
             .borrow()
             .fs
@@ -1004,7 +1031,8 @@ impl<FS: ShimFS> Task<FS> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
+        let current_support_flags =
+            AtFlags::AT_EMPTY_PATH | AtFlags::AT_NO_AUTOMOUNT | AtFlags::AT_SYMLINK_NOFOLLOW;
         if flags.contains(current_support_flags.complement()) {
             todo!("unsupported flags");
         }
@@ -1026,6 +1054,34 @@ impl<FS: ShimFS> Task<FS> {
             FsPath::FdRelative { .. } => todo!(),
         };
         Ok(fstat)
+    }
+
+    pub fn sys_statx(
+        &self,
+        dirfd: i32,
+        pathname: impl path::Arg,
+        flags: AtFlags,
+        mask: u32,
+    ) -> Result<Statx, Errno> {
+        let current_support_flags = AtFlags::AT_EMPTY_PATH
+            | AtFlags::AT_NO_AUTOMOUNT
+            | AtFlags::AT_SYMLINK_NOFOLLOW
+            | AtFlags::AT_STATX_SYNC_TYPE;
+        if flags.contains(current_support_flags.complement()) {
+            todo!("unsupported statx flags");
+        }
+
+        let supported_mask = STATX_ALL | STATX_MNT_ID | STATX_DIOALIGN;
+        if mask & !supported_mask != 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        let fstat_flags = flags - AtFlags::AT_STATX_SYNC_TYPE;
+        let mut statx = self
+            .sys_newfstatat(dirfd, pathname, fstat_flags)
+            .map(Statx::from)?;
+        statx.stx_mask &= mask | STATX_BASIC_STATS;
+        Ok(statx)
     }
 
     pub(crate) fn sys_fcntl(
