@@ -22,7 +22,9 @@ use litebox::mm::PageManager;
 use litebox::mm::linux::{
     CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
 };
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{
+    PunchthroughProvider as _, PunchthroughToken as _, RawConstPointer as _, RawMutPointer as _,
+};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
@@ -31,15 +33,131 @@ use litebox_common_windows::loader::{
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
+use zerocopy::{FromBytes, IntoBytes};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
+const INITIAL_PEB_SIZE: usize = PAGE_SIZE;
+const INITIAL_TEB_SIZE: usize = PAGE_SIZE * 2;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 const NTDLL_PATHS: &[&str] = &[
     "/windows/system32/ntdll.dll",
     "/Windows/System32/ntdll.dll",
     "/ntdll.dll",
 ];
+const INITIAL_PROCESS_ID: usize = 1000;
+const INITIAL_THREAD_ID: usize = 1000;
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+// Minimal PEB prefix used to bootstrap the first guest thread. This is not a
+// complete Windows PEB definition and is subject to change as loader support grows.
+struct ProcessEnvironmentBlock {
+    /// PEB.InheritedAddressSpace.
+    inherited_address_space: u8,
+    /// PEB.ReadImageFileExecOptions.
+    read_image_file_exec_options: u8,
+    /// PEB.BeingDebugged.
+    being_debugged: u8,
+    /// PEB.BitField.
+    bit_field: u8,
+    /// Explicit padding before pointer-sized fields.
+    _padding0: u32,
+    /// PEB.Mutant.
+    mutant: usize,
+    /// PEB.ImageBaseAddress: base address of the initial executable image.
+    image_base_address: usize,
+}
+
+impl ProcessEnvironmentBlock {
+    const fn new(image_base_address: usize) -> Self {
+        Self {
+            inherited_address_space: 0,
+            read_image_file_exec_options: 0,
+            being_debugged: 0,
+            bit_field: 0,
+            _padding0: 0,
+            mutant: 0,
+            image_base_address,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+struct InitialNtTib {
+    /// NT_TIB.ExceptionList.
+    exception_list: usize,
+    /// NT_TIB.StackBase: the high address of the initial thread stack.
+    stack_base: usize,
+    /// NT_TIB.StackLimit: the low address of the initial thread stack.
+    stack_limit: usize,
+    /// NT_TIB.SubSystemTib.
+    sub_system_tib: usize,
+    /// NT_TIB.FiberData / Version.
+    fiber_data: usize,
+    /// NT_TIB.ArbitraryUserPointer.
+    arbitrary_user_pointer: usize,
+    /// NT_TIB.Self: points back to this TEB.
+    self_pointer: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+struct InitialClientId {
+    /// CLIENT_ID.UniqueProcess: placeholder process identifier.
+    unique_process: usize,
+    /// CLIENT_ID.UniqueThread: placeholder thread identifier.
+    unique_thread: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+// Minimal TEB prefix used to bootstrap the first guest thread. This is not a
+// complete Windows TEB definition and is subject to change as loader support grows.
+struct ThreadEnvironmentBlock {
+    /// TEB.NtTib.
+    nt_tib: InitialNtTib,
+    /// TEB.EnvironmentPointer.
+    environment_pointer: usize,
+    /// TEB.ClientId.
+    client_id: InitialClientId,
+    /// TEB.ActiveRpcHandle.
+    active_rpc_handle: usize,
+    /// TEB.ThreadLocalStoragePointer.
+    thread_local_storage_pointer: usize,
+    /// TEB.ProcessEnvironmentBlock: points to the process PEB.
+    process_environment_block: usize,
+}
+
+impl ThreadEnvironmentBlock {
+    const fn new(
+        teb_address: usize,
+        peb_address: usize,
+        stack_base: usize,
+        stack_top: usize,
+    ) -> Self {
+        Self {
+            nt_tib: InitialNtTib {
+                exception_list: 0,
+                stack_base: stack_top,
+                stack_limit: stack_base,
+                sub_system_tib: 0,
+                fiber_data: 0,
+                arbitrary_user_pointer: 0,
+                self_pointer: teb_address,
+            },
+            environment_pointer: 0,
+            client_id: InitialClientId {
+                unique_process: INITIAL_PROCESS_ID,
+                unique_thread: INITIAL_THREAD_ID,
+            },
+            active_rpc_handle: 0,
+            thread_local_storage_pointer: 0,
+            process_environment_block: peb_address,
+        }
+    }
+}
 
 type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 
@@ -142,11 +260,14 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .as_usize()
             .checked_add(INITIAL_STACK_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
+        let process_environment =
+            self.create_process_environment(mapping.base_addr, stack_base.as_usize(), stack_top)?;
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 entry_point,
                 stack_top,
+                teb_address: process_environment.teb_address,
                 _fs: PhantomData,
             },
             process: WindowsShimProcess { mapping },
@@ -182,6 +303,47 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .map_err(WindowsLoadError::Load)
     }
 
+    fn create_process_environment(
+        &self,
+        image_base: usize,
+        stack_base: usize,
+        stack_top: usize,
+    ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
+        let peb_address = self.create_zeroed_pages(INITIAL_PEB_SIZE)?;
+        let teb_address = self.create_zeroed_pages(INITIAL_TEB_SIZE)?;
+
+        write_value(peb_address, ProcessEnvironmentBlock::new(image_base))?;
+        write_value(
+            teb_address,
+            ThreadEnvironmentBlock::new(teb_address, peb_address, stack_base, stack_top),
+        )?;
+
+        litebox_util_log::debug!(
+            peb:% = format_args!("{peb_address:#x}"),
+            teb:% = format_args!("{teb_address:#x}"),
+            image_base:% = format_args!("{image_base:#x}");
+            "Created initial Windows PEB/TEB"
+        );
+
+        Ok(WindowsProcessEnvironment {
+            _peb_address: peb_address,
+            teb_address,
+        })
+    }
+
+    fn create_zeroed_pages(&self, size: usize) -> Result<usize, WindowsLoadError> {
+        let length = NonZeroPageSize::new(size).ok_or(PeImageAccessError::AddressOverflow)?;
+        // SAFETY: These pages are private shim-created process metadata initialized before guest execution.
+        let ptr = unsafe {
+            self.page_manager
+                .create_writable_pages(None, length, CreatePagesFlags::empty(), |_| Ok(0))
+        }
+        .map_err(PeImageAccessError::Mapping)?;
+        ptr.copy_from_slice(0, &vec![0; size])
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+        Ok(ptr.as_usize())
+    }
+
     /// Returns the LiteBox object for the shim.
     #[must_use]
     pub fn litebox(&self) -> &LiteBox<Platform> {
@@ -193,6 +355,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
+    teb_address: usize,
     _fs: PhantomData<FS>,
 }
 
@@ -200,12 +363,16 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        if !set_guest_teb(self.teb_address) {
+            return ContinueOperation::Terminate;
+        }
         ctx.rip = self.entry_point;
         ctx.rsp = self.stack_top;
         ctx.eflags = 0x202;
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
-            stack_top:% = format_args!("{:#x}", self.stack_top);
+            stack_top:% = format_args!("{:#x}", self.stack_top),
+            teb:% = format_args!("{:#x}", self.teb_address);
             "Starting initial Windows guest thread"
         );
         ContinueOperation::Resume
@@ -246,6 +413,11 @@ pub struct LoadedProgram<FS: NtShimFS> {
 /// A placeholder handle to a process loaded via [`WindowsShim::load_program`].
 pub struct WindowsShimProcess {
     mapping: MappingInfo,
+}
+
+struct WindowsProcessEnvironment {
+    _peb_address: usize,
+    teb_address: usize,
 }
 
 impl WindowsShimProcess {
@@ -318,6 +490,32 @@ fn is_missing_file_error(error: &WindowsLoadError) -> bool {
                 | litebox::fs::errors::PathError::MissingComponent
         )
     )
+}
+
+fn set_guest_teb(teb_address: usize) -> bool {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr: teb_address };
+    let Some(token) =
+        litebox_platform_multiplex::platform().get_punchthrough_token_for(punchthrough)
+    else {
+        litebox_util_log::warn!(teb:% = format_args!("{teb_address:#x}"); "Failed to get punchthrough token for Windows TEB base");
+        return false;
+    };
+
+    if let Err(error) = token.execute() {
+        litebox_util_log::warn!(error:? = error, teb:% = format_args!("{teb_address:#x}"); "Failed to set Windows TEB base");
+        return false;
+    }
+
+    true
+}
+
+fn write_value<GuestValue>(address: usize, value: GuestValue) -> Result<(), PeImageAccessError>
+where
+    GuestValue: FromBytes + IntoBytes,
+{
+    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<GuestValue>::from_usize(address);
+    ptr.write_at_offset(0, value)
+        .ok_or(PeImageAccessError::MemoryAccess)
 }
 
 struct PeImageFile<FS: NtShimFS> {
