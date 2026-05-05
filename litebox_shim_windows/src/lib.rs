@@ -33,6 +33,12 @@ use litebox_common_windows::loader::{
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
+mod nt_sysno {
+    include!(concat!(env!("OUT_DIR"), "/nt_sysno.rs"));
+}
+
+use nt_sysno::NtSysno;
+
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -200,15 +206,22 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        // TODO: Decode the NT syscall number and dispatch only NtTerminateProcess here.
-        litebox_util_log::debug!(
-            syscall_number = ctx.orig_rax,
-            process_handle:% = format_args!("{:#x}", ctx.r10),
-            exit_status:% = format_args!("{:#x}", ctx.rdx);
-            "Handling temporary NtTerminateProcess syscall"
-        );
-        self.exit_code
-            .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
+        if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtTerminateProcess) {
+            litebox_util_log::debug!(
+                syscall_number = ctx.orig_rax,
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                exit_status:% = format_args!("{:#x}", ctx.rdx);
+                "Handling NtTerminateProcess syscall"
+            );
+            self.exit_code
+                .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
+        } else {
+            litebox_util_log::debug!(
+                syscall:? = NtSysno::from_raw(ctx.orig_rax),
+                process_handle:% = format_args!("{:#x}", ctx.r10);
+                "Unsupported Windows syscall"
+            );
+        }
         ContinueOperation::Terminate
     }
 
