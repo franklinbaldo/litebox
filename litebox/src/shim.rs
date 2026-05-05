@@ -114,6 +114,16 @@ pub struct ExceptionInfo {
     pub kernel_mode: bool,
 }
 
+/// Information about a hardware exception on aarch64.
+#[cfg(target_arch = "aarch64")]
+#[derive(Copy, Clone, Debug)]
+pub struct ExceptionInfo {
+    /// The fault address (FAR_EL1).
+    pub fault_address: usize,
+    /// The exception syndrome register value (ESR_EL1).
+    pub esr: u64,
+}
+
 /// An x86 exception type.
 #[cfg(target_arch = "x86_64")]
 #[repr(transparent)]

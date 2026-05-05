@@ -83,10 +83,29 @@ pub unsafe fn memcpy_fallible(dst: *mut u8, src: *const u8, size: usize) -> Resu
             fault = label { return Err(Fault) }
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm! {
+            "cbz {size}, 3f",
+            "2:",
+            "ldrb {tmp:w}, [{src}], #1",
+            "strb {tmp:w}, [{dst}], #1",
+            "subs {size}, {size}, #1",
+            "b.ne 2b",
+            "3:",
+            ex_table_entry!("2b", "3b", "{fault}"),
+            dst = inout(reg) dst => _,
+            src = inout(reg) src => _,
+            size = inout(reg) size => _,
+            tmp = out(reg) _,
+            fault = label { return Err(Fault) }
+        }
+    }
 
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 macro_rules! read_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
         /// Reads a value from the given `src` pointer in a fallible manner.
@@ -121,12 +140,57 @@ macro_rules! read_fn {
     };
 }
 
+#[cfg(target_arch = "x86_64")]
 read_fn!(read_u8_fallible, u8, "movzx {dest:e}, byte ptr [{src}]");
+#[cfg(target_arch = "x86_64")]
 read_fn!(read_u16_fallible, u16, "movzx {dest:e}, word ptr [{src}]");
+#[cfg(target_arch = "x86_64")]
 read_fn!(read_u32_fallible, u32, "mov {dest:e}, dword ptr [{src}]");
-#[cfg(target_pointer_width = "64")]
+#[cfg(target_arch = "x86_64")]
 read_fn!(read_u64_fallible, u64, "mov {dest:r}, qword ptr [{src}]");
 
+#[cfg(target_arch = "aarch64")]
+macro_rules! read_fn {
+    ($name:ident, $ty:ty, $load_instr:expr) => {
+        /// Reads a value from the given `src` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `src` must be valid for reads or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(src: *const $ty) -> Result<$ty, Fault> {
+            let value: usize;
+            let failed: u32;
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $load_instr,
+                    "mov {failed:w}, wzr",
+                    "3:",
+                    ex_table_entry!("2b", "3b", "3b"),
+                    src = in(reg) src,
+                    dest = out(reg) value,
+                    failed = inout(reg) 1u32 => failed,
+                }
+            }
+            if failed == 0 {
+                Ok((value as u64).truncate())
+            } else {
+                Err(Fault)
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u8_fallible, u8, "ldrb {dest:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u16_fallible, u16, "ldrh {dest:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u32_fallible, u32, "ldr {dest:w}, [{src}]");
+#[cfg(target_arch = "aarch64")]
+read_fn!(read_u64_fallible, u64, "ldr {dest}, [{src}]");
+
+#[cfg(target_arch = "x86_64")]
 macro_rules! write_fn {
     ($name:ident, $ty:ty, $mov_instr:expr) => {
         /// Writes a value to the given `dest` pointer in a fallible manner.
@@ -155,10 +219,56 @@ macro_rules! write_fn {
 
 #[cfg(target_arch = "x86_64")]
 write_fn!(write_u8_fallible, u8, "mov byte ptr [{dest}], {src:l}");
+#[cfg(target_arch = "x86_64")]
 write_fn!(write_u16_fallible, u16, "mov word ptr [{dest}], {src:x}");
+#[cfg(target_arch = "x86_64")]
 write_fn!(write_u32_fallible, u32, "mov dword ptr [{dest}], {src:e}");
-#[cfg(target_pointer_width = "64")]
+#[cfg(target_arch = "x86_64")]
 write_fn!(write_u64_fallible, u64, "mov qword ptr [{dest}], {src:r}");
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! write_fn {
+    ($name:ident, $ty:ty, $store_instr:expr, $convert:expr) => {
+        /// Writes a value to the given `dest` pointer in a fallible manner.
+        ///
+        /// # Safety
+        /// `dest` must be valid for writes or a pointer that's guaranteed to be
+        /// in non-Rust memory.
+        pub unsafe fn $name(dest: *mut $ty, value: $ty) -> Result<(), Fault> {
+            unsafe {
+                core::arch::asm! {
+                    "2:",
+                    $store_instr,
+                    "3:",
+                    ex_table_entry!("2b", "3b", "{fault}"),
+                    src = in(reg) $convert(value),
+                    dest = in(reg) dest,
+                    fault = label { return Err(Fault) }
+                }
+            }
+            Ok(())
+        }
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+write_fn!(write_u8_fallible, u8, "strb {src:w}, [{dest}]", u32::from);
+#[cfg(target_arch = "aarch64")]
+write_fn!(write_u16_fallible, u16, "strh {src:w}, [{dest}]", u32::from);
+#[cfg(target_arch = "aarch64")]
+write_fn!(
+    write_u32_fallible,
+    u32,
+    "str {src:w}, [{dest}]",
+    core::convert::identity
+);
+#[cfg(target_arch = "aarch64")]
+write_fn!(
+    write_u64_fallible,
+    u64,
+    "str {src}, [{dest}]",
+    core::convert::identity
+);
 
 /// Exception table entry with relative offsets
 #[repr(C)]

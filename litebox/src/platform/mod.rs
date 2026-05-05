@@ -489,7 +489,11 @@ where
         // safe (it probably is fine, but the following sequence of steps ensures we are
         // staying in a very safe subset).
         let bytes: *mut [c_char] = Box::into_raw(bytes);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: c_char is i8 on x86_64, and i8 and u8 have the same size and alignment.
         let bytes: *mut [u8] = bytes as *mut [u8];
+        #[cfg(target_arch = "aarch64")]
+        let bytes: *mut [u8] = bytes;
         let bytes: Box<[u8]> = unsafe { Box::from_raw(bytes) };
         let bytes: Vec<u8> = Vec::from(bytes);
         alloc::ffi::CString::from_vec_with_nul(bytes).ok()
