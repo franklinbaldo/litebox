@@ -1763,6 +1763,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_windows",
  "litebox_platform_multiplex",
+ "litebox_util_log",
  "thiserror",
 ]
 

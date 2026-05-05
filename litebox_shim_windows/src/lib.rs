@@ -33,6 +33,8 @@ use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
+const INITIAL_STACK_SIZE: usize = 1024 * 1024;
+const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 
 type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 
@@ -132,9 +134,22 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .map_err(WindowsLoadError::Load)?;
         let entry_point = mapping.entry_point;
 
+        let length =
+            NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
+        let stack_base = unsafe {
+            self.page_manager
+                .create_stack_pages(None, length, CreatePagesFlags::empty())
+                .map_err(PeImageAccessError::Mapping)?
+        };
+        let stack_top = stack_base
+            .as_usize()
+            .checked_add(INITIAL_STACK_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 entry_point,
+                stack_top,
                 _fs: PhantomData,
             },
             process: WindowsShimProcess { mapping },
@@ -151,6 +166,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 /// The shim entrypoint object passed to the platform.
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
+    stack_top: usize,
     _fs: PhantomData<FS>,
 }
 
@@ -159,8 +175,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         ctx.rip = self.entry_point;
-        // TODO: Initialize the first Windows guest thread stack and enter the PE entrypoint.
-        ContinueOperation::Terminate
+        ctx.rsp = self.stack_top;
+        ctx.eflags = 0x202;
+        litebox_util_log::debug!(
+            entry_point:% = format_args!("{:#x}", self.entry_point),
+            stack_top:% = format_args!("{:#x}", self.stack_top);
+            "Starting initial Windows guest thread"
+        );
+        ContinueOperation::Resume
     }
 
     fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -170,9 +192,15 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
 
     fn exception(
         &self,
-        _ctx: &mut Self::ExecutionContext,
-        _info: &ExceptionInfo,
+        ctx: &mut Self::ExecutionContext,
+        info: &ExceptionInfo,
     ) -> ContinueOperation {
+        litebox_util_log::debug!(
+            exception:? = info.exception,
+            rip:% = format_args!("{:#x}", ctx.rip),
+            cr2:% = format_args!("{:#x}", info.cr2);
+            "Windows guest exception"
+        );
         // TODO: Translate hardware exceptions into Windows SEH where appropriate.
         ContinueOperation::Terminate
     }
@@ -205,7 +233,7 @@ impl WindowsShimProcess {
     #[must_use]
     pub fn wait(&self) -> i32 {
         // TODO: Wait for the NT process object once process lifecycle exists.
-        0
+        DEFAULT_PROCESS_EXIT_CODE
     }
 }
 
