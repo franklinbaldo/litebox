@@ -12,7 +12,6 @@ use core::cmp;
 
 use object::endian::LittleEndian as LE;
 use object::pe::{self, ImageNtHeaders64};
-use object::read::Object as _;
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64, Relocation};
 use thiserror::Error;
 
@@ -370,8 +369,11 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
     let file_header = nt_headers.file_header();
     let optional_header = nt_headers.optional_header();
     let machine = file_header.machine.get(LE);
+    let characteristics = file_header.characteristics.get(LE);
 
-    if machine != pe::IMAGE_FILE_MACHINE_AMD64 || pe.kind() != object::ObjectKind::Executable {
+    if machine != pe::IMAGE_FILE_MACHINE_AMD64
+        || characteristics & pe::IMAGE_FILE_EXECUTABLE_IMAGE == 0
+    {
         return Err(PeParseError::UnsupportedImage);
     }
 
@@ -379,7 +381,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
     let entry_point_rva = usize_from_u32(optional_header.address_of_entry_point())?;
     let image = PeImageInfo {
         machine,
-        characteristics: file_header.characteristics.get(LE),
+        characteristics,
         image_base,
         entry_point_rva,
         entry_point: image_base

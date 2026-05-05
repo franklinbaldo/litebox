@@ -35,6 +35,11 @@ use thiserror::Error;
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
+const NTDLL_PATHS: &[&str] = &[
+    "/windows/system32/ntdll.dll",
+    "/Windows/System32/ntdll.dll",
+    "/ntdll.dll",
+];
 
 type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 
@@ -122,17 +127,9 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
-        let file = PeImageFile::open(fs, path)?;
-        let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
-        let mut mapper = PeImageMapper {
-            file: &file,
-            page_manager: &self.page_manager,
-        };
-        let mut memory = PeImageMemory;
-        let mapping = parsed
-            .load(&mut mapper, &mut memory)
-            .map_err(WindowsLoadError::Load)?;
+        let mapping = self.load_image(fs.clone(), path)?;
         let entry_point = mapping.entry_point;
+        self.load_ntdll(fs)?;
 
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
@@ -154,6 +151,35 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             },
             process: WindowsShimProcess { mapping },
         })
+    }
+
+    fn load_ntdll(&self, fs: Arc<FS>) -> Result<(), WindowsLoadError> {
+        for path in NTDLL_PATHS {
+            match self.load_image(fs.clone(), path) {
+                Ok(_) => {
+                    litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
+                    return Ok(());
+                }
+                Err(error) if is_missing_file_error(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        litebox_util_log::debug!("Guest ntdll.dll was not found in the initial filesystem");
+        Ok(())
+    }
+
+    fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<MappingInfo, WindowsLoadError> {
+        let file = PeImageFile::open(fs, path)?;
+        let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let mut mapper = PeImageMapper {
+            file: &file,
+            page_manager: &self.page_manager,
+        };
+        let mut memory = PeImageMemory;
+        parsed
+            .load(&mut mapper, &mut memory)
+            .map_err(WindowsLoadError::Load)
     }
 
     /// Returns the LiteBox object for the shim.
@@ -278,6 +304,20 @@ pub enum PeImageAccessError {
     /// A mapped memory access failed.
     #[error("mapped PE image memory access failed")]
     MemoryAccess,
+}
+
+fn is_missing_file_error(error: &WindowsLoadError) -> bool {
+    let WindowsLoadError::Access(PeImageAccessError::Open(error)) = error else {
+        return false;
+    };
+
+    matches!(
+        error,
+        litebox::fs::errors::OpenError::PathError(
+            litebox::fs::errors::PathError::NoSuchFileOrDirectory
+                | litebox::fs::errors::PathError::MissingComponent
+        )
+    )
 }
 
 struct PeImageFile<FS: NtShimFS> {
