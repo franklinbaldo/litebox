@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Rewrite ELF files to hook syscalls
+//! Rewrite binaries for LiteBox execution.
 //!
 //! This crate sets up a trampoline point for every `syscall` instruction in its input binary,
 //! allowing for conveniently taking control of a binary without ptrace/systrap/seccomp/...
@@ -12,7 +12,8 @@
 //! However, as an explicit goal, it is intended to provide low-overhead hooking of syscalls,
 //! without needing to undergo a user-kernel transition.
 //!
-//! This crate currently only supports x86-64 (i.e., amd64) ELFs.
+//! This crate currently supports x86-64 ELFs for syscall hooking and x86-64 PEs for syscall
+//! hooking plus rewriting Windows TEB accesses from GS segment overrides to FS segment overrides.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -23,7 +24,9 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::elf::{ElfFile, ProgramHeader as _};
+use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -73,6 +76,19 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
+/// Rewrite a supported binary for LiteBox.
+///
+/// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
+/// executable-section GS segment overrides rewritten to FS and `syscall`
+/// instructions redirected through a LiteBox trampoline footer.
+pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    if is_pe_binary(input_binary) {
+        rewrite_pe_for_litebox(input_binary, trampoline)
+    } else {
+        hook_syscalls_in_elf(input_binary, trampoline)
+    }
+}
+
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
 #[derive(FromBytes, IntoBytes, Immutable)]
@@ -83,7 +99,7 @@ struct TrampolineHeader64 {
     trampoline_size: u64,
 }
 
-/// Metadata about an executable section, extracted from the read-only ELF parse.
+/// Metadata about an executable section, extracted from a read-only object parse.
 struct TextSectionInfo {
     /// Virtual address of the section
     vaddr: u64,
@@ -91,6 +107,11 @@ struct TextSectionInfo {
     file_offset: u64,
     /// Size of the section data in bytes
     size: u64,
+}
+
+struct SyscallPatchResult {
+    found_syscall: bool,
+    skipped_addrs: Vec<u64>,
 }
 
 /// Update the `input_binary` with a call to `trampoline` instead of any `syscall` instructions.
@@ -153,7 +174,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, control_transfer_targets, trampoline_base_addr) = {
+    let (arch, text_sections, trampoline_base_addr) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -172,72 +193,243 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             return Ok(input_binary.to_vec());
         }
 
-        let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
-
         let trampoline_base_addr = find_addr_for_trampoline_code(&file)?;
 
-        (
-            arch,
-            text_sections,
-            control_transfer_targets,
-            trampoline_base_addr,
-        )
+        (arch, text_sections, trampoline_base_addr)
     };
 
-    // Build the trampoline code (without header - header goes at the end)
-    // The code starts with the syscall entry point placeholder (8 bytes for x86-64)
-    let mut trampoline_data = vec![];
-    let trampoline = trampoline.unwrap_or(0);
-    trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
-    // Patch syscalls in-place in buf
+    let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
+    let patch_result = patch_syscalls_in_sections(
+        arch,
+        buf,
+        &text_sections,
+        trampoline_base_addr,
+        trampoline_base_addr,
+        &mut trampoline_data,
+    )?;
+
+    // Build output: [patched ELF][padding to page boundary][trampoline code][header]
+    let mut out = buf.to_vec();
+    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
+
+    if !patch_result.skipped_addrs.is_empty() {
+        return Err(Error::UnpatchableSyscalls(format!(
+            "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+            patch_result.skipped_addrs.len(),
+            skipped_addrs = patch_result.skipped_addrs,
+        )));
+    }
+    Ok(out)
+}
+
+/// Rewrite an x86-64 PE for LiteBox's current Windows shim.
+///
+/// The PE file layout is preserved, but executable-section GS segment overrides
+/// are rewritten to FS and `syscall` instructions are redirected through a
+/// LiteBox trampoline appended as a file overlay. The Windows shim loader maps
+/// that overlay by reading the footer this function appends.
+pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    if !is_pe_binary(input_binary) || is_already_hooked(input_binary, Arch::X86_64) {
+        return Ok(input_binary.to_vec());
+    }
+
+    let mut backing = vec![0u64; input_binary.len().div_ceil(8)];
+    let buf: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(backing.as_mut_slice());
+    buf[..input_binary.len()].copy_from_slice(input_binary);
+    let buf = &mut buf[..input_binary.len()];
+
+    let (text_sections, trampoline_base_rva, trampoline_base_addr) = {
+        let pe = PeFile64::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+        let optional_header = pe.nt_headers().optional_header();
+        let size_of_image = u64::from(optional_header.size_of_image());
+        let trampoline_base_rva =
+            checked_add_u64(size_of_image, 0xfff, "PE trampoline base")? & !0xfff;
+        let trampoline_base_addr = checked_add_u64(
+            optional_header.image_base(),
+            trampoline_base_rva,
+            "PE trampoline virtual address",
+        )?;
+
+        let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+        match file {
+            object::File::Pe64(_) if file.architecture() == object::Architecture::X86_64 => {}
+            _ => return Ok(input_binary.to_vec()),
+        }
+
+        let text_sections = match pe_text_sections(&file) {
+            Ok(sections) => sections,
+            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+            Err(InternalError::Public(e)) => return Err(e),
+            Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        };
+        (text_sections, trampoline_base_rva, trampoline_base_addr)
+    };
+
+    for section in &text_sections {
+        let section_data = section_slice_mut(buf, section)?;
+        rewrite_gs_to_fs_in_section(Arch::X86_64, section.vaddr, section_data)?;
+    }
+
+    let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
+    let patch_result = patch_syscalls_in_sections(
+        Arch::X86_64,
+        buf,
+        &text_sections,
+        trampoline_base_addr,
+        trampoline_base_addr,
+        &mut trampoline_data,
+    )?;
+
+    if !patch_result.found_syscall {
+        return Ok(buf.to_vec());
+    }
+
+    let mut out = buf.to_vec();
+    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_rva, true);
+
+    if !patch_result.skipped_addrs.is_empty() {
+        return Err(Error::UnpatchableSyscalls(format!(
+            "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
+            patch_result.skipped_addrs.len(),
+            skipped_addrs = patch_result.skipped_addrs,
+        )));
+    }
+
+    Ok(out)
+}
+
+fn is_pe_binary(input_binary: &[u8]) -> bool {
+    if input_binary.len() < 0x40 || &input_binary[..2] != b"MZ" {
+        return false;
+    }
+    let pe_offset = u32::from_le_bytes(input_binary[0x3c..0x40].try_into().unwrap()) as usize;
+    input_binary
+        .get(pe_offset..pe_offset.saturating_add(4))
+        .is_some_and(|magic| magic == b"PE\0\0")
+}
+
+fn pe_text_sections(
+    file: &object::File<'_>,
+) -> core::result::Result<Vec<TextSectionInfo>, InternalError> {
+    let text_sections: Vec<_> = file
+        .sections()
+        .filter_map(|section| {
+            let object::SectionFlags::Coff { characteristics } = section.flags() else {
+                return None;
+            };
+            if characteristics & IMAGE_SCN_CNT_CODE == 0 {
+                return None;
+            }
+            if characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+                return None;
+            }
+            let (file_offset, size) = section.file_range()?;
+            Some(TextSectionInfo {
+                vaddr: section.address(),
+                file_offset,
+                size,
+            })
+        })
+        .collect();
+    if text_sections.is_empty() {
+        return Err(InternalError::NoTextSectionFound);
+    }
+    Ok(text_sections)
+}
+
+fn rewrite_gs_to_fs_in_section(
+    arch: Arch,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+) -> Result<usize> {
+    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
+    let mut rewritten = 0;
+
+    for instruction in &instructions {
+        if instruction.memory_segment() != iced_x86::Register::GS {
+            continue;
+        }
+
+        let offset = usize::try_from(instruction.ip() - section_base_addr).unwrap();
+        let instruction_bytes = &mut section_data[offset..offset + instruction.len()];
+        let Some(segment_prefix) = instruction_bytes.iter_mut().find(|byte| **byte == 0x65) else {
+            return Err(Error::DisassemblyFailure(format!(
+                "GS memory operand at {:#x} has no GS segment prefix",
+                instruction.ip()
+            )));
+        };
+        *segment_prefix = 0x64;
+        rewritten += 1;
+    }
+
+    Ok(rewritten)
+}
+
+fn patch_syscalls_in_sections(
+    arch: Arch,
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+) -> Result<SyscallPatchResult> {
+    let control_transfer_targets = get_control_transfer_targets(arch, &*buf, text_sections)?;
+    let mut found_syscall = false;
     let mut skipped_addrs = Vec::new();
-    for s in &text_sections {
-        let section_data = section_slice_mut(buf, s)?;
+
+    for section in text_sections {
+        let section_data = section_slice_mut(buf, section)?;
         match hook_syscalls_in_section(
             arch,
             &control_transfer_targets,
-            s.vaddr,
+            section.vaddr,
             section_data,
             trampoline_base_addr,
-            trampoline_base_addr, // entry point is at offset 0 of trampoline
-            &mut trampoline_data,
+            syscall_entry_addr,
+            trampoline_data,
         ) {
-            Ok(addrs) => skipped_addrs.extend(addrs),
+            Ok(addrs) => {
+                found_syscall = true;
+                skipped_addrs.extend(addrs);
+            }
             Err(InternalError::NoSyscallInstructionsFound) => {}
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         }
     }
 
-    // Build output: [patched ELF][padding to page boundary][trampoline code][header]
-    let mut out = buf.to_vec();
+    Ok(SyscallPatchResult {
+        found_syscall,
+        skipped_addrs,
+    })
+}
+
+fn append_trampoline_footer(
+    out: &mut Vec<u8>,
+    trampoline_data: &mut Vec<u8>,
+    header_vaddr: u64,
+    align_trampoline_size: bool,
+) {
     let remain = out.len() % 0x1000;
     out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
 
-    // Calculate file offset where trampoline code starts
     let trampoline_file_offset = out.len() as u64;
+    if align_trampoline_size {
+        let trampoline_size = trampoline_data.len().next_multiple_of(0x1000);
+        trampoline_data.extend_from_slice(&vec![0; trampoline_size - trampoline_data.len()]);
+    }
     let trampoline_size = trampoline_data.len();
+    out.extend_from_slice(trampoline_data);
 
-    // Append trampoline code
-    out.extend_from_slice(&trampoline_data);
-
-    // Build the header (goes at the end of the file)
-    // The entry point placeholder is at offset 0 of the trampoline code, not in the header.
     let header = TrampolineHeader64 {
         magic: *TRAMPOLINE_MAGIC,
         file_offset: trampoline_file_offset,
-        vaddr: trampoline_base_addr,
+        vaddr: header_vaddr,
         trampoline_size: trampoline_size as u64,
     };
     out.extend_from_slice(header.as_bytes());
-    if !skipped_addrs.is_empty() {
-        return Err(Error::UnpatchableSyscalls(format!(
-            "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
-            skipped_addrs.len(),
-        )));
-    }
-    Ok(out)
 }
+
 /// (private) Get metadata for executable sections
 fn text_sections(
     file: &object::File<'_>,
