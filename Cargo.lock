@@ -1604,6 +1604,7 @@ dependencies = [
  "getrandom 0.3.4",
  "litebox",
  "litebox_common_linux",
+ "litebox_util_log",
  "windows-sys 0.60.2",
  "zerocopy",
 ]

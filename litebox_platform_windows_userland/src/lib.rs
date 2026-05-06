@@ -112,6 +112,14 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     if !tls.is_in_guest.get() {
+        litebox_util_log::debug!(
+            code:% = format_args!("{:#x}", exception_record.ExceptionCode),
+            rip:% = format_args!("{:#x}", context.Rip),
+            exception_address:% = format_args!("{:p}", exception_record.ExceptionAddress),
+            info0:% = format_args!("{:#x}", exception_record.ExceptionInformation[0]),
+            info1:% = format_args!("{:#x}", exception_record.ExceptionInformation[1]);
+            "Windows vectored exception while not in guest"
+        );
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
         if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
@@ -126,6 +134,14 @@ unsafe extern "system" fn vectored_exception_handler(
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
+    litebox_util_log::debug!(
+        code:% = format_args!("{:#x}", exception_record.ExceptionCode),
+        rip:% = format_args!("{:#x}", context.Rip),
+        exception_address:% = format_args!("{:p}", exception_record.ExceptionAddress),
+        info0:% = format_args!("{:#x}", exception_record.ExceptionInformation[0]),
+        info1:% = format_args!("{:#x}", exception_record.ExceptionInformation[1]);
+        "Windows vectored exception while in guest"
+    );
     tls.is_in_guest.set(false);
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
@@ -143,20 +159,15 @@ unsafe extern "system" fn vectored_exception_handler(
     {
         set_context_to_interrupt_callback(tls, context);
     } else {
-        // Push the exception record onto the host stack.
-        let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
-        assert!(exception_record_ptr.is_aligned());
+        let exception_record_ptr = tls.exception_record.get();
         unsafe { exception_record_ptr.write(*exception_record) };
-
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
 
         // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
         let _ = run_thread_arch as *const () as usize;
 
         // Update the thread context to jump to the exception handler.
         context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = rsp as u64;
+        context.Rsp = tls.host_sp.get() as u64;
         context.Rbp = tls.host_bp.get() as u64;
         context.Rdx = exception_record_ptr as u64;
     }
@@ -418,6 +429,7 @@ struct TlsState {
     interrupt: Cell<bool>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
+    exception_record: Box<std::cell::UnsafeCell<EXCEPTION_RECORD>>,
     /// Bitmask of pending host-originated signals for this thread.
     pending_host_signals: AtomicU32,
     /// Pointer to the `Waker` currently being waited on, or null if not
@@ -436,6 +448,7 @@ impl TlsState {
             is_in_guest: false.into(),
             interrupt: false.into(),
             continue_context: Box::default(),
+            exception_record: Box::default(),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }

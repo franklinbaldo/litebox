@@ -13,10 +13,11 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::{vec, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
+use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicUsize, Ordering};
 
 use litebox::fd::TypedFd;
 use litebox::fs::{Mode, OFlags};
@@ -31,12 +32,52 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeLoadError, PeParseError, PeParsedFile,
-    Protection, ReadAt,
+    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeImport, PeImportTarget, PeLoadError,
+    PeParseError, PeParsedFile, Protection, ReadAt,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetStdHandle"]
+    fn host_get_std_handle(n_std_handle: u32) -> *mut c_void;
+    #[link_name = "WriteFile"]
+    fn host_write_file(
+        file: *mut c_void,
+        buffer: *const c_void,
+        bytes_to_write: u32,
+        bytes_written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    #[link_name = "ExitProcess"]
+    fn host_exit_process(exit_code: u32) -> !;
+}
+
+extern "system" fn litebox_kernel32_get_std_handle(n_std_handle: u32) -> *mut c_void {
+    // SAFETY: This thunk forwards the guest's Win32 ABI call to the host API in
+    // the same process during early Windows-runner bring-up.
+    unsafe { host_get_std_handle(n_std_handle) }
+}
+
+extern "system" fn litebox_kernel32_write_file(
+    file: *mut c_void,
+    buffer: *const c_void,
+    bytes_to_write: u32,
+    bytes_written: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    // SAFETY: The guest and runner share an address space in this userland
+    // prototype, so guest buffers are directly readable by the host call.
+    unsafe { host_write_file(file, buffer, bytes_to_write, bytes_written, overlapped) }
+}
+
+extern "system" fn litebox_kernel32_exit_process(exit_code: u32) -> ! {
+    // SAFETY: The runner process represents this single guest process in the
+    // current Windows userland prototype.
+    unsafe { host_exit_process(exit_code) }
+}
 
 mod nt_sysno {
     include!(concat!(env!("OUT_DIR"), "/nt_sysno.rs"));
@@ -52,6 +93,7 @@ const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
+const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 const NTDLL_PATHS: &[&str] = &[
     "/windows/system32/ntdll.dll",
@@ -59,6 +101,81 @@ const NTDLL_PATHS: &[&str] = &[
     "/ntdll.dll",
 ];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
+const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
+const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
+const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
+const STATUS_SUCCESS: usize = 0;
+const STATUS_INVALID_INFO_CLASS: usize = 0xc000_0003;
+const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
+const STATUS_ACCESS_VIOLATION: usize = 0xc000_0005;
+const STATUS_INVALID_PARAMETER: usize = 0xc000_000d;
+const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
+const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
+const STATUS_NOT_SUPPORTED: usize = 0xc000_00bb;
+const PERFORMANCE_FREQUENCY: i64 = 10_000_000;
+const WINDOWS_PAGE_SIZE_U32: u32 = 4096;
+const WINDOWS_ALLOCATION_GRANULARITY: u32 = 0x1_0000;
+const WINDOWS_ALLOCATION_GRANULARITY_USIZE: usize = 0x1_0000;
+const WINDOWS_MINIMUM_USER_ADDRESS: usize = 0x1_0000;
+const WINDOWS_MAXIMUM_USER_ADDRESS: usize = 0x7fff_fffe_ffff;
+const WINDOWS_STACK_ARGUMENT_5_OFFSET: usize = 0x28;
+const WINDOWS_STACK_ARGUMENT_6_OFFSET: usize = 0x30;
+const WINDOWS_STACK_ARGUMENT_7_OFFSET: usize = 0x38;
+const WINDOWS_STACK_ARGUMENT_8_OFFSET: usize = 0x40;
+const WINDOWS_STACK_ARGUMENT_9_OFFSET: usize = 0x48;
+const WINDOWS_STACK_ARGUMENT_10_OFFSET: usize = 0x50;
+const SYSTEM_BASIC_INFORMATION_CLASS: usize = 0;
+const SYSTEM_NUMA_PROCESSOR_MAP_CLASS: usize = 55;
+const SYSTEM_EMULATION_BASIC_INFORMATION_CLASS: usize = 62;
+const SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS: usize = 107;
+const SYSTEM_FLUSH_INFORMATION_CLASS: usize = 192;
+const SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION_CLASS: usize = 197;
+const SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS: usize = 0xd3;
+const SYSTEM_PROCESSOR_FEATURES_BITMAP_INFORMATION_CLASS: usize = 250;
+const LOGICAL_PROCESSOR_RELATIONSHIP_GROUP: u32 = 4;
+const PROCESS_BASIC_INFORMATION_CLASS: usize = 0;
+const PROCESS_COOKIE_INFORMATION_CLASS: usize = 36;
+const PROCESS_SCHEDULER_SHARED_DATA_CLASS: usize = 112;
+const THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS: usize = 57;
+const MEMORY_BASIC_INFORMATION_CLASS: usize = 0;
+const MEMORY_WORKING_SET_EX_INFORMATION_CLASS: usize = 4;
+const MEMORY_IMAGE_INFORMATION_CLASS: usize = 6;
+const MEMORY_IMAGE_EXTENSION_INFORMATION_CLASS: usize = 0xe;
+const FILE_FS_SIZE_INFORMATION_CLASS: usize = 3;
+const FILE_FS_DEVICE_INFORMATION_CLASS: usize = 4;
+const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: usize = 5;
+const WINDOWS_FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
+const WINDOWS_FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
+const WINDOWS_FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+const WINDOWS_FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
+const WINDOWS_FILE_DEVICE_DISK: u32 = 0x0000_0007;
+const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
+const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
+const MEM_EXTENDED_PARAMETER_NUMA_NODE: u64 = 2;
+const MEM_EXTENDED_PARAMETER_PARTITION_HANDLE: u64 = 3;
+const MEM_EXTENDED_PARAMETER_USER_PHYSICAL_HANDLE: u64 = 4;
+const MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: u64 = 5;
+const MEM_EXTENDED_PARAMETER_IMAGE_MACHINE: u64 = 6;
+const MEM_EXTENDED_PARAMETER_MAX: u64 = 7;
+const MEM_EXTENDED_PARAMETER_SUPPORTED_ATTRIBUTE_FLAGS: usize = 0x7f;
+const WINDOWS_MEM_COMMIT_FLAG: usize = 0x1000;
+const WINDOWS_MEM_RESERVE_FLAG: usize = 0x2000;
+const WINDOWS_MEM_DECOMMIT_FLAG: usize = 0x4000;
+const WINDOWS_MEM_RELEASE_FLAG: usize = 0x8000;
+const WINDOWS_PAGE_PROTECTION_MASK: usize = 0xff;
+const WINDOWS_PAGE_NOACCESS: u32 = 0x01;
+const WINDOWS_PAGE_READONLY: u32 = 0x02;
+const WINDOWS_PAGE_READWRITE: u32 = 0x04;
+const WINDOWS_PAGE_WRITECOPY: u32 = 0x08;
+const WINDOWS_PAGE_EXECUTE: u32 = 0x10;
+const WINDOWS_PAGE_EXECUTE_READ: u32 = 0x20;
+const WINDOWS_PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const WINDOWS_PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+const WINDOWS_OLD_PROTECTION_FALLBACK: u32 = WINDOWS_PAGE_EXECUTE_READWRITE;
+const WINDOWS_MEM_COMMIT: u32 = 0x1000;
+const WINDOWS_MEM_FREE: u32 = 0x1_0000;
+const WINDOWS_MEM_PRIVATE: u32 = 0x2_0000;
+const WINDOWS_MEM_IMAGE: u32 = 0x100_0000;
 const INITIAL_PROCESS_ID: usize = 1000;
 const INITIAL_THREAD_ID: usize = 1000;
 const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
@@ -68,6 +185,25 @@ const PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET: usize = 0x30;
 const TEB_AFTER_WIN32_THREAD_INFO_OFFSET: usize = 0x80;
 const TEB_TLS_SLOTS_OFFSET: usize = 0x1480;
 const TEB_TLS_SLOT_COUNT: usize = 64;
+const TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET: usize = 0x1850;
+const TEB_SCHEDULER_SHARED_DATA_STORAGE_OFFSET: usize = 0x1860;
+const TEB_PROCESSOR_FEATURES_BITMAP_OFFSET: usize = 0x1870;
+const SCHEDULER_SHARED_SLOT_ASSIGN: u32 = 0;
+const SCHEDULER_SHARED_SLOT_FREE: u32 = 1;
+const SCHEDULER_SHARED_SLOT_QUERY: u32 = 2;
+const COMMON_PROCESSOR_FEATURE_BITS: u64 = 0x0003_8005_0001_3b2a;
+
+static PERFORMANCE_COUNTER: AtomicI64 = AtomicI64::new(1_000_000);
+static NEXT_SYNTHETIC_HANDLE: AtomicUsize = AtomicUsize::new(0x10000);
+
+const _: () =
+    assert!(TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET + size_of::<usize>() <= INITIAL_TEB_SIZE);
+const _: () =
+    assert!(TEB_SCHEDULER_SHARED_DATA_STORAGE_OFFSET + size_of::<u64>() <= INITIAL_TEB_SIZE);
+const _: () = assert!(
+    TEB_PROCESSOR_FEATURES_BITMAP_OFFSET + size_of::<ProcessorFeatureBitmapWords>()
+        <= INITIAL_TEB_SIZE
+);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
@@ -98,6 +234,73 @@ struct UnicodeString {
     _padding0: u32,
     /// UNICODE_STRING.Buffer.
     buffer: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ObjectAttributes {
+    length: u32,
+    _padding0: u32,
+    root_directory: usize,
+    object_name: usize,
+    attributes: u32,
+    _padding1: u32,
+    security_descriptor: usize,
+    security_quality_of_service: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct IoStatusBlock {
+    status: usize,
+    information: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct FileFsSizeInformation {
+    total_allocation_units: i64,
+    available_allocation_units: i64,
+    sectors_per_allocation_unit: u32,
+    bytes_per_sector: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct FileFsDeviceInformation {
+    device_type: u32,
+    characteristics: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct FileFsAttributeInformation {
+    file_system_attributes: u32,
+    maximum_component_name_length: i32,
+    file_system_name_length: u32,
+    file_system_name: [u16; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ApiSetNamespace {
+    version: u32,
+    size: u32,
+    flags: u32,
+    count: u32,
+    entry_offset: u32,
+    hash_offset: u32,
+    hash_factor: u32,
+}
+
+impl ApiSetNamespace {
+    fn empty() -> Self {
+        let size = u32::try_from(size_of::<Self>()).expect("API set namespace fits in u32");
+        Self {
+            size,
+            ..Self::default()
+        }
+    }
 }
 
 #[repr(C)]
@@ -257,6 +460,7 @@ impl ProcessEnvironmentBlock {
         process_parameters: usize,
         process_heap: usize,
         fast_peb_lock: usize,
+        api_set_map: usize,
     ) -> Self {
         Self {
             image_base_address,
@@ -264,6 +468,7 @@ impl ProcessEnvironmentBlock {
             process_parameters,
             process_heap,
             fast_peb_lock,
+            api_set_map,
             ..Default::default()
         }
     }
@@ -295,6 +500,204 @@ struct InitialClientId {
     unique_process: usize,
     /// CLIENT_ID.UniqueThread: placeholder thread identifier.
     unique_thread: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    partition_id: u16,
+    _padding0: u16,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    type_: u32,
+    _padding1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct MemoryImageInformation {
+    image_base: usize,
+    size_of_image: usize,
+    image_flags: u32,
+    _padding0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct MemoryImageExtensionInformation {
+    extension_type: u32,
+    flags: u32,
+    extension_image_base_rva: usize,
+    extension_size: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct MemoryWorkingSetExInformation {
+    virtual_address: usize,
+    virtual_attributes: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct MemExtendedParameter {
+    type_and_reserved: u64,
+    value: usize,
+}
+
+impl MemExtendedParameter {
+    fn type_(&self) -> u64 {
+        self.type_and_reserved & MEM_EXTENDED_PARAMETER_TYPE_MASK
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct MemAddressRequirements {
+    lowest_starting_address: usize,
+    highest_ending_address: usize,
+    alignment: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemBasicInformation {
+    reserved: u32,
+    timer_resolution: u32,
+    page_size: u32,
+    number_of_physical_pages: u32,
+    lowest_physical_page_number: u32,
+    highest_physical_page_number: u32,
+    allocation_granularity: u32,
+    _padding0: u32,
+    minimum_user_mode_address: usize,
+    maximum_user_mode_address: usize,
+    active_processors_affinity_mask: usize,
+    number_of_processors: u8,
+    _padding1: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemFlushInformation {
+    supported_flush_methods: u32,
+    processor_cache_flush_size: u32,
+    system_flush_capabilities: u64,
+    reserved: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct RtlBitmapEx {
+    size_of_bit_map: u64,
+    buffer: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ProcessorFeatureBitmapWords {
+    bits0: u64,
+    bits1: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemFeatureConfigurationSectionsInformation {
+    section_count: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+struct SystemNumaInformation {
+    highest_node_number: u32,
+    reserved: u32,
+    active_processors_group_affinity: [GroupAffinity; 64],
+}
+
+impl Default for SystemNumaInformation {
+    fn default() -> Self {
+        Self {
+            highest_node_number: 0,
+            reserved: 0,
+            active_processors_group_affinity: [GroupAffinity::default(); 64],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemHypervisorSharedPageInformation {
+    hypervisor_shared_user_va: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
+struct ProcessorGroupInfo {
+    maximum_processor_count: u8,
+    active_processor_count: u8,
+    reserved: [u8; 38],
+    active_processor_mask: usize,
+}
+
+impl Default for ProcessorGroupInfo {
+    fn default() -> Self {
+        Self {
+            maximum_processor_count: 0,
+            active_processor_count: 0,
+            reserved: [0; 38],
+            active_processor_mask: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct GroupRelationship {
+    maximum_group_count: u16,
+    active_group_count: u16,
+    reserved: [u8; 20],
+    group_info: ProcessorGroupInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemLogicalProcessorGroupInformation {
+    relationship: u32,
+    size: u32,
+    group: GroupRelationship,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ProcessBasicInformation {
+    exit_status: usize,
+    peb_base_address: usize,
+    affinity_mask: usize,
+    base_priority: usize,
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SchedulerSharedDataSlotInformation {
+    action: u32,
+    _padding0: u32,
+    scheduler_shared_data_handle: usize,
+    slot: usize,
 }
 
 #[repr(C)]
@@ -466,8 +869,15 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let image = self.load_image(fs.clone(), path)?;
         let application_entry_point = image.mapping.entry_point;
+        self.resolve_initial_imports(&image)?;
         let ntdll = self.load_ntdll(fs)?;
-        let (entry_point, start_mode) = if let Some(ntdll) = &ntdll {
+        let (entry_point, start_mode) = if !image.imports.is_empty() {
+            litebox_util_log::debug!(
+                application_entry_point:% = format_args!("{application_entry_point:#x}");
+                "Starting Windows guest through built-in import thunks"
+            );
+            (application_entry_point, WindowsStartMode::Application)
+        } else if let Some(ntdll) = &ntdll {
             if !ntdll.has_trampoline {
                 return Err(WindowsLoadError::UnrewrittenNtDll);
             }
@@ -483,6 +893,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 loader_entry_point,
                 WindowsStartMode::NtDllLoader {
                     application_entry_point,
+                    image_base: image.mapping.base_addr,
                 },
             )
         } else {
@@ -504,8 +915,16 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             image.mapping.base_addr,
             stack_base.as_usize(),
             stack_top,
+            path,
         )?;
         let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
+        let diagnostic_regions = guest_address_regions(
+            &image.mapping,
+            ntdll.as_ref().map(|image| &image.mapping),
+            stack_base.as_usize(),
+            stack_top,
+            &process_environment,
+        );
         let ntdll_mapping = ntdll.map(|image| image.mapping);
 
         Ok(LoadedProgram {
@@ -513,8 +932,11 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 entry_point,
                 stack_top,
                 teb_address: process_environment.teb,
+                peb_address: process_environment.peb,
                 start_mode,
                 exit_code: exit_code.clone(),
+                page_manager: self.page_manager.clone(),
+                diagnostic_regions: litebox::sync::Mutex::new(diagnostic_regions),
                 _fs: PhantomData,
             },
             process: WindowsShimProcess {
@@ -544,6 +966,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<LoadedImage, WindowsLoadError> {
         let file = PeImageFile::open(fs, path)?;
         let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let imports = parsed.imports.clone();
         let exports = parsed.exports.clone();
         parsed
             .parse_trampoline(
@@ -562,9 +985,59 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .map_err(WindowsLoadError::Load)?;
         Ok(LoadedImage {
             mapping,
+            imports,
             exports,
             has_trampoline,
         })
+    }
+
+    fn resolve_initial_imports(&self, image: &LoadedImage) -> Result<(), WindowsLoadError> {
+        for import in &image.imports {
+            let address = Self::builtin_import_address(import)?;
+            let iat_address = image
+                .mapping
+                .base_addr
+                .checked_add(usize::try_from(import.iat_rva).expect("IAT RVA fits in usize"))
+                .ok_or(PeImageAccessError::AddressOverflow)?;
+            make_pages_writable(&self.page_manager, iat_address, size_of::<usize>())?;
+            write_value(iat_address, address)?;
+            litebox_util_log::debug!(
+                library:% = String::from_utf8_lossy(&import.library),
+                iat:% = format_args!("{iat_address:#x}"),
+                address:% = format_args!("{address:#x}");
+                "Resolved built-in Windows import"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn builtin_import_address(import: &PeImport) -> Result<usize, WindowsLoadError> {
+        if !import.library.eq_ignore_ascii_case(b"kernel32.dll") {
+            return Err(WindowsLoadError::UnsupportedImportLibrary(
+                import.library.clone(),
+            ));
+        }
+
+        let PeImportTarget::Name { name, .. } = &import.target else {
+            let PeImportTarget::Ordinal(ordinal) = import.target else {
+                unreachable!();
+            };
+            return Err(WindowsLoadError::UnsupportedImportOrdinal {
+                library: import.library.clone(),
+                ordinal,
+            });
+        };
+
+        match name.as_slice() {
+            b"GetStdHandle" => Ok(litebox_kernel32_get_std_handle as *const () as usize),
+            b"WriteFile" => Ok(litebox_kernel32_write_file as *const () as usize),
+            b"ExitProcess" => Ok(litebox_kernel32_exit_process as *const () as usize),
+            _ => Err(WindowsLoadError::UnsupportedImportName {
+                library: import.library.clone(),
+                name: name.clone(),
+            }),
+        }
     }
 
     fn create_process_environment(
@@ -572,6 +1045,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         image_base: usize,
         stack_base: usize,
         stack_top: usize,
+        image_path: &str,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let peb_address = self.create_zeroed_pages(INITIAL_PEB_SIZE)?;
         let teb_address = self.create_zeroed_pages(INITIAL_TEB_SIZE)?;
@@ -580,20 +1054,47 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             self.create_zeroed_pages(INITIAL_PROCESS_PARAMETERS_SIZE)?;
         let process_heap_address = self.create_zeroed_pages(INITIAL_PROCESS_HEAP_SIZE)?;
         let fast_peb_lock_address = self.create_zeroed_pages(INITIAL_FAST_PEB_LOCK_SIZE)?;
+        let api_set_namespace_address = self.create_zeroed_pages(INITIAL_API_SET_NAMESPACE_SIZE)?;
         let tls_slots_address = teb_address
             .checked_add(TEB_TLS_SLOTS_OFFSET)
             .ok_or(PeImageAccessError::AddressOverflow)?;
+        let scheduler_shared_data_slot_address = teb_address
+            .checked_add(TEB_SCHEDULER_SHARED_DATA_STORAGE_OFFSET)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let processor_feature_bitmap_address = teb_address
+            .checked_add(TEB_PROCESSOR_FEATURES_BITMAP_OFFSET)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+
+        let mut process_parameters = RtlUserProcessParameters::new();
+        let mut process_parameters_string_cursor = process_parameters_address
+            .checked_add(align_up(size_of::<RtlUserProcessParameters>(), 16)?)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let process_image_path = initial_dos_image_path(image_path);
+        process_parameters.current_directory.dos_path = write_utf16_string(
+            &mut process_parameters_string_cursor,
+            INITIAL_CURRENT_DIRECTORY_PATH,
+        )?;
+        process_parameters.dll_path = write_utf16_string(
+            &mut process_parameters_string_cursor,
+            INITIAL_DLL_SEARCH_PATH,
+        )?;
+        process_parameters.image_path_name =
+            write_utf16_string(&mut process_parameters_string_cursor, &process_image_path)?;
+        process_parameters.command_line =
+            write_utf16_string(&mut process_parameters_string_cursor, &process_image_path)?;
 
         write_value(ldr_data_address, PebLdrData::new(ldr_data_address))?;
-        write_value(process_parameters_address, RtlUserProcessParameters::new())?;
+        write_value(api_set_namespace_address, ApiSetNamespace::empty())?;
+        write_value(process_parameters_address, process_parameters)?;
         write_value(
             peb_address,
             ProcessEnvironmentBlock::new(
                 image_base,
                 ldr_data_address,
                 process_parameters_address,
-                process_heap_address,
+                0,
                 fast_peb_lock_address,
+                api_set_namespace_address,
             ),
         )?;
         write_value(
@@ -606,6 +1107,17 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 tls_slots_address,
             ),
         )?;
+        write_value(
+            teb_address
+                .checked_add(TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET)
+                .ok_or(PeImageAccessError::AddressOverflow)?,
+            scheduler_shared_data_slot_address,
+        )?;
+        write_value(scheduler_shared_data_slot_address, 0u64)?;
+        write_value(
+            processor_feature_bitmap_address,
+            Self::processor_feature_bitmap_words(),
+        )?;
 
         litebox_util_log::debug!(
             peb:% = format_args!("{peb_address:#x}"),
@@ -613,17 +1125,21 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ldr:% = format_args!("{ldr_data_address:#x}"),
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
             process_heap:% = format_args!("{process_heap_address:#x}"),
+            api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
             tls_slots:% = format_args!("{tls_slots_address:#x}"),
+            scheduler_shared_data_slot:% = format_args!("{scheduler_shared_data_slot_address:#x}"),
+            processor_feature_bitmap:% = format_args!("{processor_feature_bitmap_address:#x}"),
             image_base:% = format_args!("{image_base:#x}");
             "Created initial Windows PEB/TEB"
         );
 
         Ok(WindowsProcessEnvironment {
-            _peb: peb_address,
-            _ldr_data: ldr_data_address,
-            _process_parameters: process_parameters_address,
-            _process_heap: process_heap_address,
-            _fast_peb_lock: fast_peb_lock_address,
+            peb: peb_address,
+            ldr_data: ldr_data_address,
+            process_parameters: process_parameters_address,
+            process_heap: process_heap_address,
+            fast_peb_lock: fast_peb_lock_address,
+            api_set_namespace: api_set_namespace_address,
             teb: teb_address,
         })
     }
@@ -641,6 +1157,13 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         Ok(ptr.as_usize())
     }
 
+    fn processor_feature_bitmap_words() -> ProcessorFeatureBitmapWords {
+        ProcessorFeatureBitmapWords {
+            bits0: COMMON_PROCESSOR_FEATURE_BITS,
+            bits1: 0,
+        }
+    }
+
     /// Returns the LiteBox object for the shim.
     #[must_use]
     pub fn litebox(&self) -> &LiteBox<Platform> {
@@ -653,15 +1176,117 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
     teb_address: usize,
+    peb_address: usize,
     start_mode: WindowsStartMode,
     exit_code: Arc<AtomicI32>,
+    page_manager: Arc<WindowsPageManager>,
+    diagnostic_regions: litebox::sync::Mutex<Platform, Vec<GuestAddressRegion>>,
     _fs: PhantomData<FS>,
+}
+
+#[derive(Clone, Copy)]
+struct GuestAddressRegion {
+    name: &'static str,
+    start: usize,
+    end: usize,
+}
+
+impl GuestAddressRegion {
+    fn new(name: &'static str, start: usize, size: usize) -> Option<Self> {
+        let end = start.checked_add(size)?;
+        (start < end).then_some(Self { name, start, end })
+    }
+
+    fn contains(&self, address: usize) -> bool {
+        (self.start..self.end).contains(&address)
+    }
+
+    fn is_image(&self) -> bool {
+        matches!(self.name, "app" | "ntdll")
+    }
+}
+
+fn guest_address_regions(
+    image: &MappingInfo,
+    ntdll: Option<&MappingInfo>,
+    stack_base: usize,
+    stack_top: usize,
+    process_environment: &WindowsProcessEnvironment,
+) -> Vec<GuestAddressRegion> {
+    let mut regions = Vec::new();
+    push_region(&mut regions, "app", image.base_addr, image.image_size);
+    if let Some(ntdll) = ntdll {
+        push_region(&mut regions, "ntdll", ntdll.base_addr, ntdll.image_size);
+    }
+    push_region(
+        &mut regions,
+        "stack",
+        stack_base,
+        stack_top.saturating_sub(stack_base),
+    );
+    push_region(
+        &mut regions,
+        "peb",
+        process_environment.peb,
+        INITIAL_PEB_SIZE,
+    );
+    push_region(
+        &mut regions,
+        "teb",
+        process_environment.teb,
+        INITIAL_TEB_SIZE,
+    );
+    push_region(
+        &mut regions,
+        "ldr-data",
+        process_environment.ldr_data,
+        INITIAL_LDR_DATA_SIZE,
+    );
+    push_region(
+        &mut regions,
+        "process-parameters",
+        process_environment.process_parameters,
+        INITIAL_PROCESS_PARAMETERS_SIZE,
+    );
+    push_region(
+        &mut regions,
+        "process-heap",
+        process_environment.process_heap,
+        INITIAL_PROCESS_HEAP_SIZE,
+    );
+    push_region(
+        &mut regions,
+        "fast-peb-lock",
+        process_environment.fast_peb_lock,
+        INITIAL_FAST_PEB_LOCK_SIZE,
+    );
+    push_region(
+        &mut regions,
+        "api-set",
+        process_environment.api_set_namespace,
+        INITIAL_API_SET_NAMESPACE_SIZE,
+    );
+    regions
+}
+
+fn push_region(
+    regions: &mut Vec<GuestAddressRegion>,
+    name: &'static str,
+    start: usize,
+    size: usize,
+) {
+    if let Some(region) = GuestAddressRegion::new(name, start, size) {
+        regions.push(region);
+    }
 }
 
 #[derive(Clone, Copy)]
 enum WindowsStartMode {
     Application,
-    NtDllLoader { application_entry_point: usize },
+    NtDllLoader {
+        application_entry_point: usize,
+        image_base: usize,
+    },
 }
 
 impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
@@ -672,21 +1297,23 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             return ContinueOperation::Terminate;
         }
         ctx.rip = self.entry_point;
-        ctx.rsp = self.stack_top;
+        ctx.rsp = self.stack_top - size_of::<usize>();
         ctx.eflags = 0x202;
         if let WindowsStartMode::NtDllLoader {
             application_entry_point,
+            image_base,
         } = self.start_mode
         {
             // TODO: Build the initial CONTEXT/loader parameter contract expected by
             // LdrInitializeThunk. For now this deliberately transfers control to
             // ntdll so the next missing pieces are visible at runtime.
             ctx.rcx = 0;
-            ctx.rdx = 0;
+            ctx.rdx = image_base;
             ctx.r8 = 0;
             ctx.r9 = 0;
             litebox_util_log::debug!(
-                application_entry_point:% = format_args!("{application_entry_point:#x}");
+                application_entry_point:% = format_args!("{application_entry_point:#x}"),
+                image_base:% = format_args!("{image_base:#x}");
                 "Prepared placeholder ntdll loader arguments"
             );
         }
@@ -700,23 +1327,228 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtTerminateProcess) {
-            litebox_util_log::debug!(
-                syscall_number = ctx.orig_rax,
-                process_handle:% = format_args!("{:#x}", ctx.r10),
-                exit_status:% = format_args!("{:#x}", ctx.rdx);
-                "Handling NtTerminateProcess syscall"
-            );
-            self.exit_code
-                .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
-        } else {
-            litebox_util_log::debug!(
-                syscall:? = NtSysno::from_raw(ctx.orig_rax),
-                process_handle:% = format_args!("{:#x}", ctx.r10);
-                "Unsupported Windows syscall"
-            );
+        match NtSysno::from_raw(ctx.orig_rax) {
+            Some(NtSysno::NtTerminateProcess) => {
+                litebox_util_log::debug!(
+                    syscall_number = ctx.orig_rax,
+                    process_handle:% = format_args!("{:#x}", ctx.r10),
+                    exit_status:% = format_args!("{:#x}", ctx.rdx);
+                    "Handling NtTerminateProcess syscall"
+                );
+                self.exit_code
+                    .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
+                ContinueOperation::Terminate
+            }
+            Some(NtSysno::NtQueryPerformanceCounter) => {
+                self.nt_query_performance_counter(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtProtectVirtualMemory) => {
+                self.nt_protect_virtual_memory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAllocateVirtualMemory) => {
+                self.nt_allocate_virtual_memory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAllocateVirtualMemoryEx) => {
+                self.nt_allocate_virtual_memory_ex(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtFreeVirtualMemory) => {
+                self.nt_free_virtual_memory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryVirtualMemory) => {
+                self.nt_query_virtual_memory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtClose) => {
+                Self::nt_close(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenFile) => {
+                Self::nt_open_file(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryVolumeInformationFile) => {
+                Self::nt_query_volume_information_file(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateEvent) => {
+                Self::nt_create_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateIoCompletion) => {
+                Self::nt_create_io_completion(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateWorkerFactory) => {
+                Self::nt_create_worker_factory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateTimer2) => {
+                Self::nt_create_timer2(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateWaitCompletionPacket) => {
+                Self::nt_create_wait_completion_packet(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAssociateWaitCompletionPacket) => {
+                Self::nt_associate_wait_completion_packet(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetInformationWorkerFactory) => {
+                Self::nt_set_information_worker_factory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetWnfProcessNotificationEvent) => {
+                Self::nt_set_wnf_process_notification_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSubscribeWnfStateChange) => {
+                Self::nt_subscribe_wnf_state_change(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtTraceControl) => {
+                Self::nt_trace_control(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtManageHotPatch) => {
+                litebox_util_log::debug!(
+                    request:% = format_args!("{:#x}", ctx.r10),
+                    flags:% = format_args!("{:#x}", ctx.rdx);
+                    "Handling NtManageHotPatch as unsupported"
+                );
+                ctx.rax = STATUS_NOT_SUPPORTED;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetEvent) => {
+                Self::nt_set_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQuerySystemInformation) => {
+                self.nt_query_system_information(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQuerySystemInformationEx) => {
+                self.nt_query_system_information_ex(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryInformationProcess) => {
+                self.nt_query_information_process(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetInformationProcess) => {
+                self.nt_set_information_process(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetInformationThread) => {
+                self.nt_set_information_thread(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenKey) => {
+                litebox_util_log::debug!(
+                    key_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+                    desired_access:% = format_args!("{:#x}", ctx.rdx),
+                    object_attributes:% = format_args!("{:#x}", ctx.r8);
+                    "Handling NtOpenKey as missing registry key"
+                );
+                ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenDirectoryObject) => {
+                let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+                if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+                    ctx.rax = STATUS_ACCESS_VIOLATION;
+                    return ContinueOperation::Resume;
+                }
+
+                litebox_util_log::debug!(
+                    directory_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+                    handle:% = format_args!("{handle:#x}"),
+                    desired_access:% = format_args!("{:#x}", ctx.rdx),
+                    object_attributes:% = format_args!("{:#x}", ctx.r8);
+                    "Handling NtOpenDirectoryObject syscall"
+                );
+                ctx.rax = STATUS_SUCCESS;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenSymbolicLinkObject) => {
+                let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+                if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+                    ctx.rax = STATUS_ACCESS_VIOLATION;
+                    return ContinueOperation::Resume;
+                }
+
+                litebox_util_log::debug!(
+                    link_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+                    handle:% = format_args!("{handle:#x}"),
+                    desired_access:% = format_args!("{:#x}", ctx.rdx),
+                    object_attributes:% = format_args!("{:#x}", ctx.r8);
+                    "Handling NtOpenSymbolicLinkObject syscall"
+                );
+                ctx.rax = STATUS_SUCCESS;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQuerySymbolicLinkObject) => {
+                Self::nt_query_symbolic_link_object(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtTraceEvent) => {
+                let trace_field0 = read_usize_or_zero(ctx.r9);
+                let trace_field1 = read_usize_or_zero(ctx.r9.saturating_add(size_of::<usize>()));
+                let trace_field2 =
+                    read_usize_or_zero(ctx.r9.saturating_add(size_of::<usize>().saturating_mul(2)));
+                let trace_field3 =
+                    read_usize_or_zero(ctx.r9.saturating_add(size_of::<usize>().saturating_mul(3)));
+                litebox_util_log::debug!(
+                    trace_handle:% = format_args!("{:#x}", ctx.r10),
+                    flags:% = format_args!("{:#x}", ctx.rdx),
+                    field_size:% = format_args!("{:#x}", ctx.r8),
+                    fields:% = format_args!("{:#x}", ctx.r9),
+                    field0:% = format_args!("{trace_field0:#x}"),
+                    field1:% = format_args!("{trace_field1:#x}"),
+                    field2:% = format_args!("{trace_field2:#x}"),
+                    field3:% = format_args!("{trace_field3:#x}");
+                    "Handling NtTraceEvent as no-op"
+                );
+                ctx.rax = STATUS_SUCCESS;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtRaiseHardError) => {
+                let valid_response_options =
+                    read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+                let response =
+                    read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+                let guest_return_address = read_usize_or_zero(ctx.rsp);
+                let parameter0 = read_usize_or_zero(ctx.r9);
+                litebox_util_log::error!(
+                    error_status:% = format_args!("{:#x}", ctx.r10),
+                    number_of_parameters = ctx.rdx,
+                    unicode_string_parameter_mask:% = format_args!("{:#x}", ctx.r8),
+                    parameters:% = format_args!("{:#x}", ctx.r9),
+                    parameter0:% = format_args!("{parameter0:#x}"),
+                    valid_response_options:% = format_args!("{valid_response_options:#x}"),
+                    response:% = format_args!("{response:#x}"),
+                    guest_return_address:% = format_args!("{guest_return_address:#x}"),
+                    guest_return_region:% = self.describe_guest_address(guest_return_address);
+                    "Guest called NtRaiseHardError"
+                );
+                ContinueOperation::Terminate
+            }
+            syscall => {
+                litebox_util_log::debug!(
+                    syscall:? = syscall,
+                    arg1:% = format_args!("{:#x}", ctx.r10),
+                    rip:% = format_args!("{:#x}", ctx.rip),
+                    rip_region:% = self.describe_guest_address(ctx.rip);
+                    "Unsupported Windows syscall"
+                );
+                ContinueOperation::Terminate
+            }
         }
-        ContinueOperation::Terminate
     }
 
     fn exception(
@@ -724,10 +1556,28 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
-        litebox_util_log::debug!(
+        litebox_util_log::error!(
             exception:? = info.exception,
             rip:% = format_args!("{:#x}", ctx.rip),
-            cr2:% = format_args!("{:#x}", info.cr2);
+            rip_region:% = self.describe_guest_address(ctx.rip),
+            cr2:% = format_args!("{:#x}", info.cr2),
+            cr2_region:% = self.describe_guest_address(info.cr2),
+            rsp:% = format_args!("{:#x}", ctx.rsp),
+            rax:% = format_args!("{:#x}", ctx.rax),
+            rbx:% = format_args!("{:#x}", ctx.rbx),
+            rcx:% = format_args!("{:#x}", ctx.rcx),
+            rdx:% = format_args!("{:#x}", ctx.rdx),
+            rbp:% = format_args!("{:#x}", ctx.rbp),
+            rsi:% = format_args!("{:#x}", ctx.rsi),
+            rdi:% = format_args!("{:#x}", ctx.rdi),
+            r8:% = format_args!("{:#x}", ctx.r8),
+            r9:% = format_args!("{:#x}", ctx.r9),
+            r10:% = format_args!("{:#x}", ctx.r10),
+            r11:% = format_args!("{:#x}", ctx.r11),
+            r12:% = format_args!("{:#x}", ctx.r12),
+            r13:% = format_args!("{:#x}", ctx.r13),
+            r14:% = format_args!("{:#x}", ctx.r14),
+            r15:% = format_args!("{:#x}", ctx.r15);
             "Windows guest exception"
         );
         // TODO: Translate hardware exceptions into Windows SEH where appropriate.
@@ -737,6 +1587,1733 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
         // TODO: Handle host interrupts for Windows guest waits/APCs.
         ContinueOperation::Terminate
+    }
+}
+
+impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
+    fn nt_query_performance_counter(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let counter = PERFORMANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if ctx.r10 == 0
+            || write_value(ctx.r10, counter).is_err()
+            || (ctx.rdx != 0 && write_value(ctx.rdx, PERFORMANCE_FREQUENCY).is_err())
+        {
+            litebox_util_log::error!(
+                counter_ptr:% = format_args!("{:#x}", ctx.r10),
+                counter_region:% = self.describe_guest_address(ctx.r10),
+                frequency_ptr:% = format_args!("{:#x}", ctx.rdx),
+                frequency_region:% = self.describe_guest_address(ctx.rdx);
+                "NtQueryPerformanceCounter could not write guest output"
+            );
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            counter_ptr:% = format_args!("{:#x}", ctx.r10),
+            frequency_ptr:% = format_args!("{:#x}", ctx.rdx),
+            counter;
+            "Handling NtQueryPerformanceCounter syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_protect_virtual_memory(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let old_protection_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let Some(old_protection_slot) = old_protection_slot else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let (Ok(base_address), Ok(region_size), Ok(old_protection_address)) = (
+            read_value::<usize>(ctx.rdx),
+            read_value::<usize>(ctx.r8),
+            read_value::<usize>(old_protection_slot),
+        ) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let Some(protection) = windows_protection(ctx.r9) else {
+            litebox_util_log::error!(new_protection:% = format_args!("{:#x}", ctx.r9); "NtProtectVirtualMemory unsupported protection flags");
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        };
+
+        if base_address == 0 || region_size == 0 || old_protection_address == 0 {
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        }
+
+        let Ok((protected_base, protected_len)) = page_range(base_address, region_size) else {
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        };
+
+        match protect_pages(
+            &self.page_manager,
+            protected_base,
+            protected_len,
+            protection,
+        ) {
+            Ok(()) => {}
+            Err(error) => {
+                litebox_util_log::error!(
+                    error:? = error,
+                    base:% = format_args!("{protected_base:#x}"),
+                    len = protected_len,
+                    base_region:% = self.describe_guest_address(protected_base),
+                    new_protection:% = format_args!("{:#x}", ctx.r9);
+                    "NtProtectVirtualMemory failed to update guest page permissions"
+                );
+                ctx.rax = STATUS_ACCESS_VIOLATION;
+                return;
+            }
+        }
+
+        if write_value(ctx.rdx, protected_base).is_err()
+            || write_value(ctx.r8, protected_len).is_err()
+            || write_value(old_protection_address, WINDOWS_OLD_PROTECTION_FALLBACK).is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", ctx.r10),
+            base:% = format_args!("{protected_base:#x}"),
+            len = protected_len,
+            new_protection:% = format_args!("{:#x}", ctx.r9),
+            old_protection_ptr:% = format_args!("{old_protection_address:#x}");
+            "Handling NtProtectVirtualMemory syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_allocate_virtual_memory(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let allocation_type_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let page_protection_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_6_OFFSET);
+        let (Some(allocation_type_slot), Some(page_protection_slot)) =
+            (allocation_type_slot, page_protection_slot)
+        else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let (Ok(allocation_type), Ok(page_protection)) = (
+            read_value::<usize>(allocation_type_slot),
+            read_value::<usize>(page_protection_slot),
+        ) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        ctx.rax = self.allocate_virtual_memory(ctx.rdx, ctx.r9, allocation_type, page_protection);
+        if ctx.rax == STATUS_SUCCESS {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                base_address_ptr:% = format_args!("{:#x}", ctx.rdx),
+                zero_bits = ctx.r8,
+                region_size_ptr:% = format_args!("{:#x}", ctx.r9),
+                allocation_type:% = format_args!("{allocation_type:#x}"),
+                page_protection:% = format_args!("{page_protection:#x}");
+                "Handling NtAllocateVirtualMemory syscall"
+            );
+        }
+    }
+
+    fn nt_allocate_virtual_memory_ex(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let page_protection_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let extended_parameters_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_6_OFFSET);
+        let extended_parameter_count_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_7_OFFSET);
+        let (
+            Some(page_protection_slot),
+            Some(extended_parameters_slot),
+            Some(extended_parameter_count_slot),
+        ) = (
+            page_protection_slot,
+            extended_parameters_slot,
+            extended_parameter_count_slot,
+        )
+        else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let (Ok(page_protection), Ok(extended_parameters), Ok(extended_parameter_count)) = (
+            read_value::<usize>(page_protection_slot),
+            read_value::<usize>(extended_parameters_slot),
+            read_value::<usize>(extended_parameter_count_slot),
+        ) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let extended_parameters_result =
+            Self::validate_mem_extended_parameters(extended_parameters, extended_parameter_count);
+        if extended_parameters_result != STATUS_SUCCESS {
+            ctx.rax = extended_parameters_result;
+            return;
+        }
+
+        ctx.rax = self.allocate_virtual_memory(ctx.rdx, ctx.r8, ctx.r9, page_protection);
+        if ctx.rax == STATUS_SUCCESS {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                base_address_ptr:% = format_args!("{:#x}", ctx.rdx),
+                region_size_ptr:% = format_args!("{:#x}", ctx.r8),
+                allocation_type:% = format_args!("{:#x}", ctx.r9),
+                page_protection:% = format_args!("{page_protection:#x}"),
+                extended_parameters:% = format_args!("{extended_parameters:#x}"),
+                extended_parameter_count;
+                "Handling NtAllocateVirtualMemoryEx syscall"
+            );
+        }
+    }
+
+    fn nt_free_virtual_memory(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx == 0 || ctx.r8 == 0 {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        let (Ok(base_address), Ok(region_size)) =
+            (read_value::<usize>(ctx.rdx), read_value::<usize>(ctx.r8))
+        else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let release = ctx.r9 & WINDOWS_MEM_RELEASE_FLAG != 0;
+        let decommit = ctx.r9 & WINDOWS_MEM_DECOMMIT_FLAG != 0;
+        if base_address == 0 || release == decommit {
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        }
+
+        let free_base = page_align_down(base_address);
+        let free_size = if region_size == 0 && release {
+            self.memory_basic_information(base_address).region_size
+        } else {
+            let Some(region_size) = page_align_up(region_size) else {
+                ctx.rax = STATUS_INVALID_PARAMETER;
+                return;
+            };
+            region_size
+        };
+
+        if free_size == 0 {
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        }
+
+        let status = if release {
+            self.release_virtual_memory(free_base, free_size)
+        } else {
+            self.decommit_virtual_memory(free_base, free_size)
+        };
+        if status != STATUS_SUCCESS {
+            ctx.rax = status;
+            return;
+        }
+
+        if write_value(ctx.rdx, free_base).is_err() || write_value(ctx.r8, free_size).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", ctx.r10),
+            base:% = format_args!("{free_base:#x}"),
+            len = free_size,
+            free_type:% = format_args!("{:#x}", ctx.r9);
+            "Handling NtFreeVirtualMemory syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn validate_mem_extended_parameters(
+        extended_parameters: usize,
+        extended_parameter_count: usize,
+    ) -> usize {
+        if extended_parameter_count == 0 {
+            return if extended_parameters == 0 {
+                STATUS_SUCCESS
+            } else {
+                STATUS_INVALID_PARAMETER
+            };
+        }
+
+        if extended_parameters == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        for index in 0..extended_parameter_count {
+            let Some(parameter_address) = index
+                .checked_mul(size_of::<MemExtendedParameter>())
+                .and_then(|offset| extended_parameters.checked_add(offset))
+            else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            let Ok(parameter) = read_value::<MemExtendedParameter>(parameter_address) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+
+            let parameter_type = parameter.type_();
+            litebox_util_log::debug!(
+                index,
+                parameter_address:% = format_args!("{parameter_address:#x}"),
+                parameter_type,
+                type_and_reserved:% = format_args!("{:#x}", parameter.type_and_reserved),
+                value:% = format_args!("{:#x}", parameter.value);
+                "Decoded NtAllocateVirtualMemoryEx extended parameter"
+            );
+
+            match parameter_type {
+                MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS => {
+                    if parameter.value == 0 {
+                        return STATUS_INVALID_PARAMETER;
+                    }
+                    let Ok(requirements) = read_value::<MemAddressRequirements>(parameter.value)
+                    else {
+                        return STATUS_ACCESS_VIOLATION;
+                    };
+                    litebox_util_log::debug!(
+                        lowest_starting_address:% = format_args!("{:#x}", requirements.lowest_starting_address),
+                        highest_ending_address:% = format_args!("{:#x}", requirements.highest_ending_address),
+                        alignment:% = format_args!("{:#x}", requirements.alignment);
+                        "Treating NtAllocateVirtualMemoryEx address requirements as advisory"
+                    );
+                }
+                MEM_EXTENDED_PARAMETER_NUMA_NODE => {
+                    litebox_util_log::debug!(
+                        numa_node = parameter.value;
+                        "Treating NtAllocateVirtualMemoryEx NUMA node as advisory"
+                    );
+                }
+                MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS => {
+                    if parameter.value & !MEM_EXTENDED_PARAMETER_SUPPORTED_ATTRIBUTE_FLAGS != 0 {
+                        litebox_util_log::error!(
+                            attribute_flags:% = format_args!("{:#x}", parameter.value);
+                            "NtAllocateVirtualMemoryEx unsupported attribute flags"
+                        );
+                        return STATUS_NOT_SUPPORTED;
+                    }
+                    litebox_util_log::debug!(
+                        attribute_flags:% = format_args!("{:#x}", parameter.value);
+                        "Treating NtAllocateVirtualMemoryEx attribute flags as advisory"
+                    );
+                }
+                MEM_EXTENDED_PARAMETER_IMAGE_MACHINE => {
+                    litebox_util_log::debug!(
+                        image_machine:% = format_args!("{:#x}", parameter.value);
+                        "Treating NtAllocateVirtualMemoryEx image machine as advisory"
+                    );
+                }
+                MEM_EXTENDED_PARAMETER_PARTITION_HANDLE
+                | MEM_EXTENDED_PARAMETER_USER_PHYSICAL_HANDLE => {
+                    litebox_util_log::error!(
+                        parameter_type,
+                        value:% = format_args!("{:#x}", parameter.value);
+                        "NtAllocateVirtualMemoryEx unsupported extended parameter type"
+                    );
+                    return STATUS_NOT_SUPPORTED;
+                }
+                0 | MEM_EXTENDED_PARAMETER_MAX.. => {
+                    return STATUS_INVALID_PARAMETER;
+                }
+            }
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn allocate_virtual_memory(
+        &self,
+        base_address_pointer: usize,
+        region_size_pointer: usize,
+        allocation_type: usize,
+        page_protection: usize,
+    ) -> usize {
+        if base_address_pointer == 0 || region_size_pointer == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let (Ok(base_address), Ok(region_size)) = (
+            read_value::<usize>(base_address_pointer),
+            read_value::<usize>(region_size_pointer),
+        ) else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+
+        if allocation_type & (WINDOWS_MEM_COMMIT_FLAG | WINDOWS_MEM_RESERVE_FLAG) == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let Some(region_size) = page_align_up(region_size) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(length) = NonZeroPageSize::new(region_size) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        let base_address = page_align_down(base_address);
+        let reserve_pages = allocation_type & WINDOWS_MEM_RESERVE_FLAG != 0;
+        let commit_pages = allocation_type & WINDOWS_MEM_COMMIT_FLAG != 0;
+        if commit_pages && !reserve_pages {
+            if base_address == 0 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            return self.commit_virtual_memory(
+                base_address_pointer,
+                region_size_pointer,
+                base_address,
+                region_size,
+                page_protection,
+            );
+        }
+
+        let suggested_address = if base_address == 0 {
+            None
+        } else {
+            let Some(address) = NonZeroAddress::new(base_address) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            Some(address)
+        };
+        let create_flags = if suggested_address.is_some() {
+            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE
+        } else {
+            CreatePagesFlags::empty()
+        };
+
+        let mapped_address = match self.create_reserved_virtual_memory(
+            suggested_address,
+            length,
+            create_flags,
+            region_size,
+        ) {
+            Ok(address) => address,
+            Err(error) => {
+                litebox_util_log::error!(
+                    error:%,
+                    requested_base:% = format_args!("{base_address:#x}"),
+                    requested_size = region_size,
+                    allocation_type:% = format_args!("{allocation_type:#x}"),
+                    page_protection:% = format_args!("{page_protection:#x}"),
+                    suggested_address:% = format_args!("{:#x}", suggested_address.map_or(0, NonZeroAddress::as_usize));
+                    "NtAllocateVirtualMemory mapping failed"
+                );
+                return STATUS_INVALID_PARAMETER;
+            }
+        };
+
+        if commit_pages {
+            let Some(protection) = windows_protection(page_protection) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            if make_pages_writable(&self.page_manager, mapped_address, region_size).is_err() {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            let ptr =
+                <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(mapped_address);
+            if ptr.copy_from_slice(0, &vec![0; region_size]).is_none() {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if protect_pages(&self.page_manager, mapped_address, region_size, protection).is_err() {
+                return STATUS_INVALID_PARAMETER;
+            }
+        }
+
+        if write_value(base_address_pointer, mapped_address).is_err()
+            || write_value(region_size_pointer, region_size).is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        self.record_memory_region(mapped_address, region_size);
+
+        STATUS_SUCCESS
+    }
+
+    fn create_reserved_virtual_memory(
+        &self,
+        suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
+        length: NonZeroPageSize<PAGE_SIZE>,
+        create_flags: CreatePagesFlags,
+        region_size: usize,
+    ) -> Result<usize, MappingError> {
+        if suggested_address.is_some() {
+            // SAFETY: This syscall owns the newly allocated guest range and maps it
+            // before returning the address to guest ntdll.
+            return unsafe {
+                self.page_manager
+                    .create_inaccessible_pages(suggested_address, length, create_flags, |_| Ok(0))
+                    .map(|ptr| ptr.as_usize())
+            };
+        }
+
+        let oversized_len = region_size
+            .checked_add(WINDOWS_ALLOCATION_GRANULARITY_USIZE - PAGE_SIZE)
+            .and_then(NonZeroPageSize::new)
+            .ok_or(MappingError::OutOfMemory)?;
+
+        // SAFETY: This temporary over-reservation is immediately trimmed so the
+        // guest-visible Windows allocation base is allocation-granularity aligned.
+        let raw_address = unsafe {
+            self.page_manager
+                .create_inaccessible_pages(None, oversized_len, create_flags, |_| Ok(0))?
+                .as_usize()
+        };
+        let Some(mapped_address) = align_up_to(raw_address, WINDOWS_ALLOCATION_GRANULARITY_USIZE)
+        else {
+            return Err(MappingError::OutOfMemory);
+        };
+
+        self.trim_reserved_virtual_memory(raw_address, mapped_address, region_size, oversized_len)?;
+        Ok(mapped_address)
+    }
+
+    fn trim_reserved_virtual_memory(
+        &self,
+        raw_address: usize,
+        mapped_address: usize,
+        region_size: usize,
+        oversized_len: NonZeroPageSize<PAGE_SIZE>,
+    ) -> Result<(), MappingError> {
+        if mapped_address > raw_address {
+            let ptr =
+                <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(raw_address);
+            // SAFETY: This prefix is the unused part of a fresh over-reservation.
+            unsafe {
+                self.page_manager
+                    .remove_pages(ptr, mapped_address - raw_address)
+                    .map_err(|_| MappingError::OutOfMemory)?;
+            }
+        }
+
+        let raw_end = raw_address
+            .checked_add(oversized_len.as_usize())
+            .ok_or(MappingError::OutOfMemory)?;
+        let mapped_end = mapped_address
+            .checked_add(region_size)
+            .ok_or(MappingError::OutOfMemory)?;
+        if mapped_end < raw_end {
+            let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(mapped_end);
+            // SAFETY: This suffix is the unused part of a fresh over-reservation.
+            unsafe {
+                self.page_manager
+                    .remove_pages(ptr, raw_end - mapped_end)
+                    .map_err(|_| MappingError::OutOfMemory)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn commit_virtual_memory(
+        &self,
+        base_address_pointer: usize,
+        region_size_pointer: usize,
+        base_address: usize,
+        region_size: usize,
+        page_protection: usize,
+    ) -> usize {
+        let Some(protection) = windows_protection(page_protection) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        if make_pages_writable(&self.page_manager, base_address, region_size).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(base_address);
+        if ptr.copy_from_slice(0, &vec![0; region_size]).is_none() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        if protect_pages(&self.page_manager, base_address, region_size, protection).is_err() {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if write_value(base_address_pointer, base_address).is_err()
+            || write_value(region_size_pointer, region_size).is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            base:% = format_args!("{base_address:#x}"),
+            len = region_size,
+            page_protection:% = format_args!("{page_protection:#x}");
+            "Committed existing virtual memory range"
+        );
+
+        STATUS_SUCCESS
+    }
+
+    fn decommit_virtual_memory(&self, base_address: usize, region_size: usize) -> usize {
+        match protect_pages(
+            &self.page_manager,
+            base_address,
+            region_size,
+            Protection {
+                read: false,
+                write: false,
+                execute: false,
+            },
+        ) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(error) => {
+                litebox_util_log::error!(
+                    error:? = error,
+                    base:% = format_args!("{base_address:#x}"),
+                    len = region_size;
+                    "NtFreeVirtualMemory failed to decommit range"
+                );
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+    }
+
+    fn release_virtual_memory(&self, base_address: usize, region_size: usize) -> usize {
+        if !self.forget_memory_region(base_address, region_size) {
+            return STATUS_MEMORY_NOT_ALLOCATED;
+        }
+
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(base_address);
+        // SAFETY: The guest explicitly released this range and the shim will not keep using it.
+        match unsafe { self.page_manager.remove_pages(ptr, region_size) } {
+            Ok(()) => STATUS_SUCCESS,
+            Err(error) => {
+                litebox_util_log::error!(
+                    error:? = error,
+                    base:% = format_args!("{base_address:#x}"),
+                    len = region_size;
+                    "NtFreeVirtualMemory failed to release range"
+                );
+                STATUS_ACCESS_VIOLATION
+            }
+        }
+    }
+
+    fn record_memory_region(&self, base_address: usize, region_size: usize) {
+        if let Some(region) = GuestAddressRegion::new("allocation", base_address, region_size) {
+            self.diagnostic_regions.lock().push(region);
+        }
+    }
+
+    fn forget_memory_region(&self, base_address: usize, region_size: usize) -> bool {
+        let Some(region_end) = base_address.checked_add(region_size) else {
+            return false;
+        };
+        let mut regions = self.diagnostic_regions.lock();
+        let Some(index) = regions.iter().position(|region| {
+            region.name == "allocation" && region.start <= base_address && region_end <= region.end
+        }) else {
+            return false;
+        };
+
+        let region = regions[index];
+        match (region.start == base_address, region.end == region_end) {
+            (true, true) => {
+                regions.remove(index);
+            }
+            (true, false) => {
+                regions[index].start = region_end;
+            }
+            (false, true) => {
+                regions[index].end = base_address;
+            }
+            (false, false) => {
+                regions[index].end = base_address;
+                regions.push(GuestAddressRegion {
+                    name: region.name,
+                    start: region_end,
+                    end: region.end,
+                });
+            }
+        }
+
+        true
+    }
+
+    fn nt_query_virtual_memory(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let length_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let return_length_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_6_OFFSET);
+        let (Some(length_slot), Some(return_length_slot)) = (length_slot, return_length_slot)
+        else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let (Ok(memory_information_length), Ok(return_length_address)) = (
+            read_value::<usize>(length_slot),
+            read_value::<usize>(return_length_slot),
+        ) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        ctx.rax = match ctx.r8 {
+            MEMORY_BASIC_INFORMATION_CLASS => Self::write_memory_information(
+                ctx.r9,
+                memory_information_length,
+                return_length_address,
+                self.memory_basic_information(ctx.rdx),
+            ),
+            MEMORY_IMAGE_INFORMATION_CLASS => match self.memory_image_information(ctx.rdx) {
+                Some(memory_information) => Self::write_memory_information(
+                    ctx.r9,
+                    memory_information_length,
+                    return_length_address,
+                    memory_information,
+                ),
+                None => STATUS_INVALID_PARAMETER,
+            },
+            MEMORY_IMAGE_EXTENSION_INFORMATION_CLASS => {
+                match self.memory_image_extension_information(ctx.rdx, ctx.r9) {
+                    Some(memory_information) => Self::write_memory_information(
+                        ctx.r9,
+                        memory_information_length,
+                        return_length_address,
+                        memory_information,
+                    ),
+                    None => STATUS_INVALID_PARAMETER,
+                }
+            }
+            MEMORY_WORKING_SET_EX_INFORMATION_CLASS => self.write_working_set_ex_information(
+                ctx.rdx,
+                ctx.r9,
+                memory_information_length,
+                return_length_address,
+            ),
+            memory_information_class => {
+                litebox_util_log::error!(memory_information_class; "NtQueryVirtualMemory unsupported information class");
+                STATUS_INVALID_INFO_CLASS
+            }
+        };
+
+        if ctx.rax != STATUS_SUCCESS {
+            return;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", ctx.r10),
+            base:% = format_args!("{:#x}", ctx.rdx),
+            base_region:% = self.describe_guest_address(ctx.rdx),
+            information:% = format_args!("{:#x}", ctx.r9),
+            len = memory_information_length;
+            "Handling NtQueryVirtualMemory syscall"
+        );
+    }
+
+    fn nt_close(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", ctx.r10);
+            "Handling NtClose as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_file(ctx: &mut litebox_common_linux::PtRegs) {
+        let share_access =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let open_options =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+
+        let object_name =
+            read_object_attributes_name(ctx.r8).unwrap_or_else(|| String::from("<unreadable>"));
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+        if ctx.r9 != 0
+            && write_value(
+                ctx.r9,
+                IoStatusBlock {
+                    status: STATUS_SUCCESS,
+                    information: 0,
+                },
+            )
+            .is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            file_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            io_status:% = format_args!("{:#x}", ctx.r9),
+            share_access:% = format_args!("{share_access:#x}"),
+            open_options:% = format_args!("{open_options:#x}"),
+            object_name:% = object_name;
+            "Handling NtOpenFile syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_query_volume_information_file(ctx: &mut litebox_common_linux::PtRegs) {
+        let fs_information_class =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+
+        ctx.rax = match fs_information_class {
+            FILE_FS_SIZE_INFORMATION_CLASS => Self::write_file_fs_information(
+                ctx.rdx,
+                ctx.r8,
+                ctx.r9,
+                FileFsSizeInformation {
+                    total_allocation_units: 1024 * 1024,
+                    available_allocation_units: 512 * 1024,
+                    sectors_per_allocation_unit: 8,
+                    bytes_per_sector: 512,
+                },
+            ),
+            FILE_FS_DEVICE_INFORMATION_CLASS => Self::write_file_fs_information(
+                ctx.rdx,
+                ctx.r8,
+                ctx.r9,
+                FileFsDeviceInformation {
+                    device_type: WINDOWS_FILE_DEVICE_DISK,
+                    characteristics: 0,
+                },
+            ),
+            FILE_FS_ATTRIBUTE_INFORMATION_CLASS => Self::write_file_fs_information(
+                ctx.rdx,
+                ctx.r8,
+                ctx.r9,
+                FileFsAttributeInformation {
+                    file_system_attributes: WINDOWS_FILE_CASE_SENSITIVE_SEARCH
+                        | WINDOWS_FILE_CASE_PRESERVED_NAMES
+                        | WINDOWS_FILE_UNICODE_ON_DISK
+                        | WINDOWS_FILE_PERSISTENT_ACLS,
+                    maximum_component_name_length: 255,
+                    file_system_name_length: 8,
+                    file_system_name: [
+                        u16::from(b'N'),
+                        u16::from(b'T'),
+                        u16::from(b'F'),
+                        u16::from(b'S'),
+                    ],
+                },
+            ),
+            information_class => {
+                litebox_util_log::error!(information_class; "NtQueryVolumeInformationFile unsupported information class");
+                STATUS_INVALID_INFO_CLASS
+            }
+        };
+
+        litebox_util_log::debug!(
+            file_handle:% = format_args!("{:#x}", ctx.r10),
+            io_status:% = format_args!("{:#x}", ctx.rdx),
+            fs_information:% = format_args!("{:#x}", ctx.r8),
+            length = ctx.r9,
+            fs_information_class,
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtQueryVolumeInformationFile syscall"
+        );
+    }
+
+    fn write_file_fs_information<GuestValue>(
+        io_status_address: usize,
+        fs_information_address: usize,
+        length: usize,
+        value: GuestValue,
+    ) -> usize
+    where
+        GuestValue: FromBytes + IntoBytes,
+    {
+        let information_length = size_of::<GuestValue>();
+        let status = if length < information_length {
+            STATUS_INFO_LENGTH_MISMATCH
+        } else if fs_information_address == 0 || write_value(fs_information_address, value).is_err()
+        {
+            STATUS_ACCESS_VIOLATION
+        } else {
+            STATUS_SUCCESS
+        };
+
+        if io_status_address != 0
+            && write_value(
+                io_status_address,
+                IoStatusBlock {
+                    status,
+                    information: if status == STATUS_SUCCESS {
+                        information_length
+                    } else {
+                        0
+                    },
+                },
+            )
+            .is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        status
+    }
+
+    fn nt_create_event(ctx: &mut litebox_common_linux::PtRegs) {
+        let initial_state_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let Some(initial_state_slot) = initial_state_slot else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+        let Ok(initial_state) = read_value::<u8>(initial_state_slot) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            event_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            event_type = ctx.r9,
+            initial_state;
+            "Handling NtCreateEvent syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_create_io_completion(ctx: &mut litebox_common_linux::PtRegs) {
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            io_completion_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            number_of_concurrent_threads = ctx.r9;
+            "Handling NtCreateIoCompletion syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_create_worker_factory(ctx: &mut litebox_common_linux::PtRegs) {
+        let worker_process_handle =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let start_routine =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let start_parameter =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+        let max_thread_count =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_8_OFFSET));
+        let stack_reserve =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_9_OFFSET));
+        let stack_commit =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_10_OFFSET));
+
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            worker_factory_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            completion_port_handle:% = format_args!("{:#x}", ctx.r9),
+            worker_process_handle:% = format_args!("{worker_process_handle:#x}"),
+            start_routine:% = format_args!("{start_routine:#x}"),
+            start_parameter:% = format_args!("{start_parameter:#x}"),
+            max_thread_count,
+            stack_reserve,
+            stack_commit;
+            "Handling NtCreateWorkerFactory syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_create_timer2(ctx: &mut litebox_common_linux::PtRegs) {
+        let desired_access =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            timer_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            timer_id:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            attributes:% = format_args!("{:#x}", ctx.r9),
+            desired_access:% = format_args!("{desired_access:#x}");
+            "Handling NtCreateTimer2 syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_create_wait_completion_packet(ctx: &mut litebox_common_linux::PtRegs) {
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            wait_completion_packet_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8);
+            "Handling NtCreateWaitCompletionPacket syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_associate_wait_completion_packet(ctx: &mut litebox_common_linux::PtRegs) {
+        let apc_context =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let io_status = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let io_status_information =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+        let already_signaled =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_8_OFFSET));
+
+        if already_signaled != 0 && write_value(already_signaled, 0u8).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            wait_completion_packet_handle:% = format_args!("{:#x}", ctx.r10),
+            io_completion_handle:% = format_args!("{:#x}", ctx.rdx),
+            target_object_handle:% = format_args!("{:#x}", ctx.r8),
+            key_context:% = format_args!("{:#x}", ctx.r9),
+            apc_context:% = format_args!("{apc_context:#x}"),
+            io_status:% = format_args!("{io_status:#x}"),
+            io_status_information:% = format_args!("{io_status_information:#x}"),
+            already_signaled:% = format_args!("{already_signaled:#x}");
+            "Handling NtAssociateWaitCompletionPacket syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_information_worker_factory(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            worker_factory_handle:% = format_args!("{:#x}", ctx.r10),
+            worker_factory_information_class = ctx.rdx,
+            worker_factory_information:% = format_args!("{:#x}", ctx.r8),
+            worker_factory_information_length = ctx.r9;
+            "Handling NtSetInformationWorkerFactory as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_wnf_process_notification_event(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            notification_event:% = format_args!("{:#x}", ctx.r10);
+            "Handling NtSetWnfProcessNotificationEvent as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_subscribe_wnf_state_change(ctx: &mut litebox_common_linux::PtRegs) {
+        let subscription_id = u64::try_from(NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed))
+            .unwrap_or(u64::MAX);
+        if ctx.r9 != 0 && write_value(ctx.r9, subscription_id).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        let state_name = read_usize_or_zero(ctx.r10);
+        litebox_util_log::debug!(
+            state_name_ptr:% = format_args!("{:#x}", ctx.r10),
+            state_name:% = format_args!("{state_name:#x}"),
+            change_stamp = ctx.rdx,
+            event_mask:% = format_args!("{:#x}", ctx.r8),
+            subscription_id_ptr:% = format_args!("{:#x}", ctx.r9),
+            subscription_id:% = format_args!("{subscription_id:#x}");
+            "Handling NtSubscribeWnfStateChange syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_trace_control(ctx: &mut litebox_common_linux::PtRegs) {
+        let output_buffer_length =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let return_length =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+
+        if return_length != 0 && write_value(return_length, 0u32).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            function_code:% = format_args!("{:#x}", ctx.r10),
+            input_buffer:% = format_args!("{:#x}", ctx.rdx),
+            input_buffer_length = ctx.r8,
+            output_buffer:% = format_args!("{:#x}", ctx.r9),
+            output_buffer_length,
+            return_length:% = format_args!("{return_length:#x}");
+            "Handling NtTraceControl as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_query_symbolic_link_object(ctx: &mut litebox_common_linux::PtRegs) {
+        ctx.rax = Self::write_symbolic_link_target(ctx.rdx, ctx.r8, SYMBOLIC_LINK_TARGET_PATH);
+
+        litebox_util_log::debug!(
+            link_handle:% = format_args!("{:#x}", ctx.r10),
+            target_name:% = format_args!("{:#x}", ctx.rdx),
+            return_length:% = format_args!("{:#x}", ctx.r8),
+            status:% = format_args!("{:#x}", ctx.rax),
+            target = SYMBOLIC_LINK_TARGET_PATH;
+            "Handling NtQuerySymbolicLinkObject syscall"
+        );
+    }
+
+    fn write_symbolic_link_target(
+        target_name_address: usize,
+        return_length_address: usize,
+        target: &str,
+    ) -> usize {
+        let target_code_units = target.encode_utf16().count();
+        let Some(target_byte_length) = target_code_units.checked_mul(size_of::<u16>()) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(required_length) = target_byte_length.checked_add(size_of::<u16>()) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(required_length_u32) = u32::try_from(required_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        if return_length_address != 0
+            && write_value(return_length_address, required_length_u32).is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let Ok(mut target_name) = read_value::<UnicodeString>(target_name_address) else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+        if usize::from(target_name.maximum_length) < required_length {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if target_name.buffer == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        for (index, code_unit) in target.encode_utf16().enumerate() {
+            let Some(offset) = index.checked_mul(size_of::<u16>()) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Some(address) = target_name.buffer.checked_add(offset) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            if write_value(address, code_unit).is_err() {
+                return STATUS_ACCESS_VIOLATION;
+            }
+        }
+
+        let Some(null_address) = target_name.buffer.checked_add(target_byte_length) else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+        if write_value(null_address, 0u16).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let Ok(length) = u16::try_from(target_byte_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        target_name.length = length;
+        if write_value(target_name_address, target_name).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn nt_set_event(ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx != 0 && write_value(ctx.rdx, 0i32).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            event_handle:% = format_args!("{:#x}", ctx.r10),
+            previous_state_ptr:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtSetEvent syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_query_system_information(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        ctx.rax = match ctx.r10 {
+            SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_EMULATION_BASIC_INFORMATION_CLASS => {
+                Self::write_u32_length_information(
+                    ctx.rdx,
+                    ctx.r8,
+                    ctx.r9,
+                    Self::system_basic_information(),
+                )
+            }
+            SYSTEM_FLUSH_INFORMATION_CLASS => Self::write_u32_length_information(
+                ctx.rdx,
+                ctx.r8,
+                ctx.r9,
+                SystemFlushInformation::default(),
+            ),
+            SYSTEM_NUMA_PROCESSOR_MAP_CLASS => Self::write_u32_length_information(
+                ctx.rdx,
+                ctx.r8,
+                ctx.r9,
+                Self::system_numa_information(),
+            ),
+            SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION_CLASS => Self::write_u32_length_information(
+                ctx.rdx,
+                ctx.r8,
+                ctx.r9,
+                SystemHypervisorSharedPageInformation::default(),
+            ),
+            SYSTEM_PROCESSOR_FEATURES_BITMAP_INFORMATION_CLASS => {
+                self.write_processor_feature_bitmap_information(ctx.rdx, ctx.r8, ctx.r9)
+            }
+            system_information_class => {
+                litebox_util_log::error!(system_information_class; "NtQuerySystemInformation unsupported information class");
+                STATUS_INVALID_INFO_CLASS
+            }
+        };
+
+        let guest_return_address = read_value::<usize>(ctx.rsp).unwrap_or_default();
+        litebox_util_log::debug!(
+            system_information_class = ctx.r10,
+            information:% = format_args!("{:#x}", ctx.rdx),
+            len = ctx.r8,
+            return_length:% = format_args!("{:#x}", ctx.r9),
+            status:% = format_args!("{:#x}", ctx.rax),
+            rip:% = format_args!("{:#x}", ctx.rip),
+            rip_region:% = self.describe_guest_address(ctx.rip),
+            rcx:% = format_args!("{:#x}", ctx.rcx),
+            rcx_region:% = self.describe_guest_address(ctx.rcx),
+            guest_return_address:% = format_args!("{guest_return_address:#x}");
+            "Handling NtQuerySystemInformation syscall"
+        );
+    }
+
+    fn system_numa_information() -> SystemNumaInformation {
+        let mut information = SystemNumaInformation::default();
+        information.active_processors_group_affinity[0].mask = 1;
+        information
+    }
+
+    fn write_processor_feature_bitmap_information(
+        &self,
+        information_address: usize,
+        information_length: usize,
+        return_length_address: usize,
+    ) -> usize {
+        let bitmap_address = self
+            .teb_address
+            .saturating_add(TEB_PROCESSOR_FEATURES_BITMAP_OFFSET);
+        if write_value(
+            bitmap_address,
+            WindowsShim::<FS>::processor_feature_bitmap_words(),
+        )
+        .is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        Self::write_u32_length_information(
+            information_address,
+            information_length,
+            return_length_address,
+            RtlBitmapEx {
+                size_of_bit_map: 64,
+                buffer: bitmap_address,
+            },
+        )
+    }
+
+    fn nt_query_system_information_ex(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let system_information_length_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let return_length_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_6_OFFSET);
+        let Some(system_information_length_slot) = system_information_length_slot else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+        let Some(return_length_slot) = return_length_slot else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+        let Ok(system_information_length) = read_value::<u32>(system_information_length_slot)
+        else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+        let Ok(return_length_address) = read_value::<usize>(return_length_slot) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let guest_return_address = read_value::<usize>(ctx.rsp).unwrap_or_default();
+        let input_word0 = read_usize_or_zero(ctx.rdx);
+        let input_word1 = read_usize_or_zero(ctx.rdx.saturating_add(size_of::<usize>()));
+        ctx.rax = match ctx.r10 {
+            SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS => {
+                Self::write_u32_length_information(
+                    ctx.r9,
+                    system_information_length as usize,
+                    return_length_address,
+                    Self::system_logical_processor_group_information(),
+                )
+            }
+            SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS => {
+                Self::write_u32_length_information(
+                    ctx.r9,
+                    system_information_length as usize,
+                    return_length_address,
+                    SystemFeatureConfigurationSectionsInformation::default(),
+                )
+            }
+            system_information_class => {
+                litebox_util_log::error!(system_information_class; "NtQuerySystemInformationEx unsupported information class");
+                STATUS_INVALID_INFO_CLASS
+            }
+        };
+
+        litebox_util_log::debug!(
+            system_information_class = ctx.r10,
+            input_buffer:% = format_args!("{:#x}", ctx.rdx),
+            input_buffer_length = ctx.r8,
+            system_information:% = format_args!("{:#x}", ctx.r9),
+            system_information_length,
+            return_length:% = format_args!("{return_length_address:#x}"),
+            input_word0:% = format_args!("{input_word0:#x}"),
+            input_word1:% = format_args!("{input_word1:#x}"),
+            status:% = format_args!("{:#x}", ctx.rax),
+            rip:% = format_args!("{:#x}", ctx.rip),
+            rip_region:% = self.describe_guest_address(ctx.rip),
+            guest_return_address:% = format_args!("{guest_return_address:#x}");
+            "Handling NtQuerySystemInformationEx syscall"
+        );
+    }
+
+    fn system_logical_processor_group_information() -> SystemLogicalProcessorGroupInformation {
+        let size =
+            u32::try_from(size_of::<SystemLogicalProcessorGroupInformation>()).unwrap_or(u32::MAX);
+
+        SystemLogicalProcessorGroupInformation {
+            relationship: LOGICAL_PROCESSOR_RELATIONSHIP_GROUP,
+            size,
+            group: GroupRelationship {
+                maximum_group_count: 1,
+                active_group_count: 1,
+                group_info: ProcessorGroupInfo {
+                    maximum_processor_count: 1,
+                    active_processor_count: 1,
+                    active_processor_mask: 1,
+                    ..ProcessorGroupInfo::default()
+                },
+                ..GroupRelationship::default()
+            },
+        }
+    }
+
+    fn system_basic_information() -> SystemBasicInformation {
+        SystemBasicInformation {
+            timer_resolution: 156_250,
+            page_size: WINDOWS_PAGE_SIZE_U32,
+            number_of_physical_pages: 1024 * 1024,
+            allocation_granularity: WINDOWS_ALLOCATION_GRANULARITY,
+            minimum_user_mode_address: WINDOWS_MINIMUM_USER_ADDRESS,
+            maximum_user_mode_address: WINDOWS_MAXIMUM_USER_ADDRESS,
+            active_processors_affinity_mask: 1,
+            number_of_processors: 1,
+            ..SystemBasicInformation::default()
+        }
+    }
+
+    fn write_u32_length_information<GuestValue>(
+        information_address: usize,
+        information_length: usize,
+        return_length_address: usize,
+        value: GuestValue,
+    ) -> usize
+    where
+        GuestValue: FromBytes + IntoBytes,
+    {
+        let required_length = size_of::<GuestValue>();
+        let Ok(required_length_u32) = u32::try_from(required_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        if return_length_address != 0
+            && write_value(return_length_address, required_length_u32).is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        if information_length < required_length {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        if information_address == 0 || write_value(information_address, value).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn nt_query_information_process(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let return_length_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
+        let Some(return_length_slot) = return_length_slot else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+        let Ok(return_length_address) = read_value::<usize>(return_length_slot) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        ctx.rax = match ctx.rdx {
+            PROCESS_BASIC_INFORMATION_CLASS => Self::write_memory_information(
+                ctx.r8,
+                ctx.r9,
+                return_length_address,
+                ProcessBasicInformation {
+                    peb_base_address: self.peb_address,
+                    affinity_mask: 1,
+                    base_priority: 8,
+                    unique_process_id: INITIAL_PROCESS_ID,
+                    inherited_from_unique_process_id: 0,
+                    ..ProcessBasicInformation::default()
+                },
+            ),
+            PROCESS_COOKIE_INFORMATION_CLASS => Self::write_memory_information(
+                ctx.r8,
+                ctx.r9,
+                return_length_address,
+                0x2b99_2ddf_u32,
+            ),
+            process_information_class => {
+                litebox_util_log::error!(process_information_class; "NtQueryInformationProcess unsupported information class");
+                STATUS_INVALID_INFO_CLASS
+            }
+        };
+
+        if ctx.rax == STATUS_SUCCESS {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                process_information_class = ctx.rdx,
+                information:% = format_args!("{:#x}", ctx.r8),
+                len = ctx.r9,
+                return_length:% = format_args!("{:#x}", return_length_address),
+                peb:% = format_args!("{:#x}", self.peb_address);
+                "Handling NtQueryInformationProcess syscall"
+            );
+        }
+    }
+
+    fn nt_set_information_process(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx == PROCESS_SCHEDULER_SHARED_DATA_CLASS {
+            let scheduler_shared_data = read_usize_or_zero(ctx.r8);
+            let fallback_scheduler_shared_data = self.scheduler_shared_data_storage_address();
+            let status = if ctx.r8 == 0
+                || ctx.r9 < size_of::<usize>()
+                || write_value(ctx.r8, fallback_scheduler_shared_data).is_err()
+            {
+                STATUS_ACCESS_VIOLATION
+            } else {
+                STATUS_SUCCESS
+            };
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                information:% = format_args!("{:#x}", ctx.r8),
+                scheduler_shared_data:% = format_args!("{scheduler_shared_data:#x}"),
+                fallback_scheduler_shared_data:% = format_args!("{fallback_scheduler_shared_data:#x}"),
+                status:% = format_args!("{status:#x}"),
+                len = ctx.r9;
+                "Handling NtSetInformationProcess(ProcessSchedulerSharedData)"
+            );
+            ctx.rax = status;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", ctx.r10),
+            process_information_class = ctx.rdx,
+            information:% = format_args!("{:#x}", ctx.r8),
+            len = ctx.r9;
+            "Handling NtSetInformationProcess as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_information_thread(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx == THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS {
+            ctx.rax = self.set_thread_scheduler_shared_data_slot(ctx.r8, ctx.r9);
+            return;
+        }
+
+        litebox_util_log::debug!(
+            thread_handle:% = format_args!("{:#x}", ctx.r10),
+            thread_information_class = ctx.rdx,
+            information:% = format_args!("{:#x}", ctx.r8),
+            len = ctx.r9;
+            "Handling NtSetInformationThread as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn set_thread_scheduler_shared_data_slot(
+        &self,
+        information_address: usize,
+        information_length: usize,
+    ) -> usize {
+        if information_address == 0
+            || information_length < size_of::<SchedulerSharedDataSlotInformation>()
+        {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        let Ok(mut information) =
+            read_value::<SchedulerSharedDataSlotInformation>(information_address)
+        else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+
+        let teb_slot_address = self
+            .teb_address
+            .saturating_add(TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET);
+        let fallback_slot = self.scheduler_shared_data_storage_address();
+        let existing_slot = read_usize_or_zero(teb_slot_address);
+        let mut selected_slot = information.slot;
+        if selected_slot == 0 {
+            selected_slot = if existing_slot != 0 {
+                existing_slot
+            } else {
+                fallback_slot
+            };
+        }
+
+        let status = match information.action {
+            SCHEDULER_SHARED_SLOT_ASSIGN | SCHEDULER_SHARED_SLOT_QUERY => {
+                let fallback_write_failed =
+                    selected_slot == fallback_slot && write_value(fallback_slot, 0u64).is_err();
+                if fallback_write_failed || write_value(teb_slot_address, selected_slot).is_err() {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    if information.scheduler_shared_data_handle == 0 {
+                        information.scheduler_shared_data_handle = selected_slot;
+                    }
+                    information.slot = selected_slot;
+                    if write_value(information_address, information).is_err() {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_SUCCESS
+                    }
+                }
+            }
+            SCHEDULER_SHARED_SLOT_FREE => {
+                if write_value(teb_slot_address, 0usize).is_err() {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    information.slot = 0;
+                    let _ = write_value(information_address, information);
+                    STATUS_SUCCESS
+                }
+            }
+            _ => STATUS_INVALID_PARAMETER,
+        };
+
+        litebox_util_log::debug!(
+            action = information.action,
+            scheduler_shared_data_handle:% = format_args!("{:#x}", information.scheduler_shared_data_handle),
+            slot:% = format_args!("{:#x}", information.slot),
+            teb_slot:% = format_args!("{teb_slot_address:#x}"),
+            fallback_slot:% = format_args!("{fallback_slot:#x}"),
+            status:% = format_args!("{status:#x}");
+            "Handling NtSetInformationThread(ThreadSchedulerSharedDataSlot)"
+        );
+
+        status
+    }
+
+    fn scheduler_shared_data_storage_address(&self) -> usize {
+        self.teb_address
+            .saturating_add(TEB_SCHEDULER_SHARED_DATA_STORAGE_OFFSET)
+    }
+
+    fn write_memory_information<GuestValue>(
+        information_address: usize,
+        information_length: usize,
+        return_length_address: usize,
+        value: GuestValue,
+    ) -> usize
+    where
+        GuestValue: FromBytes + IntoBytes,
+    {
+        let required_length = size_of::<GuestValue>();
+        if return_length_address != 0
+            && write_value(return_length_address, required_length).is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        if information_length < required_length {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        if information_address == 0 || write_value(information_address, value).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn memory_basic_information(&self, address: usize) -> MemoryBasicInformation {
+        let page_base = page_align_down(address);
+        let Some(region) = self.guest_region(address) else {
+            return MemoryBasicInformation {
+                base_address: page_base,
+                allocation_base: 0,
+                allocation_protect: WINDOWS_PAGE_NOACCESS,
+                region_size: PAGE_SIZE,
+                state: WINDOWS_MEM_FREE,
+                protect: WINDOWS_PAGE_NOACCESS,
+                type_: 0,
+                ..MemoryBasicInformation::default()
+            };
+        };
+
+        let (protect, type_) = if region.is_image() {
+            (WINDOWS_PAGE_EXECUTE_READWRITE, WINDOWS_MEM_IMAGE)
+        } else {
+            (WINDOWS_PAGE_READWRITE, WINDOWS_MEM_PRIVATE)
+        };
+
+        MemoryBasicInformation {
+            base_address: region.start,
+            allocation_base: region.start,
+            allocation_protect: protect,
+            region_size: region.end - region.start,
+            state: WINDOWS_MEM_COMMIT,
+            protect,
+            type_,
+            ..MemoryBasicInformation::default()
+        }
+    }
+
+    fn memory_image_information(&self, address: usize) -> Option<MemoryImageInformation> {
+        let region = self
+            .guest_region(address)
+            .filter(GuestAddressRegion::is_image)?;
+        Some(MemoryImageInformation {
+            image_base: region.start,
+            size_of_image: region.end - region.start,
+            image_flags: 0,
+            ..MemoryImageInformation::default()
+        })
+    }
+
+    fn memory_image_extension_information(
+        &self,
+        address: usize,
+        information_address: usize,
+    ) -> Option<MemoryImageExtensionInformation> {
+        self.guest_region(address)
+            .filter(GuestAddressRegion::is_image)?;
+
+        let extension_type = if information_address == 0 {
+            0
+        } else {
+            read_value::<MemoryImageExtensionInformation>(information_address)
+                .map(|information| information.extension_type)
+                .unwrap_or(0)
+        };
+
+        Some(MemoryImageExtensionInformation {
+            extension_type,
+            ..MemoryImageExtensionInformation::default()
+        })
+    }
+
+    fn write_working_set_ex_information(
+        &self,
+        base_address: usize,
+        information_address: usize,
+        information_length: usize,
+        return_length_address: usize,
+    ) -> usize {
+        let entry_size = size_of::<MemoryWorkingSetExInformation>();
+        if information_length < entry_size {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        if return_length_address != 0 && write_value(return_length_address, entry_size).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        let Ok(mut information) = read_value::<MemoryWorkingSetExInformation>(information_address)
+        else {
+            return STATUS_ACCESS_VIOLATION;
+        };
+
+        if information.virtual_address == 0 {
+            information.virtual_address = base_address;
+        }
+
+        information.virtual_attributes =
+            self.guest_region(information.virtual_address)
+                .map_or(0, |region| {
+                    let protection = if region.is_image() {
+                        WINDOWS_PAGE_EXECUTE_READ
+                    } else {
+                        WINDOWS_PAGE_READWRITE
+                    };
+                    1 | (usize::try_from(protection)
+                        .expect("Windows page protection fits in usize")
+                        << 4)
+                });
+
+        if write_value(information_address, information).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn guest_region(&self, address: usize) -> Option<GuestAddressRegion> {
+        self.diagnostic_regions
+            .lock()
+            .iter()
+            .copied()
+            .find(|region| region.contains(address))
+    }
+
+    fn describe_guest_address(&self, address: usize) -> String {
+        if let Some(region) = self.guest_region(address) {
+            return format!(
+                "{}+{:#x} [{:#x}..{:#x})",
+                region.name,
+                address - region.start,
+                region.start,
+                region.end
+            );
+        }
+        format!("unknown({address:#x})")
     }
 }
 
@@ -760,6 +3337,7 @@ pub struct WindowsShimProcess {
 
 struct LoadedImage {
     mapping: MappingInfo,
+    imports: Vec<PeImport>,
     exports: Vec<PeExport>,
     has_trampoline: bool,
 }
@@ -779,11 +3357,12 @@ impl LoadedImage {
 }
 
 struct WindowsProcessEnvironment {
-    _peb: usize,
-    _ldr_data: usize,
-    _process_parameters: usize,
-    _process_heap: usize,
-    _fast_peb_lock: usize,
+    peb: usize,
+    ldr_data: usize,
+    process_parameters: usize,
+    process_heap: usize,
+    fast_peb_lock: usize,
+    api_set_namespace: usize,
     teb: usize,
 }
 
@@ -820,6 +3399,15 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
     #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
     UnrewrittenNtDll,
+    /// A PE import library is not provided by the built-in import resolver.
+    #[error("unsupported Windows import library {0:?}")]
+    UnsupportedImportLibrary(Vec<u8>),
+    /// A named PE import is not provided by the built-in import resolver.
+    #[error("unsupported Windows import {library:?}!{name:?}")]
+    UnsupportedImportName { library: Vec<u8>, name: Vec<u8> },
+    /// An ordinal PE import is not provided by the built-in import resolver.
+    #[error("unsupported Windows import {library:?}!#{ordinal}")]
+    UnsupportedImportOrdinal { library: Vec<u8>, ordinal: u16 },
 }
 
 /// Errors from the shim-side PE image backing file and memory mapper.
@@ -882,6 +3470,48 @@ fn set_guest_teb(teb_address: usize) -> bool {
     true
 }
 
+fn read_value<GuestValue>(address: usize) -> Result<GuestValue, PeImageAccessError>
+where
+    GuestValue: FromBytes,
+{
+    let ptr = <Platform as RawPointerProvider>::RawConstPointer::<GuestValue>::from_usize(address);
+    ptr.read_at_offset(0)
+        .ok_or(PeImageAccessError::MemoryAccess)
+}
+
+fn read_usize_or_zero(address: usize) -> usize {
+    read_value::<usize>(address).unwrap_or(0)
+}
+
+fn read_guest_unicode_string(address: usize) -> Option<String> {
+    let unicode_string = read_value::<UnicodeString>(address).ok()?;
+    if unicode_string.length == 0 {
+        return Some(String::new());
+    }
+    if unicode_string.buffer == 0 || unicode_string.length % 2 != 0 {
+        return None;
+    }
+
+    let code_unit_count = usize::from(unicode_string.length) / size_of::<u16>();
+    let mut code_units = Vec::with_capacity(code_unit_count);
+    for index in 0..code_unit_count {
+        let offset = index.checked_mul(size_of::<u16>())?;
+        let address = unicode_string.buffer.checked_add(offset)?;
+        code_units.push(read_value::<u16>(address).ok()?);
+    }
+
+    String::from_utf16(&code_units).ok()
+}
+
+fn read_object_attributes_name(address: usize) -> Option<String> {
+    let object_attributes = read_value::<ObjectAttributes>(address).ok()?;
+    if object_attributes.object_name == 0 {
+        return Some(String::new());
+    }
+
+    read_guest_unicode_string(object_attributes.object_name)
+}
+
 fn write_value<GuestValue>(address: usize, value: GuestValue) -> Result<(), PeImageAccessError>
 where
     GuestValue: FromBytes + IntoBytes,
@@ -889,6 +3519,58 @@ where
     let ptr = <Platform as RawPointerProvider>::RawMutPointer::<GuestValue>::from_usize(address);
     ptr.write_at_offset(0, value)
         .ok_or(PeImageAccessError::MemoryAccess)
+}
+
+fn initial_dos_image_path(path: &str) -> String {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    let mut dos_path = String::from("C:\\");
+    dos_path.push_str(file_name);
+    dos_path
+}
+
+fn write_utf16_string(cursor: &mut usize, text: &str) -> Result<UnicodeString, PeImageAccessError> {
+    let code_units = text.encode_utf16().count();
+    let byte_len = code_units
+        .checked_mul(size_of::<u16>())
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let maximum_byte_len = byte_len
+        .checked_add(size_of::<u16>())
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let buffer = *cursor;
+
+    for (index, code_unit) in text.encode_utf16().chain(core::iter::once(0)).enumerate() {
+        let offset = index
+            .checked_mul(size_of::<u16>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let address = buffer
+            .checked_add(offset)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_value(address, code_unit)?;
+    }
+
+    *cursor = align_up(
+        buffer
+            .checked_add(maximum_byte_len)
+            .ok_or(PeImageAccessError::AddressOverflow)?,
+        size_of::<usize>(),
+    )?;
+    Ok(UnicodeString {
+        length: u16::try_from(byte_len).map_err(|_| PeImageAccessError::AddressOverflow)?,
+        maximum_length: u16::try_from(maximum_byte_len)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?,
+        buffer,
+        ..Default::default()
+    })
+}
+
+fn align_up(value: usize, alignment: usize) -> Result<usize, PeImageAccessError> {
+    let mask = alignment
+        .checked_sub(1)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    value
+        .checked_add(mask)
+        .map(|value| value & !mask)
+        .ok_or(PeImageAccessError::AddressOverflow)
 }
 
 struct PeImageFile<FS: NtShimFS> {
@@ -1087,6 +3769,42 @@ fn protect_pages(
     Ok(())
 }
 
+fn windows_protection(protection: usize) -> Option<Protection> {
+    match u32::try_from(protection & WINDOWS_PAGE_PROTECTION_MASK).ok()? {
+        WINDOWS_PAGE_NOACCESS => Some(Protection {
+            read: false,
+            write: false,
+            execute: false,
+        }),
+        WINDOWS_PAGE_READONLY => Some(Protection {
+            read: true,
+            write: false,
+            execute: false,
+        }),
+        WINDOWS_PAGE_READWRITE | WINDOWS_PAGE_WRITECOPY => Some(Protection {
+            read: true,
+            write: true,
+            execute: false,
+        }),
+        WINDOWS_PAGE_EXECUTE => Some(Protection {
+            read: false,
+            write: false,
+            execute: true,
+        }),
+        WINDOWS_PAGE_EXECUTE_READ => Some(Protection {
+            read: true,
+            write: false,
+            execute: true,
+        }),
+        WINDOWS_PAGE_EXECUTE_READWRITE | WINDOWS_PAGE_EXECUTE_WRITECOPY => Some(Protection {
+            read: true,
+            write: true,
+            execute: true,
+        }),
+        _ => None,
+    }
+}
+
 fn page_range(address: usize, len: usize) -> Result<(usize, usize), PeImageAccessError> {
     if len == 0 {
         return Ok((address, 0));
@@ -1107,6 +3825,12 @@ fn page_align_down(address: usize) -> usize {
 
 fn page_align_up(address: usize) -> Option<usize> {
     address.checked_add(PAGE_SIZE - 1).map(page_align_down)
+}
+
+fn align_up_to(address: usize, alignment: usize) -> Option<usize> {
+    address
+        .checked_add(alignment.checked_sub(1)?)
+        .map(|address| address & !(alignment - 1))
 }
 
 fn default_fs(
