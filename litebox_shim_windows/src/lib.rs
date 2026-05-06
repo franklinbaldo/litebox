@@ -15,6 +15,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::marker::PhantomData;
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicI32, Ordering};
 
 use litebox::fd::TypedFd;
@@ -47,6 +48,10 @@ const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const INITIAL_PEB_SIZE: usize = PAGE_SIZE;
 const INITIAL_TEB_SIZE: usize = PAGE_SIZE * 2;
+const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
+const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
+const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
+const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 const NTDLL_PATHS: &[&str] = &[
     "/windows/system32/ntdll.dll",
@@ -55,9 +60,150 @@ const NTDLL_PATHS: &[&str] = &[
 ];
 const INITIAL_PROCESS_ID: usize = 1000;
 const INITIAL_THREAD_ID: usize = 1000;
+const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
+const PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET: usize = 0x10;
+const PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET: usize = 0x20;
+const PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET: usize = 0x30;
+const TEB_AFTER_WIN32_THREAD_INFO_OFFSET: usize = 0x80;
+const TEB_TLS_SLOTS_OFFSET: usize = 0x1480;
+const TEB_TLS_SLOT_COUNT: usize = 64;
 
 #[repr(C)]
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ListEntry {
+    /// LIST_ENTRY.Flink.
+    flink: usize,
+    /// LIST_ENTRY.Blink.
+    blink: usize,
+}
+
+impl ListEntry {
+    const fn new_self(address: usize) -> Self {
+        Self {
+            flink: address,
+            blink: address,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct UnicodeString {
+    /// UNICODE_STRING.Length.
+    length: u16,
+    /// UNICODE_STRING.MaximumLength.
+    maximum_length: u16,
+    /// Explicit padding before the x64 pointer field.
+    _padding0: u32,
+    /// UNICODE_STRING.Buffer.
+    buffer: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct CurrentDirectory {
+    /// CURDIR.DosPath.
+    dos_path: UnicodeString,
+    /// CURDIR.Handle.
+    handle: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct PebLdrData {
+    /// PEB_LDR_DATA.Length.
+    length: u32,
+    /// PEB_LDR_DATA.Initialized.
+    initialized: u8,
+    /// Explicit padding before pointer-sized fields.
+    _padding0: [u8; 3],
+    /// PEB_LDR_DATA.SsHandle.
+    ss_handle: usize,
+    /// PEB_LDR_DATA.InLoadOrderModuleList.
+    in_load_order_module_list: ListEntry,
+    /// PEB_LDR_DATA.InMemoryOrderModuleList.
+    in_memory_order_module_list: ListEntry,
+    /// PEB_LDR_DATA.InInitializationOrderModuleList.
+    in_initialization_order_module_list: ListEntry,
+    /// PEB_LDR_DATA.EntryInProgress.
+    entry_in_progress: usize,
+    /// PEB_LDR_DATA.ShutdownInProgress.
+    shutdown_in_progress: u8,
+    /// Explicit padding before pointer-sized fields.
+    _padding1: [u8; 7],
+    /// PEB_LDR_DATA.ShutdownThreadId.
+    shutdown_thread_id: usize,
+}
+
+impl PebLdrData {
+    fn new(address: usize) -> Self {
+        Self {
+            length: u32::try_from(size_of::<Self>()).expect("PEB_LDR_DATA prefix fits in u32"),
+            initialized: 1,
+            in_load_order_module_list: ListEntry::new_self(
+                address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
+            ),
+            in_memory_order_module_list: ListEntry::new_self(
+                address + PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET,
+            ),
+            in_initialization_order_module_list: ListEntry::new_self(
+                address + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct RtlUserProcessParameters {
+    /// RTL_USER_PROCESS_PARAMETERS.MaximumLength.
+    maximum_length: u32,
+    /// RTL_USER_PROCESS_PARAMETERS.Length.
+    length: u32,
+    /// RTL_USER_PROCESS_PARAMETERS.Flags.
+    flags: u32,
+    /// RTL_USER_PROCESS_PARAMETERS.DebugFlags.
+    debug_flags: u32,
+    /// RTL_USER_PROCESS_PARAMETERS.ConsoleHandle.
+    console_handle: usize,
+    /// RTL_USER_PROCESS_PARAMETERS.ConsoleFlags.
+    console_flags: u32,
+    /// Explicit padding before pointer-sized fields.
+    _padding0: u32,
+    /// RTL_USER_PROCESS_PARAMETERS.StandardInput.
+    standard_input: usize,
+    /// RTL_USER_PROCESS_PARAMETERS.StandardOutput.
+    standard_output: usize,
+    /// RTL_USER_PROCESS_PARAMETERS.StandardError.
+    standard_error: usize,
+    /// RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.
+    current_directory: CurrentDirectory,
+    /// RTL_USER_PROCESS_PARAMETERS.DllPath.
+    dll_path: UnicodeString,
+    /// RTL_USER_PROCESS_PARAMETERS.ImagePathName.
+    image_path_name: UnicodeString,
+    /// RTL_USER_PROCESS_PARAMETERS.CommandLine.
+    command_line: UnicodeString,
+    /// RTL_USER_PROCESS_PARAMETERS.Environment.
+    environment: usize,
+}
+
+impl RtlUserProcessParameters {
+    fn new() -> Self {
+        Self {
+            maximum_length: u32::try_from(INITIAL_PROCESS_PARAMETERS_SIZE)
+                .expect("process parameters page size fits in u32"),
+            length: u32::try_from(size_of::<Self>())
+                .expect("RTL_USER_PROCESS_PARAMETERS prefix fits in u32"),
+            flags: RTL_USER_PROCESS_PARAMETERS_NORMALIZED,
+            ..Default::default()
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 // Minimal PEB prefix used to bootstrap the first guest thread. This is not a
 // complete Windows PEB definition and is subject to change as loader support grows.
 struct ProcessEnvironmentBlock {
@@ -75,24 +221,55 @@ struct ProcessEnvironmentBlock {
     mutant: usize,
     /// PEB.ImageBaseAddress: base address of the initial executable image.
     image_base_address: usize,
+    /// PEB.Ldr.
+    loader_data: usize,
+    /// PEB.ProcessParameters.
+    process_parameters: usize,
+    /// PEB.SubSystemData.
+    sub_system_data: usize,
+    /// PEB.ProcessHeap.
+    process_heap: usize,
+    /// PEB.FastPebLock.
+    fast_peb_lock: usize,
+    /// PEB.AtlThunkSListPtr.
+    atl_thunk_s_list_ptr: usize,
+    /// PEB.IFEOKey.
+    ifeo_key: usize,
+    /// PEB.CrossProcessFlags.
+    cross_process_flags: u32,
+    /// Explicit padding before pointer-sized fields.
+    _padding1: u32,
+    /// PEB.KernelCallbackTable / UserSharedInfoPtr.
+    kernel_callback_table: usize,
+    /// PEB.SystemReserved.
+    system_reserved: u32,
+    /// PEB.AtlThunkSListPtr32.
+    atl_thunk_s_list_ptr32: u32,
+    /// PEB.ApiSetMap.
+    api_set_map: usize,
 }
 
 impl ProcessEnvironmentBlock {
-    const fn new(image_base_address: usize) -> Self {
+    fn new(
+        image_base_address: usize,
+        loader_data: usize,
+        process_parameters: usize,
+        process_heap: usize,
+        fast_peb_lock: usize,
+    ) -> Self {
         Self {
-            inherited_address_space: 0,
-            read_image_file_exec_options: 0,
-            being_debugged: 0,
-            bit_field: 0,
-            _padding0: 0,
-            mutant: 0,
             image_base_address,
+            loader_data,
+            process_parameters,
+            process_heap,
+            fast_peb_lock,
+            ..Default::default()
         }
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 struct InitialNtTib {
     /// NT_TIB.ExceptionList.
     exception_list: usize,
@@ -111,7 +288,7 @@ struct InitialNtTib {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 struct InitialClientId {
     /// CLIENT_ID.UniqueProcess: placeholder process identifier.
     unique_process: usize,
@@ -136,33 +313,66 @@ struct ThreadEnvironmentBlock {
     thread_local_storage_pointer: usize,
     /// TEB.ProcessEnvironmentBlock: points to the process PEB.
     process_environment_block: usize,
+    /// TEB.LastErrorValue.
+    last_error_value: u32,
+    /// TEB.CountOfOwnedCriticalSections.
+    count_of_owned_critical_sections: u32,
+    /// TEB.CsrClientThread.
+    csr_client_thread: usize,
+    /// TEB.Win32ThreadInfo.
+    win32_thread_info: usize,
+    /// Reserved TEB fields before TEB.TlsSlots.
+    _reserved_to_tls_slots: [u8; TEB_TLS_SLOTS_OFFSET - TEB_AFTER_WIN32_THREAD_INFO_OFFSET],
+    /// TEB.TlsSlots.
+    tls_slots: [usize; TEB_TLS_SLOT_COUNT],
+}
+
+const _: () = assert!(
+    TEB_AFTER_WIN32_THREAD_INFO_OFFSET
+        == offset_of!(ThreadEnvironmentBlock, _reserved_to_tls_slots)
+);
+
+impl Default for ThreadEnvironmentBlock {
+    fn default() -> Self {
+        Self {
+            nt_tib: InitialNtTib::default(),
+            environment_pointer: 0,
+            client_id: InitialClientId::default(),
+            active_rpc_handle: 0,
+            thread_local_storage_pointer: 0,
+            process_environment_block: 0,
+            last_error_value: 0,
+            count_of_owned_critical_sections: 0,
+            csr_client_thread: 0,
+            win32_thread_info: 0,
+            _reserved_to_tls_slots: [0; TEB_TLS_SLOTS_OFFSET - TEB_AFTER_WIN32_THREAD_INFO_OFFSET],
+            tls_slots: [0; TEB_TLS_SLOT_COUNT],
+        }
+    }
 }
 
 impl ThreadEnvironmentBlock {
-    const fn new(
+    fn new(
         teb_address: usize,
         peb_address: usize,
         stack_base: usize,
         stack_top: usize,
+        tls_slots_address: usize,
     ) -> Self {
         Self {
             nt_tib: InitialNtTib {
-                exception_list: 0,
                 stack_base: stack_top,
                 stack_limit: stack_base,
-                sub_system_tib: 0,
-                fiber_data: 0,
-                arbitrary_user_pointer: 0,
                 self_pointer: teb_address,
+                ..Default::default()
             },
-            environment_pointer: 0,
             client_id: InitialClientId {
                 unique_process: INITIAL_PROCESS_ID,
                 unique_thread: INITIAL_THREAD_ID,
             },
-            active_rpc_handle: 0,
-            thread_local_storage_pointer: 0,
+            thread_local_storage_pointer: tls_slots_address,
             process_environment_block: peb_address,
+            ..Default::default()
         }
     }
 }
@@ -276,7 +486,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             entrypoints: WindowsShimEntrypoints {
                 entry_point,
                 stack_top,
-                teb_address: process_environment.teb_address,
+                teb_address: process_environment.teb,
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
             },
@@ -327,23 +537,56 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let peb_address = self.create_zeroed_pages(INITIAL_PEB_SIZE)?;
         let teb_address = self.create_zeroed_pages(INITIAL_TEB_SIZE)?;
+        let ldr_data_address = self.create_zeroed_pages(INITIAL_LDR_DATA_SIZE)?;
+        let process_parameters_address =
+            self.create_zeroed_pages(INITIAL_PROCESS_PARAMETERS_SIZE)?;
+        let process_heap_address = self.create_zeroed_pages(INITIAL_PROCESS_HEAP_SIZE)?;
+        let fast_peb_lock_address = self.create_zeroed_pages(INITIAL_FAST_PEB_LOCK_SIZE)?;
+        let tls_slots_address = teb_address
+            .checked_add(TEB_TLS_SLOTS_OFFSET)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
 
-        write_value(peb_address, ProcessEnvironmentBlock::new(image_base))?;
+        write_value(ldr_data_address, PebLdrData::new(ldr_data_address))?;
+        write_value(process_parameters_address, RtlUserProcessParameters::new())?;
+        write_value(
+            peb_address,
+            ProcessEnvironmentBlock::new(
+                image_base,
+                ldr_data_address,
+                process_parameters_address,
+                process_heap_address,
+                fast_peb_lock_address,
+            ),
+        )?;
         write_value(
             teb_address,
-            ThreadEnvironmentBlock::new(teb_address, peb_address, stack_base, stack_top),
+            ThreadEnvironmentBlock::new(
+                teb_address,
+                peb_address,
+                stack_base,
+                stack_top,
+                tls_slots_address,
+            ),
         )?;
 
         litebox_util_log::debug!(
             peb:% = format_args!("{peb_address:#x}"),
             teb:% = format_args!("{teb_address:#x}"),
+            ldr:% = format_args!("{ldr_data_address:#x}"),
+            process_parameters:% = format_args!("{process_parameters_address:#x}"),
+            process_heap:% = format_args!("{process_heap_address:#x}"),
+            tls_slots:% = format_args!("{tls_slots_address:#x}"),
             image_base:% = format_args!("{image_base:#x}");
             "Created initial Windows PEB/TEB"
         );
 
         Ok(WindowsProcessEnvironment {
-            _peb_address: peb_address,
-            teb_address,
+            _peb: peb_address,
+            _ldr_data: ldr_data_address,
+            _process_parameters: process_parameters_address,
+            _process_heap: process_heap_address,
+            _fast_peb_lock: fast_peb_lock_address,
+            teb: teb_address,
         })
     }
 
@@ -454,8 +697,12 @@ pub struct WindowsShimProcess {
 }
 
 struct WindowsProcessEnvironment {
-    _peb_address: usize,
-    teb_address: usize,
+    _peb: usize,
+    _ldr_data: usize,
+    _process_parameters: usize,
+    _process_heap: usize,
+    _fast_peb_lock: usize,
+    teb: usize,
 }
 
 impl WindowsShimProcess {
