@@ -571,6 +571,18 @@ fn hook_syscalls_in_section(
             ) {
                 Ok(()) => {}
                 Err(InternalError::InsufficientBytesBeforeOrAfter) => {
+                    if hook_dense_windows_syscall_stub(
+                        control_transfer_targets,
+                        section_base_addr,
+                        section_data,
+                        trampoline_base_addr,
+                        syscall_entry_addr,
+                        trampoline_data,
+                        &instructions,
+                        i,
+                    )? {
+                        continue;
+                    }
                     // Replace the unpatchable syscall with ICEBP;HLT so it
                     // traps instead of escaping to the host kernel.
                     replace_with_trap(section_data, section_base_addr, inst);
@@ -817,6 +829,131 @@ fn replace_with_trap(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn hook_dense_windows_syscall_stub(
+    control_transfer_targets: &BTreeSet<u64>,
+    section_base_addr: u64,
+    section_data: &mut [u8],
+    trampoline_base_addr: u64,
+    syscall_entry_addr: u64,
+    trampoline_data: &mut Vec<u8>,
+    instructions: &[iced_x86::Instruction],
+    inst_index: usize,
+) -> core::result::Result<bool, InternalError> {
+    if inst_index < 2 {
+        return Ok(false);
+    }
+
+    let test_inst = &instructions[inst_index - 2];
+    let jne_inst = &instructions[inst_index - 1];
+    let syscall_inst = &instructions[inst_index];
+
+    if !is_dense_windows_syscall_stub_sequence(test_inst, jne_inst, section_base_addr, section_data)
+    {
+        return Ok(false);
+    }
+
+    let stub_addr = test_inst.ip();
+    let fallback_addr = checked_add_u64(
+        jne_inst.ip(),
+        DENSE_WINDOWS_SYSCALL_STUB_TAIL_FALLBACK_OFFSET as u64,
+        "dense Windows syscall fallback address",
+    )?;
+    let stub_end_addr = checked_add_u64(
+        jne_inst.ip(),
+        DENSE_WINDOWS_SYSCALL_STUB_TAIL.len() as u64,
+        "dense Windows syscall stub end address",
+    )?;
+    if control_transfer_targets
+        .iter()
+        .any(|target| (stub_addr..stub_end_addr).contains(target) && *target != fallback_addr)
+    {
+        return Ok(false);
+    }
+
+    let target_addr = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64,
+        "dense Windows syscall trampoline target",
+    )?;
+
+    let return_addr = syscall_inst.next_ip();
+    let jmp_back_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 7,
+        "dense Windows syscall trampoline return base",
+    )?;
+    // lea rcx, [rip + disp32]
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]);
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        return_addr,
+        jmp_back_base,
+        "dense Windows syscall trampoline return",
+    )?);
+
+    // jmp qword ptr [rip + disp32]
+    trampoline_data.extend_from_slice(&[0xFF, 0x25]);
+    let entry_base = checked_add_u64(
+        trampoline_base_addr,
+        trampoline_data.len() as u64 + 4,
+        "dense Windows syscall trampoline entry base",
+    )?;
+    trampoline_data.extend_from_slice(&rel32_bytes(
+        syscall_entry_addr,
+        entry_base,
+        "dense Windows syscall trampoline entry",
+    )?);
+
+    let stub_offset = usize::try_from(stub_addr - section_base_addr).unwrap();
+    section_data[stub_offset] = 0xe9;
+    let patch_base = checked_add_u64(stub_addr, 5, "dense Windows syscall patch jump base")?;
+    section_data[stub_offset + 1..stub_offset + 5].copy_from_slice(&rel32_bytes(
+        target_addr,
+        patch_base,
+        "dense Windows syscall patch jump",
+    )?);
+
+    let syscall_end_offset = usize::try_from(syscall_inst.next_ip() - section_base_addr).unwrap();
+    for byte in &mut section_data[stub_offset + 5..syscall_end_offset] {
+        *byte = 0x90;
+    }
+
+    let fallback_offset = usize::try_from(fallback_addr - section_base_addr).unwrap();
+    section_data[fallback_offset] = 0xeb;
+    section_data[fallback_offset + 1] =
+        i8::try_from(i128::from(stub_addr) - i128::from(fallback_addr + 2))
+            .map_err(|_| {
+                Error::AddressOverflow("dense Windows syscall fallback jump out of range".into())
+            })?
+            .to_ne_bytes()[0];
+
+    Ok(true)
+}
+
+fn is_dense_windows_syscall_stub_sequence(
+    test_inst: &iced_x86::Instruction,
+    jne_inst: &iced_x86::Instruction,
+    section_base_addr: u64,
+    section_data: &[u8],
+) -> bool {
+    if !matches!(
+        test_inst.code(),
+        iced_x86::Code::Test_rm8_imm8 | iced_x86::Code::Test_rm8_imm8_F6r1
+    ) || test_inst.immediate8() != 1
+    {
+        return false;
+    }
+
+    let Ok(tail_offset) = usize::try_from(jne_inst.ip() - section_base_addr) else {
+        return false;
+    };
+    let Some(tail_end) = tail_offset.checked_add(DENSE_WINDOWS_SYSCALL_STUB_TAIL.len()) else {
+        return false;
+    };
+
+    section_data.get(tail_offset..tail_end) == Some(DENSE_WINDOWS_SYSCALL_STUB_TAIL)
+}
+
 fn checked_add_u64(base: u64, addend: u64, context: &'static str) -> Result<u64> {
     base.checked_add(addend)
         .ok_or_else(|| Error::AddressOverflow(format!("{context} address overflow")))
@@ -882,6 +1019,9 @@ fn get_control_transfer_targets(
 const MAX_X86_INSTRUCTION_LEN: usize = 15;
 const CHUNK_OVERLAP_LEN: usize = MAX_X86_INSTRUCTION_LEN - 1;
 const TARGET_DECODE_CHUNK_LEN: usize = 8 * 1024 * 1024;
+// jne +3; syscall; ret; int 0x2e; ret
+const DENSE_WINDOWS_SYSCALL_STUB_TAIL: &[u8] = &[0x75, 0x03, 0x0f, 0x05, 0xc3, 0xcd, 0x2e, 0xc3];
+const DENSE_WINDOWS_SYSCALL_STUB_TAIL_FALLBACK_OFFSET: usize = 5;
 
 fn bytes_until_next_4g_boundary(ptr: *const u8) -> usize {
     let low = (ptr as u64) & 0xFFFF_FFFF;
