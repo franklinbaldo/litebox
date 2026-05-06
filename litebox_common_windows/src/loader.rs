@@ -30,6 +30,8 @@ pub struct PeParsedFile {
     pub data_directories: Vec<PeDataDirectory>,
     /// Import lookup table entries grouped only by their source DLL name in each entry.
     pub imports: Vec<PeImport>,
+    /// Named exports from the PE export directory.
+    pub exports: Vec<PeExport>,
     /// Base relocation entries from the `.reloc` directory.
     pub relocations: Vec<Relocation>,
     trampoline: Option<PeTrampolineInfo>,
@@ -137,6 +139,15 @@ pub enum PeImportTarget {
     },
 }
 
+/// A named PE export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeExport {
+    /// Export name.
+    pub name: Vec<u8>,
+    /// Export target RVA.
+    pub rva: u32,
+}
+
 /// Errors that can occur when parsing a PE file.
 #[derive(Debug, Error)]
 pub enum PeParseError<E> {
@@ -193,6 +204,12 @@ impl PeParsedFile {
     /// Parse a PE32+ x86-64 image from file bytes.
     pub fn parse_bytes(data: &[u8]) -> Result<Self, PeParseError<core::convert::Infallible>> {
         parse_bytes(data)
+    }
+
+    /// Returns whether the image has a parsed LiteBox syscall trampoline.
+    #[must_use]
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
     }
 
     /// Load the PE image into memory.
@@ -572,6 +589,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
         .collect();
 
     let imports = parse_imports(&pe)?;
+    let exports = parse_exports(&pe)?;
     let relocations = parse_relocations(&pe)?;
 
     Ok(PeParsedFile {
@@ -579,6 +597,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
         sections,
         data_directories,
         imports,
+        exports,
         relocations,
         trampoline: None,
     })
@@ -729,6 +748,26 @@ fn parse_imports(pe: &PeFile64<'_>) -> Result<Vec<PeImport>, object::read::Error
     Ok(imports)
 }
 
+fn parse_exports(pe: &PeFile64<'_>) -> Result<Vec<PeExport>, object::read::Error> {
+    let Some(export_table) = pe.export_table()? else {
+        return Ok(Vec::new());
+    };
+
+    let mut exports = Vec::new();
+    for (name_pointer, address_index) in export_table.name_iter() {
+        let rva = export_table.address_by_index(u32::from(address_index))?;
+        if export_table.is_forward(rva) {
+            continue;
+        }
+        exports.push(PeExport {
+            name: export_table.name_from_pointer(name_pointer)?.to_vec(),
+            rva,
+        });
+    }
+
+    Ok(exports)
+}
+
 fn parse_relocations(pe: &PeFile64<'_>) -> Result<Vec<Relocation>, object::read::Error> {
     let Some(mut blocks) = pe
         .data_directories()
@@ -792,6 +831,7 @@ mod tests {
             sections: Vec::new(),
             data_directories: Vec::new(),
             imports: Vec::new(),
+            exports: Vec::new(),
             relocations: Vec::new(),
             trampoline: None,
         }

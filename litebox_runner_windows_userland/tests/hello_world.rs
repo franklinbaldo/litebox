@@ -51,9 +51,16 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 
 #[test]
 fn run_minimal_hello_world_pe() {
-    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hello_world");
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hello_world_{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
     let pe_path = build_minimal_hello_world_pe(&test_dir);
     println!("Built hello-world PE fixture at `{}`", pe_path.display());
+    let ntdll_path = build_rewritten_ntdll(&test_dir);
+    println!(
+        "Built rewritten ntdll fixture at `{}`",
+        ntdll_path.display()
+    );
     let tar_path = test_dir.join("hello_world.tar");
     create_tar_with_hello_exe(&test_dir, &tar_path);
 
@@ -114,6 +121,30 @@ fn build_minimal_hello_world_pe(test_dir: &std::path::Path) -> std::path::PathBu
     exe_path
 }
 
+fn build_rewritten_ntdll(test_dir: &std::path::Path) -> std::path::PathBuf {
+    let ntdll_path = test_dir.join("ntdll.dll");
+    let host_ntdll = std::fs::read(host_ntdll_path()).expect("failed to read host ntdll.dll");
+    let rewritten = match litebox_syscall_rewriter::rewrite_binary(&host_ntdll, None) {
+        Ok(rewritten) => rewritten,
+        Err(litebox_syscall_rewriter::Error::UnpatchableSyscalls(_)) => panic!(
+            "failed to rewrite host ntdll.dll; required support: patch dense ntdll syscall stubs or provide a pre-rewritten guest ntdll.dll"
+        ),
+        Err(error) => panic!("failed to rewrite host ntdll.dll: {error}"),
+    };
+    std::fs::write(&ntdll_path, rewritten).unwrap();
+    ntdll_path
+}
+
+fn host_ntdll_path() -> std::path::PathBuf {
+    std::env::var_os("SystemRoot")
+        .map_or_else(
+            || std::path::PathBuf::from(r"C:\Windows"),
+            std::path::PathBuf::from,
+        )
+        .join("System32")
+        .join("ntdll.dll")
+}
+
 fn create_tar_with_hello_exe(test_dir: &std::path::Path, tar_path: &std::path::Path) {
     let output = std::process::Command::new("tar.exe")
         .args([
@@ -122,6 +153,7 @@ fn create_tar_with_hello_exe(test_dir: &std::path::Path, tar_path: &std::path::P
             "-C",
             test_dir.to_str().unwrap(),
             "hello.exe",
+            "ntdll.dll",
         ])
         .output()
         .expect("failed to run tar.exe for the minimal Windows PE fixture");

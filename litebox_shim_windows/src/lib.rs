@@ -31,7 +31,7 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeLoadError, PeParseError, PeParsedFile,
+    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeLoadError, PeParseError, PeParsedFile,
     Protection, ReadAt,
 };
 use litebox_platform_multiplex::Platform;
@@ -58,6 +58,7 @@ const NTDLL_PATHS: &[&str] = &[
     "/Windows/System32/ntdll.dll",
     "/ntdll.dll",
 ];
+const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 const INITIAL_PROCESS_ID: usize = 1000;
 const INITIAL_THREAD_ID: usize = 1000;
 const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
@@ -463,9 +464,30 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
-        let mapping = self.load_image(fs.clone(), path)?;
-        let entry_point = mapping.entry_point;
-        self.load_ntdll(fs)?;
+        let image = self.load_image(fs.clone(), path)?;
+        let application_entry_point = image.mapping.entry_point;
+        let ntdll = self.load_ntdll(fs)?;
+        let (entry_point, start_mode) = if let Some(ntdll) = &ntdll {
+            if !ntdll.has_trampoline {
+                return Err(WindowsLoadError::UnrewrittenNtDll);
+            }
+            let loader_entry_point = ntdll
+                .export_address(NTDLL_LOADER_ENTRYPOINT)?
+                .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+            litebox_util_log::debug!(
+                entry_point:% = format_args!("{loader_entry_point:#x}"),
+                application_entry_point:% = format_args!("{application_entry_point:#x}");
+                "Starting Windows guest through ntdll!LdrInitializeThunk"
+            );
+            (
+                loader_entry_point,
+                WindowsStartMode::NtDllLoader {
+                    application_entry_point,
+                },
+            )
+        } else {
+            (application_entry_point, WindowsStartMode::Application)
+        };
 
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
@@ -478,28 +500,37 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .as_usize()
             .checked_add(INITIAL_STACK_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        let process_environment =
-            self.create_process_environment(mapping.base_addr, stack_base.as_usize(), stack_top)?;
+        let process_environment = self.create_process_environment(
+            image.mapping.base_addr,
+            stack_base.as_usize(),
+            stack_top,
+        )?;
         let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
+        let ntdll_mapping = ntdll.map(|image| image.mapping);
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 entry_point,
                 stack_top,
                 teb_address: process_environment.teb,
+                start_mode,
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
             },
-            process: WindowsShimProcess { mapping, exit_code },
+            process: WindowsShimProcess {
+                mapping: image.mapping,
+                _ntdll_mapping: ntdll_mapping,
+                exit_code,
+            },
         })
     }
 
-    fn load_ntdll(&self, fs: Arc<FS>) -> Result<(), WindowsLoadError> {
+    fn load_ntdll(&self, fs: Arc<FS>) -> Result<Option<LoadedImage>, WindowsLoadError> {
         for path in NTDLL_PATHS {
             match self.load_image(fs.clone(), path) {
-                Ok(_) => {
+                Ok(image) => {
                     litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
-                    return Ok(());
+                    return Ok(Some(image));
                 }
                 Err(error) if is_missing_file_error(&error) => {}
                 Err(error) => return Err(error),
@@ -507,26 +538,33 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         }
 
         litebox_util_log::debug!("Guest ntdll.dll was not found in the initial filesystem");
-        Ok(())
+        Ok(None)
     }
 
-    fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<MappingInfo, WindowsLoadError> {
+    fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<LoadedImage, WindowsLoadError> {
         let file = PeImageFile::open(fs, path)?;
         let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let exports = parsed.exports.clone();
         parsed
             .parse_trampoline(
                 &mut &file,
                 litebox_platform_multiplex::platform().get_syscall_entry_point(),
             )
             .map_err(WindowsLoadError::Parse)?;
+        let has_trampoline = parsed.has_trampoline();
         let mut mapper = PeImageMapper {
             file: &file,
             page_manager: &self.page_manager,
         };
         let mut memory = PeImageMemory;
-        parsed
+        let mapping = parsed
             .load(&mut mapper, &mut memory)
-            .map_err(WindowsLoadError::Load)
+            .map_err(WindowsLoadError::Load)?;
+        Ok(LoadedImage {
+            mapping,
+            exports,
+            has_trampoline,
+        })
     }
 
     fn create_process_environment(
@@ -615,8 +653,15 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
     teb_address: usize,
+    start_mode: WindowsStartMode,
     exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
+}
+
+#[derive(Clone, Copy)]
+enum WindowsStartMode {
+    Application,
+    NtDllLoader { application_entry_point: usize },
 }
 
 impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
@@ -629,6 +674,22 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         ctx.rip = self.entry_point;
         ctx.rsp = self.stack_top;
         ctx.eflags = 0x202;
+        if let WindowsStartMode::NtDllLoader {
+            application_entry_point,
+        } = self.start_mode
+        {
+            // TODO: Build the initial CONTEXT/loader parameter contract expected by
+            // LdrInitializeThunk. For now this deliberately transfers control to
+            // ntdll so the next missing pieces are visible at runtime.
+            ctx.rcx = 0;
+            ctx.rdx = 0;
+            ctx.r8 = 0;
+            ctx.r9 = 0;
+            litebox_util_log::debug!(
+                application_entry_point:% = format_args!("{application_entry_point:#x}");
+                "Prepared placeholder ntdll loader arguments"
+            );
+        }
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
             stack_top:% = format_args!("{:#x}", self.stack_top),
@@ -693,7 +754,28 @@ pub struct LoadedProgram<FS: NtShimFS> {
 /// A placeholder handle to a process loaded via [`WindowsShim::load_program`].
 pub struct WindowsShimProcess {
     mapping: MappingInfo,
+    _ntdll_mapping: Option<MappingInfo>,
     exit_code: Arc<AtomicI32>,
+}
+
+struct LoadedImage {
+    mapping: MappingInfo,
+    exports: Vec<PeExport>,
+    has_trampoline: bool,
+}
+
+impl LoadedImage {
+    fn export_address(&self, name: &[u8]) -> Result<Option<usize>, PeImageAccessError> {
+        let Some(export) = self.exports.iter().find(|export| export.name == name) else {
+            return Ok(None);
+        };
+        let rva = usize::try_from(export.rva).map_err(|_| PeImageAccessError::AddressOverflow)?;
+        self.mapping
+            .base_addr
+            .checked_add(rva)
+            .ok_or(PeImageAccessError::AddressOverflow)
+            .map(Some)
+    }
 }
 
 struct WindowsProcessEnvironment {
@@ -732,6 +814,12 @@ pub enum WindowsLoadError {
     /// Opening the PE image failed.
     #[error(transparent)]
     Access(#[from] PeImageAccessError),
+    /// Guest ntdll.dll does not export LdrInitializeThunk.
+    #[error("guest ntdll.dll does not export LdrInitializeThunk")]
+    MissingNtDllLoaderEntrypoint,
+    /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
+    #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
+    UnrewrittenNtDll,
 }
 
 /// Errors from the shim-side PE image backing file and memory mapper.
