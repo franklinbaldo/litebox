@@ -52,32 +52,6 @@ unsafe extern "system" {
         bytes_written: *mut u32,
         overlapped: *mut c_void,
     ) -> i32;
-    #[link_name = "ExitProcess"]
-    fn host_exit_process(exit_code: u32) -> !;
-}
-
-extern "system" fn litebox_kernel32_get_std_handle(n_std_handle: u32) -> *mut c_void {
-    // SAFETY: This thunk forwards the guest's Win32 ABI call to the host API in
-    // the same process during early Windows-runner bring-up.
-    unsafe { host_get_std_handle(n_std_handle) }
-}
-
-extern "system" fn litebox_kernel32_write_file(
-    file: *mut c_void,
-    buffer: *const c_void,
-    bytes_to_write: u32,
-    bytes_written: *mut u32,
-    overlapped: *mut c_void,
-) -> i32 {
-    // SAFETY: The guest and runner share an address space in this userland
-    // prototype, so guest buffers are directly readable by the host call.
-    unsafe { host_write_file(file, buffer, bytes_to_write, bytes_written, overlapped) }
-}
-
-extern "system" fn litebox_kernel32_exit_process(exit_code: u32) -> ! {
-    // SAFETY: The runner process represents this single guest process in the
-    // current Windows userland prototype.
-    unsafe { host_exit_process(exit_code) }
 }
 
 extern "system" fn litebox_ntdll_rtl_allocate_heap(
@@ -201,7 +175,8 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     let mut replacement_name = None;
     if unicode_string.buffer == 0
         && unicode_string.length != 0
-        && let Some(replacement) = ntdll_guest_heap_utf16_string("C:\\Windows\\System32\\ntdll.dll")
+        && let Some(replacement) =
+            ntdll_guest_heap_utf16_string("C:\\Windows\\System32\\kernel32.dll")
     {
         let _ = write_value(name_address, replacement);
         replacement_name = Some(replacement);
@@ -359,6 +334,9 @@ const NTDLL_APPHELP_STATUS_TEST_RVA: usize = 0xbb41a;
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
+const WINDOWS_STD_INPUT_HANDLE: u32 = u32::MAX - 9;
+const WINDOWS_STD_OUTPUT_HANDLE: u32 = u32::MAX - 10;
+const WINDOWS_STD_ERROR_HANDLE: u32 = u32::MAX - 11;
 const STATUS_SUCCESS: usize = 0;
 const STATUS_INVALID_INFO_CLASS: usize = 0xc000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
@@ -659,7 +637,6 @@ impl PebLdrData {
         );
         Self {
             length: u32::try_from(size_of::<Self>()).expect("PEB_LDR_DATA prefix fits in u32"),
-            initialized: 1,
             in_load_order_module_list,
             in_memory_order_module_list,
             in_initialization_order_module_list,
@@ -1446,8 +1423,9 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let image = self.load_image(fs.clone(), path)?;
         let application_entry_point = image.mapping.entry_point;
-        self.resolve_initial_imports(&image)?;
-        let ntdll = self.load_ntdll(fs)?.ok_or(WindowsLoadError::MissingNtDll)?;
+        let ntdll = self
+            .load_ntdll(fs.clone())?
+            .ok_or(WindowsLoadError::MissingNtDll)?;
         if !ntdll.has_trampoline {
             return Err(WindowsLoadError::UnrewrittenNtDll);
         }
@@ -1516,10 +1494,18 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 teb_address: process_environment.teb,
                 peb_address: process_environment.peb,
                 start_mode,
+                fs,
+                application_base: image.mapping.base_addr,
+                application_imports: image.imports.clone(),
                 exit_code: exit_code.clone(),
                 page_manager: self.page_manager.clone(),
+                handles: litebox::sync::Mutex::new(Vec::new()),
+                loaded_modules: litebox::sync::Mutex::new(vec![LoadedModule {
+                    path: String::from("/Windows/System32/ntdll.dll"),
+                    base_addr: ntdll_mapping.base_addr,
+                    exports: ntdll.exports,
+                }]),
                 diagnostic_regions: litebox::sync::Mutex::new(diagnostic_regions),
-                _fs: PhantomData,
             },
             process: WindowsShimProcess {
                 mapping: image.mapping,
@@ -1571,27 +1557,6 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             exports,
             has_trampoline,
         })
-    }
-
-    fn resolve_initial_imports(&self, image: &LoadedImage) -> Result<(), WindowsLoadError> {
-        for import in &image.imports {
-            let address = Self::builtin_import_address(import)?;
-            let iat_address = image
-                .mapping
-                .base_addr
-                .checked_add(usize::try_from(import.iat_rva).expect("IAT RVA fits in usize"))
-                .ok_or(PeImageAccessError::AddressOverflow)?;
-            make_pages_writable(&self.page_manager, iat_address, size_of::<usize>())?;
-            write_value(iat_address, address)?;
-            litebox_util_log::debug!(
-                library:% = String::from_utf8_lossy(&import.library),
-                iat:% = format_args!("{iat_address:#x}"),
-                address:% = format_args!("{address:#x}");
-                "Resolved built-in Windows import"
-            );
-        }
-
-        Ok(())
     }
 
     fn patch_ntdll_builtin_exports(&self, image: &LoadedImage) -> Result<(), WindowsLoadError> {
@@ -1692,34 +1657,6 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         Ok(())
     }
 
-    fn builtin_import_address(import: &PeImport) -> Result<usize, WindowsLoadError> {
-        if !import.library.eq_ignore_ascii_case(b"kernel32.dll") {
-            return Err(WindowsLoadError::UnsupportedImportLibrary(
-                import.library.clone(),
-            ));
-        }
-
-        let PeImportTarget::Name { name, .. } = &import.target else {
-            let PeImportTarget::Ordinal(ordinal) = import.target else {
-                unreachable!();
-            };
-            return Err(WindowsLoadError::UnsupportedImportOrdinal {
-                library: import.library.clone(),
-                ordinal,
-            });
-        };
-
-        match name.as_slice() {
-            b"GetStdHandle" => Ok(litebox_kernel32_get_std_handle as *const () as usize),
-            b"WriteFile" => Ok(litebox_kernel32_write_file as *const () as usize),
-            b"ExitProcess" => Ok(litebox_kernel32_exit_process as *const () as usize),
-            _ => Err(WindowsLoadError::UnsupportedImportName {
-                library: import.library.clone(),
-                name: name.clone(),
-            }),
-        }
-    }
-
     fn create_process_environment(
         &self,
         image: &MappingInfo,
@@ -1761,6 +1698,9 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .ok_or(PeImageAccessError::AddressOverflow)?;
 
         let mut process_parameters = RtlUserProcessParameters::new();
+        process_parameters.standard_input = host_standard_handle(WINDOWS_STD_INPUT_HANDLE);
+        process_parameters.standard_output = host_standard_handle(WINDOWS_STD_OUTPUT_HANDLE);
+        process_parameters.standard_error = host_standard_handle(WINDOWS_STD_ERROR_HANDLE);
         let mut process_parameters_string_cursor = process_parameters_address
             .checked_add(align_up(size_of::<RtlUserProcessParameters>(), 16)?)
             .ok_or(PeImageAccessError::AddressOverflow)?;
@@ -1943,10 +1883,30 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     teb_address: usize,
     peb_address: usize,
     start_mode: WindowsStartMode,
+    fs: Arc<FS>,
+    application_base: usize,
+    application_imports: Vec<PeImport>,
     exit_code: Arc<AtomicI32>,
     page_manager: Arc<WindowsPageManager>,
+    handles: litebox::sync::Mutex<Platform, Vec<WindowsHandle>>,
+    loaded_modules: litebox::sync::Mutex<Platform, Vec<LoadedModule>>,
     diagnostic_regions: litebox::sync::Mutex<Platform, Vec<GuestAddressRegion>>,
-    _fs: PhantomData<FS>,
+}
+
+struct LoadedModule {
+    path: String,
+    base_addr: usize,
+    exports: Vec<PeExport>,
+}
+
+struct WindowsHandle {
+    handle: usize,
+    kind: WindowsHandleKind,
+}
+
+enum WindowsHandleKind {
+    File { path: String },
+    Section { path: Option<String> },
 }
 
 #[derive(Clone, Copy)]
@@ -2063,6 +2023,113 @@ fn push_region(
     }
 }
 
+fn windows_object_path_to_guest_path(path: &str) -> String {
+    let without_prefix = path
+        .strip_prefix("\\??\\")
+        .or_else(|| path.strip_prefix("\\DosDevices\\"))
+        .unwrap_or(path);
+    let lower_without_prefix = without_prefix.to_ascii_lowercase();
+    let without_drive = if let Some(drive_index) = lower_without_prefix.rfind("c:\\") {
+        &without_prefix[drive_index + 3..]
+    } else {
+        without_prefix
+    };
+    let mut guest_path = String::from("/");
+    let mut first = true;
+    for component in without_drive
+        .split(['\\', '/'])
+        .filter(|component| !component.is_empty())
+    {
+        if !first {
+            guest_path.push('/');
+        }
+        first = false;
+        if component.eq_ignore_ascii_case("windows") {
+            guest_path.push_str("Windows");
+        } else if component.eq_ignore_ascii_case("system32") {
+            guest_path.push_str("System32");
+        } else if component
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("dll"))
+        {
+            guest_path.push_str(&component.to_ascii_lowercase());
+        } else {
+            guest_path.push_str(component);
+        }
+    }
+    guest_path
+}
+
+fn is_ntdll_guest_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .eq_ignore_ascii_case("ntdll.dll")
+}
+
+fn is_kernel32_guest_path(path: &str) -> bool {
+    module_basename(path).eq_ignore_ascii_case("kernel32.dll")
+}
+
+fn module_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn import_library_name(library: &[u8]) -> &str {
+    core::str::from_utf8(library).unwrap_or("")
+}
+
+fn import_library_is_kernel32(library: &[u8]) -> bool {
+    module_basename(import_library_name(library)).eq_ignore_ascii_case("kernel32.dll")
+}
+
+fn import_library_is_api_set(library: &[u8]) -> bool {
+    let name = module_basename(import_library_name(library));
+    name.starts_with("api-ms-") || name.starts_with("ext-ms-")
+}
+
+fn module_matches_import(module: &LoadedModule, library: &[u8]) -> bool {
+    let module_name = module_basename(&module.path);
+    let library_name = module_basename(import_library_name(library));
+    module_name.eq_ignore_ascii_case(library_name)
+        || import_library_is_api_set(library) && module_name.eq_ignore_ascii_case("kernelbase.dll")
+}
+
+fn export_address(module: &LoadedModule, name: &[u8]) -> Option<usize> {
+    module
+        .exports
+        .iter()
+        .find(|export| export.name.eq_ignore_ascii_case(name))
+        .and_then(|export| module.base_addr.checked_add(export.rva as usize))
+}
+
+fn import_name(import: &PeImport) -> alloc::borrow::Cow<'_, str> {
+    match &import.target {
+        PeImportTarget::Ordinal(ordinal) => alloc::borrow::Cow::Owned(format!("#{ordinal}")),
+        PeImportTarget::Name { name, .. } => String::from_utf8_lossy(name),
+    }
+}
+
+fn host_standard_handle(kind: u32) -> usize {
+    // SAFETY: The shim process hosts the current userland prototype, so its
+    // standard handles are the backing console handles for guest process params.
+    unsafe { host_get_std_handle(kind) as usize }
+}
+
+fn loaded_image_region_name(path: &str) -> &'static str {
+    match path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "kernel32.dll" => "kernel32",
+        "kernelbase.dll" => "kernelbase",
+        _ => "dll",
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WindowsStartMode {
     application_entry_point: usize,
@@ -2154,11 +2221,15 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtClose) => {
-                Self::nt_close(ctx);
+                self.nt_close(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWriteFile) => {
+                Self::nt_write_file(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenFile) => {
-                Self::nt_open_file(ctx);
+                self.nt_open_file(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQueryAttributesFile) => {
@@ -2183,7 +2254,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateSection) => {
-                Self::nt_create_section(ctx);
+                self.nt_create_section(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtApphelpCacheControl) => {
@@ -2196,7 +2267,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtMapViewOfSection) => {
-                Self::nt_map_view_of_section(ctx);
+                self.nt_map_view_of_section(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtUnmapViewOfSection) => {
@@ -2459,6 +2530,160 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
 }
 
 impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
+    fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<LoadedImage, WindowsLoadError> {
+        let file = PeImageFile::open(fs, path)?;
+        let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let imports = parsed.imports.clone();
+        let exports = parsed.exports.clone();
+        parsed
+            .parse_trampoline(
+                &mut &file,
+                litebox_platform_multiplex::platform().get_syscall_entry_point(),
+            )
+            .map_err(WindowsLoadError::Parse)?;
+        let has_trampoline = parsed.has_trampoline();
+        let mut mapper = PeImageMapper {
+            file: &file,
+            page_manager: &self.page_manager,
+        };
+        let mut memory = PeImageMemory;
+        let mapping = parsed
+            .load(&mut mapper, &mut memory)
+            .map_err(WindowsLoadError::Load)?;
+        Ok(LoadedImage {
+            mapping,
+            imports,
+            exports,
+            has_trampoline,
+        })
+    }
+
+    fn ensure_support_dll_loaded(&self, path: &str, region_name: &'static str) {
+        if self.has_loaded_module(path) {
+            return;
+        }
+
+        match self.load_image(self.fs.clone(), path) {
+            Ok(image) => {
+                self.record_named_memory_region(region_name, &image.mapping);
+                self.resolve_image_imports_from_loaded_modules(
+                    image.mapping.base_addr,
+                    &image.imports,
+                    path,
+                );
+                self.record_loaded_module(path, &image);
+            }
+            Err(error) if is_missing_file_error(&error) => {}
+            Err(error) => {
+                litebox_util_log::debug!(
+                    error:%,
+                    path:% = path;
+                    "Support DLL could not be loaded"
+                );
+            }
+        }
+    }
+
+    fn has_loaded_module(&self, path: &str) -> bool {
+        self.loaded_modules
+            .lock()
+            .iter()
+            .any(|module| module_basename(&module.path).eq_ignore_ascii_case(module_basename(path)))
+    }
+
+    fn record_loaded_module(&self, path: &str, image: &LoadedImage) {
+        let mut loaded_modules = self.loaded_modules.lock();
+        if loaded_modules
+            .iter()
+            .any(|module| module_basename(&module.path).eq_ignore_ascii_case(module_basename(path)))
+        {
+            return;
+        }
+        loaded_modules.push(LoadedModule {
+            path: String::from(path),
+            base_addr: image.mapping.base_addr,
+            exports: image.exports.clone(),
+        });
+        litebox_util_log::debug!(
+            path:% = path,
+            base:% = format_args!("{:#x}", image.mapping.base_addr),
+            export_count = image.exports.len();
+            "Recorded loaded Windows module"
+        );
+    }
+
+    fn resolve_application_imports_from_loaded_modules(&self) {
+        self.resolve_image_imports_from_loaded_modules(
+            self.application_base,
+            &self.application_imports,
+            "app",
+        );
+    }
+
+    fn resolve_image_imports_from_loaded_modules(
+        &self,
+        image_base: usize,
+        imports: &[PeImport],
+        image_name: &str,
+    ) {
+        for import in imports {
+            let Some(address) = self.loaded_module_import_address(import) else {
+                continue;
+            };
+            let Some(iat_address) = image_base.checked_add(import.iat_rva as usize) else {
+                continue;
+            };
+            if make_pages_writable(&self.page_manager, iat_address, size_of::<usize>()).is_err()
+                || write_value(iat_address, address).is_err()
+            {
+                litebox_util_log::debug!(
+                    image:% = image_name,
+                    library:% = String::from_utf8_lossy(&import.library),
+                    iat:% = format_args!("{iat_address:#x}");
+                    "Could not write resolved Windows import"
+                );
+                continue;
+            }
+            litebox_util_log::debug!(
+                image:% = image_name,
+                library:% = String::from_utf8_lossy(&import.library),
+                name:% = import_name(import),
+                iat:% = format_args!("{iat_address:#x}"),
+                address:% = format_args!("{address:#x}");
+                "Resolved Windows import from loaded guest module"
+            );
+        }
+    }
+
+    fn loaded_module_import_address(&self, import: &PeImport) -> Option<usize> {
+        let PeImportTarget::Name { name, .. } = &import.target else {
+            return None;
+        };
+        let loaded_modules = self.loaded_modules.lock();
+        loaded_modules
+            .iter()
+            .find_map(|module| {
+                if module_matches_import(module, &import.library) {
+                    export_address(module, name)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                if import_library_is_kernel32(&import.library) {
+                    loaded_modules.iter().find_map(|module| {
+                        if module_basename(&module.path).eq_ignore_ascii_case("kernelbase.dll") {
+                            export_address(module, name)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            })
+    }
+
     fn nt_query_performance_counter(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let counter = PERFORMANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         if ctx.r10 == 0
@@ -3092,6 +3317,12 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         }
     }
 
+    fn record_named_memory_region(&self, name: &'static str, mapping: &MappingInfo) {
+        if let Some(region) = GuestAddressRegion::new(name, mapping.base_addr, mapping.image_size) {
+            self.diagnostic_regions.lock().push(region);
+        }
+    }
+
     fn forget_memory_region(&self, base_address: usize, region_size: usize) -> bool {
         let Some(region_end) = base_address.checked_add(region_size) else {
             return false;
@@ -3197,7 +3428,41 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         );
     }
 
-    fn nt_close(ctx: &mut litebox_common_linux::PtRegs) {
+    fn insert_handle(&self, kind: WindowsHandleKind) -> usize {
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        self.handles.lock().push(WindowsHandle { handle, kind });
+        handle
+    }
+
+    fn remove_handle(&self, handle: usize) {
+        let mut handles = self.handles.lock();
+        if let Some(index) = handles.iter().position(|entry| entry.handle == handle) {
+            handles.remove(index);
+        }
+    }
+
+    fn file_path_for_handle(&self, handle: usize) -> Option<String> {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::File { path }, true) => Some(path.clone()),
+                _ => None,
+            })
+    }
+
+    fn section_path_for_handle(&self, handle: usize) -> Option<String> {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::Section { path }, true) => path.clone(),
+                _ => None,
+            })
+    }
+
+    fn nt_close(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        self.remove_handle(ctx.r10);
         litebox_util_log::debug!(
             handle:% = format_args!("{:#x}", ctx.r10);
             "Handling NtClose as no-op"
@@ -3205,7 +3470,71 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_open_file(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_write_file(ctx: &mut litebox_common_linux::PtRegs) {
+        let io_status = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let buffer = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let length = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+        let byte_offset =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_8_OFFSET));
+        let key = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_9_OFFSET));
+
+        if buffer == 0 && length != 0 {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        let bytes_to_write = u32::try_from(length).unwrap_or(u32::MAX);
+        let mut bytes_written = 0_u32;
+        let host_stdout = host_standard_handle(WINDOWS_STD_OUTPUT_HANDLE) as *mut c_void;
+        // SAFETY: In the Windows userland prototype the guest buffer is mapped in
+        // this process, and this handler is only used to surface console writes.
+        let write_ok = unsafe {
+            host_write_file(
+                host_stdout,
+                buffer as *const c_void,
+                bytes_to_write,
+                &raw mut bytes_written,
+                core::ptr::null_mut(),
+            )
+        };
+        let status = if write_ok == 0 {
+            STATUS_ACCESS_VIOLATION
+        } else {
+            STATUS_SUCCESS
+        };
+
+        if io_status != 0
+            && write_value(
+                io_status,
+                IoStatusBlock {
+                    status,
+                    information: usize::try_from(bytes_written).expect("u32 fits in usize"),
+                },
+            )
+            .is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            file_handle:% = format_args!("{:#x}", ctx.r10),
+            event:% = format_args!("{:#x}", ctx.rdx),
+            apc_routine:% = format_args!("{:#x}", ctx.r8),
+            apc_context:% = format_args!("{:#x}", ctx.r9),
+            io_status:% = format_args!("{io_status:#x}"),
+            buffer:% = format_args!("{buffer:#x}"),
+            length,
+            bytes_written,
+            byte_offset:% = format_args!("{byte_offset:#x}"),
+            key:% = format_args!("{key:#x}"),
+            status:% = format_args!("{status:#x}");
+            "Handling NtWriteFile syscall"
+        );
+        ctx.rax = status;
+    }
+
+    fn nt_open_file(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let share_access =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
         let open_options =
@@ -3213,7 +3542,10 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         let object_name =
             read_object_attributes_name(ctx.r8).unwrap_or_else(|| String::from("<unreadable>"));
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        let guest_path = windows_object_path_to_guest_path(&object_name);
+        let handle = self.insert_handle(WindowsHandleKind::File {
+            path: guest_path.clone(),
+        });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -3240,7 +3572,8 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             io_status:% = format_args!("{:#x}", ctx.r9),
             share_access:% = format_args!("{share_access:#x}"),
             open_options:% = format_args!("{open_options:#x}"),
-            object_name:% = object_name;
+            object_name:% = object_name,
+            guest_path:% = guest_path;
             "Handling NtOpenFile syscall"
         );
         ctx.rax = STATUS_SUCCESS;
@@ -3367,7 +3700,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_create_section(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_create_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let section_page_protection =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
         let allocation_attributes =
@@ -3375,7 +3708,10 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let file_handle =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
 
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        let file_path = self.file_path_for_handle(file_handle);
+        let handle = self.insert_handle(WindowsHandleKind::Section {
+            path: file_path.clone(),
+        });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -3389,13 +3725,14 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             maximum_size:% = format_args!("{:#x}", ctx.r9),
             section_page_protection:% = format_args!("{section_page_protection:#x}"),
             allocation_attributes:% = format_args!("{allocation_attributes:#x}"),
-            file_handle:% = format_args!("{file_handle:#x}");
+            file_handle:% = format_args!("{file_handle:#x}"),
+            file_path:% = file_path.as_deref().unwrap_or("<none>");
             "Handling NtCreateSection syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_map_view_of_section(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_map_view_of_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let commit_size =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
         let section_offset =
@@ -3408,12 +3745,58 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let win32_protect =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_10_OFFSET));
 
-        let ntdll_base = GUEST_NTDLL_BASE.load(Ordering::Relaxed);
-        let ntdll_size = GUEST_NTDLL_SIZE.load(Ordering::Relaxed);
-        if ntdll_base == 0
-            || ctx.r8 == 0
-            || write_value(ctx.r8, ntdll_base).is_err()
-            || view_size != 0 && write_value(view_size, ntdll_size).is_err()
+        let section_path = self.section_path_for_handle(ctx.r10);
+        let (mapped_base, mapped_size, region_name) = match section_path.as_deref() {
+            Some(path) if !is_ntdll_guest_path(path) => {
+                match self.load_image(self.fs.clone(), path) {
+                    Ok(image) => {
+                        let region_name = loaded_image_region_name(path);
+                        self.record_named_memory_region(region_name, &image.mapping);
+                        if is_kernel32_guest_path(path) {
+                            self.ensure_support_dll_loaded(
+                                "/Windows/System32/kernelbase.dll",
+                                "kernelbase",
+                            );
+                        }
+                        self.resolve_image_imports_from_loaded_modules(
+                            image.mapping.base_addr,
+                            &image.imports,
+                            path,
+                        );
+                        self.record_loaded_module(path, &image);
+                        self.resolve_application_imports_from_loaded_modules();
+                        (
+                            image.mapping.base_addr,
+                            image.mapping.image_size,
+                            region_name,
+                        )
+                    }
+                    Err(error) => {
+                        litebox_util_log::error!(
+                            error:%,
+                            section_handle:% = format_args!("{:#x}", ctx.r10),
+                            section_path:% = path;
+                            "NtMapViewOfSection failed to map guest image section"
+                        );
+                        ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let ntdll_base = GUEST_NTDLL_BASE.load(Ordering::Relaxed);
+                let ntdll_size = GUEST_NTDLL_SIZE.load(Ordering::Relaxed);
+                if ntdll_base == 0 {
+                    ctx.rax = STATUS_ACCESS_VIOLATION;
+                    return;
+                }
+                (ntdll_base, ntdll_size, "ntdll")
+            }
+        };
+
+        if ctx.r8 == 0
+            || write_value(ctx.r8, mapped_base).is_err()
+            || view_size != 0 && write_value(view_size, mapped_size).is_err()
         {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -3421,18 +3804,20 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         litebox_util_log::debug!(
             section_handle:% = format_args!("{:#x}", ctx.r10),
+            section_path:% = section_path.as_deref().unwrap_or("<none>"),
             process_handle:% = format_args!("{:#x}", ctx.rdx),
             base_address_ptr:% = format_args!("{:#x}", ctx.r8),
-            mapped_base:% = format_args!("{ntdll_base:#x}"),
+            mapped_base:% = format_args!("{mapped_base:#x}"),
             zero_bits:% = format_args!("{:#x}", ctx.r9),
             commit_size:% = format_args!("{commit_size:#x}"),
             section_offset:% = format_args!("{section_offset:#x}"),
             view_size:% = format_args!("{view_size:#x}"),
-            mapped_size = ntdll_size,
+            mapped_size,
+            region_name,
             inherit_disposition,
             allocation_type:% = format_args!("{allocation_type:#x}"),
             win32_protect:% = format_args!("{win32_protect:#x}");
-            "Handling NtMapViewOfSection with existing guest ntdll mapping"
+            "Handling NtMapViewOfSection syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }

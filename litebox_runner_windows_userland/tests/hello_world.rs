@@ -66,6 +66,13 @@ fn run_minimal_hello_world_pe() {
         "Built rewritten ntdll fixture at `{}`",
         ntdll_path.display()
     );
+    for dll_name in ["kernel32.dll", "kernelbase.dll"] {
+        let dll_path = build_rewritten_system_dll(&test_dir, dll_name);
+        println!(
+            "Built rewritten {dll_name} fixture at `{}`",
+            dll_path.display()
+        );
+    }
     let tar_path = test_dir.join("hello_world.tar");
     create_tar_with_hello_exe(&test_dir, &tar_path);
 
@@ -106,11 +113,29 @@ fn run_with_timeout(
     mut command: std::process::Command,
     timeout: std::time::Duration,
 ) -> CommandOutput {
+    use std::io::Read as _;
+
     let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("failed to run litebox_runner_windows_userland");
+    let mut stdout = child.stdout.take().expect("child stdout was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout
+            .read_to_end(&mut output)
+            .expect("failed to read child stdout");
+        output
+    });
+    let mut stderr = child.stderr.take().expect("child stderr was piped");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr
+            .read_to_end(&mut output)
+            .expect("failed to read child stderr");
+        output
+    });
     let deadline = std::time::Instant::now() + timeout;
     let mut timed_out = false;
     while child
@@ -126,9 +151,12 @@ fn run_with_timeout(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let output = child
-        .wait_with_output()
-        .expect("failed to collect runner child output");
+    let status = child.wait().expect("failed to collect runner child status");
+    let output = std::process::Output {
+        status,
+        stdout: stdout_reader.join().expect("stdout reader panicked"),
+        stderr: stderr_reader.join().expect("stderr reader panicked"),
+    };
     CommandOutput { output, timed_out }
 }
 
@@ -164,27 +192,34 @@ fn build_minimal_hello_world_pe(test_dir: &std::path::Path) -> std::path::PathBu
 }
 
 fn build_rewritten_ntdll(test_dir: &std::path::Path) -> std::path::PathBuf {
-    let ntdll_path = test_dir.join("ntdll.dll");
-    let host_ntdll = std::fs::read(host_ntdll_path()).expect("failed to read host ntdll.dll");
-    let rewritten = match litebox_syscall_rewriter::rewrite_binary(&host_ntdll, None) {
-        Ok(rewritten) => rewritten,
-        Err(litebox_syscall_rewriter::Error::UnpatchableSyscalls(_)) => panic!(
-            "failed to rewrite host ntdll.dll; required support: patch dense ntdll syscall stubs or provide a pre-rewritten guest ntdll.dll"
-        ),
-        Err(error) => panic!("failed to rewrite host ntdll.dll: {error}"),
-    };
-    std::fs::write(&ntdll_path, rewritten).unwrap();
-    ntdll_path
+    build_rewritten_system_dll(test_dir, "ntdll.dll")
 }
 
-fn host_ntdll_path() -> std::path::PathBuf {
+fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std::path::PathBuf {
+    let system32_dir = test_dir.join("Windows").join("System32");
+    std::fs::create_dir_all(&system32_dir).unwrap();
+    let dll_path = system32_dir.join(dll_name);
+    let host_dll = std::fs::read(host_system32_dll_path(dll_name))
+        .unwrap_or_else(|error| panic!("failed to read host {dll_name}: {error}"));
+    let rewritten = match litebox_syscall_rewriter::rewrite_binary(&host_dll, None) {
+        Ok(rewritten) => rewritten,
+        Err(litebox_syscall_rewriter::Error::UnpatchableSyscalls(_)) => panic!(
+            "failed to rewrite host {dll_name}; required support: patch dense ntdll syscall stubs or provide a pre-rewritten guest DLL"
+        ),
+        Err(error) => panic!("failed to rewrite host {dll_name}: {error}"),
+    };
+    std::fs::write(&dll_path, rewritten).unwrap();
+    dll_path
+}
+
+fn host_system32_dll_path(dll_name: &str) -> std::path::PathBuf {
     std::env::var_os("SystemRoot")
         .map_or_else(
             || std::path::PathBuf::from(r"C:\Windows"),
             std::path::PathBuf::from,
         )
         .join("System32")
-        .join("ntdll.dll")
+        .join(dll_name)
 }
 
 fn create_tar_with_hello_exe(test_dir: &std::path::Path, tar_path: &std::path::Path) {
@@ -195,7 +230,9 @@ fn create_tar_with_hello_exe(test_dir: &std::path::Path, tar_path: &std::path::P
             "-C",
             test_dir.to_str().unwrap(),
             "hello.exe",
-            "ntdll.dll",
+            "Windows/System32/ntdll.dll",
+            "Windows/System32/kernel32.dll",
+            "Windows/System32/kernelbase.dll",
         ])
         .output()
         .expect("failed to run tar.exe for the minimal Windows PE fixture");
