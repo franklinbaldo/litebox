@@ -161,6 +161,27 @@ extern "system" fn litebox_ntdll_rtl_destroy_heap(_heap: *mut c_void) -> *mut c_
     core::ptr::null_mut()
 }
 
+extern "system" fn litebox_ntdll_api_set_resolve(
+    name: *const u16,
+    length: u16,
+    _flags: u8,
+    result: *mut c_void,
+) -> u8 {
+    const API_SET_RESOLUTION_RESULT_SIZE: usize = 0x28;
+
+    if !result.is_null() {
+        let ptr =
+            <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(result as usize);
+        let _ = ptr.copy_from_slice(0, &[0; API_SET_RESOLUTION_RESULT_SIZE]);
+    }
+    litebox_util_log::debug!(
+        name:% = format_args!("{name:p}"),
+        length;
+        "Handled ntdll API-set helper as unresolved"
+    );
+    0
+}
+
 fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
     const HEADER_SIZE: usize = size_of::<usize>();
     const HEAP_ALIGNMENT: usize = 16;
@@ -258,6 +279,9 @@ const NTDLL_PATHS: &[&str] = &[
     "/ntdll.dll",
 ];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
+// Current forced-loader diagnostics use the host ntdll fixture. This helper is
+// patched so malformed API-set probes fail visibly instead of faulting first.
+const NTDLL_API_SET_RESOLVE_HELPER_RVA: usize = 0x135fa8;
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
@@ -1558,6 +1582,21 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 "Patched guest ntdll export to built-in thunk"
             );
         }
+
+        let api_set_helper = image
+            .mapping
+            .base_addr
+            .checked_add(NTDLL_API_SET_RESOLVE_HELPER_RVA)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_absolute_jump(
+            &self.page_manager,
+            api_set_helper,
+            litebox_ntdll_api_set_resolve as *const () as usize,
+        )?;
+        litebox_util_log::debug!(
+            address:% = format_args!("{api_set_helper:#x}");
+            "Patched guest ntdll API-set helper to built-in guard"
+        );
 
         Ok(())
     }
