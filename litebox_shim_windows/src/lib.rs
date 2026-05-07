@@ -482,6 +482,7 @@ const PROCESS_SCHEDULER_SHARED_DATA_CLASS: usize = 112;
 const THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS: usize = 57;
 const WINDOWS_DEFAULT_LOCALE_ID: u32 = 0x0409;
 const WINDOWS_DEFAULT_UI_LANGUAGE_ID: u16 = 0x0409;
+const TIMER_BASIC_INFORMATION_CLASS: usize = 0;
 const APPHELP_CACHE_SERVICE_LOOKUP: usize = 0;
 const APPHELP_CACHE_SERVICE_REMOVE: usize = 1;
 const APPHELP_CACHE_SERVICE_UPDATE: usize = 2;
@@ -674,6 +675,14 @@ struct FileFsAttributeInformation {
     maximum_component_name_length: i32,
     file_system_name_length: u32,
     file_system_name: [u16; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct TimerBasicInformation {
+    remaining_time: i64,
+    timer_state: u8,
+    _padding0: [u8; 7],
 }
 
 #[repr(C)]
@@ -2227,7 +2236,9 @@ enum WindowsHandleKind {
     },
     IoCompletion,
     WorkerFactory,
-    Timer,
+    Timer {
+        set: bool,
+    },
     KeyedEvent,
     WaitCompletionPacket,
 }
@@ -2776,6 +2787,42 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtCreateTimer2) => {
                 self.nt_create_timer2(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateTimer) => {
+                self.nt_create_timer(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenTimer) => {
+                self.nt_open_timer(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetTimer) => {
+                self.nt_set_timer(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetTimer2) => {
+                self.nt_set_timer2(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCancelTimer) => {
+                self.nt_cancel_timer(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCancelTimer2) => {
+                self.nt_cancel_timer2(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryTimer) => {
+                self.nt_query_timer(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryTimerResolution) => {
+                Self::nt_query_timer_resolution(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetTimerResolution) => {
+                Self::nt_set_timer_resolution(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateWaitCompletionPacket) => {
@@ -4279,7 +4326,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     }
                     WindowsHandleKind::IoCompletion => String::from("io-completion"),
                     WindowsHandleKind::WorkerFactory => String::from("worker-factory"),
-                    WindowsHandleKind::Timer => String::from("timer"),
+                    WindowsHandleKind::Timer { set } => {
+                        format!("timer:{}", if *set { "set" } else { "unset" })
+                    }
                     WindowsHandleKind::KeyedEvent => String::from("keyed-event"),
                     WindowsHandleKind::WaitCompletionPacket => {
                         String::from("wait-completion-packet")
@@ -4366,6 +4415,29 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     fn handle_is_keyed_event(&self, handle: usize) -> bool {
         self.handles.lock().iter().any(|entry| {
             entry.handle == handle && matches!(entry.kind, WindowsHandleKind::KeyedEvent)
+        })
+    }
+
+    fn timer_set(&self, handle: usize) -> Option<bool> {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::Timer { set }, true) => Some(*set),
+                _ => None,
+            })
+    }
+
+    fn set_timer_state(&self, handle: usize, set: bool) -> Option<bool> {
+        self.handles.lock().iter_mut().find_map(|entry| {
+            match (&mut entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::Timer { set: current }, true) => {
+                    let previous = *current;
+                    *current = set;
+                    Some(previous)
+                }
+                _ => None,
+            }
         })
     }
 
@@ -5487,7 +5559,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     fn nt_create_timer2(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let desired_access =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
-        let handle = self.insert_handle(WindowsHandleKind::Timer);
+        let handle = self.insert_handle(WindowsHandleKind::Timer { set: false });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -5501,6 +5573,190 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             attributes:% = format_args!("{:#x}", ctx.r9),
             desired_access:% = format_args!("{desired_access:#x}");
             "Handling NtCreateTimer2 syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_create_timer(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let handle = self.insert_handle(WindowsHandleKind::Timer { set: false });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            timer_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            timer_type:% = format_args!("{:#x}", ctx.r9);
+            "Handling NtCreateTimer syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_timer(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let handle = self.insert_handle(WindowsHandleKind::Timer { set: false });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            timer_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenTimer syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_timer(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let period = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let previous_state =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+        let Some(was_set) = self.set_timer_state(ctx.r10, true) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+        if previous_state != 0 && write_value(previous_state, u8::from(was_set)).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            timer_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            due_time:% = format_args!("{:#x}", ctx.rdx),
+            timer_apc_routine:% = format_args!("{:#x}", ctx.r8),
+            timer_context:% = format_args!("{:#x}", ctx.r9),
+            period,
+            previous_state:% = format_args!("{previous_state:#x}"),
+            was_set;
+            "Handling NtSetTimer syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_timer2(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Some(was_set) = self.set_timer_state(ctx.r10, true) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+
+        litebox_util_log::debug!(
+            timer_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            due_time:% = format_args!("{:#x}", ctx.rdx),
+            period:% = format_args!("{:#x}", ctx.r8),
+            parameters:% = format_args!("{:#x}", ctx.r9),
+            was_set;
+            "Handling NtSetTimer2 syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_cancel_timer(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Some(was_set) = self.set_timer_state(ctx.r10, false) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+        if ctx.rdx != 0 && write_value(ctx.rdx, u8::from(was_set)).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            timer_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            current_state:% = format_args!("{:#x}", ctx.rdx),
+            was_set;
+            "Handling NtCancelTimer syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_cancel_timer2(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Some(was_set) = self.set_timer_state(ctx.r10, false) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+
+        litebox_util_log::debug!(
+            timer_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            parameters:% = format_args!("{:#x}", ctx.rdx),
+            was_set;
+            "Handling NtCancelTimer2 syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_query_timer(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let return_length =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let Some(timer_set) = self.timer_set(ctx.r10) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+        ctx.rax = match ctx.rdx {
+            TIMER_BASIC_INFORMATION_CLASS => Self::write_u32_length_information(
+                ctx.r8,
+                ctx.r9,
+                return_length,
+                TimerBasicInformation {
+                    timer_state: u8::from(timer_set),
+                    ..TimerBasicInformation::default()
+                },
+            ),
+            _ => STATUS_INVALID_INFO_CLASS,
+        };
+
+        litebox_util_log::debug!(
+            timer_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            timer_information_class = ctx.rdx,
+            timer_information:% = format_args!("{:#x}", ctx.r8),
+            timer_information_length = ctx.r9,
+            return_length:% = format_args!("{return_length:#x}"),
+            timer_set,
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtQueryTimer syscall"
+        );
+    }
+
+    fn nt_query_timer_resolution(ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.r10 != 0 && write_value(ctx.r10, 10_000u32).is_err()
+            || ctx.rdx != 0 && write_value(ctx.rdx, 156_250u32).is_err()
+            || ctx.r8 != 0 && write_value(ctx.r8, 156_250u32).is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            minimum_resolution:% = format_args!("{:#x}", ctx.r10),
+            maximum_resolution:% = format_args!("{:#x}", ctx.rdx),
+            current_resolution:% = format_args!("{:#x}", ctx.r8);
+            "Handling NtQueryTimerResolution syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_timer_resolution(ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.r8 != 0 && write_value(ctx.r8, 156_250u32).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            desired_resolution = ctx.r10,
+            set_resolution:% = format_args!("{:#x}", ctx.rdx),
+            actual_resolution:% = format_args!("{:#x}", ctx.r8);
+            "Handling NtSetTimerResolution syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
