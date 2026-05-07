@@ -2183,7 +2183,7 @@ enum WindowsHandleKind {
     Directory { path: String },
     SymbolicLink { path: String },
     Key { path: String },
-    Event,
+    Event { signaled: bool },
     IoCompletion,
     WorkerFactory,
     Timer,
@@ -2751,6 +2751,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtSetEvent) => {
                 self.nt_set_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtResetEvent) => {
+                self.nt_reset_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtClearEvent) => {
+                self.nt_clear_event(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQuerySystemInformation) => {
@@ -4147,7 +4155,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     WindowsHandleKind::Directory { path } => format!("directory:{path}"),
                     WindowsHandleKind::SymbolicLink { path } => format!("symlink:{path}"),
                     WindowsHandleKind::Key { path } => format!("key:{path}"),
-                    WindowsHandleKind::Event => String::from("event"),
+                    WindowsHandleKind::Event { signaled } => {
+                        format!("event:{}", if *signaled { "signaled" } else { "waiting" })
+                    }
                     WindowsHandleKind::IoCompletion => String::from("io-completion"),
                     WindowsHandleKind::WorkerFactory => String::from("worker-factory"),
                     WindowsHandleKind::Timer => String::from("timer"),
@@ -4160,10 +4170,32 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn handle_is_event(&self, handle: usize) -> bool {
+        self.handles.lock().iter().any(|entry| {
+            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::Event { .. })
+        })
+    }
+
+    fn event_signaled(&self, handle: usize) -> Option<bool> {
         self.handles
             .lock()
             .iter()
-            .any(|entry| entry.handle == handle && matches!(entry.kind, WindowsHandleKind::Event))
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::Event { signaled }, true) => Some(*signaled),
+                _ => None,
+            })
+    }
+
+    fn set_event_signaled(&self, handle: usize, signaled: bool) -> Option<bool> {
+        self.handles.lock().iter_mut().find_map(|entry| {
+            match (&mut entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::Event { signaled: current }, true) => {
+                    let previous = *current;
+                    *current = signaled;
+                    Some(previous)
+                }
+                _ => None,
+            }
+        })
     }
 
     fn handle_is_io_completion(&self, handle: usize) -> bool {
@@ -4954,7 +4986,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             return;
         };
 
-        let handle = self.insert_handle(WindowsHandleKind::Event);
+        let handle = self.insert_handle(WindowsHandleKind::Event {
+            signaled: initial_state != 0,
+        });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -5283,7 +5317,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn nt_set_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        if !self.handle_is_event(ctx.r10) {
+        let Some(previous_state) = self.event_signaled(ctx.r10) else {
             litebox_util_log::debug!(
                 event_handle:% = format_args!("{:#x}", ctx.r10),
                 handle_description:% = self.describe_handle(ctx.r10);
@@ -5291,18 +5325,69 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             );
             ctx.rax = STATUS_INVALID_HANDLE;
             return;
-        }
+        };
 
-        if ctx.rdx != 0 && write_value(ctx.rdx, 0i32).is_err() {
+        if ctx.rdx != 0 && write_value(ctx.rdx, i32::from(previous_state)).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
         }
 
+        let _ = self.set_event_signaled(ctx.r10, true);
+
         litebox_util_log::debug!(
             event_handle:% = format_args!("{:#x}", ctx.r10),
             handle_description:% = self.describe_handle(ctx.r10),
-            previous_state_ptr:% = format_args!("{:#x}", ctx.rdx);
+            previous_state_ptr:% = format_args!("{:#x}", ctx.rdx),
+            previous_state;
             "Handling NtSetEvent syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_reset_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Some(previous_state) = self.event_signaled(ctx.r10) else {
+            litebox_util_log::debug!(
+                event_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10);
+                "NtResetEvent received unknown event handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+
+        if ctx.rdx != 0 && write_value(ctx.rdx, i32::from(previous_state)).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        let _ = self.set_event_signaled(ctx.r10, false);
+
+        litebox_util_log::debug!(
+            event_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            previous_state_ptr:% = format_args!("{:#x}", ctx.rdx),
+            previous_state;
+            "Handling NtResetEvent syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_clear_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Some(previous_state) = self.set_event_signaled(ctx.r10, false) else {
+            litebox_util_log::debug!(
+                event_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10);
+                "NtClearEvent received unknown event handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+
+        litebox_util_log::debug!(
+            event_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            previous_state;
+            "Handling NtClearEvent syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
