@@ -2106,10 +2106,6 @@ fn is_ntdll_guest_path(path: &str) -> bool {
         .eq_ignore_ascii_case("ntdll.dll")
 }
 
-fn is_kernel32_guest_path(path: &str) -> bool {
-    module_basename(path).eq_ignore_ascii_case("kernel32.dll")
-}
-
 fn module_basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
@@ -2264,6 +2260,30 @@ fn normalize_api_set_name(name: &str) -> String {
 fn read_api_set_string(api_set_map: usize, offset: u32, byte_length: u32) -> Option<String> {
     let address = api_set_map.checked_add(usize::try_from(offset).ok()?)?;
     read_utf16_string(address, u16::try_from(byte_length).ok()?).ok()
+}
+
+fn import_library_guest_path(library: &[u8]) -> Option<String> {
+    let library_name = module_basename(import_library_name(library));
+    if library_name.is_empty() {
+        return None;
+    }
+
+    let dll_name = if import_library_is_api_set(library) {
+        module_basename(
+            &resolve_api_set_host_dll(GUEST_API_SET_MAP.load(Ordering::Relaxed), library_name)
+                .unwrap_or_else(|| String::from("kernelbase.dll")),
+        )
+        .to_ascii_lowercase()
+    } else if library_name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("dll"))
+    {
+        library_name.to_ascii_lowercase()
+    } else {
+        format!("{}.dll", library_name.to_ascii_lowercase())
+    };
+
+    Some(format!("/Windows/System32/{dll_name}"))
 }
 
 fn host_standard_handle(kind: u32) -> usize {
@@ -2722,12 +2742,14 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         match self.load_image(self.fs.clone(), path) {
             Ok(image) => {
                 self.record_named_memory_region(region_name, &image.mapping);
+                self.record_loaded_module(path, &image);
+                self.ensure_import_modules_loaded(&image.imports);
                 self.resolve_image_imports_from_loaded_modules(
                     image.mapping.base_addr,
                     &image.imports,
                     path,
                 );
-                self.record_loaded_module(path, &image);
+                self.resolve_application_imports_from_loaded_modules();
             }
             Err(error) if is_missing_file_error(&error) => {}
             Err(error) => {
@@ -2737,6 +2759,26 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     "Support DLL could not be loaded"
                 );
             }
+        }
+    }
+
+    fn ensure_import_modules_loaded(&self, imports: &[PeImport]) {
+        let mut paths = Vec::new();
+        for import in imports {
+            let Some(path) = import_library_guest_path(&import.library) else {
+                continue;
+            };
+            if paths.iter().any(|existing: &String| {
+                module_name_matches(module_basename(existing), module_basename(&path))
+            }) {
+                continue;
+            }
+            paths.push(path);
+        }
+
+        for path in paths {
+            let region_name = loaded_image_region_name(&path);
+            self.ensure_support_dll_loaded(&path, region_name);
         }
     }
 
@@ -3908,18 +3950,13 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     Ok(image) => {
                         let region_name = loaded_image_region_name(path);
                         self.record_named_memory_region(region_name, &image.mapping);
-                        if is_kernel32_guest_path(path) {
-                            self.ensure_support_dll_loaded(
-                                "/Windows/System32/kernelbase.dll",
-                                "kernelbase",
-                            );
-                        }
+                        self.record_loaded_module(path, &image);
+                        self.ensure_import_modules_loaded(&image.imports);
                         self.resolve_image_imports_from_loaded_modules(
                             image.mapping.base_addr,
                             &image.imports,
                             path,
                         );
-                        self.record_loaded_module(path, &image);
                         self.resolve_application_imports_from_loaded_modules();
                         (
                             image.mapping.base_addr,
