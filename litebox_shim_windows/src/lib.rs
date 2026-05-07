@@ -90,6 +90,7 @@ const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const INITIAL_PEB_SIZE: usize = PAGE_SIZE;
 const INITIAL_TEB_SIZE: usize = PAGE_SIZE * 2;
 const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
+const INITIAL_LDR_ENTRIES_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
@@ -190,6 +191,10 @@ const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
 const PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET: usize = 0x10;
 const PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET: usize = 0x20;
 const PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET: usize = 0x30;
+const LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET: usize = 0x00;
+const LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET: usize = 0x10;
+const LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET: usize = 0x20;
+const LDR_DATA_TABLE_ENTRY_SIZE: usize = 0x80;
 const TEB_AFTER_WIN32_THREAD_INFO_OFFSET: usize = 0x80;
 const TEB_TLS_SLOTS_OFFSET: usize = 0x1480;
 const TEB_TLS_SLOT_COUNT: usize = 64;
@@ -354,20 +359,127 @@ struct PebLdrData {
 }
 
 impl PebLdrData {
-    fn new(address: usize) -> Self {
+    fn new(address: usize, first_entry: Option<usize>, last_entry: Option<usize>) -> Self {
+        let in_load_order_module_list = module_list_head(
+            address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
+            first_entry,
+            last_entry,
+            LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET,
+        );
+        let in_memory_order_module_list = module_list_head(
+            address + PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET,
+            first_entry,
+            last_entry,
+            LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET,
+        );
+        let in_initialization_order_module_list = module_list_head(
+            address + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
+            first_entry,
+            last_entry,
+            LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET,
+        );
         Self {
             length: u32::try_from(size_of::<Self>()).expect("PEB_LDR_DATA prefix fits in u32"),
-            in_load_order_module_list: ListEntry::new_self(
-                address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
-            ),
-            in_memory_order_module_list: ListEntry::new_self(
-                address + PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET,
-            ),
-            in_initialization_order_module_list: ListEntry::new_self(
-                address + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
-            ),
+            in_load_order_module_list,
+            in_memory_order_module_list,
+            in_initialization_order_module_list,
             ..Default::default()
         }
+    }
+}
+
+fn module_list_head(
+    head: usize,
+    first_entry: Option<usize>,
+    last_entry: Option<usize>,
+    link_offset: usize,
+) -> ListEntry {
+    match (first_entry, last_entry) {
+        (Some(first_entry), Some(last_entry)) => ListEntry {
+            flink: first_entry + link_offset,
+            blink: last_entry + link_offset,
+        },
+        _ => ListEntry::new_self(head),
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct LdrDataTableEntry {
+    in_load_order_links: ListEntry,
+    in_memory_order_links: ListEntry,
+    in_initialization_order_links: ListEntry,
+    dll_base: usize,
+    entry_point: usize,
+    size_of_image: u32,
+    _padding0: u32,
+    full_dll_name: UnicodeString,
+    base_dll_name: UnicodeString,
+    flags: u32,
+    load_count: u16,
+    tls_index: u16,
+}
+
+const _: () = assert!(offset_of!(LdrDataTableEntry, dll_base) == 0x30);
+const _: () = assert!(offset_of!(LdrDataTableEntry, full_dll_name) == 0x48);
+const _: () = assert!(offset_of!(LdrDataTableEntry, base_dll_name) == 0x58);
+
+impl LdrDataTableEntry {
+    fn new(
+        previous_entry: Option<usize>,
+        next_entry: Option<usize>,
+        list_heads: LdrListHeads,
+        mapping: &MappingInfo,
+        full_dll_name: UnicodeString,
+        base_dll_name: UnicodeString,
+    ) -> Self {
+        Self {
+            in_load_order_links: module_list_entry(
+                previous_entry,
+                next_entry,
+                list_heads.load,
+                LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET,
+            ),
+            in_memory_order_links: module_list_entry(
+                previous_entry,
+                next_entry,
+                list_heads.memory,
+                LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET,
+            ),
+            in_initialization_order_links: module_list_entry(
+                previous_entry,
+                next_entry,
+                list_heads.initialization,
+                LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET,
+            ),
+            dll_base: mapping.base_addr,
+            entry_point: mapping.entry_point,
+            size_of_image: u32::try_from(mapping.image_size).expect("image size fits u32"),
+            full_dll_name,
+            base_dll_name,
+            flags: 0x22,
+            load_count: 0xffff,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LdrListHeads {
+    load: usize,
+    memory: usize,
+    initialization: usize,
+}
+
+fn module_list_entry(
+    previous_entry: Option<usize>,
+    next_entry: Option<usize>,
+    head: usize,
+    link_offset: usize,
+) -> ListEntry {
+    ListEntry {
+        flink: next_entry.map_or(head, |entry| entry + link_offset),
+        blink: previous_entry.map_or(head, |entry| entry + link_offset),
     }
 }
 
@@ -1033,7 +1145,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .checked_add(INITIAL_STACK_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
         let process_environment = self.create_process_environment(
-            image.mapping.base_addr,
+            &image.mapping,
+            ntdll.as_ref().map(|image| &image.mapping),
             stack_base.as_usize(),
             stack_top,
             path,
@@ -1186,7 +1299,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 
     fn create_process_environment(
         &self,
-        image_base: usize,
+        image: &MappingInfo,
+        ntdll: Option<&MappingInfo>,
         stack_base: usize,
         stack_top: usize,
         image_path: &str,
@@ -1194,6 +1308,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let peb_address = self.create_zeroed_pages(INITIAL_PEB_SIZE)?;
         let teb_address = self.create_zeroed_pages(INITIAL_TEB_SIZE)?;
         let ldr_data_address = self.create_zeroed_pages(INITIAL_LDR_DATA_SIZE)?;
+        let ldr_entries_address = self.create_zeroed_pages(INITIAL_LDR_ENTRIES_SIZE)?;
         let process_parameters_address =
             self.create_zeroed_pages(INITIAL_PROCESS_PARAMETERS_SIZE)?;
         let process_heap_address = self.create_zeroed_pages(INITIAL_PROCESS_HEAP_SIZE)?;
@@ -1229,13 +1344,24 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         process_parameters.command_line =
             write_utf16_string(&mut process_parameters_string_cursor, &process_image_path)?;
 
-        write_value(ldr_data_address, PebLdrData::new(ldr_data_address))?;
+        let ldr_entries = Self::write_initial_ldr_entries(
+            ldr_entries_address,
+            ldr_data_address,
+            image,
+            ntdll,
+            &process_image_path,
+            &mut process_parameters_string_cursor,
+        )?;
+        write_value(
+            ldr_data_address,
+            PebLdrData::new(ldr_data_address, ldr_entries.first, ldr_entries.last),
+        )?;
         write_initial_api_set_namespace(api_set_namespace_address)?;
         write_value(process_parameters_address, process_parameters)?;
         write_value(
             peb_address,
             ProcessEnvironmentBlock::new(
-                image_base,
+                image.base_addr,
                 ldr_data_address,
                 process_parameters_address,
                 0,
@@ -1269,6 +1395,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             peb:% = format_args!("{peb_address:#x}"),
             teb:% = format_args!("{teb_address:#x}"),
             ldr:% = format_args!("{ldr_data_address:#x}"),
+            ldr_entries:% = format_args!("{ldr_entries_address:#x}"),
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
             process_heap:% = format_args!("{process_heap_address:#x}"),
             api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
@@ -1276,19 +1403,70 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             tls_slots:% = format_args!("{tls_slots_address:#x}"),
             scheduler_shared_data_slot:% = format_args!("{scheduler_shared_data_slot_address:#x}"),
             processor_feature_bitmap:% = format_args!("{processor_feature_bitmap_address:#x}"),
-            image_base:% = format_args!("{image_base:#x}");
+            image_base:% = format_args!("{:#x}", image.base_addr);
             "Created initial Windows PEB/TEB"
         );
 
         Ok(WindowsProcessEnvironment {
             peb: peb_address,
             ldr_data: ldr_data_address,
+            ldr_entries: ldr_entries_address,
             process_parameters: process_parameters_address,
             process_heap: process_heap_address,
             fast_peb_lock: fast_peb_lock_address,
             api_set_namespace: api_set_namespace_address,
             initial_thread_context: initial_thread_context_address,
             teb: teb_address,
+        })
+    }
+
+    fn write_initial_ldr_entries(
+        entries_address: usize,
+        ldr_data_address: usize,
+        image: &MappingInfo,
+        ntdll: Option<&MappingInfo>,
+        process_image_path: &str,
+        string_cursor: &mut usize,
+    ) -> Result<InitialLdrEntries, PeImageAccessError> {
+        let app_entry_address = entries_address;
+        let ntdll_entry_address = entries_address
+            .checked_add(LDR_DATA_TABLE_ENTRY_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let last_entry = if ntdll.is_some() {
+            ntdll_entry_address
+        } else {
+            app_entry_address
+        };
+        let list_heads = LdrListHeads {
+            load: ldr_data_address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
+            memory: ldr_data_address + PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET,
+            initialization: ldr_data_address + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
+        };
+        let app_entry = LdrDataTableEntry::new(
+            None,
+            ntdll.map(|_| ntdll_entry_address),
+            list_heads,
+            image,
+            write_utf16_string(string_cursor, process_image_path)?,
+            write_utf16_string(string_cursor, initial_image_base_name(process_image_path))?,
+        );
+        write_value(app_entry_address, app_entry)?;
+
+        if let Some(ntdll) = ntdll {
+            let ntdll_entry = LdrDataTableEntry::new(
+                Some(app_entry_address),
+                None,
+                list_heads,
+                ntdll,
+                write_utf16_string(string_cursor, "C:\\Windows\\System32\\ntdll.dll")?,
+                write_utf16_string(string_cursor, "ntdll.dll")?,
+            );
+            write_value(ntdll_entry_address, ntdll_entry)?;
+        }
+
+        Ok(InitialLdrEntries {
+            first: Some(app_entry_address),
+            last: Some(last_entry),
         })
     }
 
@@ -1402,6 +1580,12 @@ fn guest_address_regions(
     );
     push_region(
         &mut regions,
+        "ldr-entries",
+        process_environment.ldr_entries,
+        INITIAL_LDR_ENTRIES_SIZE,
+    );
+    push_region(
+        &mut regions,
         "process-parameters",
         process_environment.process_parameters,
         INITIAL_PROCESS_PARAMETERS_SIZE,
@@ -1471,7 +1655,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         } = self.start_mode
         {
             ctx.rcx = initial_context;
-            ctx.rdx = image_base;
+            ctx.rdx = 0;
             ctx.r8 = 0;
             ctx.r9 = 0;
             litebox_util_log::debug!(
@@ -3556,12 +3740,18 @@ impl LoadedImage {
 struct WindowsProcessEnvironment {
     peb: usize,
     ldr_data: usize,
+    ldr_entries: usize,
     process_parameters: usize,
     process_heap: usize,
     fast_peb_lock: usize,
     api_set_namespace: usize,
     initial_thread_context: usize,
     teb: usize,
+}
+
+struct InitialLdrEntries {
+    first: Option<usize>,
+    last: Option<usize>,
 }
 
 impl WindowsShimProcess {
@@ -3725,12 +3915,18 @@ where
 fn write_initial_api_set_namespace(address: usize) -> Result<(), PeImageAccessError> {
     if let Some(host_namespace) = host_api_set_namespace() {
         if host_namespace.len() <= INITIAL_API_SET_NAMESPACE_SIZE {
+            let namespace = read_host_api_set_namespace_header(host_namespace)?;
             let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
             ptr.copy_from_slice(0, host_namespace)
                 .ok_or(PeImageAccessError::MemoryAccess)?;
             litebox_util_log::debug!(
                 address:% = format_args!("{address:#x}"),
-                size = host_namespace.len();
+                size = host_namespace.len(),
+                version = namespace.version,
+                count = namespace.count,
+                entry_offset:% = format_args!("{:#x}", namespace.entry_offset),
+                hash_offset:% = format_args!("{:#x}", namespace.hash_offset),
+                hash_factor = namespace.hash_factor;
                 "Copied host API-set namespace into guest PEB"
             );
             return Ok(());
@@ -3745,6 +3941,15 @@ fn write_initial_api_set_namespace(address: usize) -> Result<(), PeImageAccessEr
     }
 
     write_value(address, ApiSetNamespace::empty())
+}
+
+fn read_host_api_set_namespace_header(
+    host_namespace: &[u8],
+) -> Result<ApiSetNamespace, PeImageAccessError> {
+    let header = host_namespace
+        .get(..size_of::<ApiSetNamespace>())
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+    ApiSetNamespace::read_from_bytes(header).map_err(|_| PeImageAccessError::MemoryAccess)
 }
 
 fn host_api_set_namespace() -> Option<&'static [u8]> {
@@ -3788,6 +3993,10 @@ fn initial_dos_image_path(path: &str) -> String {
     let mut dos_path = String::from("C:\\");
     dos_path.push_str(file_name);
     dos_path
+}
+
+fn initial_image_base_name(path: &str) -> &str {
+    path.rsplit('\\').next().unwrap_or(path)
 }
 
 fn write_utf16_string(cursor: &mut usize, text: &str) -> Result<UnicodeString, PeImageAccessError> {

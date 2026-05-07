@@ -161,6 +161,7 @@ unsafe extern "system" fn vectored_exception_handler(
         && faulting_address != 0
         && fs_base == 0
         && WindowsUserland::get_thread_fs_base() != 0
+        && instruction_has_teb_segment_prefix(context.Rip.truncate())
     {
         set_context_to_interrupt_callback(tls, context);
     } else {
@@ -178,6 +179,32 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn instruction_has_teb_segment_prefix(rip: usize) -> bool {
+    const MAX_PREFIX_BYTES: usize = 8;
+    for offset in 0..MAX_PREFIX_BYTES {
+        let Some(address) = rip.checked_add(offset) else {
+            return false;
+        };
+        // SAFETY: `rip` points at the currently executing guest instruction in an
+        // executable image mapping, so reading its prefix bytes is valid here.
+        let byte = unsafe { (address as *const u8).read() };
+        if byte == 0x64 || byte == 0x65 {
+            return true;
+        }
+        if !is_x86_prefix_byte(byte) {
+            return false;
+        }
+    }
+    false
+}
+
+fn is_x86_prefix_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x26 | 0x2e | 0x36 | 0x3e | 0x40..=0x4f | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+    )
 }
 
 fn save_guest_context(
