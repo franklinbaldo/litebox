@@ -2344,6 +2344,13 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                     response:% = format_args!("{response:#x}"),
                     rip:% = format_args!("{:#x}", ctx.rip),
                     rip_region:% = self.describe_guest_address(ctx.rip),
+                    rax:% = format_args!("{:#x}", ctx.rax),
+                    rbx:% = format_args!("{:#x}", ctx.rbx),
+                    rcx:% = format_args!("{:#x}", ctx.rcx),
+                    rdx:% = format_args!("{:#x}", ctx.rdx),
+                    r8:% = format_args!("{:#x}", ctx.r8),
+                    r9:% = format_args!("{:#x}", ctx.r9),
+                    stack:% = format_stack_words(ctx.rsp, 32),
                     guest_return_address:% = format_args!("{guest_return_address:#x}"),
                     guest_return_region:% = self.describe_guest_address(guest_return_address);
                     "Guest called NtRaiseHardError"
