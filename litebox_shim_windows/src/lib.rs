@@ -423,6 +423,8 @@ const WINDOWS_STD_INPUT_HANDLE: u32 = u32::MAX - 9;
 const WINDOWS_STD_OUTPUT_HANDLE: u32 = u32::MAX - 10;
 const WINDOWS_STD_ERROR_HANDLE: u32 = u32::MAX - 11;
 const STATUS_SUCCESS: usize = 0;
+const STATUS_TIMEOUT: usize = 0x0000_0102;
+const STATUS_NO_YIELD_PERFORMED: usize = 0x4000_0024;
 const STATUS_INVALID_INFO_CLASS: usize = 0xc000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
 const STATUS_ACCESS_VIOLATION: usize = 0xc000_0005;
@@ -516,6 +518,7 @@ const WINDOWS_MEM_RESERVE_FLAG: usize = 0x2000;
 const WINDOWS_MEM_DECOMMIT_FLAG: usize = 0x4000;
 const WINDOWS_MEM_RELEASE_FLAG: usize = 0x8000;
 const WINDOWS_PAGE_PROTECTION_MASK: usize = 0xff;
+const WINDOWS_SYNCHRONIZATION_EVENT_TYPE: usize = 1;
 const WINDOWS_PAGE_NOACCESS: u32 = 0x01;
 const WINDOWS_PAGE_READONLY: u32 = 0x02;
 const WINDOWS_PAGE_READWRITE: u32 = 0x04;
@@ -2186,12 +2189,25 @@ struct WindowsHandle {
 }
 
 enum WindowsHandleKind {
-    File { path: String },
-    Section { path: Option<String> },
-    Directory { path: String },
-    SymbolicLink { path: String },
-    Key { path: String },
-    Event { signaled: bool },
+    File {
+        path: String,
+    },
+    Section {
+        path: Option<String>,
+    },
+    Directory {
+        path: String,
+    },
+    SymbolicLink {
+        path: String,
+    },
+    Key {
+        path: String,
+    },
+    Event {
+        signaled: bool,
+        synchronization: bool,
+    },
     IoCompletion,
     WorkerFactory,
     Timer,
@@ -2647,6 +2663,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ctx.rax = STATUS_SUCCESS;
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtDelayExecution) => {
+                Self::nt_delay_execution(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtYieldExecution) => {
+                Self::nt_yield_execution(ctx);
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtQueryVirtualMemory) => {
                 self.nt_query_virtual_memory(ctx);
                 ContinueOperation::Resume
@@ -2771,6 +2795,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtClearEvent) => {
                 self.nt_clear_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWaitForSingleObject) => {
+                self.nt_wait_for_single_object(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWaitForMultipleObjects) => {
+                self.nt_wait_for_multiple_objects(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQuerySystemInformation) => {
@@ -4183,8 +4215,17 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     WindowsHandleKind::Directory { path } => format!("directory:{path}"),
                     WindowsHandleKind::SymbolicLink { path } => format!("symlink:{path}"),
                     WindowsHandleKind::Key { path } => format!("key:{path}"),
-                    WindowsHandleKind::Event { signaled } => {
-                        format!("event:{}", if *signaled { "signaled" } else { "waiting" })
+                    WindowsHandleKind::Event {
+                        signaled,
+                        synchronization,
+                    } => {
+                        let event_type = if *synchronization {
+                            "synchronization"
+                        } else {
+                            "notification"
+                        };
+                        let state = if *signaled { "signaled" } else { "waiting" };
+                        format!("event:{event_type}:{state}")
                     }
                     WindowsHandleKind::IoCompletion => String::from("io-completion"),
                     WindowsHandleKind::WorkerFactory => String::from("worker-factory"),
@@ -4203,12 +4244,19 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         })
     }
 
+    fn handle_exists(&self, handle: usize) -> bool {
+        self.handles
+            .lock()
+            .iter()
+            .any(|entry| entry.handle == handle)
+    }
+
     fn event_signaled(&self, handle: usize) -> Option<bool> {
         self.handles
             .lock()
             .iter()
             .find_map(|entry| match (&entry.kind, entry.handle == handle) {
-                (WindowsHandleKind::Event { signaled }, true) => Some(*signaled),
+                (WindowsHandleKind::Event { signaled, .. }, true) => Some(*signaled),
                 _ => None,
             })
     }
@@ -4216,10 +4264,36 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     fn set_event_signaled(&self, handle: usize, signaled: bool) -> Option<bool> {
         self.handles.lock().iter_mut().find_map(|entry| {
             match (&mut entry.kind, entry.handle == handle) {
-                (WindowsHandleKind::Event { signaled: current }, true) => {
+                (
+                    WindowsHandleKind::Event {
+                        signaled: current, ..
+                    },
+                    true,
+                ) => {
                     let previous = *current;
                     *current = signaled;
                     Some(previous)
+                }
+                _ => None,
+            }
+        })
+    }
+
+    fn wait_event_once(&self, handle: usize) -> Option<bool> {
+        self.handles.lock().iter_mut().find_map(|entry| {
+            match (&mut entry.kind, entry.handle == handle) {
+                (
+                    WindowsHandleKind::Event {
+                        signaled,
+                        synchronization,
+                    },
+                    true,
+                ) => {
+                    let ready = *signaled;
+                    if ready && *synchronization {
+                        *signaled = false;
+                    }
+                    Some(ready)
                 }
                 _ => None,
             }
@@ -5242,6 +5316,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         let handle = self.insert_handle(WindowsHandleKind::Event {
             signaled: initial_state != 0,
+            synchronization: ctx.r9 == WINDOWS_SYNCHRONIZATION_EVENT_TYPE,
         });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
@@ -5644,6 +5719,146 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtClearEvent syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_delay_execution(ctx: &mut litebox_common_linux::PtRegs) {
+        let delay_interval = if ctx.rdx == 0 {
+            0
+        } else {
+            let Ok(delay_interval) = read_value::<i64>(ctx.rdx) else {
+                ctx.rax = STATUS_ACCESS_VIOLATION;
+                return;
+            };
+            delay_interval
+        };
+
+        litebox_util_log::debug!(
+            alertable:% = format_args!("{:#x}", ctx.r10),
+            delay_interval_ptr:% = format_args!("{:#x}", ctx.rdx),
+            delay_interval;
+            "Handling NtDelayExecution as immediate completion"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_yield_execution(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!("Handling NtYieldExecution as no yield performed");
+        ctx.rax = STATUS_NO_YIELD_PERFORMED;
+    }
+
+    fn nt_wait_for_single_object(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Ok(timeout_is_zero) = Self::timeout_is_zero(ctx.r8) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        ctx.rax = self.wait_for_handle(ctx.r10);
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            alertable:% = format_args!("{:#x}", ctx.rdx),
+            timeout:% = format_args!("{:#x}", ctx.r8),
+            timeout_is_zero,
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtWaitForSingleObject without blocking"
+        );
+    }
+
+    fn nt_wait_for_multiple_objects(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout_address =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let Ok(timeout_is_zero) = Self::timeout_is_zero(timeout_address) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        ctx.rax = self.wait_for_multiple_handles(ctx.r10, ctx.rdx, ctx.r8);
+        litebox_util_log::debug!(
+            count = ctx.r10,
+            handles:% = format_args!("{:#x}", ctx.rdx),
+            wait_type:% = format_args!("{:#x}", ctx.r8),
+            alertable:% = format_args!("{:#x}", ctx.r9),
+            timeout:% = format_args!("{timeout_address:#x}"),
+            timeout_is_zero,
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtWaitForMultipleObjects without blocking"
+        );
+    }
+
+    fn timeout_is_zero(timeout_address: usize) -> Result<bool, PeImageAccessError> {
+        if timeout_address == 0 {
+            return Ok(false);
+        }
+
+        read_value::<i64>(timeout_address).map(|timeout| timeout == 0)
+    }
+
+    fn wait_for_handle(&self, handle: usize) -> usize {
+        if let Some(ready) = self.wait_event_once(handle) {
+            return if ready {
+                STATUS_SUCCESS
+            } else {
+                STATUS_TIMEOUT
+            };
+        }
+
+        if self.handle_exists(handle) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_HANDLE
+        }
+    }
+
+    fn wait_for_multiple_handles(
+        &self,
+        count: usize,
+        handles_address: usize,
+        wait_type: usize,
+    ) -> usize {
+        if count == 0 || handles_address == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut handles = Vec::new();
+        for index in 0..count {
+            let Some(offset) = index.checked_mul(size_of::<usize>()) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Ok(handle) = read_value::<usize>(handles_address.saturating_add(offset)) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            if self.handle_ready_for_wait(handle).is_none() {
+                return STATUS_INVALID_HANDLE;
+            }
+            handles.push(handle);
+        }
+
+        if wait_type == 0 {
+            if handles
+                .iter()
+                .all(|&handle| self.handle_ready_for_wait(handle).unwrap_or(false))
+            {
+                for handle in handles {
+                    let _ = self.wait_event_once(handle);
+                }
+                STATUS_SUCCESS
+            } else {
+                STATUS_TIMEOUT
+            }
+        } else {
+            for (index, handle) in handles.into_iter().enumerate() {
+                if self.handle_ready_for_wait(handle).unwrap_or(false) {
+                    let _ = self.wait_event_once(handle);
+                    return index;
+                }
+            }
+            STATUS_TIMEOUT
+        }
+    }
+
+    fn handle_ready_for_wait(&self, handle: usize) -> Option<bool> {
+        self.event_signaled(handle)
+            .or_else(|| self.handle_exists(handle).then_some(true))
     }
 
     fn nt_query_system_information(&self, ctx: &mut litebox_common_linux::PtRegs) {
