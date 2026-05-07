@@ -33,8 +33,8 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeImport, PeImportTarget, PeLoadError,
-    PeParseError, PeParsedFile, Protection, ReadAt,
+    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeExportForwarder, PeImport,
+    PeImportTarget, PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
@@ -2119,7 +2119,7 @@ fn import_library_name(library: &[u8]) -> &str {
 }
 
 fn import_library_is_kernel32(library: &[u8]) -> bool {
-    module_basename(import_library_name(library)).eq_ignore_ascii_case("kernel32.dll")
+    module_name_matches("kernel32.dll", import_library_name(library))
 }
 
 fn import_library_is_api_set(library: &[u8]) -> bool {
@@ -2130,16 +2130,70 @@ fn import_library_is_api_set(library: &[u8]) -> bool {
 fn module_matches_import(module: &LoadedModule, library: &[u8]) -> bool {
     let module_name = module_basename(&module.path);
     let library_name = module_basename(import_library_name(library));
-    module_name.eq_ignore_ascii_case(library_name)
+    module_name_matches(module_name, library_name)
         || import_library_is_api_set(library) && module_name.eq_ignore_ascii_case("kernelbase.dll")
 }
 
-fn export_address(module: &LoadedModule, name: &[u8]) -> Option<usize> {
-    module
+fn module_name_matches(module_name: &str, library_name: &str) -> bool {
+    if module_name.eq_ignore_ascii_case(library_name) {
+        return true;
+    }
+    if library_name
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("dll"))
+    {
+        return false;
+    }
+    module_name
+        .rsplit_once('.')
+        .filter(|(_, extension)| extension.eq_ignore_ascii_case("dll"))
+        .map_or(module_name, |(stem, _)| stem)
+        .eq_ignore_ascii_case(library_name)
+}
+
+fn export_address(modules: &[LoadedModule], library: &[u8], name: &[u8]) -> Option<usize> {
+    resolve_export_name(modules, library, name, 0)
+}
+
+fn resolve_export_name(
+    modules: &[LoadedModule],
+    library: &[u8],
+    name: &[u8],
+    depth: usize,
+) -> Option<usize> {
+    const MAX_EXPORT_FORWARD_DEPTH: usize = 8;
+
+    if depth >= MAX_EXPORT_FORWARD_DEPTH {
+        return None;
+    }
+
+    modules.iter().enumerate().find_map(|(index, module)| {
+        if module_matches_import(module, library) {
+            resolve_export_name_in_module(modules, index, name, depth)
+        } else {
+            None
+        }
+    })
+}
+
+fn resolve_export_name_in_module(
+    modules: &[LoadedModule],
+    module_index: usize,
+    name: &[u8],
+    depth: usize,
+) -> Option<usize> {
+    let module = modules.get(module_index)?;
+    let export = module
         .exports
         .iter()
-        .find(|export| export.name.eq_ignore_ascii_case(name))
-        .and_then(|export| module.base_addr.checked_add(export.rva as usize))
+        .find(|export| export.name.eq_ignore_ascii_case(name))?;
+    match &export.forwarder {
+        None => module.base_addr.checked_add(export.rva as usize),
+        Some(PeExportForwarder::Name { library, name }) => {
+            resolve_export_name(modules, library, name, depth + 1)
+        }
+        Some(PeExportForwarder::Ordinal { .. }) => None,
+    }
 }
 
 fn import_name(import: &PeImport) -> alloc::borrow::Cow<'_, str> {
@@ -2766,7 +2820,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             .iter()
             .find_map(|module| {
                 if module_matches_import(module, &import.library) {
-                    export_address(module, name)
+                    export_address(&loaded_modules, &import.library, name)
                 } else {
                     None
                 }
@@ -2775,7 +2829,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                 if import_library_is_kernel32(&import.library) {
                     loaded_modules.iter().find_map(|module| {
                         if module_basename(&module.path).eq_ignore_ascii_case("kernelbase.dll") {
-                            export_address(module, name)
+                            export_address(&loaded_modules, b"kernelbase.dll", name)
                         } else {
                             None
                         }
@@ -4877,6 +4931,9 @@ impl LoadedImage {
         let Some(export) = self.exports.iter().find(|export| export.name == name) else {
             return Ok(None);
         };
+        if export.forwarder.is_some() {
+            return Ok(None);
+        }
         let rva = usize::try_from(export.rva).map_err(|_| PeImageAccessError::AddressOverflow)?;
         self.mapping
             .base_addr

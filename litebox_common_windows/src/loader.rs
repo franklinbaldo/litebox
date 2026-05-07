@@ -146,6 +146,27 @@ pub struct PeExport {
     pub name: Vec<u8>,
     /// Export target RVA.
     pub rva: u32,
+    /// Forwarded export target, if this export forwards into another DLL.
+    pub forwarder: Option<PeExportForwarder>,
+}
+
+/// A forwarded PE export target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeExportForwarder {
+    /// Forwarded by name into another DLL.
+    Name {
+        /// Target DLL name from the forwarder string.
+        library: Vec<u8>,
+        /// Target export name.
+        name: Vec<u8>,
+    },
+    /// Forwarded by ordinal into another DLL.
+    Ordinal {
+        /// Target DLL name from the forwarder string.
+        library: Vec<u8>,
+        /// Target export ordinal.
+        ordinal: u32,
+    },
 }
 
 /// Errors that can occur when parsing a PE file.
@@ -755,13 +776,28 @@ fn parse_exports(pe: &PeFile64<'_>) -> Result<Vec<PeExport>, object::read::Error
 
     let mut exports = Vec::new();
     for (name_pointer, address_index) in export_table.name_iter() {
-        let rva = export_table.address_by_index(u32::from(address_index))?;
-        if export_table.is_forward(rva) {
-            continue;
-        }
+        let target = export_table.target_by_index(u32::from(address_index))?;
+        let (rva, forwarder) = match target {
+            object::read::pe::ExportTarget::Address(rva) => (rva, None),
+            object::read::pe::ExportTarget::ForwardByName(library, name) => (
+                0,
+                Some(PeExportForwarder::Name {
+                    library: library.to_vec(),
+                    name: name.to_vec(),
+                }),
+            ),
+            object::read::pe::ExportTarget::ForwardByOrdinal(library, ordinal) => (
+                0,
+                Some(PeExportForwarder::Ordinal {
+                    library: library.to_vec(),
+                    ordinal,
+                }),
+            ),
+        };
         exports.push(PeExport {
             name: export_table.name_from_pointer(name_pointer)?.to_vec(),
             rva,
+            forwarder,
         });
     }
 
