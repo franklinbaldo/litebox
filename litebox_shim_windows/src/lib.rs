@@ -481,6 +481,9 @@ const MEMORY_BASIC_INFORMATION_CLASS: usize = 0;
 const MEMORY_WORKING_SET_EX_INFORMATION_CLASS: usize = 4;
 const MEMORY_IMAGE_INFORMATION_CLASS: usize = 6;
 const MEMORY_IMAGE_EXTENSION_INFORMATION_CLASS: usize = 0xe;
+const KEY_VALUE_BASIC_INFORMATION_CLASS: usize = 0;
+const KEY_VALUE_FULL_INFORMATION_CLASS: usize = 1;
+const KEY_VALUE_PARTIAL_INFORMATION_CLASS: usize = 2;
 const FILE_FS_SIZE_INFORMATION_CLASS: usize = 3;
 const FILE_FS_DEVICE_INFORMATION_CLASS: usize = 4;
 const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: usize = 5;
@@ -2179,6 +2182,7 @@ enum WindowsHandleKind {
     Section { path: Option<String> },
     Directory { path: String },
     SymbolicLink { path: String },
+    Key { path: String },
 }
 
 struct MappedSectionView {
@@ -2774,13 +2778,11 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenKey) => {
-                litebox_util_log::debug!(
-                    key_handle_ptr:% = format_args!("{:#x}", ctx.r10),
-                    desired_access:% = format_args!("{:#x}", ctx.rdx),
-                    object_attributes:% = format_args!("{:#x}", ctx.r8);
-                    "Handling NtOpenKey as missing registry key"
-                );
-                ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                self.nt_open_key(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryValueKey) => {
+                self.nt_query_value_key(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenThreadToken) => {
@@ -4139,6 +4141,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     }
                     WindowsHandleKind::Directory { path } => format!("directory:{path}"),
                     WindowsHandleKind::SymbolicLink { path } => format!("symlink:{path}"),
+                    WindowsHandleKind::Key { path } => format!("key:{path}"),
                 })
             })
             .unwrap_or_else(|| String::from("<unknown>"))
@@ -4170,6 +4173,16 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             .iter()
             .find_map(|entry| match (&entry.kind, entry.handle == handle) {
                 (WindowsHandleKind::SymbolicLink { path }, true) => Some(path.clone()),
+                _ => None,
+            })
+    }
+
+    fn key_path_for_handle(&self, handle: usize) -> Option<String> {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::Key { path }, true) => Some(path.clone()),
                 _ => None,
             })
     }
@@ -4366,6 +4379,69 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtOpenSymbolicLinkObject syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_key(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        if object_name.is_empty() {
+            ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+            return;
+        }
+
+        let handle = self.insert_handle(WindowsHandleKind::Key {
+            path: object_name.clone(),
+        });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            key_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenKey syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_query_value_key(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let key_value_information_length =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let result_length =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let value_name = read_guest_unicode_string(ctx.rdx).unwrap_or_default();
+        let Some(key_path) = self.key_path_for_handle(ctx.r10) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+
+        ctx.rax = match ctx.r8 {
+            KEY_VALUE_BASIC_INFORMATION_CLASS
+            | KEY_VALUE_FULL_INFORMATION_CLASS
+            | KEY_VALUE_PARTIAL_INFORMATION_CLASS => {
+                if result_length != 0 && write_value(result_length, 0u32).is_err() {
+                    STATUS_ACCESS_VIOLATION
+                } else {
+                    STATUS_OBJECT_NAME_NOT_FOUND
+                }
+            }
+            _ => STATUS_INVALID_INFO_CLASS,
+        };
+
+        litebox_util_log::debug!(
+            key_handle:% = format_args!("{:#x}", ctx.r10),
+            key_path:% = key_path,
+            value_name:% = value_name,
+            key_value_information_class = ctx.r8,
+            key_value_information:% = format_args!("{:#x}", ctx.r9),
+            key_value_information_length,
+            result_length:% = format_args!("{result_length:#x}"),
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtQueryValueKey syscall"
+        );
     }
 
     fn nt_query_attributes_file(ctx: &mut litebox_common_linux::PtRegs) {
