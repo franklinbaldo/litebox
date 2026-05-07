@@ -152,7 +152,7 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     let mut replacement_name = None;
     let mut replacement_path = None;
     if let Some(api_set_name) = api_set_name.as_deref()
-        && let Some(host_dll) = resolve_api_set_host_dll(api_set_map as usize, api_set_name)
+        && let Some(host_dll) = api_set_host_dll_or_default(api_set_map as usize, api_set_name)
     {
         let path = format!("C:\\Windows\\System32\\{host_dll}");
         if let Some(replacement) = ntdll_guest_heap_utf16_string(&path) {
@@ -2264,6 +2264,16 @@ fn well_known_api_set_host_dll(normalized_name: &str) -> Option<&'static str> {
     }
 }
 
+fn api_set_host_dll_or_default(api_set_map: usize, api_set_name: &str) -> Option<String> {
+    let normalized_name = normalize_api_set_name(api_set_name);
+    if !(normalized_name.starts_with("api-ms-") || normalized_name.starts_with("ext-ms-")) {
+        return None;
+    }
+    resolve_api_set_host_dll(api_set_map, api_set_name)
+        .or_else(|| well_known_api_set_host_dll(&normalized_name).map(String::from))
+        .or_else(|| Some(String::from("kernelbase.dll")))
+}
+
 fn module_matches_import(module: &LoadedModule, library: &[u8]) -> bool {
     let module_name = module_basename(&module.path);
     let library_name = module_basename(import_library_name(library));
@@ -2365,8 +2375,7 @@ fn import_library_guest_path(library: &[u8]) -> Option<String> {
 
     let dll_name = if import_library_is_api_set(library) {
         module_basename(
-            &resolve_api_set_host_dll(GUEST_API_SET_MAP.load(Ordering::Relaxed), library_name)
-                .or_else(|| well_known_api_set_host_dll(library_name).map(String::from))
+            &api_set_host_dll_or_default(GUEST_API_SET_MAP.load(Ordering::Relaxed), library_name)
                 .unwrap_or_else(|| String::from("kernelbase.dll")),
         )
         .to_ascii_lowercase()
@@ -3252,11 +3261,10 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             return entry.host_dll.as_bytes().to_vec();
         }
 
-        let host_dll = resolve_api_set_host_dll(
+        let host_dll = api_set_host_dll_or_default(
             GUEST_API_SET_MAP.load(Ordering::Relaxed),
             api_set_name.as_str(),
         )
-        .or_else(|| well_known_api_set_host_dll(&api_set_name).map(String::from))
         .unwrap_or_else(|| String::from("kernelbase.dll"));
         api_set_hosts.push(ApiSetHostCacheEntry {
             api_set_name,
