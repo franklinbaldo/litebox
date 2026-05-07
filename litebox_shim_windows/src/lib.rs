@@ -2725,11 +2725,11 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtSetInformationWorkerFactory) => {
-                Self::nt_set_information_worker_factory(ctx);
+                self.nt_set_information_worker_factory(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtSetWnfProcessNotificationEvent) => {
-                Self::nt_set_wnf_process_notification_event(ctx);
+                self.nt_set_wnf_process_notification_event(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtSubscribeWnfStateChange) => {
@@ -4166,6 +4166,24 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             .any(|entry| entry.handle == handle && matches!(entry.kind, WindowsHandleKind::Event))
     }
 
+    fn handle_is_io_completion(&self, handle: usize) -> bool {
+        self.handles.lock().iter().any(|entry| {
+            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::IoCompletion)
+        })
+    }
+
+    fn handle_is_worker_factory(&self, handle: usize) -> bool {
+        self.handles.lock().iter().any(|entry| {
+            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::WorkerFactory)
+        })
+    }
+
+    fn handle_is_wait_completion_packet(&self, handle: usize) -> bool {
+        self.handles.lock().iter().any(|entry| {
+            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::WaitCompletionPacket)
+        })
+    }
+
     fn file_path_for_handle(&self, handle: usize) -> Option<String> {
         self.handles
             .lock()
@@ -5061,6 +5079,19 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             return;
         }
 
+        if !self.handle_is_wait_completion_packet(ctx.r10) || !self.handle_is_io_completion(ctx.rdx)
+        {
+            litebox_util_log::debug!(
+                wait_completion_packet_handle:% = format_args!("{:#x}", ctx.r10),
+                wait_completion_packet:% = self.describe_handle(ctx.r10),
+                io_completion_handle:% = format_args!("{:#x}", ctx.rdx),
+                io_completion:% = self.describe_handle(ctx.rdx);
+                "NtAssociateWaitCompletionPacket received invalid handles"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
         litebox_util_log::debug!(
             wait_completion_packet_handle:% = format_args!("{:#x}", ctx.r10),
             wait_completion_packet:% = self.describe_handle(ctx.r10),
@@ -5078,21 +5109,44 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_set_information_worker_factory(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_set_information_worker_factory(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if !self.handle_is_worker_factory(ctx.r10) {
+            litebox_util_log::debug!(
+                worker_factory_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10),
+                worker_factory_information_class = ctx.rdx;
+                "NtSetInformationWorkerFactory received invalid handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
         litebox_util_log::debug!(
             worker_factory_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
             worker_factory_information_class = ctx.rdx,
             worker_factory_information:% = format_args!("{:#x}", ctx.r8),
             worker_factory_information_length = ctx.r9;
-            "Handling NtSetInformationWorkerFactory as no-op"
+            "Handling NtSetInformationWorkerFactory syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_set_wnf_process_notification_event(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_set_wnf_process_notification_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if !self.handle_is_event(ctx.r10) {
+            litebox_util_log::debug!(
+                notification_event:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10);
+                "NtSetWnfProcessNotificationEvent received invalid event handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
         litebox_util_log::debug!(
-            notification_event:% = format_args!("{:#x}", ctx.r10);
-            "Handling NtSetWnfProcessNotificationEvent as no-op"
+            notification_event:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10);
+            "Handling NtSetWnfProcessNotificationEvent syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
