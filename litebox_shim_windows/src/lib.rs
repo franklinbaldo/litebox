@@ -417,6 +417,8 @@ const NTDLL_APPHELP_STATUS_TEST_RVA: usize = 0xbb41a;
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
+const WINDOWS_NLS_CODEPAGE_KEY: &str =
+    "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
 const WINDOWS_STD_INPUT_HANDLE: u32 = u32::MAX - 9;
 const WINDOWS_STD_OUTPUT_HANDLE: u32 = u32::MAX - 10;
 const WINDOWS_STD_ERROR_HANDLE: u32 = u32::MAX - 11;
@@ -484,6 +486,10 @@ const MEMORY_IMAGE_EXTENSION_INFORMATION_CLASS: usize = 0xe;
 const KEY_VALUE_BASIC_INFORMATION_CLASS: usize = 0;
 const KEY_VALUE_FULL_INFORMATION_CLASS: usize = 1;
 const KEY_VALUE_PARTIAL_INFORMATION_CLASS: usize = 2;
+const KEY_VALUE_BASIC_INFORMATION_HEADER_SIZE: usize = size_of::<u32>() * 3;
+const KEY_VALUE_FULL_INFORMATION_HEADER_SIZE: usize = size_of::<u32>() * 5;
+const KEY_VALUE_PARTIAL_INFORMATION_HEADER_SIZE: usize = size_of::<u32>() * 3;
+const WINDOWS_REGISTRY_TYPE_SZ: u32 = 1;
 const FILE_FS_SIZE_INFORMATION_CLASS: usize = 3;
 const FILE_FS_DEVICE_INFORMATION_CLASS: usize = 4;
 const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: usize = 5;
@@ -2667,6 +2673,10 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 Self::nt_get_cached_signing_level(ctx);
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtGetNlsSectionPtr) => {
+                Self::nt_get_nls_section_ptr(ctx);
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtCompareSigningLevels) => {
                 litebox_util_log::debug!(
                     first_signing_level:% = format_args!("{:#x}", ctx.r10),
@@ -4487,17 +4497,28 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             return;
         };
 
-        ctx.rax = match ctx.r8 {
-            KEY_VALUE_BASIC_INFORMATION_CLASS
-            | KEY_VALUE_FULL_INFORMATION_CLASS
-            | KEY_VALUE_PARTIAL_INFORMATION_CLASS => {
-                if result_length != 0 && write_value(result_length, 0u32).is_err() {
-                    STATUS_ACCESS_VIOLATION
-                } else {
-                    STATUS_OBJECT_NAME_NOT_FOUND
+        ctx.rax = if let Some(value) = known_registry_string_value(&key_path, &value_name) {
+            Self::write_key_value_string_information(
+                ctx.r8,
+                ctx.r9,
+                key_value_information_length,
+                result_length,
+                &value_name,
+                value,
+            )
+        } else {
+            match ctx.r8 {
+                KEY_VALUE_BASIC_INFORMATION_CLASS
+                | KEY_VALUE_FULL_INFORMATION_CLASS
+                | KEY_VALUE_PARTIAL_INFORMATION_CLASS => {
+                    if result_length != 0 && write_value(result_length, 0u32).is_err() {
+                        STATUS_ACCESS_VIOLATION
+                    } else {
+                        STATUS_OBJECT_NAME_NOT_FOUND
+                    }
                 }
+                _ => STATUS_INVALID_INFO_CLASS,
             }
-            _ => STATUS_INVALID_INFO_CLASS,
         };
 
         litebox_util_log::debug!(
@@ -4511,6 +4532,200 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             status:% = format_args!("{:#x}", ctx.rax);
             "Handling NtQueryValueKey syscall"
         );
+    }
+
+    fn write_key_value_string_information(
+        information_class: usize,
+        information_address: usize,
+        information_length: usize,
+        result_length_address: usize,
+        value_name: &str,
+        value: &str,
+    ) -> usize {
+        let Some(name_length) = utf16_byte_len(value_name, false) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(data_length) = utf16_byte_len(value, true) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        let required_length = match information_class {
+            KEY_VALUE_BASIC_INFORMATION_CLASS => {
+                KEY_VALUE_BASIC_INFORMATION_HEADER_SIZE.checked_add(name_length)
+            }
+            KEY_VALUE_FULL_INFORMATION_CLASS => {
+                let Some(name_end) =
+                    KEY_VALUE_FULL_INFORMATION_HEADER_SIZE.checked_add(name_length)
+                else {
+                    return STATUS_INVALID_PARAMETER;
+                };
+                let Ok(data_offset) = align_up(name_end, size_of::<u32>()) else {
+                    return STATUS_INVALID_PARAMETER;
+                };
+                data_offset.checked_add(data_length)
+            }
+            KEY_VALUE_PARTIAL_INFORMATION_CLASS => {
+                KEY_VALUE_PARTIAL_INFORMATION_HEADER_SIZE.checked_add(data_length)
+            }
+            _ => return STATUS_INVALID_INFO_CLASS,
+        };
+        let Some(required_length) = required_length else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(required_length_u32) = u32::try_from(required_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        if result_length_address != 0
+            && write_value(result_length_address, required_length_u32).is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+        if information_length < required_length {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+        if information_address == 0 {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        match information_class {
+            KEY_VALUE_BASIC_INFORMATION_CLASS => {
+                Self::write_key_value_basic_information(information_address, value_name)
+            }
+            KEY_VALUE_FULL_INFORMATION_CLASS => {
+                Self::write_key_value_full_information(information_address, value_name, value)
+            }
+            KEY_VALUE_PARTIAL_INFORMATION_CLASS => {
+                Self::write_key_value_partial_information(information_address, value)
+            }
+            _ => STATUS_INVALID_INFO_CLASS,
+        }
+    }
+
+    fn write_key_value_basic_information(information_address: usize, value_name: &str) -> usize {
+        let Some(name_length) = utf16_byte_len(value_name, false) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(name_length_u32) = u32::try_from(name_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        if write_value(information_address, 0u32).is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>()),
+                WINDOWS_REGISTRY_TYPE_SZ,
+            )
+            .is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>() * 2),
+                name_length_u32,
+            )
+            .is_err()
+            || write_utf16_units(
+                information_address.saturating_add(KEY_VALUE_BASIC_INFORMATION_HEADER_SIZE),
+                value_name,
+                false,
+            )
+            .is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn write_key_value_full_information(
+        information_address: usize,
+        value_name: &str,
+        value: &str,
+    ) -> usize {
+        let Some(name_length) = utf16_byte_len(value_name, false) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Some(data_length) = utf16_byte_len(value, true) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(data_offset) = align_up(
+            KEY_VALUE_FULL_INFORMATION_HEADER_SIZE.saturating_add(name_length),
+            size_of::<u32>(),
+        ) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(data_offset_u32) = u32::try_from(data_offset) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(data_length_u32) = u32::try_from(data_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(name_length_u32) = u32::try_from(name_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        if write_value(information_address, 0u32).is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>()),
+                WINDOWS_REGISTRY_TYPE_SZ,
+            )
+            .is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>() * 2),
+                data_offset_u32,
+            )
+            .is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>() * 3),
+                data_length_u32,
+            )
+            .is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>() * 4),
+                name_length_u32,
+            )
+            .is_err()
+            || write_utf16_units(
+                information_address.saturating_add(KEY_VALUE_FULL_INFORMATION_HEADER_SIZE),
+                value_name,
+                false,
+            )
+            .is_err()
+            || write_utf16_units(information_address.saturating_add(data_offset), value, true)
+                .is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn write_key_value_partial_information(information_address: usize, value: &str) -> usize {
+        let Some(data_length) = utf16_byte_len(value, true) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let Ok(data_length_u32) = u32::try_from(data_length) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+
+        if write_value(information_address, 0u32).is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>()),
+                WINDOWS_REGISTRY_TYPE_SZ,
+            )
+            .is_err()
+            || write_value(
+                information_address.saturating_add(size_of::<u32>() * 2),
+                data_length_u32,
+            )
+            .is_err()
+            || write_utf16_units(
+                information_address.saturating_add(KEY_VALUE_PARTIAL_INFORMATION_HEADER_SIZE),
+                value,
+                true,
+            )
+            .is_err()
+        {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
     }
 
     fn nt_query_attributes_file(ctx: &mut litebox_common_linux::PtRegs) {
@@ -4632,6 +4847,27 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtGetCachedSigningLevel syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_get_nls_section_ptr(ctx: &mut litebox_common_linux::PtRegs) {
+        let section_size =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        if ctx.r9 != 0 && write_value(ctx.r9, 0usize).is_err()
+            || section_size != 0 && write_value(section_size, 0u32).is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            section_type:% = format_args!("{:#x}", ctx.r10),
+            section_data:% = format_args!("{:#x}", ctx.rdx),
+            context_data:% = format_args!("{:#x}", ctx.r8),
+            section_pointer:% = format_args!("{:#x}", ctx.r9),
+            section_size:% = format_args!("{section_size:#x}");
+            "Handling NtGetNlsSectionPtr as unavailable"
+        );
+        ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
     fn nt_create_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
@@ -6197,6 +6433,54 @@ fn read_utf16_string(address: usize, byte_length: u16) -> Result<String, PeImage
     }
 
     String::from_utf16(&code_units).map_err(|_| PeImageAccessError::MemoryAccess)
+}
+
+fn utf16_byte_len(text: &str, include_null: bool) -> Option<usize> {
+    text.encode_utf16()
+        .count()
+        .checked_add(usize::from(include_null))?
+        .checked_mul(size_of::<u16>())
+}
+
+fn write_utf16_units(
+    address: usize,
+    text: &str,
+    include_null: bool,
+) -> Result<(), PeImageAccessError> {
+    let mut offset = 0usize;
+    for code_unit in text.encode_utf16() {
+        let write_address = address
+            .checked_add(offset)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_value(write_address, code_unit)?;
+        offset = offset
+            .checked_add(size_of::<u16>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+    }
+    if include_null {
+        let write_address = address
+            .checked_add(offset)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_value(write_address, 0u16)?;
+    }
+
+    Ok(())
+}
+
+fn known_registry_string_value(key_path: &str, value_name: &str) -> Option<&'static str> {
+    if !key_path.eq_ignore_ascii_case(WINDOWS_NLS_CODEPAGE_KEY) {
+        return None;
+    }
+
+    if value_name.eq_ignore_ascii_case("ACP") {
+        Some("1252")
+    } else if value_name.eq_ignore_ascii_case("OEMCP") {
+        Some("437")
+    } else if value_name.eq_ignore_ascii_case("MACCP") {
+        Some("10000")
+    } else {
+        None
+    }
 }
 
 fn read_object_attributes_name(address: usize) -> Option<String> {
