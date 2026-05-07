@@ -2717,9 +2717,45 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 self.nt_continue(ctx);
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtContinueEx) => {
+                self.nt_continue_ex(ctx);
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtTestAlert) => {
                 litebox_util_log::debug!("Handling NtTestAlert as no-op");
                 ctx.rax = STATUS_SUCCESS;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAlertThread) => {
+                Self::nt_alert_thread(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAlertResumeThread) => {
+                Self::nt_alert_resume_thread(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAlertThreadByThreadId) => {
+                Self::nt_alert_thread_by_thread_id(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAlertThreadByThreadIdEx) => {
+                Self::nt_alert_thread_by_thread_id_ex(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAlertMultipleThreadByThreadId) => {
+                Self::nt_alert_multiple_thread_by_thread_id(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueueApcThread) => {
+                Self::nt_queue_apc_thread(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueueApcThreadEx) => {
+                self.nt_queue_apc_thread_ex(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueueApcThreadEx2) => {
+                self.nt_queue_apc_thread_ex2(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtDelayExecution) => {
@@ -3856,6 +3892,126 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtContinue syscall"
         );
         context.apply_to(ctx);
+    }
+
+    fn nt_continue_ex(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            continue_argument:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtContinueEx syscall"
+        );
+        self.nt_continue(ctx);
+    }
+
+    fn nt_alert_thread(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            thread_handle:% = format_args!("{:#x}", ctx.r10);
+            "Handling NtAlertThread syscall as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_alert_resume_thread(ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx != 0 && write_value(ctx.rdx, 0u32).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            thread_handle:% = format_args!("{:#x}", ctx.r10),
+            previous_suspend_count:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtAlertResumeThread syscall as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_alert_thread_by_thread_id(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            thread_id:% = format_args!("{:#x}", ctx.r10);
+            "Handling NtAlertThreadByThreadId syscall as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_alert_thread_by_thread_id_ex(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            thread_id:% = format_args!("{:#x}", ctx.r10),
+            reserved:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtAlertThreadByThreadIdEx syscall as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_alert_multiple_thread_by_thread_id(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            thread_id_count = ctx.r10,
+            thread_ids:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtAlertMultipleThreadByThreadId syscall as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_queue_apc_thread(ctx: &mut litebox_common_linux::PtRegs) {
+        let apc_argument3 =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        litebox_util_log::debug!(
+            thread_handle:% = format_args!("{:#x}", ctx.r10),
+            apc_routine:% = format_args!("{:#x}", ctx.rdx),
+            apc_argument1:% = format_args!("{:#x}", ctx.r8),
+            apc_argument2:% = format_args!("{:#x}", ctx.r9),
+            apc_argument3:% = format_args!("{apc_argument3:#x}");
+            "Handling NtQueueApcThread syscall as deferred no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_queue_apc_thread_ex(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let apc_argument2 =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let apc_argument3 =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        if ctx.rdx != 0 && !self.handle_exists(ctx.rdx) {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            thread_handle:% = format_args!("{:#x}", ctx.r10),
+            reserve_handle:% = format_args!("{:#x}", ctx.rdx),
+            apc_routine:% = format_args!("{:#x}", ctx.r8),
+            apc_argument1:% = format_args!("{:#x}", ctx.r9),
+            apc_argument2:% = format_args!("{apc_argument2:#x}"),
+            apc_argument3:% = format_args!("{apc_argument3:#x}");
+            "Handling NtQueueApcThreadEx syscall as deferred no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_queue_apc_thread_ex2(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let apc_routine =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let apc_argument1 =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let apc_argument2 =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+        let apc_argument3 =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_8_OFFSET));
+        if ctx.rdx != 0 && !self.handle_exists(ctx.rdx) {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            thread_handle:% = format_args!("{:#x}", ctx.r10),
+            reserve_handle:% = format_args!("{:#x}", ctx.rdx),
+            apc_flags:% = format_args!("{:#x}", ctx.r8),
+            user_apc_option:% = format_args!("{:#x}", ctx.r9),
+            apc_routine:% = format_args!("{apc_routine:#x}"),
+            apc_argument1:% = format_args!("{apc_argument1:#x}"),
+            apc_argument2:% = format_args!("{apc_argument2:#x}"),
+            apc_argument3:% = format_args!("{apc_argument3:#x}");
+            "Handling NtQueueApcThreadEx2 syscall as deferred no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
     }
 
     fn validate_mem_extended_parameters(
