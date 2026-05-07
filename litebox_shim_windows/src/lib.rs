@@ -482,6 +482,7 @@ const PROCESS_SCHEDULER_SHARED_DATA_CLASS: usize = 112;
 const THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS: usize = 57;
 const WINDOWS_DEFAULT_LOCALE_ID: u32 = 0x0409;
 const WINDOWS_DEFAULT_UI_LANGUAGE_ID: u16 = 0x0409;
+const IO_COMPLETION_BASIC_INFORMATION_CLASS: usize = 0;
 const TIMER_BASIC_INFORMATION_CLASS: usize = 0;
 const APPHELP_CACHE_SERVICE_LOOKUP: usize = 0;
 const APPHELP_CACHE_SERVICE_REMOVE: usize = 1;
@@ -683,6 +684,33 @@ struct TimerBasicInformation {
     remaining_time: i64,
     timer_state: u8,
     _padding0: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct IoCompletionBasicInformation {
+    depth: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct IoCompletionInformation {
+    key_context: usize,
+    apc_context: usize,
+    io_status: IoStatusBlock,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IoCompletionPacket {
+    key_context: usize,
+    apc_context: usize,
+    io_status: IoStatusBlock,
+}
+
+enum IoCompletionPopResult {
+    InvalidHandle,
+    Empty,
+    Packet(IoCompletionPacket),
 }
 
 #[repr(C)]
@@ -2234,7 +2262,9 @@ enum WindowsHandleKind {
         signaled: bool,
         synchronization: bool,
     },
-    IoCompletion,
+    IoCompletion {
+        packets: Vec<IoCompletionPacket>,
+    },
     WorkerFactory,
     Timer {
         set: bool,
@@ -2779,6 +2809,30 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtCreateIoCompletion) => {
                 self.nt_create_io_completion(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenIoCompletion) => {
+                self.nt_open_io_completion(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetIoCompletion) => {
+                self.nt_set_io_completion(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetIoCompletionEx) => {
+                self.nt_set_io_completion_ex(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtRemoveIoCompletion) => {
+                self.nt_remove_io_completion(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtRemoveIoCompletionEx) => {
+                self.nt_remove_io_completion_ex(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryIoCompletion) => {
+                self.nt_query_io_completion(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateWorkerFactory) => {
@@ -4324,7 +4378,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                         let state = if *signaled { "signaled" } else { "waiting" };
                         format!("event:{event_type}:{state}")
                     }
-                    WindowsHandleKind::IoCompletion => String::from("io-completion"),
+                    WindowsHandleKind::IoCompletion { packets } => {
+                        format!("io-completion:depth={}", packets.len())
+                    }
                     WindowsHandleKind::WorkerFactory => String::from("worker-factory"),
                     WindowsHandleKind::Timer { set } => {
                         format!("timer:{}", if *set { "set" } else { "unset" })
@@ -4402,8 +4458,51 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
     fn handle_is_io_completion(&self, handle: usize) -> bool {
         self.handles.lock().iter().any(|entry| {
-            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::IoCompletion)
+            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::IoCompletion { .. })
         })
+    }
+
+    fn io_completion_depth(&self, handle: usize) -> Option<usize> {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::IoCompletion { packets }, true) => Some(packets.len()),
+                _ => None,
+            })
+    }
+
+    fn push_io_completion(&self, handle: usize, packet: IoCompletionPacket) -> bool {
+        self.handles.lock().iter_mut().any(|entry| {
+            if let (WindowsHandleKind::IoCompletion { packets }, true) =
+                (&mut entry.kind, entry.handle == handle)
+            {
+                packets.push(packet);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    fn pop_io_completion(&self, handle: usize) -> IoCompletionPopResult {
+        self.handles
+            .lock()
+            .iter_mut()
+            .find_map(|entry| {
+                if let (WindowsHandleKind::IoCompletion { packets }, true) =
+                    (&mut entry.kind, entry.handle == handle)
+                {
+                    Some(if packets.is_empty() {
+                        IoCompletionPopResult::Empty
+                    } else {
+                        IoCompletionPopResult::Packet(packets.remove(0))
+                    })
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(IoCompletionPopResult::InvalidHandle)
     }
 
     fn handle_is_worker_factory(&self, handle: usize) -> bool {
@@ -5502,7 +5601,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn nt_create_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        let handle = self.insert_handle(WindowsHandleKind::IoCompletion);
+        let handle = self.insert_handle(WindowsHandleKind::IoCompletion {
+            packets: Vec::new(),
+        });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -5517,6 +5618,214 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtCreateIoCompletion syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let handle = self.insert_handle(WindowsHandleKind::IoCompletion {
+            packets: Vec::new(),
+        });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            io_completion_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenIoCompletion syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let io_status_information =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let packet = IoCompletionPacket {
+            key_context: ctx.rdx,
+            apc_context: ctx.r8,
+            io_status: IoStatusBlock {
+                status: ctx.r9,
+                information: io_status_information,
+            },
+        };
+        if !self.push_io_completion(ctx.r10, packet) {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            io_completion_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            key_context:% = format_args!("{:#x}", ctx.rdx),
+            apc_context:% = format_args!("{:#x}", ctx.r8),
+            io_status:% = format_args!("{:#x}", ctx.r9),
+            io_status_information;
+            "Handling NtSetIoCompletion syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_io_completion_ex(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let io_status = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let io_status_information =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        if ctx.rdx != 0 && !self.handle_exists(ctx.rdx) {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+        let packet = IoCompletionPacket {
+            key_context: ctx.r8,
+            apc_context: ctx.r9,
+            io_status: IoStatusBlock {
+                status: io_status,
+                information: io_status_information,
+            },
+        };
+        if !self.push_io_completion(ctx.r10, packet) {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            io_completion_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            io_completion_packet_handle:% = format_args!("{:#x}", ctx.rdx),
+            key_context:% = format_args!("{:#x}", ctx.r8),
+            apc_context:% = format_args!("{:#x}", ctx.r9),
+            io_status:% = format_args!("{io_status:#x}"),
+            io_status_information;
+            "Handling NtSetIoCompletionEx syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_remove_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let packet = match self.pop_io_completion(ctx.r10) {
+            IoCompletionPopResult::Packet(packet) => packet,
+            IoCompletionPopResult::Empty => {
+                ctx.rax = STATUS_TIMEOUT;
+                return;
+            }
+            IoCompletionPopResult::InvalidHandle => {
+                ctx.rax = STATUS_INVALID_HANDLE;
+                return;
+            }
+        };
+        if (ctx.rdx != 0 && write_value(ctx.rdx, packet.key_context).is_err())
+            || (ctx.r8 != 0 && write_value(ctx.r8, packet.apc_context).is_err())
+            || (ctx.r9 != 0 && write_value(ctx.r9, packet.io_status).is_err())
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            io_completion_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            key_context_ptr:% = format_args!("{:#x}", ctx.rdx),
+            apc_context_ptr:% = format_args!("{:#x}", ctx.r8),
+            io_status:% = format_args!("{:#x}", ctx.r9),
+            timeout:% = format_args!("{timeout:#x}");
+            "Handling NtRemoveIoCompletion syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_remove_io_completion_ex(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let alertable = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let mut removed = 0usize;
+        for index in 0..ctx.r8 {
+            let packet = match self.pop_io_completion(ctx.r10) {
+                IoCompletionPopResult::Packet(packet) => packet,
+                IoCompletionPopResult::Empty => break,
+                IoCompletionPopResult::InvalidHandle => {
+                    ctx.rax = STATUS_INVALID_HANDLE;
+                    return;
+                }
+            };
+            let Some(entry_address) = ctx
+                .rdx
+                .checked_add(index.saturating_mul(size_of::<IoCompletionInformation>()))
+            else {
+                ctx.rax = STATUS_ACCESS_VIOLATION;
+                return;
+            };
+            if write_value(
+                entry_address,
+                IoCompletionInformation {
+                    key_context: packet.key_context,
+                    apc_context: packet.apc_context,
+                    io_status: packet.io_status,
+                },
+            )
+            .is_err()
+            {
+                ctx.rax = STATUS_ACCESS_VIOLATION;
+                return;
+            }
+            removed += 1;
+        }
+        if ctx.r9 != 0 && write_value(ctx.r9, removed).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            io_completion_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            io_completion_information:% = format_args!("{:#x}", ctx.rdx),
+            count = ctx.r8,
+            num_entries_removed:% = format_args!("{:#x}", ctx.r9),
+            removed,
+            timeout:% = format_args!("{timeout:#x}"),
+            alertable;
+            "Handling NtRemoveIoCompletionEx syscall"
+        );
+        ctx.rax = if removed == 0 {
+            STATUS_TIMEOUT
+        } else {
+            STATUS_SUCCESS
+        };
+    }
+
+    fn nt_query_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let return_length =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let Some(depth) = self.io_completion_depth(ctx.r10) else {
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+        let Ok(depth) = u32::try_from(depth) else {
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        };
+        ctx.rax = match ctx.rdx {
+            IO_COMPLETION_BASIC_INFORMATION_CLASS => Self::write_u32_length_information(
+                ctx.r8,
+                ctx.r9,
+                return_length,
+                IoCompletionBasicInformation { depth },
+            ),
+            _ => STATUS_INVALID_INFO_CLASS,
+        };
+
+        litebox_util_log::debug!(
+            io_completion_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            io_completion_information_class = ctx.rdx,
+            io_completion_information:% = format_args!("{:#x}", ctx.r8),
+            io_completion_information_length = ctx.r9,
+            return_length:% = format_args!("{return_length:#x}"),
+            depth,
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtQueryIoCompletion syscall"
+        );
     }
 
     fn nt_create_worker_factory(&self, ctx: &mut litebox_common_linux::PtRegs) {
