@@ -1738,6 +1738,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 page_manager: self.page_manager.clone(),
                 handles: litebox::sync::Mutex::new(Vec::new()),
                 mapped_section_views: litebox::sync::Mutex::new(Vec::new()),
+                apphelp_cache: litebox::sync::Mutex::new(Vec::new()),
                 loaded_modules: litebox::sync::Mutex::new(vec![LoadedModule {
                     path: String::from("/Windows/System32/ntdll.dll"),
                     base_addr: ntdll_mapping.base_addr,
@@ -2141,6 +2142,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     page_manager: Arc<WindowsPageManager>,
     handles: litebox::sync::Mutex<Platform, Vec<WindowsHandle>>,
     mapped_section_views: litebox::sync::Mutex<Platform, Vec<MappedSectionView>>,
+    apphelp_cache: litebox::sync::Mutex<Platform, Vec<String>>,
     loaded_modules: litebox::sync::Mutex<Platform, Vec<LoadedModule>>,
     api_set_hosts: litebox::sync::Mutex<Platform, Vec<ApiSetHostCacheEntry>>,
     diagnostic_regions: litebox::sync::Mutex<Platform, Vec<GuestAddressRegion>>,
@@ -2671,7 +2673,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtApphelpCacheControl) => {
-                Self::nt_apphelp_cache_control(ctx);
+                self.nt_apphelp_cache_control(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtMapViewOfSection) => {
@@ -4506,27 +4508,37 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_apphelp_cache_control(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_apphelp_cache_control(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let lookup = read_apphelp_cache_service_lookup(ctx.rdx);
         ctx.rax = match ctx.r10 {
-            APPHELP_CACHE_SERVICE_LOOKUP | APPHELP_CACHE_SERVICE_REMOVE => {
-                if lookup.is_some() {
-                    STATUS_NOT_FOUND
-                } else {
-                    STATUS_INVALID_PARAMETER
-                }
-            }
-            APPHELP_CACHE_SERVICE_UPDATE => {
-                if lookup.is_some() {
+            APPHELP_CACHE_SERVICE_LOOKUP => match lookup.as_ref() {
+                Some((_, image_name)) if self.apphelp_cache_contains(image_name) => STATUS_SUCCESS,
+                Some(_) => STATUS_NOT_FOUND,
+                None => STATUS_INVALID_PARAMETER,
+            },
+            APPHELP_CACHE_SERVICE_REMOVE => match lookup.as_ref() {
+                Some((_, image_name)) if self.remove_apphelp_cache_entry(image_name) => {
                     STATUS_SUCCESS
-                } else {
-                    STATUS_INVALID_PARAMETER
                 }
+                Some(_) => STATUS_NOT_FOUND,
+                None => STATUS_INVALID_PARAMETER,
+            },
+            APPHELP_CACHE_SERVICE_UPDATE => match lookup.as_ref() {
+                Some((_, image_name)) => {
+                    self.insert_apphelp_cache_entry(image_name);
+                    STATUS_SUCCESS
+                }
+                None => STATUS_INVALID_PARAMETER,
+            },
+            APPHELP_CACHE_SERVICE_FLUSH => {
+                self.apphelp_cache.lock().clear();
+                STATUS_SUCCESS
             }
-            APPHELP_CACHE_SERVICE_FLUSH
-            | APPHELP_CACHE_SERVICE_DUMP
-            | APPHELP_DEBUG_WRITE_REGISTRY => STATUS_SUCCESS,
-            APPHELP_DEBUG_READ_REGISTRY => STATUS_NOT_FOUND,
+            APPHELP_CACHE_SERVICE_DUMP | APPHELP_DEBUG_WRITE_REGISTRY => STATUS_SUCCESS,
+            APPHELP_DEBUG_READ_REGISTRY => {
+                self.apphelp_cache.lock().clear();
+                STATUS_NOT_FOUND
+            }
             _ => STATUS_INVALID_PARAMETER,
         };
 
@@ -4543,6 +4555,35 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             status:% = format_args!("{:#x}", ctx.rax);
             "Handling NtApphelpCacheControl syscall"
         );
+    }
+
+    fn apphelp_cache_contains(&self, image_name: &str) -> bool {
+        self.apphelp_cache
+            .lock()
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(image_name))
+    }
+
+    fn insert_apphelp_cache_entry(&self, image_name: &str) {
+        let mut apphelp_cache = self.apphelp_cache.lock();
+        if !apphelp_cache
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(image_name))
+        {
+            apphelp_cache.push(String::from(image_name));
+        }
+    }
+
+    fn remove_apphelp_cache_entry(&self, image_name: &str) -> bool {
+        let mut apphelp_cache = self.apphelp_cache.lock();
+        let Some(index) = apphelp_cache
+            .iter()
+            .position(|entry| entry.eq_ignore_ascii_case(image_name))
+        else {
+            return false;
+        };
+        apphelp_cache.remove(index);
+        true
     }
 
     fn nt_map_view_of_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
