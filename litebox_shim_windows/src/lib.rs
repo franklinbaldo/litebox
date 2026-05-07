@@ -74,12 +74,14 @@ extern "system" fn litebox_ntdll_rtl_free_heap(
     flags: u32,
     memory: *mut c_void,
 ) -> u8 {
+    let free_result = ntdll_guest_heap_free(memory);
     litebox_util_log::debug!(
         flags:% = format_args!("{flags:#x}"),
-        memory:% = format_args!("{memory:p}");
+        memory:% = format_args!("{memory:p}"),
+        reclaimed_top = free_result.unwrap_or(false);
         "Handled ntdll!RtlFreeHeap through built-in thunk"
     );
-    1
+    u8::from(free_result.is_some())
 }
 
 extern "system" fn litebox_ntdll_rtl_reallocate_heap(
@@ -196,21 +198,15 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
 }
 
 fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
-    const HEADER_SIZE: usize = size_of::<usize>();
-    const HEAP_ALIGNMENT: usize = 16;
-
     let requested_size = bytes.max(1);
-    let Some(total_size) = requested_size
-        .checked_add(HEADER_SIZE)
-        .and_then(|size| align_up_power_of_two(size, HEAP_ALIGNMENT))
-    else {
+    let Some(total_size) = ntdll_guest_heap_total_size(requested_size) else {
         return core::ptr::null_mut();
     };
 
     loop {
         let current = NTDLL_HEAP_BUMP.load(Ordering::Relaxed);
         let limit = NTDLL_HEAP_LIMIT.load(Ordering::Relaxed);
-        let Some(allocation) = align_up_power_of_two(current, HEAP_ALIGNMENT) else {
+        let Some(allocation) = align_up_power_of_two(current, NTDLL_HEAP_ALIGNMENT) else {
             return core::ptr::null_mut();
         };
         let Some(next) = allocation.checked_add(total_size) else {
@@ -228,7 +224,57 @@ fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
                 core::ptr::write_bytes(allocation as *mut u8, 0, total_size);
                 (allocation as *mut usize).write(requested_size);
             }
-            return allocation.saturating_add(HEADER_SIZE) as *mut c_void;
+            return allocation.saturating_add(NTDLL_HEAP_HEADER_SIZE) as *mut c_void;
+        }
+    }
+}
+
+fn ntdll_guest_heap_total_size(requested_size: usize) -> Option<usize> {
+    requested_size
+        .checked_add(NTDLL_HEAP_HEADER_SIZE)
+        .and_then(|size| align_up_power_of_two(size, NTDLL_HEAP_ALIGNMENT))
+}
+
+fn ntdll_guest_heap_requested_size(memory: *const c_void) -> Option<usize> {
+    if memory.is_null() {
+        return None;
+    }
+    let header = (memory as usize).checked_sub(NTDLL_HEAP_HEADER_SIZE)?;
+    let heap_base = NTDLL_HEAP_HANDLE.load(Ordering::Relaxed);
+    let heap_limit = NTDLL_HEAP_LIMIT.load(Ordering::Relaxed);
+    if heap_base == 0 || header < heap_base || header >= heap_limit {
+        return None;
+    }
+    // SAFETY: The bounds check above verifies the header lies inside the shim heap range.
+    Some(unsafe { (header as *const usize).read() })
+}
+
+fn ntdll_guest_heap_free(memory: *mut c_void) -> Option<bool> {
+    if memory.is_null() {
+        return Some(false);
+    }
+    let header = (memory as usize).checked_sub(NTDLL_HEAP_HEADER_SIZE)?;
+    let heap_base = NTDLL_HEAP_HANDLE.load(Ordering::Relaxed);
+    let heap_limit = NTDLL_HEAP_LIMIT.load(Ordering::Relaxed);
+    if heap_base == 0 || header < heap_base || header >= heap_limit {
+        return None;
+    }
+    let requested_size = ntdll_guest_heap_requested_size(memory.cast_const())?;
+    let allocation_end = header.checked_add(ntdll_guest_heap_total_size(requested_size)?)?;
+    if allocation_end > heap_limit {
+        return None;
+    }
+
+    loop {
+        let current = NTDLL_HEAP_BUMP.load(Ordering::Relaxed);
+        if current != allocation_end {
+            return Some(false);
+        }
+        if NTDLL_HEAP_BUMP
+            .compare_exchange(current, header, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(true);
         }
     }
 }
@@ -261,12 +307,16 @@ fn ntdll_guest_heap_reallocate(memory: *mut c_void, bytes: usize) -> *mut c_void
         return ntdll_guest_heap_allocate(bytes);
     }
 
+    let old_size = ntdll_guest_heap_size(memory.cast_const());
+    if bytes <= old_size {
+        return memory;
+    }
+
     let new_memory = ntdll_guest_heap_allocate(bytes);
     if new_memory.is_null() {
         return core::ptr::null_mut();
     }
 
-    let old_size = ntdll_guest_heap_size(memory.cast_const());
     let copy_size = old_size.min(bytes);
     // SAFETY: Both pointers are allocations from the shim bump heap and do not overlap.
     unsafe {
@@ -276,13 +326,7 @@ fn ntdll_guest_heap_reallocate(memory: *mut c_void, bytes: usize) -> *mut c_void
 }
 
 fn ntdll_guest_heap_size(memory: *const c_void) -> usize {
-    if memory.is_null() {
-        return usize::MAX;
-    }
-
-    let header = (memory as usize).saturating_sub(size_of::<usize>()) as *const usize;
-    // SAFETY: Heap thunk pointers place a usize allocation-size header immediately before the user pointer.
-    unsafe { header.read() }
+    ntdll_guest_heap_requested_size(memory).unwrap_or(usize::MAX)
 }
 
 fn align_up_power_of_two(value: usize, alignment: usize) -> Option<usize> {
@@ -305,6 +349,8 @@ const INITIAL_LDR_ENTRIES_SIZE: usize = PAGE_SIZE;
 const DYNAMIC_LDR_ENTRY_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_HEAP_SIZE: usize = 1024 * 1024;
+const NTDLL_HEAP_ALIGNMENT: usize = 16;
+const NTDLL_HEAP_HEADER_SIZE: usize = size_of::<usize>();
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
 const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE * 64;
 const INITIAL_THREAD_CONTEXT_SIZE: usize = PAGE_SIZE;
