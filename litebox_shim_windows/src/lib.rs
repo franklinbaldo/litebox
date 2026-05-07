@@ -336,6 +336,7 @@ const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
 const STATUS_NO_TOKEN: usize = 0xc000_007c;
 const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
 const STATUS_NOT_SUPPORTED: usize = 0xc000_00bb;
+const STATUS_NOT_SAME_DEVICE: usize = 0xc000_00d4;
 const STATUS_DEBUGGER_INACTIVE: usize = 0xc000_0354;
 const WINDOWS_CONTEXT_AMD64: u32 = 0x0010_0000;
 const WINDOWS_CONTEXT_CONTROL: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0001;
@@ -1544,6 +1545,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 loaded_modules: litebox::sync::Mutex::new(vec![LoadedModule {
                     path: String::from("/Windows/System32/ntdll.dll"),
                     base_addr: ntdll_mapping.base_addr,
+                    image_size: ntdll_mapping.image_size,
                     exports: ntdll.exports,
                 }]),
                 api_set_hosts: litebox::sync::Mutex::new(Vec::new()),
@@ -1927,6 +1929,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
 struct LoadedModule {
     path: String,
     base_addr: usize,
+    image_size: usize,
     exports: Vec<PeExport>,
 }
 
@@ -2420,7 +2423,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenSection) => {
-                Self::nt_open_section(ctx);
+                self.nt_open_section(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtApphelpCacheControl) => {
@@ -2434,6 +2437,10 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtMapViewOfSection) => {
                 self.nt_map_view_of_section(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtAreMappedFilesTheSame) => {
+                self.nt_are_mapped_files_the_same(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtUnmapViewOfSection) => {
@@ -2779,6 +2786,32 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             .any(|module| module_basename(&module.path).eq_ignore_ascii_case(module_basename(path)))
     }
 
+    fn loaded_module_mapping(&self, path: &str) -> Option<(usize, usize)> {
+        self.loaded_modules.lock().iter().find_map(|module| {
+            module_basename(&module.path)
+                .eq_ignore_ascii_case(module_basename(path))
+                .then_some((module.base_addr, module.image_size))
+        })
+    }
+
+    fn section_object_guest_path(&self, object_name: &str) -> Option<String> {
+        let library_name = module_basename(object_name.trim());
+        if library_name.is_empty() {
+            return None;
+        }
+        let lower_library_name = library_name.to_ascii_lowercase();
+        if !(lower_library_name.starts_with("api-ms-")
+            || lower_library_name.starts_with("ext-ms-")
+            || lower_library_name
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("dll")))
+        {
+            return None;
+        }
+        let normalized_library = self.import_lookup_library(library_name.as_bytes());
+        import_library_guest_path(&normalized_library)
+    }
+
     fn record_loaded_module(&self, path: &str, image: &LoadedImage) {
         let mut loaded_modules = self.loaded_modules.lock();
         if loaded_modules
@@ -2790,6 +2823,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         loaded_modules.push(LoadedModule {
             path: String::from(path),
             base_addr: image.mapping.base_addr,
+            image_size: image.mapping.image_size,
             exports: image.exports.clone(),
         });
         litebox_util_log::debug!(
@@ -3890,6 +3924,14 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             })
     }
 
+    fn image_region_containing(&self, address: usize) -> Option<GuestAddressRegion> {
+        self.diagnostic_regions
+            .lock()
+            .iter()
+            .copied()
+            .find(|region| region.is_image() && region.contains(address))
+    }
+
     fn nt_close(&self, ctx: &mut litebox_common_linux::PtRegs) {
         self.remove_handle(ctx.r10);
         litebox_util_log::debug!(
@@ -4161,16 +4203,39 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_open_section(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_open_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let section_path = self.section_object_guest_path(&object_name);
+        let Some(section_path) = section_path else {
+            litebox_util_log::debug!(
+                section_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+                desired_access:% = format_args!("{:#x}", ctx.rdx),
+                object_attributes:% = format_args!("{:#x}", ctx.r8),
+                object_name:% = object_name;
+                "Handling NtOpenSection as missing named section"
+            );
+            ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+            return;
+        };
+
+        let handle = self.insert_handle(WindowsHandleKind::Section {
+            path: Some(section_path.clone()),
+        });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
         litebox_util_log::debug!(
             section_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
             desired_access:% = format_args!("{:#x}", ctx.rdx),
             object_attributes:% = format_args!("{:#x}", ctx.r8),
-            object_name:% = object_name;
-            "Handling NtOpenSection as missing named section"
+            object_name:% = object_name,
+            section_path:% = section_path;
+            "Handling NtOpenSection syscall"
         );
-        ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+        ctx.rax = STATUS_SUCCESS;
     }
 
     fn nt_map_view_of_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
@@ -4189,33 +4254,37 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let section_path = self.section_path_for_handle(ctx.r10);
         let (mapped_base, mapped_size, region_name) = match section_path.as_deref() {
             Some(path) if !is_ntdll_guest_path(path) => {
-                match self.load_image(self.fs.clone(), path) {
-                    Ok(image) => {
-                        let region_name = loaded_image_region_name(path);
-                        self.record_named_memory_region(region_name, &image.mapping);
-                        self.record_loaded_module(path, &image);
-                        self.ensure_import_modules_loaded(&image.imports);
-                        self.resolve_image_imports_from_loaded_modules(
-                            image.mapping.base_addr,
-                            &image.imports,
-                            path,
-                        );
-                        self.resolve_application_imports_from_loaded_modules();
-                        (
-                            image.mapping.base_addr,
-                            image.mapping.image_size,
-                            region_name,
-                        )
-                    }
-                    Err(error) => {
-                        litebox_util_log::error!(
-                            error:%,
-                            section_handle:% = format_args!("{:#x}", ctx.r10),
-                            section_path:% = path;
-                            "NtMapViewOfSection failed to map guest image section"
-                        );
-                        ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
-                        return;
+                if let Some((base_addr, image_size)) = self.loaded_module_mapping(path) {
+                    (base_addr, image_size, loaded_image_region_name(path))
+                } else {
+                    match self.load_image(self.fs.clone(), path) {
+                        Ok(image) => {
+                            let region_name = loaded_image_region_name(path);
+                            self.record_named_memory_region(region_name, &image.mapping);
+                            self.record_loaded_module(path, &image);
+                            self.ensure_import_modules_loaded(&image.imports);
+                            self.resolve_image_imports_from_loaded_modules(
+                                image.mapping.base_addr,
+                                &image.imports,
+                                path,
+                            );
+                            self.resolve_application_imports_from_loaded_modules();
+                            (
+                                image.mapping.base_addr,
+                                image.mapping.image_size,
+                                region_name,
+                            )
+                        }
+                        Err(error) => {
+                            litebox_util_log::error!(
+                                error:%,
+                                section_handle:% = format_args!("{:#x}", ctx.r10),
+                                section_path:% = path;
+                                "NtMapViewOfSection failed to map guest image section"
+                            );
+                            ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                            return;
+                        }
                     }
                 }
             }
@@ -4256,6 +4325,27 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtMapViewOfSection syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_are_mapped_files_the_same(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let first_region = self.image_region_containing(ctx.r10);
+        let second_region = self.image_region_containing(ctx.rdx);
+        let same_mapping = first_region
+            .zip(second_region)
+            .is_some_and(|(first, second)| first.start == second.start && first.end == second.end);
+        litebox_util_log::debug!(
+            first_address:% = format_args!("{:#x}", ctx.r10),
+            first_region:% = self.describe_guest_address(ctx.r10),
+            second_address:% = format_args!("{:#x}", ctx.rdx),
+            second_region:% = self.describe_guest_address(ctx.rdx),
+            same_mapping;
+            "Handling NtAreMappedFilesTheSame syscall"
+        );
+        ctx.rax = if same_mapping {
+            STATUS_SUCCESS
+        } else {
+            STATUS_NOT_SAME_DEVICE
+        };
     }
 
     fn write_file_fs_information<GuestValue>(
