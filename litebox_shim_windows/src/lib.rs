@@ -414,6 +414,11 @@ const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA: usize = 0x41600;
 const NTDLL_APPHELP_FAILURE_BRANCH_RVAS: &[usize] = &[0xbb56d];
 const NTDLL_APPHELP_STATUS_TEST_RVA: usize = 0xbb41a;
+const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_BYTES: &[u8] = &[
+    0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x41, 0x56,
+];
+const NTDLL_APPHELP_FAILURE_BRANCH_BYTES: &[u8] = &[0x0f, 0x88, 0x41, 0x02, 0x00, 0x00];
+const NTDLL_APPHELP_STATUS_TEST_BYTES: &[u8] = &[0x85, 0xdb];
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
@@ -1862,9 +1867,10 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .base_addr
             .checked_add(NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA)
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        write_absolute_jump(
+        write_checked_absolute_jump(
             &self.page_manager,
             api_set_unicode_wrapper,
+            NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_BYTES,
             litebox_ntdll_api_set_resolve_unicode as *const () as usize,
         )?;
         litebox_util_log::debug!(
@@ -1878,7 +1884,12 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 .base_addr
                 .checked_add(branch_rva)
                 .ok_or(PeImageAccessError::AddressOverflow)?;
-            write_code_bytes(&self.page_manager, branch_address, &[0x90; 6])?;
+            write_checked_code_bytes(
+                &self.page_manager,
+                branch_address,
+                NTDLL_APPHELP_FAILURE_BRANCH_BYTES,
+                &[0x90; 6],
+            )?;
             litebox_util_log::debug!(
                 address:% = format_args!("{branch_address:#x}");
                 "Patched guest ntdll apphelp failure branch"
@@ -1890,7 +1901,12 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .base_addr
             .checked_add(NTDLL_APPHELP_STATUS_TEST_RVA)
             .ok_or(PeImageAccessError::AddressOverflow)?;
-        write_code_bytes(&self.page_manager, apphelp_status_test, &[0x31, 0xdb])?;
+        write_checked_code_bytes(
+            &self.page_manager,
+            apphelp_status_test,
+            NTDLL_APPHELP_STATUS_TEST_BYTES,
+            &[0x31, 0xdb],
+        )?;
         litebox_util_log::debug!(
             address:% = format_args!("{apphelp_status_test:#x}");
             "Patched guest ntdll apphelp cached status check"
@@ -7149,6 +7165,16 @@ fn write_absolute_jump(
     )
 }
 
+fn write_checked_absolute_jump(
+    page_manager: &WindowsPageManager,
+    address: usize,
+    expected: &[u8],
+    target: usize,
+) -> Result<(), PeImageAccessError> {
+    verify_code_bytes(address, expected)?;
+    write_absolute_jump(page_manager, address, target)
+}
+
 fn write_code_bytes(
     page_manager: &WindowsPageManager,
     address: usize,
@@ -7168,6 +7194,48 @@ fn write_code_bytes(
             execute: true,
         },
     )
+}
+
+fn write_checked_code_bytes(
+    page_manager: &WindowsPageManager,
+    address: usize,
+    expected: &[u8],
+    bytes: &[u8],
+) -> Result<(), PeImageAccessError> {
+    verify_code_bytes(address, expected)?;
+    write_code_bytes(page_manager, address, bytes)
+}
+
+fn verify_code_bytes(address: usize, expected: &[u8]) -> Result<(), PeImageAccessError> {
+    let ptr = <Platform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(address);
+    let Some(actual) = ptr.to_owned_slice(expected.len()) else {
+        return Err(PeImageAccessError::MemoryAccess);
+    };
+    if actual.as_ref() != expected {
+        litebox_util_log::error!(
+            address:% = format_args!("{address:#x}"),
+            expected:% = HexBytes(expected),
+            actual:% = HexBytes(&actual);
+            "Guest ntdll guard patch bytes did not match expected host version"
+        );
+        return Err(PeImageAccessError::MemoryAccess);
+    }
+
+    Ok(())
+}
+
+struct HexBytes<'a>(&'a [u8]);
+
+impl core::fmt::Display for HexBytes<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (index, byte) in self.0.iter().enumerate() {
+            if index != 0 {
+                formatter.write_char(' ')?;
+            }
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 struct PeImageFile<FS: NtShimFS> {
