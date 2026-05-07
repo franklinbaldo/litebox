@@ -197,8 +197,11 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
 ) -> usize {
     let name_address = name as usize;
     let unicode_string = read_value::<UnicodeString>(name_address).unwrap_or_default();
-    if unicode_string.buffer == 0 && unicode_string.length != 0 {
-        let _ = write_value(name_address, UnicodeString::default());
+    if unicode_string.buffer == 0
+        && unicode_string.length != 0
+        && let Some(replacement) = ntdll_guest_heap_utf16_string("C:\\Windows\\System32\\ntdll.dll")
+    {
+        let _ = write_value(name_address, replacement);
     }
     litebox_util_log::debug!(
         api_set_map:% = format_args!("{api_set_map:p}"),
@@ -249,6 +252,29 @@ fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
             return allocation.saturating_add(HEADER_SIZE) as *mut c_void;
         }
     }
+}
+
+fn ntdll_guest_heap_utf16_string(text: &str) -> Option<UnicodeString> {
+    let code_units = text.encode_utf16().count();
+    let byte_len = code_units.checked_mul(size_of::<u16>())?;
+    let maximum_byte_len = byte_len.checked_add(size_of::<u16>())?;
+    let buffer = ntdll_guest_heap_allocate(maximum_byte_len) as usize;
+    if buffer == 0 {
+        return None;
+    }
+
+    for (index, code_unit) in text.encode_utf16().chain(core::iter::once(0)).enumerate() {
+        let offset = index.checked_mul(size_of::<u16>())?;
+        let address = buffer.checked_add(offset)?;
+        write_value(address, code_unit).ok()?;
+    }
+
+    Some(UnicodeString {
+        length: u16::try_from(byte_len).ok()?,
+        maximum_length: u16::try_from(maximum_byte_len).ok()?,
+        buffer,
+        ..Default::default()
+    })
 }
 
 fn ntdll_guest_heap_reallocate(memory: *mut c_void, bytes: usize) -> *mut c_void {
