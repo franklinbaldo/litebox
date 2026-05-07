@@ -302,6 +302,7 @@ const INITIAL_PEB_SIZE: usize = PAGE_SIZE;
 const INITIAL_TEB_SIZE: usize = PAGE_SIZE * 2;
 const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
 const INITIAL_LDR_ENTRIES_SIZE: usize = PAGE_SIZE;
+const DYNAMIC_LDR_ENTRY_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_HEAP_SIZE: usize = 1024 * 1024;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
@@ -748,6 +749,34 @@ fn module_list_entry(
         flink: next_entry.map_or(head, |entry| entry + link_offset),
         blink: previous_entry.map_or(head, |entry| entry + link_offset),
     }
+}
+
+fn append_ldr_list_entry(
+    head: usize,
+    previous_entry: Option<usize>,
+    entry: usize,
+    link_offset: usize,
+) -> Result<(), PeImageAccessError> {
+    let entry_link = entry
+        .checked_add(link_offset)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let mut head_link = read_value::<ListEntry>(head)?;
+    head_link.blink = entry_link;
+    if previous_entry.is_none() {
+        head_link.flink = entry_link;
+    }
+    write_value(head, head_link)?;
+
+    if let Some(previous_entry) = previous_entry {
+        let previous_link_address = previous_entry
+            .checked_add(link_offset)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let mut previous_link = read_value::<ListEntry>(previous_link_address)?;
+        previous_link.flink = entry_link;
+        write_value(previous_link_address, previous_link)?;
+    }
+
+    Ok(())
 }
 
 #[repr(C)]
@@ -1507,6 +1536,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 fs,
                 application_base: image.mapping.base_addr,
                 application_imports: image.imports.clone(),
+                ldr_data_address: process_environment.ldr_data,
+                ldr_tail_entry: litebox::sync::Mutex::new(process_environment.ldr_tail_entry),
                 exit_code: exit_code.clone(),
                 page_manager: self.page_manager.clone(),
                 handles: litebox::sync::Mutex::new(Vec::new()),
@@ -1785,6 +1816,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             peb: peb_address,
             ldr_data: ldr_data_address,
             ldr_entries: ldr_entries_address,
+            ldr_tail_entry: ldr_entries.last,
             process_parameters: process_parameters_address,
             process_heap: process_heap_address,
             fast_peb_lock: fast_peb_lock_address,
@@ -1882,6 +1914,8 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     fs: Arc<FS>,
     application_base: usize,
     application_imports: Vec<PeImport>,
+    ldr_data_address: usize,
+    ldr_tail_entry: litebox::sync::Mutex<Platform, Option<usize>>,
     exit_code: Arc<AtomicI32>,
     page_manager: Arc<WindowsPageManager>,
     handles: litebox::sync::Mutex<Platform, Vec<WindowsHandle>>,
@@ -1937,7 +1971,10 @@ impl GuestAddressRegion {
     }
 
     fn is_image(&self) -> bool {
-        matches!(self.name, "app" | "ntdll")
+        matches!(
+            self.name,
+            "app" | "ntdll" | "kernel32" | "kernelbase" | "dll"
+        )
     }
 }
 
@@ -2068,6 +2105,19 @@ fn windows_object_path_to_guest_path(path: &str) -> String {
         }
     }
     guest_path
+}
+
+fn guest_path_to_dos_path(path: &str) -> String {
+    let mut dos_path = String::from("C:");
+    for component in path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        dos_path.push('\\');
+        dos_path.push_str(component);
+    }
+    dos_path
 }
 
 fn is_ntdll_guest_path(path: &str) -> bool {
@@ -2367,6 +2417,10 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtCreateSection) => {
                 self.nt_create_section(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenSection) => {
+                Self::nt_open_section(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtApphelpCacheControl) => {
@@ -2744,6 +2798,81 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             export_count = image.exports.len();
             "Recorded loaded Windows module"
         );
+        if let Err(error) = self.append_dynamic_ldr_entry(path, &image.mapping) {
+            litebox_util_log::debug!(
+                error:?,
+                path:% = path,
+                base:% = format_args!("{:#x}", image.mapping.base_addr);
+                "Could not append dynamic Windows LDR entry"
+            );
+        }
+    }
+
+    fn append_dynamic_ldr_entry(
+        &self,
+        path: &str,
+        mapping: &MappingInfo,
+    ) -> Result<(), PeImageAccessError> {
+        let entry_address = self.create_metadata_pages(DYNAMIC_LDR_ENTRY_SIZE)?;
+        let mut string_cursor = entry_address
+            .checked_add(LDR_DATA_TABLE_ENTRY_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let list_heads = LdrListHeads {
+            load: self.ldr_data_address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
+            memory: self.ldr_data_address + PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET,
+            initialization: self.ldr_data_address
+                + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
+        };
+        let mut tail = self.ldr_tail_entry.lock();
+        let previous_entry = *tail;
+        let entry = LdrDataTableEntry::new(
+            previous_entry,
+            None,
+            list_heads,
+            mapping,
+            write_utf16_string(&mut string_cursor, &guest_path_to_dos_path(path))?,
+            write_utf16_string(&mut string_cursor, module_basename(path))?,
+        );
+        write_value(entry_address, entry)?;
+        append_ldr_list_entry(
+            list_heads.load,
+            previous_entry,
+            entry_address,
+            LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET,
+        )?;
+        append_ldr_list_entry(
+            list_heads.memory,
+            previous_entry,
+            entry_address,
+            LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET,
+        )?;
+        append_ldr_list_entry(
+            list_heads.initialization,
+            previous_entry,
+            entry_address,
+            LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET,
+        )?;
+        *tail = Some(entry_address);
+        litebox_util_log::debug!(
+            path:% = path,
+            entry:% = format_args!("{entry_address:#x}"),
+            previous_entry:% = previous_entry.map_or_else(|| String::from("<none>"), |entry| format!("{entry:#x}"));
+            "Appended dynamic Windows LDR entry"
+        );
+        Ok(())
+    }
+
+    fn create_metadata_pages(&self, size: usize) -> Result<usize, PeImageAccessError> {
+        let length = NonZeroPageSize::new(size).ok_or(PeImageAccessError::AddressOverflow)?;
+        // SAFETY: These pages are private guest metadata pages owned and initialized by the shim.
+        let ptr = unsafe {
+            self.page_manager
+                .create_writable_pages(None, length, CreatePagesFlags::empty(), |_| Ok(0))
+        }
+        .map_err(PeImageAccessError::Mapping)?;
+        ptr.copy_from_slice(0, &vec![0; size])
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+        Ok(ptr.as_usize())
     }
 
     fn resolve_application_imports_from_loaded_modules(&self) {
@@ -4032,6 +4161,18 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
+    fn nt_open_section(ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        litebox_util_log::debug!(
+            section_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenSection as missing named section"
+        );
+        ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     fn nt_map_view_of_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let commit_size =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
@@ -5086,6 +5227,7 @@ struct WindowsProcessEnvironment {
     peb: usize,
     ldr_data: usize,
     ldr_entries: usize,
+    ldr_tail_entry: Option<usize>,
     process_parameters: usize,
     process_heap: usize,
     fast_peb_lock: usize,
