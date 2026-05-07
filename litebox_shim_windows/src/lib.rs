@@ -135,34 +135,6 @@ extern "system" fn litebox_ntdll_rtl_destroy_heap(_heap: *mut c_void) -> *mut c_
     core::ptr::null_mut()
 }
 
-extern "system" fn litebox_ntdll_api_set_resolve(
-    name: *const u16,
-    length: u16,
-    _flags: u8,
-    result: *mut c_void,
-) -> u8 {
-    const API_SET_RESOLUTION_RESULT_SIZE: usize = 0x28;
-
-    if !result.is_null() {
-        let ptr =
-            <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(result as usize);
-        let _ = ptr.copy_from_slice(0, &[0; API_SET_RESOLUTION_RESULT_SIZE]);
-    }
-    let guest_peb = GUEST_PEB_ADDRESS.load(Ordering::Relaxed);
-    let expected_api_set_map = GUEST_API_SET_MAP.load(Ordering::Relaxed);
-    let actual_api_set_map =
-        read_usize_or_zero(guest_peb.saturating_add(HOST_PEB_API_SET_MAP_OFFSET));
-    litebox_util_log::debug!(
-        name:% = format_args!("{name:p}"),
-        length,
-        guest_peb:% = format_args!("{guest_peb:#x}"),
-        expected_api_set_map:% = format_args!("{expected_api_set_map:#x}"),
-        actual_api_set_map:% = format_args!("{actual_api_set_map:#x}");
-        "Handled ntdll API-set helper as unresolved"
-    );
-    0
-}
-
 extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     api_set_map: *const c_void,
     name: *const UnicodeString,
@@ -345,7 +317,6 @@ const NTDLL_PATHS: &[&str] = &[
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 // Current forced-loader diagnostics use the host ntdll fixture. These RVAs are
 // host-version-specific guard rails for early ntdll loader bring-up.
-const NTDLL_API_SET_RESOLVE_HELPER_RVA: usize = 0x135fa8;
 const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA: usize = 0x41600;
 const NTDLL_APPHELP_FAILURE_BRANCH_RVAS: &[usize] = &[0xbb56d];
 const NTDLL_APPHELP_STATUS_TEST_RVA: usize = 0xbb41a;
@@ -1638,21 +1609,6 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 "Patched guest ntdll export to built-in thunk"
             );
         }
-
-        let api_set_helper = image
-            .mapping
-            .base_addr
-            .checked_add(NTDLL_API_SET_RESOLVE_HELPER_RVA)
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        write_absolute_jump(
-            &self.page_manager,
-            api_set_helper,
-            litebox_ntdll_api_set_resolve as *const () as usize,
-        )?;
-        litebox_util_log::debug!(
-            address:% = format_args!("{api_set_helper:#x}");
-            "Patched guest ntdll API-set helper to built-in guard"
-        );
 
         let api_set_unicode_wrapper = image
             .mapping
