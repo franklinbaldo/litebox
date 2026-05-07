@@ -172,7 +172,22 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
 ) -> usize {
     let name_address = name as usize;
     let unicode_string = read_value::<UnicodeString>(name_address).unwrap_or_default();
+    let api_set_name = if unicode_string.buffer != 0 && unicode_string.length != 0 {
+        read_utf16_string(unicode_string.buffer, unicode_string.length).ok()
+    } else {
+        None
+    };
     let mut replacement_name = None;
+    let mut replacement_path = None;
+    if let Some(api_set_name) = api_set_name.as_deref()
+        && let Some(host_dll) = resolve_api_set_host_dll(api_set_map as usize, api_set_name)
+    {
+        let path = format!("C:\\Windows\\System32\\{host_dll}");
+        if let Some(replacement) = ntdll_guest_heap_utf16_string(&path) {
+            replacement_name = Some(replacement);
+            replacement_path = Some(path);
+        }
+    }
     if unicode_string.buffer == 0
         && unicode_string.length != 0
         && let Some(replacement) =
@@ -180,6 +195,7 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     {
         let _ = write_value(name_address, replacement);
         replacement_name = Some(replacement);
+        replacement_path = Some(String::from("C:\\Windows\\System32\\kernel32.dll"));
     }
     if !resolved.is_null() {
         let _ = write_value(resolved as usize, u8::from(replacement_name.is_some()));
@@ -196,6 +212,8 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
         length = unicode_string.length,
         maximum_length = unicode_string.maximum_length,
         buffer:% = format_args!("{:#x}", unicode_string.buffer),
+        api_set_name:% = api_set_name.as_deref().unwrap_or("<unreadable>"),
+        replacement_path:% = replacement_path.as_deref().unwrap_or("<none>"),
         parent_name:% = format_args!("{parent_name:p}"),
         resolved:% = format_args!("{resolved:p}"),
         resolved_name:% = format_args!("{resolved_name:p}"),
@@ -577,6 +595,27 @@ impl ApiSetNamespace {
             ..Self::default()
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ApiSetNamespaceEntry {
+    flags: u32,
+    name_offset: u32,
+    name_length: u32,
+    hashed_length: u32,
+    value_offset: u32,
+    value_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ApiSetValueEntry {
+    flags: u32,
+    name_offset: u32,
+    name_length: u32,
+    value_offset: u32,
+    value_length: u32,
 }
 
 #[repr(C)]
@@ -2108,6 +2147,69 @@ fn import_name(import: &PeImport) -> alloc::borrow::Cow<'_, str> {
         PeImportTarget::Ordinal(ordinal) => alloc::borrow::Cow::Owned(format!("#{ordinal}")),
         PeImportTarget::Name { name, .. } => String::from_utf8_lossy(name),
     }
+}
+
+fn resolve_api_set_host_dll(api_set_map: usize, api_set_name: &str) -> Option<String> {
+    if api_set_map == 0 {
+        return None;
+    }
+
+    let namespace = read_value::<ApiSetNamespace>(api_set_map).ok()?;
+    let count = usize::try_from(namespace.count).ok()?;
+    let entry_offset = usize::try_from(namespace.entry_offset).ok()?;
+    let normalized_name = normalize_api_set_name(api_set_name);
+
+    for index in 0..count {
+        let entry_address = api_set_map
+            .checked_add(entry_offset)?
+            .checked_add(index.checked_mul(size_of::<ApiSetNamespaceEntry>())?)?;
+        let entry = read_value::<ApiSetNamespaceEntry>(entry_address).ok()?;
+        let namespace_name = read_api_set_string(
+            api_set_map,
+            entry.name_offset,
+            entry.hashed_length.max(entry.name_length),
+        )?;
+        if !normalize_api_set_name(&namespace_name).eq_ignore_ascii_case(&normalized_name) {
+            continue;
+        }
+
+        let value_count = usize::try_from(entry.value_count).ok()?;
+        let value_offset = usize::try_from(entry.value_offset).ok()?;
+        for value_index in 0..value_count {
+            let value_address = api_set_map
+                .checked_add(value_offset)?
+                .checked_add(value_index.checked_mul(size_of::<ApiSetValueEntry>())?)?;
+            let value = read_value::<ApiSetValueEntry>(value_address).ok()?;
+            if value.value_length == 0 {
+                continue;
+            }
+            let host_dll =
+                read_api_set_string(api_set_map, value.value_offset, value.value_length)?;
+            litebox_util_log::debug!(
+                api_set_name:% = api_set_name,
+                namespace_name:% = namespace_name,
+                host_dll:% = host_dll;
+                "Resolved API-set namespace entry"
+            );
+            return Some(host_dll);
+        }
+    }
+
+    None
+}
+
+fn normalize_api_set_name(name: &str) -> String {
+    let basename = module_basename(name);
+    basename
+        .strip_suffix(".dll")
+        .or_else(|| basename.strip_suffix(".DLL"))
+        .unwrap_or(basename)
+        .to_ascii_lowercase()
+}
+
+fn read_api_set_string(api_set_map: usize, offset: u32, byte_length: u32) -> Option<String> {
+    let address = api_set_map.checked_add(usize::try_from(offset).ok()?)?;
+    read_utf16_string(address, u16::try_from(byte_length).ok()?).ok()
 }
 
 fn host_standard_handle(kind: u32) -> usize {
@@ -4931,15 +5033,27 @@ fn read_guest_unicode_string(address: usize) -> Option<String> {
         return None;
     }
 
-    let code_unit_count = usize::from(unicode_string.length) / size_of::<u16>();
-    let mut code_units = Vec::with_capacity(code_unit_count);
-    for index in 0..code_unit_count {
-        let offset = index.checked_mul(size_of::<u16>())?;
-        let address = unicode_string.buffer.checked_add(offset)?;
-        code_units.push(read_value::<u16>(address).ok()?);
+    read_utf16_string(unicode_string.buffer, unicode_string.length).ok()
+}
+
+fn read_utf16_string(address: usize, byte_length: u16) -> Result<String, PeImageAccessError> {
+    if !byte_length.is_multiple_of(2) {
+        return Err(PeImageAccessError::MemoryAccess);
     }
 
-    String::from_utf16(&code_units).ok()
+    let code_unit_count = usize::from(byte_length) / size_of::<u16>();
+    let mut code_units = Vec::with_capacity(code_unit_count);
+    for index in 0..code_unit_count {
+        let offset = index
+            .checked_mul(size_of::<u16>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let address = address
+            .checked_add(offset)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        code_units.push(read_value::<u16>(address)?);
+    }
+
+    String::from_utf16(&code_units).map_err(|_| PeImageAccessError::MemoryAccess)
 }
 
 fn read_object_attributes_name(address: usize) -> Option<String> {
