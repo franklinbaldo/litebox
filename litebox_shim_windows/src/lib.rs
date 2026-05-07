@@ -192,16 +192,28 @@ extern "system" fn litebox_ntdll_api_set_resolve(
 extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     api_set_map: *const c_void,
     name: *const UnicodeString,
-    resolved_name: *mut c_void,
-    resolved_parent_name: *mut c_void,
+    parent_name: *const UnicodeString,
+    resolved: *mut u8,
+    resolved_name: *mut UnicodeString,
 ) -> usize {
     let name_address = name as usize;
     let unicode_string = read_value::<UnicodeString>(name_address).unwrap_or_default();
+    let mut replacement_name = None;
     if unicode_string.buffer == 0
         && unicode_string.length != 0
         && let Some(replacement) = ntdll_guest_heap_utf16_string("C:\\Windows\\System32\\ntdll.dll")
     {
         let _ = write_value(name_address, replacement);
+        replacement_name = Some(replacement);
+    }
+    if !resolved.is_null() {
+        let _ = write_value(resolved as usize, u8::from(replacement_name.is_some()));
+    }
+    if !resolved_name.is_null() {
+        let _ = write_value(
+            resolved_name as usize,
+            replacement_name.unwrap_or_else(UnicodeString::default),
+        );
     }
     litebox_util_log::debug!(
         api_set_map:% = format_args!("{api_set_map:p}"),
@@ -209,8 +221,10 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
         length = unicode_string.length,
         maximum_length = unicode_string.maximum_length,
         buffer:% = format_args!("{:#x}", unicode_string.buffer),
+        parent_name:% = format_args!("{parent_name:p}"),
+        resolved:% = format_args!("{resolved:p}"),
         resolved_name:% = format_args!("{resolved_name:p}"),
-        resolved_parent_name:% = format_args!("{resolved_parent_name:p}");
+        replacement_buffer:% = format_args!("{:#x}", replacement_name.map_or(0, |name| name.buffer));
         "Handled ntdll API-set Unicode wrapper through built-in guard"
     );
     STATUS_SUCCESS
@@ -396,6 +410,8 @@ const MEMORY_IMAGE_EXTENSION_INFORMATION_CLASS: usize = 0xe;
 const FILE_FS_SIZE_INFORMATION_CLASS: usize = 3;
 const FILE_FS_DEVICE_INFORMATION_CLASS: usize = 4;
 const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: usize = 5;
+const WINDOWS_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+const WINDOWS_FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
 const WINDOWS_FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
 const WINDOWS_FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
 const WINDOWS_FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
@@ -456,6 +472,8 @@ static NEXT_SYNTHETIC_HANDLE: AtomicUsize = AtomicUsize::new(0x10000);
 static NTDLL_HEAP_HANDLE: AtomicUsize = AtomicUsize::new(0);
 static NTDLL_HEAP_BUMP: AtomicUsize = AtomicUsize::new(0);
 static NTDLL_HEAP_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static GUEST_NTDLL_BASE: AtomicUsize = AtomicUsize::new(0);
+static GUEST_NTDLL_SIZE: AtomicUsize = AtomicUsize::new(0);
 static GUEST_PEB_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 static GUEST_API_SET_MAP: AtomicUsize = AtomicUsize::new(0);
 
@@ -517,6 +535,17 @@ struct ObjectAttributes {
 struct IoStatusBlock {
     status: usize,
     information: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct FileBasicInformation {
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+    _padding0: u32,
 }
 
 #[repr(C)]
@@ -1519,6 +1548,13 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             &process_environment,
         );
         let ntdll_mapping = ntdll.map(|image| image.mapping);
+        if let Some(mapping) = &ntdll_mapping {
+            GUEST_NTDLL_BASE.store(mapping.base_addr, Ordering::Relaxed);
+            GUEST_NTDLL_SIZE.store(mapping.image_size, Ordering::Relaxed);
+        } else {
+            GUEST_NTDLL_BASE.store(0, Ordering::Relaxed);
+            GUEST_NTDLL_SIZE.store(0, Ordering::Relaxed);
+        }
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
@@ -2161,8 +2197,51 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 Self::nt_open_file(ctx);
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtQueryAttributesFile) => {
+                Self::nt_query_attributes_file(ctx);
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtQueryVolumeInformationFile) => {
                 Self::nt_query_volume_information_file(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtGetCachedSigningLevel) => {
+                Self::nt_get_cached_signing_level(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCompareSigningLevels) => {
+                litebox_util_log::debug!(
+                    first_signing_level:% = format_args!("{:#x}", ctx.r10),
+                    second_signing_level:% = format_args!("{:#x}", ctx.rdx);
+                    "Handling NtCompareSigningLevels as compatible"
+                );
+                ctx.rax = STATUS_SUCCESS;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtCreateSection) => {
+                Self::nt_create_section(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtApphelpCacheControl) => {
+                litebox_util_log::debug!(
+                    service_class:% = format_args!("{:#x}", ctx.r10),
+                    service_data:% = format_args!("{:#x}", ctx.rdx);
+                    "Handling NtApphelpCacheControl as no-op"
+                );
+                ctx.rax = STATUS_SUCCESS;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtMapViewOfSection) => {
+                Self::nt_map_view_of_section(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtUnmapViewOfSection) => {
+                litebox_util_log::debug!(
+                    process_handle:% = format_args!("{:#x}", ctx.r10),
+                    base_address:% = format_args!("{:#x}", ctx.rdx);
+                    "Handling NtUnmapViewOfSection as no-op"
+                );
+                ctx.rax = STATUS_SUCCESS;
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateEvent) => {
@@ -3203,6 +3282,39 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
+    fn nt_query_attributes_file(ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name =
+            read_object_attributes_name(ctx.r10).unwrap_or_else(|| String::from("<unreadable>"));
+        let file_attributes = if object_name.ends_with('\\') || object_name.ends_with(':') {
+            WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+        };
+
+        if ctx.rdx == 0
+            || write_value(
+                ctx.rdx,
+                FileBasicInformation {
+                    file_attributes,
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            object_attributes:% = format_args!("{:#x}", ctx.r10),
+            file_information:% = format_args!("{:#x}", ctx.rdx),
+            object_name:% = object_name,
+            file_attributes:% = format_args!("{file_attributes:#x}");
+            "Handling NtQueryAttributesFile syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
     fn nt_query_volume_information_file(ctx: &mut litebox_common_linux::PtRegs) {
         let fs_information_class =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
@@ -3262,6 +3374,103 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             status:% = format_args!("{:#x}", ctx.rax);
             "Handling NtQueryVolumeInformationFile syscall"
         );
+    }
+
+    fn nt_get_cached_signing_level(ctx: &mut litebox_common_linux::PtRegs) {
+        let thumbprint_size =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let thumbprint_algorithm =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+
+        if ctx.rdx != 0 && write_value(ctx.rdx, 0_u32).is_err()
+            || ctx.r8 != 0 && write_value(ctx.r8, 0_u8).is_err()
+            || thumbprint_size != 0 && write_value(thumbprint_size, 0_u32).is_err()
+            || thumbprint_algorithm != 0 && write_value(thumbprint_algorithm, 0_u32).is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            file_handle:% = format_args!("{:#x}", ctx.r10),
+            flags:% = format_args!("{:#x}", ctx.rdx),
+            signing_level:% = format_args!("{:#x}", ctx.r8),
+            thumbprint:% = format_args!("{:#x}", ctx.r9),
+            thumbprint_size:% = format_args!("{thumbprint_size:#x}"),
+            thumbprint_algorithm:% = format_args!("{thumbprint_algorithm:#x}");
+            "Handling NtGetCachedSigningLevel syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_create_section(ctx: &mut litebox_common_linux::PtRegs) {
+        let section_page_protection =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let allocation_attributes =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let file_handle =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+
+        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            section_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            maximum_size:% = format_args!("{:#x}", ctx.r9),
+            section_page_protection:% = format_args!("{section_page_protection:#x}"),
+            allocation_attributes:% = format_args!("{allocation_attributes:#x}"),
+            file_handle:% = format_args!("{file_handle:#x}");
+            "Handling NtCreateSection syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_map_view_of_section(ctx: &mut litebox_common_linux::PtRegs) {
+        let commit_size =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let section_offset =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
+        let view_size = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
+        let inherit_disposition =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_8_OFFSET));
+        let allocation_type =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_9_OFFSET));
+        let win32_protect =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_10_OFFSET));
+
+        let ntdll_base = GUEST_NTDLL_BASE.load(Ordering::Relaxed);
+        let ntdll_size = GUEST_NTDLL_SIZE.load(Ordering::Relaxed);
+        if ntdll_base == 0
+            || ctx.r8 == 0
+            || write_value(ctx.r8, ntdll_base).is_err()
+            || view_size != 0 && write_value(view_size, ntdll_size).is_err()
+        {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            section_handle:% = format_args!("{:#x}", ctx.r10),
+            process_handle:% = format_args!("{:#x}", ctx.rdx),
+            base_address_ptr:% = format_args!("{:#x}", ctx.r8),
+            mapped_base:% = format_args!("{ntdll_base:#x}"),
+            zero_bits:% = format_args!("{:#x}", ctx.r9),
+            commit_size:% = format_args!("{commit_size:#x}"),
+            section_offset:% = format_args!("{section_offset:#x}"),
+            view_size:% = format_args!("{view_size:#x}"),
+            mapped_size = ntdll_size,
+            inherit_disposition,
+            allocation_type:% = format_args!("{allocation_type:#x}"),
+            win32_protect:% = format_args!("{win32_protect:#x}");
+            "Handling NtMapViewOfSection with existing guest ntdll mapping"
+        );
+        ctx.rax = STATUS_SUCCESS;
     }
 
     fn write_file_fs_information<GuestValue>(
