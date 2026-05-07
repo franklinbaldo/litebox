@@ -80,6 +80,159 @@ extern "system" fn litebox_kernel32_exit_process(exit_code: u32) -> ! {
     unsafe { host_exit_process(exit_code) }
 }
 
+extern "system" fn litebox_ntdll_rtl_allocate_heap(
+    _heap: *mut c_void,
+    flags: u32,
+    bytes: usize,
+) -> *mut c_void {
+    let memory = ntdll_guest_heap_allocate(bytes);
+    litebox_util_log::debug!(
+        flags:% = format_args!("{flags:#x}"),
+        bytes,
+        memory:% = format_args!("{memory:p}");
+        "Handled ntdll!RtlAllocateHeap through built-in thunk"
+    );
+    memory
+}
+
+extern "system" fn litebox_ntdll_rtl_free_heap(
+    _heap: *mut c_void,
+    flags: u32,
+    memory: *mut c_void,
+) -> u8 {
+    litebox_util_log::debug!(
+        flags:% = format_args!("{flags:#x}"),
+        memory:% = format_args!("{memory:p}");
+        "Handled ntdll!RtlFreeHeap through built-in thunk"
+    );
+    1
+}
+
+extern "system" fn litebox_ntdll_rtl_reallocate_heap(
+    _heap: *mut c_void,
+    flags: u32,
+    memory: *mut c_void,
+    bytes: usize,
+) -> *mut c_void {
+    let new_memory = ntdll_guest_heap_reallocate(memory, bytes);
+    litebox_util_log::debug!(
+        flags:% = format_args!("{flags:#x}"),
+        memory:% = format_args!("{memory:p}"),
+        bytes,
+        new_memory:% = format_args!("{new_memory:p}");
+        "Handled ntdll!RtlReAllocateHeap through built-in thunk"
+    );
+    new_memory
+}
+
+extern "system" fn litebox_ntdll_rtl_size_heap(
+    _heap: *mut c_void,
+    flags: u32,
+    memory: *const c_void,
+) -> usize {
+    let size = ntdll_guest_heap_size(memory);
+    litebox_util_log::debug!(
+        flags:% = format_args!("{flags:#x}"),
+        memory:% = format_args!("{memory:p}"),
+        size;
+        "Handled ntdll!RtlSizeHeap through built-in thunk"
+    );
+    size
+}
+
+extern "system" fn litebox_ntdll_rtl_create_heap(
+    _flags: u32,
+    _heap_base: *mut c_void,
+    _reserve_size: usize,
+    _commit_size: usize,
+    _lock: *mut c_void,
+    _parameters: *mut c_void,
+) -> *mut c_void {
+    let heap = NTDLL_HEAP_HANDLE.load(Ordering::Relaxed) as *mut c_void;
+    litebox_util_log::debug!(
+        heap:% = format_args!("{heap:p}");
+        "Handled ntdll!RtlCreateHeap through built-in thunk"
+    );
+    heap
+}
+
+extern "system" fn litebox_ntdll_rtl_destroy_heap(_heap: *mut c_void) -> *mut c_void {
+    litebox_util_log::debug!("Handled ntdll!RtlDestroyHeap through built-in thunk");
+    core::ptr::null_mut()
+}
+
+fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
+    const HEADER_SIZE: usize = size_of::<usize>();
+    const HEAP_ALIGNMENT: usize = 16;
+
+    let requested_size = bytes.max(1);
+    let Some(total_size) = requested_size
+        .checked_add(HEADER_SIZE)
+        .and_then(|size| align_up_power_of_two(size, HEAP_ALIGNMENT))
+    else {
+        return core::ptr::null_mut();
+    };
+
+    loop {
+        let current = NTDLL_HEAP_BUMP.load(Ordering::Relaxed);
+        let limit = NTDLL_HEAP_LIMIT.load(Ordering::Relaxed);
+        let Some(allocation) = align_up_power_of_two(current, HEAP_ALIGNMENT) else {
+            return core::ptr::null_mut();
+        };
+        let Some(next) = allocation.checked_add(total_size) else {
+            return core::ptr::null_mut();
+        };
+        if current == 0 || next > limit {
+            return core::ptr::null_mut();
+        }
+        if NTDLL_HEAP_BUMP
+            .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            // SAFETY: The bump range is initialized from pages mapped and owned by the shim.
+            unsafe {
+                core::ptr::write_bytes(allocation as *mut u8, 0, total_size);
+                (allocation as *mut usize).write(requested_size);
+            }
+            return allocation.saturating_add(HEADER_SIZE) as *mut c_void;
+        }
+    }
+}
+
+fn ntdll_guest_heap_reallocate(memory: *mut c_void, bytes: usize) -> *mut c_void {
+    if memory.is_null() {
+        return ntdll_guest_heap_allocate(bytes);
+    }
+
+    let new_memory = ntdll_guest_heap_allocate(bytes);
+    if new_memory.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let old_size = ntdll_guest_heap_size(memory.cast_const());
+    let copy_size = old_size.min(bytes);
+    // SAFETY: Both pointers are allocations from the shim bump heap and do not overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(memory.cast::<u8>(), new_memory.cast::<u8>(), copy_size);
+    }
+    new_memory
+}
+
+fn ntdll_guest_heap_size(memory: *const c_void) -> usize {
+    if memory.is_null() {
+        return usize::MAX;
+    }
+
+    let header = (memory as usize).saturating_sub(size_of::<usize>()) as *const usize;
+    // SAFETY: Heap thunk pointers place a usize allocation-size header immediately before the user pointer.
+    unsafe { header.read() }
+}
+
+fn align_up_power_of_two(value: usize, alignment: usize) -> Option<usize> {
+    let mask = alignment.checked_sub(1)?;
+    value.checked_add(mask).map(|value| value & !mask)
+}
+
 mod nt_sysno {
     include!(concat!(env!("OUT_DIR"), "/nt_sysno.rs"));
 }
@@ -93,7 +246,7 @@ const INITIAL_TEB_SIZE: usize = PAGE_SIZE * 2;
 const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
 const INITIAL_LDR_ENTRIES_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
-const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
+const INITIAL_PROCESS_HEAP_SIZE: usize = 1024 * 1024;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
 const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE * 64;
 const INITIAL_THREAD_CONTEXT_SIZE: usize = PAGE_SIZE;
@@ -114,8 +267,10 @@ const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
 const STATUS_ACCESS_VIOLATION: usize = 0xc000_0005;
 const STATUS_INVALID_PARAMETER: usize = 0xc000_000d;
 const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
+const STATUS_NO_TOKEN: usize = 0xc000_007c;
 const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
 const STATUS_NOT_SUPPORTED: usize = 0xc000_00bb;
+const STATUS_DEBUGGER_INACTIVE: usize = 0xc000_0354;
 const WINDOWS_CONTEXT_AMD64: u32 = 0x0010_0000;
 const WINDOWS_CONTEXT_CONTROL: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0001;
 const WINDOWS_CONTEXT_INTEGER: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0002;
@@ -216,6 +371,9 @@ const COMMON_PROCESSOR_FEATURE_BITS: u64 = 0x0003_8005_0001_3b2a;
 
 static PERFORMANCE_COUNTER: AtomicI64 = AtomicI64::new(1_000_000);
 static NEXT_SYNTHETIC_HANDLE: AtomicUsize = AtomicUsize::new(0x10000);
+static NTDLL_HEAP_HANDLE: AtomicUsize = AtomicUsize::new(0);
+static NTDLL_HEAP_BUMP: AtomicUsize = AtomicUsize::new(0);
+static NTDLL_HEAP_LIMIT: AtomicUsize = AtomicUsize::new(0);
 
 const _: () =
     assert!(TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET + size_of::<usize>() <= INITIAL_TEB_SIZE);
@@ -1197,6 +1355,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             if !ntdll.has_trampoline {
                 return Err(WindowsLoadError::UnrewrittenNtDll);
             }
+            self.patch_ntdll_builtin_exports(ntdll)?;
             let loader_entry_point = ntdll
                 .export_address(NTDLL_LOADER_ENTRYPOINT)?
                 .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
@@ -1359,6 +1518,50 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         Ok(())
     }
 
+    fn patch_ntdll_builtin_exports(&self, image: &LoadedImage) -> Result<(), WindowsLoadError> {
+        let thunks: &[(&[u8], usize)] = &[
+            (
+                b"RtlAllocateHeap".as_slice(),
+                litebox_ntdll_rtl_allocate_heap as *const () as usize,
+            ),
+            (
+                b"RtlFreeHeap".as_slice(),
+                litebox_ntdll_rtl_free_heap as *const () as usize,
+            ),
+            (
+                b"RtlReAllocateHeap".as_slice(),
+                litebox_ntdll_rtl_reallocate_heap as *const () as usize,
+            ),
+            (
+                b"RtlSizeHeap".as_slice(),
+                litebox_ntdll_rtl_size_heap as *const () as usize,
+            ),
+            (
+                b"RtlCreateHeap".as_slice(),
+                litebox_ntdll_rtl_create_heap as *const () as usize,
+            ),
+            (
+                b"RtlDestroyHeap".as_slice(),
+                litebox_ntdll_rtl_destroy_heap as *const () as usize,
+            ),
+        ];
+
+        for &(name, target) in thunks {
+            let Some(address) = image.export_address(name)? else {
+                continue;
+            };
+            write_absolute_jump(&self.page_manager, address, target)?;
+            litebox_util_log::debug!(
+                name:% = String::from_utf8_lossy(name),
+                address:% = format_args!("{address:#x}"),
+                target:% = format_args!("{target:#x}");
+                "Patched guest ntdll export to built-in thunk"
+            );
+        }
+
+        Ok(())
+    }
+
     fn builtin_import_address(import: &PeImport) -> Result<usize, WindowsLoadError> {
         if !import.library.eq_ignore_ascii_case(b"kernel32.dll") {
             return Err(WindowsLoadError::UnsupportedImportLibrary(
@@ -1402,6 +1605,15 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let process_parameters_address =
             self.create_zeroed_pages(INITIAL_PROCESS_PARAMETERS_SIZE)?;
         let process_heap_address = self.create_zeroed_pages(INITIAL_PROCESS_HEAP_SIZE)?;
+        let process_heap_bump = process_heap_address
+            .checked_add(PAGE_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let process_heap_limit = process_heap_address
+            .checked_add(INITIAL_PROCESS_HEAP_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        NTDLL_HEAP_HANDLE.store(process_heap_address, Ordering::Relaxed);
+        NTDLL_HEAP_BUMP.store(process_heap_bump, Ordering::Relaxed);
+        NTDLL_HEAP_LIMIT.store(process_heap_limit, Ordering::Relaxed);
         let fast_peb_lock_address = self.create_zeroed_pages(INITIAL_FAST_PEB_LOCK_SIZE)?;
         let api_set_namespace_address = self.create_zeroed_pages(INITIAL_API_SET_NAMESPACE_SIZE)?;
         let initial_thread_context_address =
@@ -1895,6 +2107,15 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 self.nt_query_system_information_ex(ctx);
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtQueryDebugFilterState) => {
+                litebox_util_log::debug!(
+                    component_id:% = format_args!("{:#x}", ctx.r10),
+                    level:% = format_args!("{:#x}", ctx.rdx);
+                    "Handling NtQueryDebugFilterState as debugger inactive"
+                );
+                ctx.rax = STATUS_DEBUGGER_INACTIVE;
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtQueryInformationProcess) => {
                 self.nt_query_information_process(ctx);
                 ContinueOperation::Resume
@@ -1915,6 +2136,17 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                     "Handling NtOpenKey as missing registry key"
                 );
                 ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenThreadToken) => {
+                litebox_util_log::debug!(
+                    thread_handle:% = format_args!("{:#x}", ctx.r10),
+                    desired_access:% = format_args!("{:#x}", ctx.rdx),
+                    open_as_self:% = format_args!("{:#x}", ctx.r8),
+                    token_handle_ptr:% = format_args!("{:#x}", ctx.r9);
+                    "Handling NtOpenThreadToken as no impersonation token"
+                );
+                ctx.rax = STATUS_NO_TOKEN;
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenDirectoryObject) => {
@@ -4199,6 +4431,34 @@ fn align_down(value: usize, alignment: usize) -> Result<usize, PeImageAccessErro
         .checked_sub(1)
         .ok_or(PeImageAccessError::AddressOverflow)?;
     Ok(value & !mask)
+}
+
+fn write_absolute_jump(
+    page_manager: &WindowsPageManager,
+    address: usize,
+    target: usize,
+) -> Result<(), PeImageAccessError> {
+    let mut jump = [0u8; 12];
+    jump[0] = 0x48;
+    jump[1] = 0xb8;
+    jump[2..10].copy_from_slice(&target.to_le_bytes());
+    jump[10] = 0xff;
+    jump[11] = 0xe0;
+
+    make_pages_writable(page_manager, address, jump.len())?;
+    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
+    ptr.copy_from_slice(0, &jump)
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+    protect_pages(
+        page_manager,
+        address,
+        jump.len(),
+        Protection {
+            read: true,
+            write: false,
+            execute: true,
+        },
+    )
 }
 
 struct PeImageFile<FS: NtShimFS> {
