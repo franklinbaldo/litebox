@@ -472,6 +472,8 @@ const PROCESS_BASIC_INFORMATION_CLASS: usize = 0;
 const PROCESS_COOKIE_INFORMATION_CLASS: usize = 36;
 const PROCESS_SCHEDULER_SHARED_DATA_CLASS: usize = 112;
 const THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS: usize = 57;
+const WINDOWS_DEFAULT_LOCALE_ID: u32 = 0x0409;
+const WINDOWS_DEFAULT_UI_LANGUAGE_ID: u16 = 0x0409;
 const APPHELP_CACHE_SERVICE_LOOKUP: usize = 0;
 const APPHELP_CACHE_SERVICE_REMOVE: usize = 1;
 const APPHELP_CACHE_SERVICE_UPDATE: usize = 2;
@@ -2779,6 +2781,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 self.nt_query_system_information_ex(ctx);
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtQueryDefaultLocale) => {
+                Self::nt_query_default_locale(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtQueryDefaultUILanguage) => {
+                Self::nt_query_default_ui_language(ctx);
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtQueryDebugFilterState) => {
                 litebox_util_log::debug!(
                     component_id:% = format_args!("{:#x}", ctx.r10),
@@ -2798,6 +2808,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtSetInformationThread) => {
                 self.nt_set_information_thread(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetDefaultLocale) => {
+                Self::nt_set_default_locale(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSetDefaultUILanguage) => {
+                Self::nt_set_default_ui_language(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenKey) => {
@@ -5801,6 +5819,52 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             guest_return_address:% = format_args!("{guest_return_address:#x}");
             "Handling NtQuerySystemInformationEx syscall"
         );
+    }
+
+    fn nt_query_default_locale(ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx == 0 || write_value(ctx.rdx, WINDOWS_DEFAULT_LOCALE_ID).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            user_profile:% = format_args!("{:#x}", ctx.r10),
+            default_locale_id:% = format_args!("{:#x}", ctx.rdx),
+            locale_id:% = format_args!("{WINDOWS_DEFAULT_LOCALE_ID:#x}");
+            "Handling NtQueryDefaultLocale syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_query_default_ui_language(ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.r10 == 0 || write_value(ctx.r10, WINDOWS_DEFAULT_UI_LANGUAGE_ID).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            default_ui_language_id:% = format_args!("{:#x}", ctx.r10),
+            language_id:% = format_args!("{WINDOWS_DEFAULT_UI_LANGUAGE_ID:#x}");
+            "Handling NtQueryDefaultUILanguage syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_default_locale(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            user_profile:% = format_args!("{:#x}", ctx.r10),
+            locale_id:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtSetDefaultLocale as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_set_default_ui_language(ctx: &mut litebox_common_linux::PtRegs) {
+        litebox_util_log::debug!(
+            language_id:% = format_args!("{:#x}", ctx.r10);
+            "Handling NtSetDefaultUILanguage as no-op"
+        );
+        ctx.rax = STATUS_SUCCESS;
     }
 
     fn system_logical_processor_group_information() -> SystemLogicalProcessorGroupInformation {
