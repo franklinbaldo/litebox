@@ -199,6 +199,10 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
 
 fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
     let requested_size = bytes.max(1);
+    if let Some(memory) = ntdll_guest_heap_reuse_free_block(requested_size) {
+        return memory;
+    }
+
     let Some(total_size) = ntdll_guest_heap_total_size(requested_size) else {
         return core::ptr::null_mut();
     };
@@ -225,6 +229,37 @@ fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
                 (allocation as *mut usize).write(requested_size);
             }
             return allocation.saturating_add(NTDLL_HEAP_HEADER_SIZE) as *mut c_void;
+        }
+    }
+}
+
+fn ntdll_guest_heap_reuse_free_block(requested_size: usize) -> Option<*mut c_void> {
+    loop {
+        let free_header = NTDLL_HEAP_FREE_LIST.load(Ordering::Relaxed);
+        if free_header == 0 {
+            return None;
+        }
+        let free_memory = free_header.checked_add(NTDLL_HEAP_HEADER_SIZE)?;
+        let free_size = ntdll_guest_heap_requested_size(free_memory as *const c_void)?;
+        if free_size < requested_size {
+            return None;
+        }
+        let next_free = read_usize_or_zero(free_memory);
+        if NTDLL_HEAP_FREE_LIST
+            .compare_exchange(free_header, next_free, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let total_size = ntdll_guest_heap_total_size(free_size)?;
+            // SAFETY: The block came from the shim heap free list and is no longer reachable there.
+            unsafe {
+                core::ptr::write_bytes(
+                    free_memory as *mut u8,
+                    0,
+                    total_size - NTDLL_HEAP_HEADER_SIZE,
+                );
+                (free_header as *mut usize).write(requested_size);
+            }
+            return Some(free_memory as *mut c_void);
         }
     }
 }
@@ -268,13 +303,25 @@ fn ntdll_guest_heap_free(memory: *mut c_void) -> Option<bool> {
     loop {
         let current = NTDLL_HEAP_BUMP.load(Ordering::Relaxed);
         if current != allocation_end {
-            return Some(false);
+            break;
         }
         if NTDLL_HEAP_BUMP
             .compare_exchange(current, header, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
             return Some(true);
+        }
+    }
+
+    let free_memory = header.checked_add(NTDLL_HEAP_HEADER_SIZE)?;
+    loop {
+        let next_free = NTDLL_HEAP_FREE_LIST.load(Ordering::Relaxed);
+        write_value(free_memory, next_free).ok()?;
+        if NTDLL_HEAP_FREE_LIST
+            .compare_exchange(next_free, header, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(false);
         }
     }
 }
@@ -490,6 +537,7 @@ static NEXT_SYNTHETIC_HANDLE: AtomicUsize = AtomicUsize::new(0x10000);
 static NTDLL_HEAP_HANDLE: AtomicUsize = AtomicUsize::new(0);
 static NTDLL_HEAP_BUMP: AtomicUsize = AtomicUsize::new(0);
 static NTDLL_HEAP_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static NTDLL_HEAP_FREE_LIST: AtomicUsize = AtomicUsize::new(0);
 static GUEST_NTDLL_BASE: AtomicUsize = AtomicUsize::new(0);
 static GUEST_NTDLL_SIZE: AtomicUsize = AtomicUsize::new(0);
 static GUEST_PEB_ADDRESS: AtomicUsize = AtomicUsize::new(0);
@@ -1841,6 +1889,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         NTDLL_HEAP_HANDLE.store(process_heap_address, Ordering::Relaxed);
         NTDLL_HEAP_BUMP.store(process_heap_bump, Ordering::Relaxed);
         NTDLL_HEAP_LIMIT.store(process_heap_limit, Ordering::Relaxed);
+        NTDLL_HEAP_FREE_LIST.store(0, Ordering::Relaxed);
         let fast_peb_lock_address = self.create_zeroed_pages(INITIAL_FAST_PEB_LOCK_SIZE)?;
         let api_set_namespace_address = self.create_zeroed_pages(INITIAL_API_SET_NAMESPACE_SIZE)?;
         let initial_thread_context_address =
