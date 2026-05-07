@@ -93,7 +93,7 @@ const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
-const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE;
+const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE * 64;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 const NTDLL_PATHS: &[&str] = &[
     "/windows/system32/ntdll.dll",
@@ -188,6 +188,8 @@ const TEB_TLS_SLOT_COUNT: usize = 64;
 const TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET: usize = 0x1850;
 const TEB_SCHEDULER_SHARED_DATA_STORAGE_OFFSET: usize = 0x1860;
 const TEB_PROCESSOR_FEATURES_BITMAP_OFFSET: usize = 0x1870;
+const HOST_TEB_PEB_OFFSET: usize = 0x60;
+const HOST_PEB_API_SET_MAP_OFFSET: usize = 0x68;
 const SCHEDULER_SHARED_SLOT_ASSIGN: u32 = 0;
 const SCHEDULER_SHARED_SLOT_FREE: u32 = 1;
 const SCHEDULER_SHARED_SLOT_QUERY: u32 = 2;
@@ -297,7 +299,11 @@ impl ApiSetNamespace {
     fn empty() -> Self {
         let size = u32::try_from(size_of::<Self>()).expect("API set namespace fits in u32");
         Self {
+            version: 6,
             size,
+            entry_offset: size,
+            hash_offset: size,
+            hash_factor: 1,
             ..Self::default()
         }
     }
@@ -864,14 +870,29 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         &self,
         fs: Arc<FS>,
         path: &str,
+        argv: Vec<alloc::ffi::CString>,
+        envp: Vec<alloc::ffi::CString>,
+    ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
+        self.load_program_with_mode(fs, path, argv, envp, WindowsLoadMode::Auto)
+    }
+
+    /// Loads the program at `path` using an explicit Windows loader strategy.
+    pub fn load_program_with_mode(
+        &self,
+        fs: Arc<FS>,
+        path: &str,
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
+        load_mode: WindowsLoadMode,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let image = self.load_image(fs.clone(), path)?;
         let application_entry_point = image.mapping.entry_point;
-        self.resolve_initial_imports(&image)?;
+        if load_mode == WindowsLoadMode::Auto {
+            self.resolve_initial_imports(&image)?;
+        }
         let ntdll = self.load_ntdll(fs)?;
-        let (entry_point, start_mode) = if !image.imports.is_empty() {
+        let force_ntdll_loader = load_mode == WindowsLoadMode::NtDllLoader;
+        let (entry_point, start_mode) = if !force_ntdll_loader && !image.imports.is_empty() {
             litebox_util_log::debug!(
                 application_entry_point:% = format_args!("{application_entry_point:#x}");
                 "Starting Windows guest through built-in import thunks"
@@ -885,6 +906,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 .export_address(NTDLL_LOADER_ENTRYPOINT)?
                 .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
             litebox_util_log::debug!(
+                forced = force_ntdll_loader,
                 entry_point:% = format_args!("{loader_entry_point:#x}"),
                 application_entry_point:% = format_args!("{application_entry_point:#x}");
                 "Starting Windows guest through ntdll!LdrInitializeThunk"
@@ -896,6 +918,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                     image_base: image.mapping.base_addr,
                 },
             )
+        } else if force_ntdll_loader {
+            return Err(WindowsLoadError::MissingNtDll);
         } else {
             (application_entry_point, WindowsStartMode::Application)
         };
@@ -1084,7 +1108,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             write_utf16_string(&mut process_parameters_string_cursor, &process_image_path)?;
 
         write_value(ldr_data_address, PebLdrData::new(ldr_data_address))?;
-        write_value(api_set_namespace_address, ApiSetNamespace::empty())?;
+        write_initial_api_set_namespace(api_set_namespace_address)?;
         write_value(process_parameters_address, process_parameters)?;
         write_value(
             peb_address,
@@ -1169,6 +1193,16 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
     }
+}
+
+/// Selects how the Windows shim transfers control to the initial executable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WindowsLoadMode {
+    /// Use the currently supported bring-up path for the image.
+    #[default]
+    Auto,
+    /// Enter guest `ntdll!LdrInitializeThunk` instead of patching built-in imports.
+    NtDllLoader,
 }
 
 /// The shim entrypoint object passed to the platform.
@@ -1532,6 +1566,8 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                     parameter0:% = format_args!("{parameter0:#x}"),
                     valid_response_options:% = format_args!("{valid_response_options:#x}"),
                     response:% = format_args!("{response:#x}"),
+                    rip:% = format_args!("{:#x}", ctx.rip),
+                    rip_region:% = self.describe_guest_address(ctx.rip),
                     guest_return_address:% = format_args!("{guest_return_address:#x}"),
                     guest_return_region:% = self.describe_guest_address(guest_return_address);
                     "Guest called NtRaiseHardError"
@@ -1539,11 +1575,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Terminate
             }
             syscall => {
+                let guest_return_address = read_usize_or_zero(ctx.rsp);
                 litebox_util_log::debug!(
                     syscall:? = syscall,
                     arg1:% = format_args!("{:#x}", ctx.r10),
                     rip:% = format_args!("{:#x}", ctx.rip),
-                    rip_region:% = self.describe_guest_address(ctx.rip);
+                    rip_region:% = self.describe_guest_address(ctx.rip),
+                    guest_return_address:% = format_args!("{guest_return_address:#x}"),
+                    guest_return_region:% = self.describe_guest_address(guest_return_address);
                     "Unsupported Windows syscall"
                 );
                 ContinueOperation::Terminate
@@ -1577,7 +1616,9 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             r12:% = format_args!("{:#x}", ctx.r12),
             r13:% = format_args!("{:#x}", ctx.r13),
             r14:% = format_args!("{:#x}", ctx.r14),
-            r15:% = format_args!("{:#x}", ctx.r15);
+            r15:% = format_args!("{:#x}", ctx.r15),
+            guest_return_address:% = format_args!("{:#x}", read_usize_or_zero(ctx.rsp)),
+            guest_return_region:% = self.describe_guest_address(read_usize_or_zero(ctx.rsp));
             "Windows guest exception"
         );
         // TODO: Translate hardware exceptions into Windows SEH where appropriate.
@@ -3396,6 +3437,9 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll does not export LdrInitializeThunk.
     #[error("guest ntdll.dll does not export LdrInitializeThunk")]
     MissingNtDllLoaderEntrypoint,
+    /// Guest ntdll.dll is required for the selected load mode but was not found.
+    #[error("guest ntdll.dll is required for the selected Windows load mode")]
+    MissingNtDll,
     /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
     #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
     UnrewrittenNtDll,
@@ -3519,6 +3563,67 @@ where
     let ptr = <Platform as RawPointerProvider>::RawMutPointer::<GuestValue>::from_usize(address);
     ptr.write_at_offset(0, value)
         .ok_or(PeImageAccessError::MemoryAccess)
+}
+
+fn write_initial_api_set_namespace(address: usize) -> Result<(), PeImageAccessError> {
+    if let Some(host_namespace) = host_api_set_namespace() {
+        if host_namespace.len() <= INITIAL_API_SET_NAMESPACE_SIZE {
+            let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
+            ptr.copy_from_slice(0, host_namespace)
+                .ok_or(PeImageAccessError::MemoryAccess)?;
+            litebox_util_log::debug!(
+                address:% = format_args!("{address:#x}"),
+                size = host_namespace.len();
+                "Copied host API-set namespace into guest PEB"
+            );
+            return Ok(());
+        }
+
+        litebox_util_log::warn!(
+            address:% = format_args!("{address:#x}"),
+            size = host_namespace.len(),
+            capacity = INITIAL_API_SET_NAMESPACE_SIZE;
+            "Host API-set namespace is too large for the initial guest allocation"
+        );
+    }
+
+    write_value(address, ApiSetNamespace::empty())
+}
+
+fn host_api_set_namespace() -> Option<&'static [u8]> {
+    let peb = host_peb_address()?;
+    // SAFETY: `peb` is read from the current host TEB, and ApiSetMap is a pointer-sized
+    // field at a fixed x64 PEB offset for the Windows process hosting this runner.
+    let api_set_map_address =
+        unsafe { (peb.checked_add(HOST_PEB_API_SET_MAP_OFFSET)? as *const usize).read_unaligned() };
+    if api_set_map_address == 0 {
+        return None;
+    }
+
+    // SAFETY: ApiSetMap points at the process-global API-set namespace header owned by Windows.
+    let namespace = unsafe { (api_set_map_address as *const ApiSetNamespace).read_unaligned() };
+    let size = usize::try_from(namespace.size).ok()?;
+    if !(size_of::<ApiSetNamespace>()..=INITIAL_API_SET_NAMESPACE_SIZE).contains(&size) {
+        return None;
+    }
+
+    // SAFETY: The size was read from the host API-set namespace header and capped to the
+    // guest allocation size before exposing the immutable byte range.
+    Some(unsafe { core::slice::from_raw_parts(api_set_map_address as *const u8, size) })
+}
+
+fn host_peb_address() -> Option<usize> {
+    let peb: usize;
+    // SAFETY: On Windows x86-64, GS points at the current host TEB and offset 0x60 is the PEB.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[{}]",
+            out(reg) peb,
+            const HOST_TEB_PEB_OFFSET,
+            options(nostack, readonly, preserves_flags),
+        );
+    }
+    (peb != 0).then_some(peb)
 }
 
 fn initial_dos_image_path(path: &str) -> String {

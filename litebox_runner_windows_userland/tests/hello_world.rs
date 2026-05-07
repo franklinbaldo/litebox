@@ -49,6 +49,11 @@ fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
 }
 "#;
 
+struct CommandOutput {
+    output: std::process::Output,
+    timed_out: bool,
+}
+
 #[test]
 fn run_minimal_hello_world_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -88,6 +93,85 @@ fn run_minimal_hello_world_pe() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+#[ignore = "documents the current incomplete guest ntdll loader path"]
+fn forced_ntdll_loader_reports_current_blocker() {
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hello_world_ntdll_loader_{}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let pe_path = build_minimal_hello_world_pe(&test_dir);
+    println!("Built hello-world PE fixture at `{}`", pe_path.display());
+    let ntdll_path = build_rewritten_ntdll(&test_dir);
+    println!(
+        "Built rewritten ntdll fixture at `{}`",
+        ntdll_path.display()
+    );
+    let tar_path = test_dir.join("hello_world_ntdll_loader.tar");
+    create_tar_with_hello_exe(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    command.env("LITEBOX_LOG", "debug").args([
+        "-Z",
+        "--force-ntdll-loader",
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/hello.exe",
+    ]);
+    println!("Running `{command:?}`");
+    let CommandOutput { output, timed_out } =
+        run_with_timeout(command, std::time::Duration::from_secs(10));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined_output = format!("{stdout}\n{stderr}");
+
+    assert!(
+        timed_out || !output.status.success(),
+        "forced ntdll loader path unexpectedly succeeded; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined_output.contains("Starting Windows guest through ntdll!LdrInitializeThunk"),
+        "forced ntdll loader path did not reach LdrInitializeThunk\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        combined_output.contains("Guest called NtRaiseHardError")
+            || combined_output.contains("Windows guest exception")
+            || combined_output.contains("Unsupported Windows syscall")
+            || combined_output.contains("Windows vectored exception while in guest"),
+        "forced ntdll loader path did not report a useful blocker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn run_with_timeout(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+) -> CommandOutput {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run litebox_runner_windows_userland");
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    while child
+        .try_wait()
+        .expect("failed to poll runner child")
+        .is_none()
+    {
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            child.kill().expect("failed to kill timed-out runner child");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect runner child output");
+    CommandOutput { output, timed_out }
 }
 
 fn build_minimal_hello_world_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
