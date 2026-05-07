@@ -174,9 +174,16 @@ extern "system" fn litebox_ntdll_api_set_resolve(
             <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(result as usize);
         let _ = ptr.copy_from_slice(0, &[0; API_SET_RESOLUTION_RESULT_SIZE]);
     }
+    let guest_peb = GUEST_PEB_ADDRESS.load(Ordering::Relaxed);
+    let expected_api_set_map = GUEST_API_SET_MAP.load(Ordering::Relaxed);
+    let actual_api_set_map =
+        read_usize_or_zero(guest_peb.saturating_add(HOST_PEB_API_SET_MAP_OFFSET));
     litebox_util_log::debug!(
         name:% = format_args!("{name:p}"),
-        length;
+        length,
+        guest_peb:% = format_args!("{guest_peb:#x}"),
+        expected_api_set_map:% = format_args!("{expected_api_set_map:#x}"),
+        actual_api_set_map:% = format_args!("{actual_api_set_map:#x}");
         "Handled ntdll API-set helper as unresolved"
     );
     0
@@ -398,6 +405,8 @@ static NEXT_SYNTHETIC_HANDLE: AtomicUsize = AtomicUsize::new(0x10000);
 static NTDLL_HEAP_HANDLE: AtomicUsize = AtomicUsize::new(0);
 static NTDLL_HEAP_BUMP: AtomicUsize = AtomicUsize::new(0);
 static NTDLL_HEAP_LIMIT: AtomicUsize = AtomicUsize::new(0);
+static GUEST_PEB_ADDRESS: AtomicUsize = AtomicUsize::new(0);
+static GUEST_API_SET_MAP: AtomicUsize = AtomicUsize::new(0);
 
 const _: () =
     assert!(TEB_SCHEDULER_SHARED_DATA_SLOT_OFFSET + size_of::<usize>() <= INITIAL_TEB_SIZE);
@@ -787,6 +796,9 @@ impl ProcessEnvironmentBlock {
         }
     }
 }
+
+const _: () =
+    assert!(offset_of!(ProcessEnvironmentBlock, api_set_map) == HOST_PEB_API_SET_MAP_OFFSET);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
@@ -1734,6 +1746,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             Self::processor_feature_bitmap_words(),
         )?;
         write_value(system_dll_init_block_address, PsSystemDllInitBlockV3::new())?;
+        GUEST_PEB_ADDRESS.store(peb_address, Ordering::Relaxed);
+        GUEST_API_SET_MAP.store(api_set_namespace_address, Ordering::Relaxed);
 
         litebox_util_log::debug!(
             peb:% = format_args!("{peb_address:#x}"),
