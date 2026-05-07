@@ -425,6 +425,7 @@ const LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET: usize = 0x00;
 const LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET: usize = 0x10;
 const LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET: usize = 0x20;
 const LDR_DATA_TABLE_ENTRY_SIZE: usize = 0x120;
+const LDR_DDAG_NODE_SIZE: usize = 0x68;
 const TEB_AFTER_WIN32_THREAD_INFO_OFFSET: usize = 0x80;
 const TEB_TLS_SLOTS_OFFSET: usize = 0x1480;
 const TEB_TLS_SLOT_COUNT: usize = 64;
@@ -687,11 +688,85 @@ struct LdrDataTableEntry {
     flags: u32,
     load_count: u16,
     tls_index: u16,
+    hash_links: ListEntry,
+    time_date_stamp: u32,
+    _padding1: u32,
+    entry_point_activation_context: usize,
+    lock: usize,
+    ddag_node: usize,
+    node_module_link: ListEntry,
+    load_context: usize,
+    parent_dll_base: usize,
+    switch_back_context: usize,
+    base_address_index_node: RtlBalancedNode,
+    mapping_info_index_node: RtlBalancedNode,
+    original_base: usize,
+    load_time: u64,
+    base_name_hash_value: u32,
+    load_reason: u32,
+    implicit_path_options: u32,
+    reference_count: u32,
+    dependent_load_flags: u32,
+    signing_level: u8,
+    _padding2: [u8; 3],
 }
 
 const _: () = assert!(offset_of!(LdrDataTableEntry, dll_base) == 0x30);
 const _: () = assert!(offset_of!(LdrDataTableEntry, full_dll_name) == 0x48);
 const _: () = assert!(offset_of!(LdrDataTableEntry, base_dll_name) == 0x58);
+const _: () = assert!(offset_of!(LdrDataTableEntry, ddag_node) == 0x98);
+const _: () = assert!(offset_of!(LdrDataTableEntry, node_module_link) == 0xa0);
+const _: () = assert!(size_of::<LdrDataTableEntry>() == LDR_DATA_TABLE_ENTRY_SIZE);
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct RtlBalancedNode {
+    left: usize,
+    right: usize,
+    parent_value: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct LdrDdagNode {
+    modules: ListEntry,
+    service_tag_list: usize,
+    load_count: u32,
+    load_while_unloading_count: u32,
+    lowest_link: usize,
+    dependencies: usize,
+    incoming_dependencies: ListEntry,
+    state: i32,
+    _padding0: u32,
+    condense_link: ListEntry,
+    predecessor: usize,
+    incoming_service_tag: usize,
+}
+
+const _: () = assert!(offset_of!(LdrDdagNode, incoming_dependencies) == 0x30);
+const _: () = assert!(size_of::<LdrDdagNode>() == LDR_DDAG_NODE_SIZE);
+
+impl LdrDdagNode {
+    fn new(address: usize, node_module_link: usize) -> Self {
+        Self {
+            modules: ListEntry {
+                flink: node_module_link,
+                blink: node_module_link,
+            },
+            load_count: 1,
+            incoming_dependencies: ListEntry::new_self(address + 0x30),
+            state: 4,
+            condense_link: ListEntry::new_self(address + 0x48),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LdrEntryAddresses {
+    entry: usize,
+    ddag_node: usize,
+}
 
 impl LdrDataTableEntry {
     fn new(
@@ -699,6 +774,7 @@ impl LdrDataTableEntry {
         next_entry: Option<usize>,
         list_heads: LdrListHeads,
         mapping: &MappingInfo,
+        addresses: LdrEntryAddresses,
         full_dll_name: UnicodeString,
         base_dll_name: UnicodeString,
     ) -> Self {
@@ -728,6 +804,15 @@ impl LdrDataTableEntry {
             base_dll_name,
             flags: 0x22,
             load_count: 0xffff,
+            hash_links: ListEntry::new_self(addresses.entry + 0x70),
+            ddag_node: addresses.ddag_node,
+            node_module_link: ListEntry {
+                flink: addresses.ddag_node,
+                blink: addresses.ddag_node,
+            },
+            original_base: mapping.base_addr,
+            load_reason: 4,
+            reference_count: 1,
             ..Self::default()
         }
     }
@@ -1841,6 +1926,12 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let ntdll_entry_address = entries_address
             .checked_add(LDR_DATA_TABLE_ENTRY_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
+        let app_ddag_node_address = entries_address
+            .checked_add(LDR_DATA_TABLE_ENTRY_SIZE * 2)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let ntdll_ddag_node_address = app_ddag_node_address
+            .checked_add(LDR_DDAG_NODE_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
         let last_entry = if ntdll.is_some() {
             ntdll_entry_address
         } else {
@@ -1856,10 +1947,18 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ntdll.map(|_| ntdll_entry_address),
             list_heads,
             image,
+            LdrEntryAddresses {
+                entry: app_entry_address,
+                ddag_node: app_ddag_node_address,
+            },
             write_utf16_string(string_cursor, process_image_path)?,
             write_utf16_string(string_cursor, initial_image_base_name(process_image_path))?,
         );
         write_value(app_entry_address, app_entry)?;
+        write_value(
+            app_ddag_node_address,
+            LdrDdagNode::new(app_ddag_node_address, app_entry_address + 0xa0),
+        )?;
 
         if let Some(ntdll) = ntdll {
             let ntdll_entry = LdrDataTableEntry::new(
@@ -1867,10 +1966,18 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 None,
                 list_heads,
                 ntdll,
+                LdrEntryAddresses {
+                    entry: ntdll_entry_address,
+                    ddag_node: ntdll_ddag_node_address,
+                },
                 write_utf16_string(string_cursor, "C:\\Windows\\System32\\ntdll.dll")?,
                 write_utf16_string(string_cursor, "ntdll.dll")?,
             );
             write_value(ntdll_entry_address, ntdll_entry)?;
+            write_value(
+                ntdll_ddag_node_address,
+                LdrDdagNode::new(ntdll_ddag_node_address, ntdll_entry_address + 0xa0),
+            )?;
         }
 
         Ok(InitialLdrEntries {
@@ -2848,8 +2955,11 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         mapping: &MappingInfo,
     ) -> Result<(), PeImageAccessError> {
         let entry_address = self.create_metadata_pages(DYNAMIC_LDR_ENTRY_SIZE)?;
-        let mut string_cursor = entry_address
+        let ddag_node_address = entry_address
             .checked_add(LDR_DATA_TABLE_ENTRY_SIZE)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let mut string_cursor = ddag_node_address
+            .checked_add(LDR_DDAG_NODE_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
         let list_heads = LdrListHeads {
             load: self.ldr_data_address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
@@ -2864,10 +2974,18 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             None,
             list_heads,
             mapping,
+            LdrEntryAddresses {
+                entry: entry_address,
+                ddag_node: ddag_node_address,
+            },
             write_utf16_string(&mut string_cursor, &guest_path_to_dos_path(path))?,
             write_utf16_string(&mut string_cursor, module_basename(path))?,
         );
         write_value(entry_address, entry)?;
+        write_value(
+            ddag_node_address,
+            LdrDdagNode::new(ddag_node_address, entry_address + 0xa0),
+        )?;
         append_ldr_list_entry(
             list_heads.load,
             previous_entry,
