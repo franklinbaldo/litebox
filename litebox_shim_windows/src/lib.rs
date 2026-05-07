@@ -94,6 +94,7 @@ const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
 const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE * 64;
+const INITIAL_THREAD_CONTEXT_SIZE: usize = PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 const NTDLL_PATHS: &[&str] = &[
     "/windows/system32/ntdll.dll",
@@ -112,6 +113,13 @@ const STATUS_INVALID_PARAMETER: usize = 0xc000_000d;
 const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
 const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
 const STATUS_NOT_SUPPORTED: usize = 0xc000_00bb;
+const WINDOWS_CONTEXT_AMD64: u32 = 0x0010_0000;
+const WINDOWS_CONTEXT_CONTROL: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0001;
+const WINDOWS_CONTEXT_INTEGER: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0002;
+const WINDOWS_CONTEXT_SEGMENTS: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0004;
+const WINDOWS_INITIAL_MXCSR: u32 = 0x1f80;
+const WINDOWS_INITIAL_CS: u16 = 0x33;
+const WINDOWS_INITIAL_SS: u16 = 0x2b;
 const PERFORMANCE_FREQUENCY: i64 = 10_000_000;
 const WINDOWS_PAGE_SIZE_U32: u32 = 4096;
 const WINDOWS_ALLOCATION_GRANULARITY: u32 = 0x1_0000;
@@ -349,7 +357,6 @@ impl PebLdrData {
     fn new(address: usize) -> Self {
         Self {
             length: u32::try_from(size_of::<Self>()).expect("PEB_LDR_DATA prefix fits in u32"),
-            initialized: 1,
             in_load_order_module_list: ListEntry::new_self(
                 address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
             ),
@@ -506,6 +513,95 @@ struct InitialClientId {
     unique_process: usize,
     /// CLIENT_ID.UniqueThread: placeholder thread identifier.
     unique_thread: usize,
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct InitialThreadContext {
+    p1_home: u64,
+    p2_home: u64,
+    p3_home: u64,
+    p4_home: u64,
+    p5_home: u64,
+    p6_home: u64,
+    context_flags: u32,
+    mx_csr: u32,
+    seg_cs: u16,
+    seg_ds: u16,
+    seg_es: u16,
+    seg_fs: u16,
+    seg_gs: u16,
+    seg_ss: u16,
+    eflags: u32,
+    dr0: u64,
+    dr1: u64,
+    dr2: u64,
+    dr3: u64,
+    dr6: u64,
+    dr7: u64,
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rsp: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
+}
+
+const _: () = assert!(offset_of!(InitialThreadContext, rax) == 0x78);
+const _: () = assert!(offset_of!(InitialThreadContext, rip) == 0xf8);
+
+impl InitialThreadContext {
+    fn new(entry_point: usize, stack_top: usize, image_base: usize) -> Self {
+        Self {
+            context_flags: WINDOWS_CONTEXT_CONTROL
+                | WINDOWS_CONTEXT_INTEGER
+                | WINDOWS_CONTEXT_SEGMENTS,
+            mx_csr: WINDOWS_INITIAL_MXCSR,
+            seg_cs: WINDOWS_INITIAL_CS,
+            seg_ss: WINDOWS_INITIAL_SS,
+            eflags: 0x202,
+            rcx: u64::try_from(image_base).expect("image base fits in Windows context"),
+            rsp: u64::try_from(stack_top).expect("stack top fits in Windows context"),
+            rip: u64::try_from(entry_point).expect("entry point fits in Windows context"),
+            ..Self::default()
+        }
+    }
+
+    fn apply_to(self, ctx: &mut litebox_common_linux::PtRegs) {
+        ctx.r15 = Self::usize_register(self.r15);
+        ctx.r14 = Self::usize_register(self.r14);
+        ctx.r13 = Self::usize_register(self.r13);
+        ctx.r12 = Self::usize_register(self.r12);
+        ctx.rbp = Self::usize_register(self.rbp);
+        ctx.rbx = Self::usize_register(self.rbx);
+        ctx.r11 = Self::usize_register(self.r11);
+        ctx.r10 = Self::usize_register(self.r10);
+        ctx.r9 = Self::usize_register(self.r9);
+        ctx.r8 = Self::usize_register(self.r8);
+        ctx.rax = Self::usize_register(self.rax);
+        ctx.rcx = Self::usize_register(self.rcx);
+        ctx.rdx = Self::usize_register(self.rdx);
+        ctx.rsi = Self::usize_register(self.rsi);
+        ctx.rdi = Self::usize_register(self.rdi);
+        ctx.rip = Self::usize_register(self.rip);
+        ctx.eflags = self.eflags as usize;
+        ctx.rsp = Self::usize_register(self.rsp);
+    }
+
+    fn usize_register(value: u64) -> usize {
+        usize::try_from(value).expect("Windows x64 context register fits usize")
+    }
 }
 
 #[repr(C)]
@@ -892,7 +988,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         }
         let ntdll = self.load_ntdll(fs)?;
         let force_ntdll_loader = load_mode == WindowsLoadMode::NtDllLoader;
-        let (entry_point, start_mode) = if !force_ntdll_loader && !image.imports.is_empty() {
+        let (entry_point, mut start_mode) = if !force_ntdll_loader && !image.imports.is_empty() {
             litebox_util_log::debug!(
                 application_entry_point:% = format_args!("{application_entry_point:#x}");
                 "Starting Windows guest through built-in import thunks"
@@ -916,6 +1012,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 WindowsStartMode::NtDllLoader {
                     application_entry_point,
                     image_base: image.mapping.base_addr,
+                    initial_context: 0,
                 },
             )
         } else if force_ntdll_loader {
@@ -941,6 +1038,29 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             stack_top,
             path,
         )?;
+        if let WindowsStartMode::NtDllLoader {
+            application_entry_point,
+            image_base,
+            ..
+        } = start_mode
+        {
+            let application_stack_top = stack_top
+                .checked_sub(size_of::<usize>())
+                .ok_or(PeImageAccessError::AddressOverflow)?;
+            write_value(
+                process_environment.initial_thread_context,
+                InitialThreadContext::new(
+                    application_entry_point,
+                    application_stack_top,
+                    image_base,
+                ),
+            )?;
+            start_mode = WindowsStartMode::NtDllLoader {
+                application_entry_point,
+                image_base,
+                initial_context: process_environment.initial_thread_context,
+            };
+        }
         let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
         let diagnostic_regions = guest_address_regions(
             &image.mapping,
@@ -1079,6 +1199,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let process_heap_address = self.create_zeroed_pages(INITIAL_PROCESS_HEAP_SIZE)?;
         let fast_peb_lock_address = self.create_zeroed_pages(INITIAL_FAST_PEB_LOCK_SIZE)?;
         let api_set_namespace_address = self.create_zeroed_pages(INITIAL_API_SET_NAMESPACE_SIZE)?;
+        let initial_thread_context_address =
+            self.create_zeroed_pages(INITIAL_THREAD_CONTEXT_SIZE)?;
         let tls_slots_address = teb_address
             .checked_add(TEB_TLS_SLOTS_OFFSET)
             .ok_or(PeImageAccessError::AddressOverflow)?;
@@ -1150,6 +1272,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
             process_heap:% = format_args!("{process_heap_address:#x}"),
             api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
+            initial_thread_context:% = format_args!("{initial_thread_context_address:#x}"),
             tls_slots:% = format_args!("{tls_slots_address:#x}"),
             scheduler_shared_data_slot:% = format_args!("{scheduler_shared_data_slot_address:#x}"),
             processor_feature_bitmap:% = format_args!("{processor_feature_bitmap_address:#x}"),
@@ -1164,6 +1287,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             process_heap: process_heap_address,
             fast_peb_lock: fast_peb_lock_address,
             api_set_namespace: api_set_namespace_address,
+            initial_thread_context: initial_thread_context_address,
             teb: teb_address,
         })
     }
@@ -1300,6 +1424,12 @@ fn guest_address_regions(
         process_environment.api_set_namespace,
         INITIAL_API_SET_NAMESPACE_SIZE,
     );
+    push_region(
+        &mut regions,
+        "thread-context",
+        process_environment.initial_thread_context,
+        INITIAL_THREAD_CONTEXT_SIZE,
+    );
     regions
 }
 
@@ -1320,6 +1450,7 @@ enum WindowsStartMode {
     NtDllLoader {
         application_entry_point: usize,
         image_base: usize,
+        initial_context: usize,
     },
 }
 
@@ -1336,19 +1467,18 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         if let WindowsStartMode::NtDllLoader {
             application_entry_point,
             image_base,
+            initial_context,
         } = self.start_mode
         {
-            // TODO: Build the initial CONTEXT/loader parameter contract expected by
-            // LdrInitializeThunk. For now this deliberately transfers control to
-            // ntdll so the next missing pieces are visible at runtime.
-            ctx.rcx = 0;
+            ctx.rcx = initial_context;
             ctx.rdx = image_base;
             ctx.r8 = 0;
             ctx.r9 = 0;
             litebox_util_log::debug!(
                 application_entry_point:% = format_args!("{application_entry_point:#x}"),
-                image_base:% = format_args!("{image_base:#x}");
-                "Prepared placeholder ntdll loader arguments"
+                image_base:% = format_args!("{image_base:#x}"),
+                initial_context:% = format_args!("{initial_context:#x}");
+                "Prepared initial ntdll loader arguments"
             );
         }
         litebox_util_log::debug!(
@@ -1391,6 +1521,10 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtFreeVirtualMemory) => {
                 self.nt_free_virtual_memory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtContinue) => {
+                self.nt_continue(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQueryVirtualMemory) => {
@@ -1870,6 +2004,28 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtFreeVirtualMemory syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_continue(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let context_address = ctx.r10;
+        let Ok(context) = read_value::<InitialThreadContext>(context_address) else {
+            litebox_util_log::error!(
+                context:% = format_args!("{context_address:#x}"),
+                context_region:% = self.describe_guest_address(context_address);
+                "NtContinue received unreadable context"
+            );
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        litebox_util_log::debug!(
+            context:% = format_args!("{context_address:#x}"),
+            context_region:% = self.describe_guest_address(context_address),
+            rip:% = format_args!("{:#x}", context.rip),
+            rsp:% = format_args!("{:#x}", context.rsp);
+            "Handling NtContinue syscall"
+        );
+        context.apply_to(ctx);
     }
 
     fn validate_mem_extended_parameters(
@@ -3404,6 +3560,7 @@ struct WindowsProcessEnvironment {
     process_heap: usize,
     fast_peb_lock: usize,
     api_set_namespace: usize,
+    initial_thread_context: usize,
     teb: usize,
 }
 
