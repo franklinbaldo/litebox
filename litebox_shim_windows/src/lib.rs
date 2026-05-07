@@ -2183,6 +2183,11 @@ enum WindowsHandleKind {
     Directory { path: String },
     SymbolicLink { path: String },
     Key { path: String },
+    Event,
+    IoCompletion,
+    WorkerFactory,
+    Timer,
+    WaitCompletionPacket,
 }
 
 struct MappedSectionView {
@@ -2696,27 +2701,27 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateEvent) => {
-                Self::nt_create_event(ctx);
+                self.nt_create_event(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateIoCompletion) => {
-                Self::nt_create_io_completion(ctx);
+                self.nt_create_io_completion(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateWorkerFactory) => {
-                Self::nt_create_worker_factory(ctx);
+                self.nt_create_worker_factory(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateTimer2) => {
-                Self::nt_create_timer2(ctx);
+                self.nt_create_timer2(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateWaitCompletionPacket) => {
-                Self::nt_create_wait_completion_packet(ctx);
+                self.nt_create_wait_completion_packet(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtAssociateWaitCompletionPacket) => {
-                Self::nt_associate_wait_completion_packet(ctx);
+                self.nt_associate_wait_completion_packet(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtSetInformationWorkerFactory) => {
@@ -2745,7 +2750,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtSetEvent) => {
-                Self::nt_set_event(ctx);
+                self.nt_set_event(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQuerySystemInformation) => {
@@ -4142,9 +4147,23 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     WindowsHandleKind::Directory { path } => format!("directory:{path}"),
                     WindowsHandleKind::SymbolicLink { path } => format!("symlink:{path}"),
                     WindowsHandleKind::Key { path } => format!("key:{path}"),
+                    WindowsHandleKind::Event => String::from("event"),
+                    WindowsHandleKind::IoCompletion => String::from("io-completion"),
+                    WindowsHandleKind::WorkerFactory => String::from("worker-factory"),
+                    WindowsHandleKind::Timer => String::from("timer"),
+                    WindowsHandleKind::WaitCompletionPacket => {
+                        String::from("wait-completion-packet")
+                    }
                 })
             })
             .unwrap_or_else(|| String::from("<unknown>"))
+    }
+
+    fn handle_is_event(&self, handle: usize) -> bool {
+        self.handles
+            .lock()
+            .iter()
+            .any(|entry| entry.handle == handle && matches!(entry.kind, WindowsHandleKind::Event))
     }
 
     fn file_path_for_handle(&self, handle: usize) -> Option<String> {
@@ -4906,7 +4925,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         status
     }
 
-    fn nt_create_event(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_create_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let initial_state_slot = ctx.rsp.checked_add(WINDOWS_STACK_ARGUMENT_5_OFFSET);
         let Some(initial_state_slot) = initial_state_slot else {
             ctx.rax = STATUS_ACCESS_VIOLATION;
@@ -4917,7 +4936,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             return;
         };
 
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        let handle = self.insert_handle(WindowsHandleKind::Event);
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -4935,8 +4954,8 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_create_io_completion(ctx: &mut litebox_common_linux::PtRegs) {
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+    fn nt_create_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let handle = self.insert_handle(WindowsHandleKind::IoCompletion);
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -4953,7 +4972,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_create_worker_factory(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_create_worker_factory(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let worker_process_handle =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
         let start_routine =
@@ -4967,7 +4986,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let stack_commit =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_10_OFFSET));
 
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        let handle = self.insert_handle(WindowsHandleKind::WorkerFactory);
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -4990,10 +5009,10 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_create_timer2(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_create_timer2(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let desired_access =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+        let handle = self.insert_handle(WindowsHandleKind::Timer);
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -5011,8 +5030,8 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_create_wait_completion_packet(ctx: &mut litebox_common_linux::PtRegs) {
-        let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
+    fn nt_create_wait_completion_packet(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let handle = self.insert_handle(WindowsHandleKind::WaitCompletionPacket);
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -5028,7 +5047,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_associate_wait_completion_packet(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_associate_wait_completion_packet(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let apc_context =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
         let io_status = read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_6_OFFSET));
@@ -5044,8 +5063,11 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         litebox_util_log::debug!(
             wait_completion_packet_handle:% = format_args!("{:#x}", ctx.r10),
+            wait_completion_packet:% = self.describe_handle(ctx.r10),
             io_completion_handle:% = format_args!("{:#x}", ctx.rdx),
+            io_completion:% = self.describe_handle(ctx.rdx),
             target_object_handle:% = format_args!("{:#x}", ctx.r8),
+            target_object:% = self.describe_handle(ctx.r8),
             key_context:% = format_args!("{:#x}", ctx.r9),
             apc_context:% = format_args!("{apc_context:#x}"),
             io_status:% = format_args!("{io_status:#x}"),
@@ -5206,7 +5228,17 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         STATUS_SUCCESS
     }
 
-    fn nt_set_event(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_set_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if !self.handle_is_event(ctx.r10) {
+            litebox_util_log::debug!(
+                event_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10);
+                "NtSetEvent received unknown event handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
         if ctx.rdx != 0 && write_value(ctx.rdx, 0i32).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
@@ -5214,6 +5246,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         litebox_util_log::debug!(
             event_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
             previous_state_ptr:% = format_args!("{:#x}", ctx.rdx);
             "Handling NtSetEvent syscall"
         );
