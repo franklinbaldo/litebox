@@ -15,6 +15,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::{format, string::String, vec, vec::Vec};
 use core::ffi::c_void;
+use core::fmt::Write as _;
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicI32, AtomicI64, AtomicUsize, Ordering};
@@ -96,6 +97,7 @@ const INITIAL_PROCESS_HEAP_SIZE: usize = PAGE_SIZE;
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
 const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE * 64;
 const INITIAL_THREAD_CONTEXT_SIZE: usize = PAGE_SIZE;
+const INITIAL_SYSTEM_DLL_INIT_BLOCK_SIZE: usize = PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 const NTDLL_PATHS: &[&str] = &[
     "/windows/system32/ntdll.dll",
@@ -139,8 +141,12 @@ const SYSTEM_EMULATION_BASIC_INFORMATION_CLASS: usize = 62;
 const SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS: usize = 107;
 const SYSTEM_FLUSH_INFORMATION_CLASS: usize = 192;
 const SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION_CLASS: usize = 197;
+const SYSTEM_FEATURE_CONFIGURATION_INFORMATION_CLASS: usize = 210;
 const SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS: usize = 0xd3;
 const SYSTEM_PROCESSOR_FEATURES_BITMAP_INFORMATION_CLASS: usize = 250;
+const SYSTEM_SUPPORTED_FLUSH_METHODS: u32 = 0x7;
+const SYSTEM_PROCESSOR_CACHE_FLUSH_SIZE: u32 = 0x40;
+const PS_SYSTEM_DLL_INIT_BLOCK_V3_SIZE: u32 = 0x118;
 const LOGICAL_PROCESSOR_RELATIONSHIP_GROUP: u32 = 4;
 const PROCESS_BASIC_INFORMATION_CLASS: usize = 0;
 const PROCESS_COOKIE_INFORMATION_CLASS: usize = 36;
@@ -194,7 +200,7 @@ const PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET: usize = 0x30;
 const LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET: usize = 0x00;
 const LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET: usize = 0x10;
 const LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET: usize = 0x20;
-const LDR_DATA_TABLE_ENTRY_SIZE: usize = 0x80;
+const LDR_DATA_TABLE_ENTRY_SIZE: usize = 0x120;
 const TEB_AFTER_WIN32_THREAD_INFO_OFFSET: usize = 0x80;
 const TEB_TLS_SLOTS_OFFSET: usize = 0x1480;
 const TEB_TLS_SLOT_COUNT: usize = 64;
@@ -380,6 +386,7 @@ impl PebLdrData {
         );
         Self {
             length: u32::try_from(size_of::<Self>()).expect("PEB_LDR_DATA prefix fits in u32"),
+            initialized: 1,
             in_load_order_module_list,
             in_memory_order_module_list,
             in_initialization_order_module_list,
@@ -673,6 +680,46 @@ struct InitialThreadContext {
 const _: () = assert!(offset_of!(InitialThreadContext, rax) == 0x78);
 const _: () = assert!(offset_of!(InitialThreadContext, rip) == 0xf8);
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct PsSystemDllInitBlockV3 {
+    size: u32,
+    _padding0: u32,
+    system_dll_wow_relocation: u64,
+    system_dll_native_relocation: u64,
+    wow64_shared_information: [u64; 16],
+    rng_data: u32,
+    flags: u32,
+    mitigation_options_map: [u64; 3],
+    cfg_bitmap: u64,
+    cfg_bitmap_size: u64,
+    wow64_cfg_bitmap: u64,
+    wow64_cfg_bitmap_size: u64,
+    mitigation_audit_options_map: usize,
+    scp_cfg_check_function: u64,
+    scp_cfg_check_es_function: u64,
+    scp_cfg_dispatch_function: u64,
+    scp_cfg_dispatch_es_function: u64,
+    scp_arm64ec_call_check: u64,
+    scp_arm64ec_cfg_check_function: u64,
+    scp_arm64ec_cfg_check_es_function: u64,
+}
+
+impl PsSystemDllInitBlockV3 {
+    fn new() -> Self {
+        Self {
+            size: PS_SYSTEM_DLL_INIT_BLOCK_V3_SIZE,
+            ..Self::default()
+        }
+    }
+}
+
+const _: () = assert!(offset_of!(PsSystemDllInitBlockV3, system_dll_wow_relocation) == 0x8);
+const _: () = assert!(offset_of!(PsSystemDllInitBlockV3, rng_data) == 0x98);
+const _: () = assert!(offset_of!(PsSystemDllInitBlockV3, mitigation_options_map) == 0xa0);
+const _: () =
+    assert!(size_of::<PsSystemDllInitBlockV3>() == PS_SYSTEM_DLL_INIT_BLOCK_V3_SIZE as usize);
+
 impl InitialThreadContext {
     fn new(entry_point: usize, stack_top: usize, image_base: usize) -> Self {
         Self {
@@ -820,10 +867,50 @@ struct ProcessorFeatureBitmapWords {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
-struct SystemFeatureConfigurationSectionsInformation {
-    section_count: u32,
-    reserved: u32,
+struct RtlFeatureConfiguration {
+    feature_id: u32,
+    flags: u32,
+    variant_payload: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemFeatureConfigurationInformation {
+    change_stamp: u64,
+    configuration: RtlFeatureConfiguration,
+    _padding0: u32,
+}
+
+impl SystemFeatureConfigurationInformation {
+    fn new(feature_id: u32) -> Self {
+        Self {
+            configuration: RtlFeatureConfiguration {
+                feature_id,
+                ..RtlFeatureConfiguration::default()
+            },
+            ..Self::default()
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemFeatureConfigurationSectionsInformationEntry {
+    change_stamp: u64,
+    section_handle: usize,
+    size: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct SystemFeatureConfigurationSectionsInformation {
+    overall_change_stamp: u64,
+    descriptors: [SystemFeatureConfigurationSectionsInformationEntry; 4],
+}
+
+const _: () = assert!(size_of::<SystemFeatureConfigurationInformation>() == 0x18);
+const _: () = assert!(size_of::<SystemFeatureConfigurationSectionsInformationEntry>() == 0x18);
+const _: () = assert!(size_of::<SystemFeatureConfigurationSectionsInformation>() == 0x68);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
@@ -1125,6 +1212,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                     application_entry_point,
                     image_base: image.mapping.base_addr,
                     initial_context: 0,
+                    system_dll_init_block: 0,
                 },
             )
         } else if force_ntdll_loader {
@@ -1158,10 +1246,11 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         } = start_mode
         {
             let application_stack_top = stack_top
-                .checked_sub(size_of::<usize>())
+                .checked_sub(0x28)
                 .ok_or(PeImageAccessError::AddressOverflow)?;
+            let initial_context = initial_context_address_on_stack(application_stack_top)?;
             write_value(
-                process_environment.initial_thread_context,
+                initial_context,
                 InitialThreadContext::new(
                     application_entry_point,
                     application_stack_top,
@@ -1171,7 +1260,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             start_mode = WindowsStartMode::NtDllLoader {
                 application_entry_point,
                 image_base,
-                initial_context: process_environment.initial_thread_context,
+                initial_context,
+                system_dll_init_block: process_environment.system_dll_init_block,
             };
         }
         let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
@@ -1316,6 +1406,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let api_set_namespace_address = self.create_zeroed_pages(INITIAL_API_SET_NAMESPACE_SIZE)?;
         let initial_thread_context_address =
             self.create_zeroed_pages(INITIAL_THREAD_CONTEXT_SIZE)?;
+        let system_dll_init_block_address =
+            self.create_zeroed_pages(INITIAL_SYSTEM_DLL_INIT_BLOCK_SIZE)?;
         let tls_slots_address = teb_address
             .checked_add(TEB_TLS_SLOTS_OFFSET)
             .ok_or(PeImageAccessError::AddressOverflow)?;
@@ -1364,7 +1456,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 image.base_addr,
                 ldr_data_address,
                 process_parameters_address,
-                0,
+                process_heap_address,
                 fast_peb_lock_address,
                 api_set_namespace_address,
             ),
@@ -1390,6 +1482,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             processor_feature_bitmap_address,
             Self::processor_feature_bitmap_words(),
         )?;
+        write_value(system_dll_init_block_address, PsSystemDllInitBlockV3::new())?;
 
         litebox_util_log::debug!(
             peb:% = format_args!("{peb_address:#x}"),
@@ -1400,6 +1493,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             process_heap:% = format_args!("{process_heap_address:#x}"),
             api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
             initial_thread_context:% = format_args!("{initial_thread_context_address:#x}"),
+            system_dll_init_block:% = format_args!("{system_dll_init_block_address:#x}"),
             tls_slots:% = format_args!("{tls_slots_address:#x}"),
             scheduler_shared_data_slot:% = format_args!("{scheduler_shared_data_slot_address:#x}"),
             processor_feature_bitmap:% = format_args!("{processor_feature_bitmap_address:#x}"),
@@ -1416,6 +1510,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             fast_peb_lock: fast_peb_lock_address,
             api_set_namespace: api_set_namespace_address,
             initial_thread_context: initial_thread_context_address,
+            system_dll_init_block: system_dll_init_block_address,
             teb: teb_address,
         })
     }
@@ -1614,6 +1709,12 @@ fn guest_address_regions(
         process_environment.initial_thread_context,
         INITIAL_THREAD_CONTEXT_SIZE,
     );
+    push_region(
+        &mut regions,
+        "system-dll-init-block",
+        process_environment.system_dll_init_block,
+        INITIAL_SYSTEM_DLL_INIT_BLOCK_SIZE,
+    );
     regions
 }
 
@@ -1635,6 +1736,7 @@ enum WindowsStartMode {
         application_entry_point: usize,
         image_base: usize,
         initial_context: usize,
+        system_dll_init_block: usize,
     },
 }
 
@@ -1652,16 +1754,21 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             application_entry_point,
             image_base,
             initial_context,
+            system_dll_init_block,
         } = self.start_mode
         {
             ctx.rcx = initial_context;
-            ctx.rdx = 0;
+            ctx.rsp = initial_context.saturating_sub(size_of::<usize>());
+            ctx.rdx = image_base;
             ctx.r8 = 0;
             ctx.r9 = 0;
             litebox_util_log::debug!(
                 application_entry_point:% = format_args!("{application_entry_point:#x}"),
                 image_base:% = format_args!("{image_base:#x}"),
-                initial_context:% = format_args!("{initial_context:#x}");
+                initial_context:% = format_args!("{initial_context:#x}"),
+                loader_parameter:% = format_args!("{:#x}", ctx.rdx),
+                system_dll_init_block:% = format_args!("{system_dll_init_block:#x}"),
+                loader_stack:% = format_args!("{:#x}", ctx.rsp);
                 "Prepared initial ntdll loader arguments"
             );
         }
@@ -1935,6 +2042,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             r13:% = format_args!("{:#x}", ctx.r13),
             r14:% = format_args!("{:#x}", ctx.r14),
             r15:% = format_args!("{:#x}", ctx.r15),
+            stack:% = format_stack_words(ctx.rsp, 16),
             guest_return_address:% = format_args!("{:#x}", read_usize_or_zero(ctx.rsp)),
             guest_return_region:% = self.describe_guest_address(read_usize_or_zero(ctx.rsp));
             "Windows guest exception"
@@ -3153,7 +3261,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                 ctx.rdx,
                 ctx.r8,
                 ctx.r9,
-                SystemFlushInformation::default(),
+                Self::system_flush_information(),
             ),
             SYSTEM_NUMA_PROCESSOR_MAP_CLASS => Self::write_u32_length_information(
                 ctx.rdx,
@@ -3196,6 +3304,14 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let mut information = SystemNumaInformation::default();
         information.active_processors_group_affinity[0].mask = 1;
         information
+    }
+
+    fn system_flush_information() -> SystemFlushInformation {
+        SystemFlushInformation {
+            supported_flush_methods: SYSTEM_SUPPORTED_FLUSH_METHODS,
+            processor_cache_flush_size: SYSTEM_PROCESSOR_CACHE_FLUSH_SIZE,
+            ..SystemFlushInformation::default()
+        }
     }
 
     fn write_processor_feature_bitmap_information(
@@ -3259,6 +3375,21 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     return_length_address,
                     Self::system_logical_processor_group_information(),
                 )
+            }
+            SYSTEM_FEATURE_CONFIGURATION_INFORMATION_CLASS => {
+                if ctx.rdx == 0 || ctx.r8 < size_of::<u32>() * 2 {
+                    STATUS_INVALID_PARAMETER
+                } else {
+                    match read_value::<u32>(ctx.rdx.saturating_add(size_of::<u32>())) {
+                        Ok(feature_id) => Self::write_u32_length_information(
+                            ctx.r9,
+                            system_information_length as usize,
+                            return_length_address,
+                            SystemFeatureConfigurationInformation::new(feature_id),
+                        ),
+                        Err(_) => STATUS_ACCESS_VIOLATION,
+                    }
+                }
             }
             SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS => {
                 Self::write_u32_length_information(
@@ -3746,6 +3877,7 @@ struct WindowsProcessEnvironment {
     fast_peb_lock: usize,
     api_set_namespace: usize,
     initial_thread_context: usize,
+    system_dll_init_block: usize,
     teb: usize,
 }
 
@@ -4042,6 +4174,31 @@ fn align_up(value: usize, alignment: usize) -> Result<usize, PeImageAccessError>
         .checked_add(mask)
         .map(|value| value & !mask)
         .ok_or(PeImageAccessError::AddressOverflow)
+}
+
+fn format_stack_words(stack_pointer: usize, count: usize) -> String {
+    let mut output = String::new();
+    for index in 0..count {
+        if index != 0 {
+            output.push(' ');
+        }
+        let address = stack_pointer.saturating_add(index.saturating_mul(size_of::<usize>()));
+        let _ = write!(&mut output, "{:#x}", read_usize_or_zero(address));
+    }
+    output
+}
+
+fn initial_context_address_on_stack(stack_top: usize) -> Result<usize, PeImageAccessError> {
+    align_down(stack_top, 16)?
+        .checked_sub(size_of::<InitialThreadContext>())
+        .ok_or(PeImageAccessError::AddressOverflow)
+}
+
+fn align_down(value: usize, alignment: usize) -> Result<usize, PeImageAccessError> {
+    let mask = alignment
+        .checked_sub(1)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    Ok(value & !mask)
 }
 
 struct PeImageFile<FS: NtShimFS> {
