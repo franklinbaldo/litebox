@@ -425,6 +425,7 @@ const WINDOWS_STD_ERROR_HANDLE: u32 = u32::MAX - 11;
 const STATUS_SUCCESS: usize = 0;
 const STATUS_TIMEOUT: usize = 0x0000_0102;
 const STATUS_NO_YIELD_PERFORMED: usize = 0x4000_0024;
+const STATUS_ALERTED: usize = 0x0000_0101;
 const STATUS_INVALID_INFO_CLASS: usize = 0xc000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
 const STATUS_ACCESS_VIOLATION: usize = 0xc000_0005;
@@ -2803,6 +2804,26 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtWaitForMultipleObjects) => {
                 self.nt_wait_for_multiple_objects(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWaitForMultipleObjects32) => {
+                self.nt_wait_for_multiple_objects32(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtSignalAndWaitForSingleObject) => {
+                self.nt_signal_and_wait_for_single_object(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWaitForWorkViaWorkerFactory) => {
+                self.nt_wait_for_work_via_worker_factory(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWaitForAlertByThreadId) => {
+                Self::nt_wait_for_alert_by_thread_id(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtWaitForKeyedEvent) => {
+                Self::nt_wait_for_keyed_event(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQuerySystemInformation) => {
@@ -5785,6 +5806,109 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         );
     }
 
+    fn nt_wait_for_multiple_objects32(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout_address =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let Ok(timeout_is_zero) = Self::timeout_is_zero(timeout_address) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        ctx.rax = self.wait_for_multiple_u32_handles(ctx.r10, ctx.rdx, ctx.r8);
+        litebox_util_log::debug!(
+            count = ctx.r10,
+            handles:% = format_args!("{:#x}", ctx.rdx),
+            wait_type:% = format_args!("{:#x}", ctx.r8),
+            alertable:% = format_args!("{:#x}", ctx.r9),
+            timeout:% = format_args!("{timeout_address:#x}"),
+            timeout_is_zero,
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtWaitForMultipleObjects32 without blocking"
+        );
+    }
+
+    fn nt_signal_and_wait_for_single_object(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout_address =
+            read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
+        let Ok(timeout_is_zero) = Self::timeout_is_zero(timeout_address) else {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        };
+
+        let signal_status = self.signal_handle(ctx.r10);
+        ctx.rax = if signal_status == STATUS_SUCCESS {
+            self.wait_for_handle(ctx.rdx)
+        } else {
+            signal_status
+        };
+
+        litebox_util_log::debug!(
+            signal_handle:% = format_args!("{:#x}", ctx.r10),
+            signal_handle_description:% = self.describe_handle(ctx.r10),
+            wait_handle:% = format_args!("{:#x}", ctx.rdx),
+            wait_handle_description:% = self.describe_handle(ctx.rdx),
+            alertable:% = format_args!("{:#x}", ctx.r8),
+            timeout:% = format_args!("{timeout_address:#x}"),
+            timeout_is_zero,
+            signal_status:% = format_args!("{signal_status:#x}"),
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtSignalAndWaitForSingleObject without blocking"
+        );
+    }
+
+    fn nt_wait_for_work_via_worker_factory(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if !self.handle_is_worker_factory(ctx.r10) {
+            litebox_util_log::debug!(
+                worker_factory_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10),
+                mini_packet:% = format_args!("{:#x}", ctx.rdx);
+                "NtWaitForWorkViaWorkerFactory received invalid handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            worker_factory_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            mini_packet:% = format_args!("{:#x}", ctx.rdx);
+            "Handling NtWaitForWorkViaWorkerFactory as no queued work"
+        );
+        ctx.rax = STATUS_TIMEOUT;
+    }
+
+    fn nt_wait_for_alert_by_thread_id(ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout_address = ctx.rdx;
+        if timeout_address != 0 && read_value::<i64>(timeout_address).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            address:% = format_args!("{:#x}", ctx.r10),
+            timeout:% = format_args!("{timeout_address:#x}");
+            "Handling NtWaitForAlertByThreadId as alerted"
+        );
+        ctx.rax = STATUS_ALERTED;
+    }
+
+    fn nt_wait_for_keyed_event(ctx: &mut litebox_common_linux::PtRegs) {
+        let timeout_address = ctx.r9;
+        if timeout_address != 0 && read_value::<i64>(timeout_address).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            keyed_event_handle:% = format_args!("{:#x}", ctx.r10),
+            key_value:% = format_args!("{:#x}", ctx.rdx),
+            alertable:% = format_args!("{:#x}", ctx.r8),
+            timeout:% = format_args!("{timeout_address:#x}");
+            "Handling NtWaitForKeyedEvent as timed out"
+        );
+        ctx.rax = STATUS_TIMEOUT;
+    }
+
     fn timeout_is_zero(timeout_address: usize) -> Result<bool, PeImageAccessError> {
         if timeout_address == 0 {
             return Ok(false);
@@ -5853,6 +5977,66 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                 }
             }
             STATUS_TIMEOUT
+        }
+    }
+
+    fn wait_for_multiple_u32_handles(
+        &self,
+        count: usize,
+        handles_address: usize,
+        wait_type: usize,
+    ) -> usize {
+        if count == 0 || handles_address == 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        let mut handles = Vec::new();
+        for index in 0..count {
+            let Some(offset) = index.checked_mul(size_of::<u32>()) else {
+                return STATUS_INVALID_PARAMETER;
+            };
+            let Ok(handle) = read_value::<u32>(handles_address.saturating_add(offset)) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            let handle = handle as usize;
+            if self.handle_ready_for_wait(handle).is_none() {
+                return STATUS_INVALID_HANDLE;
+            }
+            handles.push(handle);
+        }
+
+        self.wait_for_ready_handles(handles, wait_type)
+    }
+
+    fn wait_for_ready_handles(&self, handles: Vec<usize>, wait_type: usize) -> usize {
+        if wait_type == 0 {
+            if handles
+                .iter()
+                .all(|&handle| self.handle_ready_for_wait(handle).unwrap_or(false))
+            {
+                for handle in handles {
+                    let _ = self.wait_event_once(handle);
+                }
+                STATUS_SUCCESS
+            } else {
+                STATUS_TIMEOUT
+            }
+        } else {
+            for (index, handle) in handles.into_iter().enumerate() {
+                if self.handle_ready_for_wait(handle).unwrap_or(false) {
+                    let _ = self.wait_event_once(handle);
+                    return index;
+                }
+            }
+            STATUS_TIMEOUT
+        }
+    }
+
+    fn signal_handle(&self, handle: usize) -> usize {
+        if self.set_event_signaled(handle, true).is_some() || self.handle_exists(handle) {
+            STATUS_SUCCESS
+        } else {
+            STATUS_INVALID_HANDLE
         }
     }
 
