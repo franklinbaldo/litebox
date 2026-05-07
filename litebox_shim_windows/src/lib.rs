@@ -1515,6 +1515,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                     base_addr: ntdll_mapping.base_addr,
                     exports: ntdll.exports,
                 }]),
+                api_set_hosts: litebox::sync::Mutex::new(Vec::new()),
                 diagnostic_regions: litebox::sync::Mutex::new(diagnostic_regions),
             },
             process: WindowsShimProcess {
@@ -1885,6 +1886,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     page_manager: Arc<WindowsPageManager>,
     handles: litebox::sync::Mutex<Platform, Vec<WindowsHandle>>,
     loaded_modules: litebox::sync::Mutex<Platform, Vec<LoadedModule>>,
+    api_set_hosts: litebox::sync::Mutex<Platform, Vec<ApiSetHostCacheEntry>>,
     diagnostic_regions: litebox::sync::Mutex<Platform, Vec<GuestAddressRegion>>,
 }
 
@@ -1892,6 +1894,19 @@ struct LoadedModule {
     path: String,
     base_addr: usize,
     exports: Vec<PeExport>,
+}
+
+#[derive(Default)]
+struct ImportResolutionStats {
+    resolved: usize,
+    unresolved: usize,
+    write_failed: usize,
+    unresolved_samples: Vec<String>,
+}
+
+struct ApiSetHostCacheEntry {
+    api_set_name: String,
+    host_dll: String,
 }
 
 struct WindowsHandle {
@@ -2079,11 +2094,20 @@ fn import_library_is_api_set(library: &[u8]) -> bool {
     name.starts_with("api-ms-") || name.starts_with("ext-ms-")
 }
 
+fn well_known_api_set_host_dll(normalized_name: &str) -> Option<&'static str> {
+    if normalized_name.starts_with("api-ms-win-core-apiquery-")
+        || normalized_name.starts_with("api-ms-win-core-rtlsupport-")
+    {
+        Some("ntdll.dll")
+    } else {
+        None
+    }
+}
+
 fn module_matches_import(module: &LoadedModule, library: &[u8]) -> bool {
     let module_name = module_basename(&module.path);
     let library_name = module_basename(import_library_name(library));
     module_name_matches(module_name, library_name)
-        || import_library_is_api_set(library) && module_name.eq_ignore_ascii_case("kernelbase.dll")
 }
 
 fn module_name_matches(module_name: &str, library_name: &str) -> bool {
@@ -2101,51 +2125,6 @@ fn module_name_matches(module_name: &str, library_name: &str) -> bool {
         .filter(|(_, extension)| extension.eq_ignore_ascii_case("dll"))
         .map_or(module_name, |(stem, _)| stem)
         .eq_ignore_ascii_case(library_name)
-}
-
-fn export_address(modules: &[LoadedModule], library: &[u8], name: &[u8]) -> Option<usize> {
-    resolve_export_name(modules, library, name, 0)
-}
-
-fn resolve_export_name(
-    modules: &[LoadedModule],
-    library: &[u8],
-    name: &[u8],
-    depth: usize,
-) -> Option<usize> {
-    const MAX_EXPORT_FORWARD_DEPTH: usize = 8;
-
-    if depth >= MAX_EXPORT_FORWARD_DEPTH {
-        return None;
-    }
-
-    modules.iter().enumerate().find_map(|(index, module)| {
-        if module_matches_import(module, library) {
-            resolve_export_name_in_module(modules, index, name, depth)
-        } else {
-            None
-        }
-    })
-}
-
-fn resolve_export_name_in_module(
-    modules: &[LoadedModule],
-    module_index: usize,
-    name: &[u8],
-    depth: usize,
-) -> Option<usize> {
-    let module = modules.get(module_index)?;
-    let export = module
-        .exports
-        .iter()
-        .find(|export| export.name.eq_ignore_ascii_case(name))?;
-    match &export.forwarder {
-        None => module.base_addr.checked_add(export.rva as usize),
-        Some(PeExportForwarder::Name { library, name }) => {
-            resolve_export_name(modules, library, name, depth + 1)
-        }
-        Some(PeExportForwarder::Ordinal { .. }) => None,
-    }
 }
 
 fn import_name(import: &PeImport) -> alloc::borrow::Cow<'_, str> {
@@ -2191,7 +2170,7 @@ fn resolve_api_set_host_dll(api_set_map: usize, api_set_name: &str) -> Option<St
             }
             let host_dll =
                 read_api_set_string(api_set_map, value.value_offset, value.value_length)?;
-            litebox_util_log::debug!(
+            litebox_util_log::trace!(
                 api_set_name:% = api_set_name,
                 namespace_name:% = namespace_name,
                 host_dll:% = host_dll;
@@ -2227,6 +2206,7 @@ fn import_library_guest_path(library: &[u8]) -> Option<String> {
     let dll_name = if import_library_is_api_set(library) {
         module_basename(
             &resolve_api_set_host_dll(GUEST_API_SET_MAP.load(Ordering::Relaxed), library_name)
+                .or_else(|| well_known_api_set_host_dll(library_name).map(String::from))
                 .unwrap_or_else(|| String::from("kernelbase.dll")),
         )
         .to_ascii_lowercase()
@@ -2780,16 +2760,33 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         imports: &[PeImport],
         image_name: &str,
     ) {
+        let mut stats = ImportResolutionStats::default();
         for import in imports {
             let Some(address) = self.loaded_module_import_address(import) else {
+                stats.unresolved += 1;
+                if stats.unresolved_samples.len() < 8 {
+                    stats.unresolved_samples.push(format!(
+                        "{}!{}",
+                        String::from_utf8_lossy(&import.library),
+                        import_name(import)
+                    ));
+                }
+                litebox_util_log::trace!(
+                    image:% = image_name,
+                    library:% = String::from_utf8_lossy(&import.library),
+                    name:% = import_name(import);
+                    "Windows import is not resolved from loaded guest modules yet"
+                );
                 continue;
             };
             let Some(iat_address) = image_base.checked_add(import.iat_rva as usize) else {
+                stats.write_failed += 1;
                 continue;
             };
             if make_pages_writable(&self.page_manager, iat_address, size_of::<usize>()).is_err()
                 || write_value(iat_address, address).is_err()
             {
+                stats.write_failed += 1;
                 litebox_util_log::debug!(
                     image:% = image_name,
                     library:% = String::from_utf8_lossy(&import.library),
@@ -2798,7 +2795,8 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                 );
                 continue;
             }
-            litebox_util_log::debug!(
+            stats.resolved += 1;
+            litebox_util_log::trace!(
                 image:% = image_name,
                 library:% = String::from_utf8_lossy(&import.library),
                 name:% = import_name(import),
@@ -2807,35 +2805,183 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                 "Resolved Windows import from loaded guest module"
             );
         }
+
+        if !imports.is_empty() {
+            litebox_util_log::debug!(
+                image:% = image_name,
+                total = imports.len(),
+                resolved = stats.resolved,
+                unresolved = stats.unresolved,
+                write_failed = stats.write_failed,
+                unresolved_samples:? = stats.unresolved_samples;
+                "Resolved Windows imports from loaded guest modules"
+            );
+        }
     }
 
     fn loaded_module_import_address(&self, import: &PeImport) -> Option<usize> {
-        let PeImportTarget::Name { name, .. } = &import.target else {
-            return None;
-        };
         let loaded_modules = self.loaded_modules.lock();
-        loaded_modules
+        match &import.target {
+            PeImportTarget::Name { name, .. } => self
+                .export_address(&loaded_modules, &import.library, name)
+                .or_else(|| {
+                    if import_library_is_kernel32(&import.library) {
+                        self.export_address(&loaded_modules, b"kernelbase.dll", name)
+                    } else {
+                        None
+                    }
+                }),
+            PeImportTarget::Ordinal(ordinal) => self
+                .export_ordinal_address(&loaded_modules, &import.library, u32::from(*ordinal))
+                .or_else(|| {
+                    if import_library_is_kernel32(&import.library) {
+                        self.export_ordinal_address(
+                            &loaded_modules,
+                            b"kernelbase.dll",
+                            u32::from(*ordinal),
+                        )
+                    } else {
+                        None
+                    }
+                }),
+        }
+    }
+
+    fn export_address(
+        &self,
+        modules: &[LoadedModule],
+        library: &[u8],
+        name: &[u8],
+    ) -> Option<usize> {
+        self.resolve_export_name(modules, library, name, 0)
+    }
+
+    fn export_ordinal_address(
+        &self,
+        modules: &[LoadedModule],
+        library: &[u8],
+        ordinal: u32,
+    ) -> Option<usize> {
+        self.resolve_export_ordinal(modules, library, ordinal, 0)
+    }
+
+    fn resolve_export_name(
+        &self,
+        modules: &[LoadedModule],
+        library: &[u8],
+        name: &[u8],
+        depth: usize,
+    ) -> Option<usize> {
+        const MAX_EXPORT_FORWARD_DEPTH: usize = 8;
+
+        if depth >= MAX_EXPORT_FORWARD_DEPTH {
+            return None;
+        }
+
+        let lookup_library = self.import_lookup_library(library);
+        modules.iter().enumerate().find_map(|(index, module)| {
+            if module_matches_import(module, &lookup_library) {
+                self.resolve_export_name_in_module(modules, index, name, depth)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn resolve_export_name_in_module(
+        &self,
+        modules: &[LoadedModule],
+        module_index: usize,
+        name: &[u8],
+        depth: usize,
+    ) -> Option<usize> {
+        let module = modules.get(module_index)?;
+        let export = module
+            .exports
             .iter()
-            .find_map(|module| {
-                if module_matches_import(module, &import.library) {
-                    export_address(&loaded_modules, &import.library, name)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                if import_library_is_kernel32(&import.library) {
-                    loaded_modules.iter().find_map(|module| {
-                        if module_basename(&module.path).eq_ignore_ascii_case("kernelbase.dll") {
-                            export_address(&loaded_modules, b"kernelbase.dll", name)
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            })
+            .find(|export| export.name.eq_ignore_ascii_case(name))?;
+        match &export.forwarder {
+            None => module.base_addr.checked_add(export.rva as usize),
+            Some(PeExportForwarder::Name { library, name }) => {
+                self.resolve_export_name(modules, library, name, depth + 1)
+            }
+            Some(PeExportForwarder::Ordinal { library, ordinal }) => {
+                self.resolve_export_ordinal(modules, library, *ordinal, depth + 1)
+            }
+        }
+    }
+
+    fn resolve_export_ordinal(
+        &self,
+        modules: &[LoadedModule],
+        library: &[u8],
+        ordinal: u32,
+        depth: usize,
+    ) -> Option<usize> {
+        const MAX_EXPORT_FORWARD_DEPTH: usize = 8;
+
+        if depth >= MAX_EXPORT_FORWARD_DEPTH {
+            return None;
+        }
+
+        let lookup_library = self.import_lookup_library(library);
+        modules.iter().enumerate().find_map(|(index, module)| {
+            if module_matches_import(module, &lookup_library) {
+                self.resolve_export_ordinal_in_module(modules, index, ordinal, depth)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn resolve_export_ordinal_in_module(
+        &self,
+        modules: &[LoadedModule],
+        module_index: usize,
+        ordinal: u32,
+        depth: usize,
+    ) -> Option<usize> {
+        let module = modules.get(module_index)?;
+        let export = module
+            .exports
+            .iter()
+            .find(|export| export.ordinal == ordinal)?;
+        match &export.forwarder {
+            None => module.base_addr.checked_add(export.rva as usize),
+            Some(PeExportForwarder::Name { library, name }) => {
+                self.resolve_export_name(modules, library, name, depth + 1)
+            }
+            Some(PeExportForwarder::Ordinal { library, ordinal }) => {
+                self.resolve_export_ordinal(modules, library, *ordinal, depth + 1)
+            }
+        }
+    }
+
+    fn import_lookup_library(&self, library: &[u8]) -> Vec<u8> {
+        if !import_library_is_api_set(library) {
+            return library.to_vec();
+        }
+
+        let api_set_name = module_basename(import_library_name(library)).to_ascii_lowercase();
+        let mut api_set_hosts = self.api_set_hosts.lock();
+        if let Some(entry) = api_set_hosts
+            .iter()
+            .find(|entry| entry.api_set_name.eq_ignore_ascii_case(&api_set_name))
+        {
+            return entry.host_dll.as_bytes().to_vec();
+        }
+
+        let host_dll = resolve_api_set_host_dll(
+            GUEST_API_SET_MAP.load(Ordering::Relaxed),
+            api_set_name.as_str(),
+        )
+        .or_else(|| well_known_api_set_host_dll(&api_set_name).map(String::from))
+        .unwrap_or_else(|| String::from("kernelbase.dll"));
+        api_set_hosts.push(ApiSetHostCacheEntry {
+            api_set_name,
+            host_dll: host_dll.clone(),
+        });
+        host_dll.into_bytes()
     }
 
     fn nt_query_performance_counter(&self, ctx: &mut litebox_common_linux::PtRegs) {

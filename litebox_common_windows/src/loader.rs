@@ -142,6 +142,8 @@ pub enum PeImportTarget {
 /// A named PE export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeExport {
+    /// Export ordinal.
+    pub ordinal: u32,
     /// Export name.
     pub name: Vec<u8>,
     /// Export target RVA.
@@ -775,9 +777,8 @@ fn parse_exports(pe: &PeFile64<'_>) -> Result<Vec<PeExport>, object::read::Error
     };
 
     let mut exports = Vec::new();
-    for (name_pointer, address_index) in export_table.name_iter() {
-        let target = export_table.target_by_index(u32::from(address_index))?;
-        let (rva, forwarder) = match target {
+    for export in export_table.exports()? {
+        let (rva, forwarder) = match export.target {
             object::read::pe::ExportTarget::Address(rva) => (rva, None),
             object::read::pe::ExportTarget::ForwardByName(library, name) => (
                 0,
@@ -795,7 +796,8 @@ fn parse_exports(pe: &PeFile64<'_>) -> Result<Vec<PeExport>, object::read::Error
             ),
         };
         exports.push(PeExport {
-            name: export_table.name_from_pointer(name_pointer)?.to_vec(),
+            ordinal: export.ordinal,
+            name: export.name.unwrap_or(&[]).to_vec(),
             rva,
             forwarder,
         });
