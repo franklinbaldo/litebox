@@ -96,8 +96,8 @@ fn run_minimal_hello_world_pe() {
 }
 
 #[test]
-#[ignore = "documents the current incomplete guest ntdll loader path"]
-fn forced_ntdll_loader_reports_current_blocker() {
+#[ignore = "uses host-version-specific ntdll loader bring-up patches"]
+fn forced_ntdll_loader_runs_minimal_hello_world_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("hello_world_ntdll_loader_{}", std::process::id()));
     std::fs::create_dir_all(&test_dir).unwrap();
@@ -127,20 +127,22 @@ fn forced_ntdll_loader_reports_current_blocker() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined_output = format!("{stdout}\n{stderr}");
 
+    assert!(!timed_out, "forced ntdll loader path timed out");
     assert!(
-        timed_out || !output.status.success(),
-        "forced ntdll loader path unexpectedly succeeded; stdout:\n{stdout}\nstderr:\n{stderr}"
+        output.status.success(),
+        "forced ntdll loader path exited with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status.code()
     );
     assert!(
         combined_output.contains("Starting Windows guest through ntdll!LdrInitializeThunk"),
         "forced ntdll loader path did not reach LdrInitializeThunk\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        combined_output.contains("Guest called NtRaiseHardError")
-            || combined_output.contains("Windows guest exception")
-            || combined_output.contains("Unsupported Windows syscall")
-            || combined_output.contains("Windows vectored exception while in guest"),
-        "forced ntdll loader path did not report a useful blocker\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        output
+            .stdout
+            .windows(HELLO_MESSAGE.len())
+            .any(|window| window == HELLO_MESSAGE),
+        "forced ntdll loader path did not print hello-world output\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

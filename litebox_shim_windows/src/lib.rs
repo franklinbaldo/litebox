@@ -230,6 +230,22 @@ extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     STATUS_SUCCESS
 }
 
+extern "system" fn litebox_ntdll_apphelp_check_module_proc(
+    proc_name: *mut UnicodeString,
+    _dll_name: *const UnicodeString,
+    _image_base: *const c_void,
+    _load_reason: usize,
+) -> usize {
+    if !proc_name.is_null() {
+        let _ = write_value(proc_name as usize, UnicodeString::default());
+    }
+    litebox_util_log::debug!(
+        proc_name:% = format_args!("{proc_name:p}");
+        "Bypassed guest ntdll apphelp shim-engine export probe"
+    );
+    STATUS_SUCCESS
+}
+
 fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
     const HEADER_SIZE: usize = size_of::<usize>();
     const HEAP_ALIGNMENT: usize = 16;
@@ -350,10 +366,13 @@ const NTDLL_PATHS: &[&str] = &[
     "/ntdll.dll",
 ];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
-// Current forced-loader diagnostics use the host ntdll fixture. These helpers
-// are patched so malformed API-set probes fail visibly instead of faulting first.
+// Current forced-loader diagnostics use the host ntdll fixture. These RVAs are
+// host-version-specific guard rails for early ntdll loader bring-up.
 const NTDLL_API_SET_RESOLVE_HELPER_RVA: usize = 0x135fa8;
 const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA: usize = 0x41600;
+const NTDLL_APPHELP_CHECK_MODULE_PROC_RVA: usize = 0xb91a0;
+const NTDLL_APPHELP_FAILURE_BRANCH_RVAS: &[usize] = &[0xb9016, 0xb9080, 0xbb56d, 0xbb612, 0xbb6eb];
+const NTDLL_APPHELP_STATUS_TEST_RVA: usize = 0xbb41a;
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
@@ -1456,7 +1475,10 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let image = self.load_image(fs.clone(), path)?;
         let application_entry_point = image.mapping.entry_point;
-        if load_mode == WindowsLoadMode::Auto {
+        if matches!(
+            load_mode,
+            WindowsLoadMode::Auto | WindowsLoadMode::NtDllLoader
+        ) {
             self.resolve_initial_imports(&image)?;
         }
         let ntdll = self.load_ntdll(fs)?;
@@ -1710,6 +1732,45 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         litebox_util_log::debug!(
             address:% = format_args!("{api_set_unicode_wrapper:#x}");
             "Patched guest ntdll API-set Unicode wrapper to built-in guard"
+        );
+
+        let apphelp_check_module_proc = image
+            .mapping
+            .base_addr
+            .checked_add(NTDLL_APPHELP_CHECK_MODULE_PROC_RVA)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_absolute_jump(
+            &self.page_manager,
+            apphelp_check_module_proc,
+            litebox_ntdll_apphelp_check_module_proc as *const () as usize,
+        )?;
+        litebox_util_log::debug!(
+            address:% = format_args!("{apphelp_check_module_proc:#x}");
+            "Patched guest ntdll apphelp shim-engine probe to built-in guard"
+        );
+
+        for &branch_rva in NTDLL_APPHELP_FAILURE_BRANCH_RVAS {
+            let branch_address = image
+                .mapping
+                .base_addr
+                .checked_add(branch_rva)
+                .ok_or(PeImageAccessError::AddressOverflow)?;
+            write_code_bytes(&self.page_manager, branch_address, &[0x90; 6])?;
+            litebox_util_log::debug!(
+                address:% = format_args!("{branch_address:#x}");
+                "Patched guest ntdll apphelp failure branch"
+            );
+        }
+
+        let apphelp_status_test = image
+            .mapping
+            .base_addr
+            .checked_add(NTDLL_APPHELP_STATUS_TEST_RVA)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_code_bytes(&self.page_manager, apphelp_status_test, &[0x31, 0xdb])?;
+        litebox_util_log::debug!(
+            address:% = format_args!("{apphelp_status_test:#x}");
+            "Patched guest ntdll apphelp cached status check"
         );
 
         Ok(())
@@ -2183,6 +2244,11 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             Some(NtSysno::NtContinue) => {
                 self.nt_continue(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtTestAlert) => {
+                litebox_util_log::debug!("Handling NtTestAlert as no-op");
+                ctx.rax = STATUS_SUCCESS;
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQueryVirtualMemory) => {
@@ -4788,6 +4854,27 @@ fn write_absolute_jump(
         page_manager,
         address,
         jump.len(),
+        Protection {
+            read: true,
+            write: false,
+            execute: true,
+        },
+    )
+}
+
+fn write_code_bytes(
+    page_manager: &WindowsPageManager,
+    address: usize,
+    bytes: &[u8],
+) -> Result<(), PeImageAccessError> {
+    make_pages_writable(page_manager, address, bytes.len())?;
+    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
+    ptr.copy_from_slice(0, bytes)
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+    protect_pages(
+        page_manager,
+        address,
+        bytes.len(),
         Protection {
             read: true,
             write: false,
