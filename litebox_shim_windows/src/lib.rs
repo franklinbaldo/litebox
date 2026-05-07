@@ -2228,6 +2228,7 @@ enum WindowsHandleKind {
     IoCompletion,
     WorkerFactory,
     Timer,
+    KeyedEvent,
     WaitCompletionPacket,
 }
 
@@ -2757,6 +2758,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 self.nt_create_event(ctx);
                 ContinueOperation::Resume
             }
+            Some(NtSysno::NtCreateKeyedEvent) => {
+                self.nt_create_keyed_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtOpenKeyedEvent) => {
+                self.nt_open_keyed_event(ctx);
+                ContinueOperation::Resume
+            }
             Some(NtSysno::NtCreateIoCompletion) => {
                 self.nt_create_io_completion(ctx);
                 ContinueOperation::Resume
@@ -2839,7 +2848,11 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtWaitForKeyedEvent) => {
-                Self::nt_wait_for_keyed_event(ctx);
+                self.nt_wait_for_keyed_event(ctx);
+                ContinueOperation::Resume
+            }
+            Some(NtSysno::NtReleaseKeyedEvent) => {
+                self.nt_release_keyed_event(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQuerySystemInformation) => {
@@ -4267,6 +4280,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     WindowsHandleKind::IoCompletion => String::from("io-completion"),
                     WindowsHandleKind::WorkerFactory => String::from("worker-factory"),
                     WindowsHandleKind::Timer => String::from("timer"),
+                    WindowsHandleKind::KeyedEvent => String::from("keyed-event"),
                     WindowsHandleKind::WaitCompletionPacket => {
                         String::from("wait-completion-packet")
                     }
@@ -4346,6 +4360,12 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     fn handle_is_worker_factory(&self, handle: usize) -> bool {
         self.handles.lock().iter().any(|entry| {
             entry.handle == handle && matches!(entry.kind, WindowsHandleKind::WorkerFactory)
+        })
+    }
+
+    fn handle_is_keyed_event(&self, handle: usize) -> bool {
+        self.handles.lock().iter().any(|entry| {
+            entry.handle == handle && matches!(entry.kind, WindowsHandleKind::KeyedEvent)
         })
     }
 
@@ -5372,6 +5392,43 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
+    fn nt_create_keyed_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let handle = self.insert_handle(WindowsHandleKind::KeyedEvent);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            keyed_event_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            flags:% = format_args!("{:#x}", ctx.r9);
+            "Handling NtCreateKeyedEvent syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_keyed_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let handle = self.insert_handle(WindowsHandleKind::KeyedEvent);
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            keyed_event_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenKeyedEvent syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
     fn nt_create_io_completion(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let handle = self.insert_handle(WindowsHandleKind::IoCompletion);
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
@@ -5908,19 +5965,54 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_ALERTED;
     }
 
-    fn nt_wait_for_keyed_event(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_wait_for_keyed_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let timeout_address = ctx.r9;
         if timeout_address != 0 && read_value::<i64>(timeout_address).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
             return;
         }
 
+        if ctx.r10 != 0 && !self.handle_is_keyed_event(ctx.r10) {
+            litebox_util_log::debug!(
+                keyed_event_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10),
+                key_value:% = format_args!("{:#x}", ctx.rdx);
+                "NtWaitForKeyedEvent received invalid keyed-event handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
         litebox_util_log::debug!(
             keyed_event_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
             key_value:% = format_args!("{:#x}", ctx.rdx),
             alertable:% = format_args!("{:#x}", ctx.r8),
             timeout:% = format_args!("{timeout_address:#x}");
             "Handling NtWaitForKeyedEvent as timed out"
+        );
+        ctx.rax = STATUS_TIMEOUT;
+    }
+
+    fn nt_release_keyed_event(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.r10 != 0 && !self.handle_is_keyed_event(ctx.r10) {
+            litebox_util_log::debug!(
+                keyed_event_handle:% = format_args!("{:#x}", ctx.r10),
+                handle_description:% = self.describe_handle(ctx.r10),
+                key_value:% = format_args!("{:#x}", ctx.rdx);
+                "NtReleaseKeyedEvent received invalid keyed-event handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            keyed_event_handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = self.describe_handle(ctx.r10),
+            key_value:% = format_args!("{:#x}", ctx.rdx),
+            alertable:% = format_args!("{:#x}", ctx.r8),
+            timeout:% = format_args!("{:#x}", ctx.r9);
+            "Handling NtReleaseKeyedEvent as no waiter released"
         );
         ctx.rax = STATUS_TIMEOUT;
     }
