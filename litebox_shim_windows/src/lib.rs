@@ -431,6 +431,7 @@ const STATUS_NO_TOKEN: usize = 0xc000_007c;
 const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
 const STATUS_NOT_SUPPORTED: usize = 0xc000_00bb;
 const STATUS_NOT_SAME_DEVICE: usize = 0xc000_00d4;
+const STATUS_NOT_FOUND: usize = 0xc000_0225;
 const STATUS_DEBUGGER_INACTIVE: usize = 0xc000_0354;
 const WINDOWS_CONTEXT_AMD64: u32 = 0x0010_0000;
 const WINDOWS_CONTEXT_CONTROL: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0001;
@@ -468,6 +469,13 @@ const PROCESS_BASIC_INFORMATION_CLASS: usize = 0;
 const PROCESS_COOKIE_INFORMATION_CLASS: usize = 36;
 const PROCESS_SCHEDULER_SHARED_DATA_CLASS: usize = 112;
 const THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS: usize = 57;
+const APPHELP_CACHE_SERVICE_LOOKUP: usize = 0;
+const APPHELP_CACHE_SERVICE_REMOVE: usize = 1;
+const APPHELP_CACHE_SERVICE_UPDATE: usize = 2;
+const APPHELP_CACHE_SERVICE_FLUSH: usize = 3;
+const APPHELP_CACHE_SERVICE_DUMP: usize = 4;
+const APPHELP_DEBUG_READ_REGISTRY: usize = 0x100;
+const APPHELP_DEBUG_WRITE_REGISTRY: usize = 0x101;
 const MEMORY_BASIC_INFORMATION_CLASS: usize = 0;
 const MEMORY_WORKING_SET_EX_INFORMATION_CLASS: usize = 4;
 const MEMORY_IMAGE_INFORMATION_CLASS: usize = 6;
@@ -595,6 +603,13 @@ struct ObjectAttributes {
     _padding1: u32,
     security_descriptor: usize,
     security_quality_of_service: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+struct ApphelpCacheServiceLookup {
+    image_name: UnicodeString,
+    image_handle: usize,
 }
 
 #[repr(C)]
@@ -2656,12 +2671,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtApphelpCacheControl) => {
-                litebox_util_log::debug!(
-                    service_class:% = format_args!("{:#x}", ctx.r10),
-                    service_data:% = format_args!("{:#x}", ctx.rdx);
-                    "Handling NtApphelpCacheControl as no-op"
-                );
-                ctx.rax = STATUS_SUCCESS;
+                Self::nt_apphelp_cache_control(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtMapViewOfSection) => {
@@ -4496,6 +4506,45 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
+    fn nt_apphelp_cache_control(ctx: &mut litebox_common_linux::PtRegs) {
+        let lookup = read_apphelp_cache_service_lookup(ctx.rdx);
+        ctx.rax = match ctx.r10 {
+            APPHELP_CACHE_SERVICE_LOOKUP | APPHELP_CACHE_SERVICE_REMOVE => {
+                if lookup.is_some() {
+                    STATUS_NOT_FOUND
+                } else {
+                    STATUS_INVALID_PARAMETER
+                }
+            }
+            APPHELP_CACHE_SERVICE_UPDATE => {
+                if lookup.is_some() {
+                    STATUS_SUCCESS
+                } else {
+                    STATUS_INVALID_PARAMETER
+                }
+            }
+            APPHELP_CACHE_SERVICE_FLUSH
+            | APPHELP_CACHE_SERVICE_DUMP
+            | APPHELP_DEBUG_WRITE_REGISTRY => STATUS_SUCCESS,
+            APPHELP_DEBUG_READ_REGISTRY => STATUS_NOT_FOUND,
+            _ => STATUS_INVALID_PARAMETER,
+        };
+
+        let (image_name, image_handle) = lookup
+            .as_ref()
+            .map_or((String::from("<invalid>"), 0), |(lookup, image_name)| {
+                (image_name.clone(), lookup.image_handle)
+            });
+        litebox_util_log::debug!(
+            service_class:% = format_args!("{:#x}", ctx.r10),
+            service_data:% = format_args!("{:#x}", ctx.rdx),
+            image_name:% = image_name,
+            image_handle:% = format_args!("{image_handle:#x}"),
+            status:% = format_args!("{:#x}", ctx.rax);
+            "Handling NtApphelpCacheControl syscall"
+        );
+    }
+
     fn nt_map_view_of_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let commit_size =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_5_OFFSET));
@@ -5759,14 +5808,26 @@ fn read_usize_or_zero(address: usize) -> usize {
 
 fn read_guest_unicode_string(address: usize) -> Option<String> {
     let unicode_string = read_value::<UnicodeString>(address).ok()?;
+    read_unicode_string_value(unicode_string)
+}
+
+fn read_unicode_string_value(unicode_string: UnicodeString) -> Option<String> {
     if unicode_string.length == 0 {
         return Some(String::new());
     }
-    if unicode_string.buffer == 0 || unicode_string.length % 2 != 0 {
+    if unicode_string.buffer == 0 || !unicode_string.length.is_multiple_of(2) {
         return None;
     }
 
     read_utf16_string(unicode_string.buffer, unicode_string.length).ok()
+}
+
+fn read_apphelp_cache_service_lookup(
+    address: usize,
+) -> Option<(ApphelpCacheServiceLookup, String)> {
+    let lookup = read_value::<ApphelpCacheServiceLookup>(address).ok()?;
+    let image_name = read_unicode_string_value(lookup.image_name)?;
+    (!image_name.is_empty()).then_some((lookup, image_name))
 }
 
 fn read_utf16_string(address: usize, byte_length: u16) -> Result<String, PeImageAccessError> {
