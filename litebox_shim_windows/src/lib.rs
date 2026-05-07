@@ -425,6 +425,7 @@ const STATUS_INVALID_INFO_CLASS: usize = 0xc000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
 const STATUS_ACCESS_VIOLATION: usize = 0xc000_0005;
 const STATUS_INVALID_PARAMETER: usize = 0xc000_000d;
+const STATUS_NOT_MAPPED_VIEW: usize = 0xc000_0019;
 const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
 const STATUS_NO_TOKEN: usize = 0xc000_007c;
 const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
@@ -1721,6 +1722,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 exit_code: exit_code.clone(),
                 page_manager: self.page_manager.clone(),
                 handles: litebox::sync::Mutex::new(Vec::new()),
+                mapped_section_views: litebox::sync::Mutex::new(Vec::new()),
                 loaded_modules: litebox::sync::Mutex::new(vec![LoadedModule {
                     path: String::from("/Windows/System32/ntdll.dll"),
                     base_addr: ntdll_mapping.base_addr,
@@ -2123,6 +2125,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     exit_code: Arc<AtomicI32>,
     page_manager: Arc<WindowsPageManager>,
     handles: litebox::sync::Mutex<Platform, Vec<WindowsHandle>>,
+    mapped_section_views: litebox::sync::Mutex<Platform, Vec<MappedSectionView>>,
     loaded_modules: litebox::sync::Mutex<Platform, Vec<LoadedModule>>,
     api_set_hosts: litebox::sync::Mutex<Platform, Vec<ApiSetHostCacheEntry>>,
     diagnostic_regions: litebox::sync::Mutex<Platform, Vec<GuestAddressRegion>>,
@@ -2156,6 +2159,21 @@ struct WindowsHandle {
 enum WindowsHandleKind {
     File { path: String },
     Section { path: Option<String> },
+}
+
+struct MappedSectionView {
+    base_addr: usize,
+    size: usize,
+    path: Option<String>,
+    region_name: &'static str,
+}
+
+impl MappedSectionView {
+    fn contains(&self, address: usize) -> bool {
+        self.base_addr
+            .checked_add(self.size)
+            .is_some_and(|end| (self.base_addr..end).contains(&address))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2655,12 +2673,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtUnmapViewOfSection) => {
-                litebox_util_log::debug!(
-                    process_handle:% = format_args!("{:#x}", ctx.r10),
-                    base_address:% = format_args!("{:#x}", ctx.rdx);
-                    "Handling NtUnmapViewOfSection as no-op"
-                );
-                ctx.rax = STATUS_SUCCESS;
+                self.nt_unmap_view_of_section(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtCreateEvent) => {
@@ -4145,6 +4158,30 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             })
     }
 
+    fn record_mapped_section_view(
+        &self,
+        base_addr: usize,
+        size: usize,
+        path: Option<String>,
+        region_name: &'static str,
+    ) {
+        if size == 0 {
+            return;
+        }
+        self.mapped_section_views.lock().push(MappedSectionView {
+            base_addr,
+            size,
+            path,
+            region_name,
+        });
+    }
+
+    fn forget_mapped_section_view(&self, base_address: usize) -> Option<MappedSectionView> {
+        let mut views = self.mapped_section_views.lock();
+        let index = views.iter().position(|view| view.contains(base_address))?;
+        Some(views.remove(index))
+    }
+
     fn image_region_containing(&self, address: usize) -> Option<GuestAddressRegion> {
         self.diagnostic_regions
             .lock()
@@ -4528,6 +4565,13 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             return;
         }
 
+        self.record_mapped_section_view(
+            mapped_base,
+            mapped_size,
+            section_path.clone(),
+            region_name,
+        );
+
         litebox_util_log::debug!(
             section_handle:% = format_args!("{:#x}", ctx.r10),
             section_path:% = section_path.as_deref().unwrap_or("<none>"),
@@ -4567,6 +4611,46 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         } else {
             STATUS_NOT_SAME_DEVICE
         };
+    }
+
+    fn nt_unmap_view_of_section(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx == 0 {
+            ctx.rax = STATUS_INVALID_PARAMETER;
+            return;
+        }
+
+        if let Some(view) = self.forget_mapped_section_view(ctx.rdx) {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                base_address:% = format_args!("{:#x}", ctx.rdx),
+                mapped_base:% = format_args!("{:#x}", view.base_addr),
+                mapped_size = view.size,
+                section_path:% = view.path.as_deref().unwrap_or("<none>"),
+                region_name = view.region_name;
+                "Handling NtUnmapViewOfSection syscall"
+            );
+            ctx.rax = STATUS_SUCCESS;
+            return;
+        }
+
+        if let Some(region) = self.image_region_containing(ctx.rdx) {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                base_address:% = format_args!("{:#x}", ctx.rdx),
+                region_name = region.name;
+                "Handling NtUnmapViewOfSection for persistent image region"
+            );
+            ctx.rax = STATUS_SUCCESS;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", ctx.r10),
+            base_address:% = format_args!("{:#x}", ctx.rdx),
+            base_region:% = self.describe_guest_address(ctx.rdx);
+            "NtUnmapViewOfSection target was not a mapped view"
+        );
+        ctx.rax = STATUS_NOT_MAPPED_VIEW;
     }
 
     fn write_file_fs_information<GuestValue>(
