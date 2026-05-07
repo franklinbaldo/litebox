@@ -153,8 +153,13 @@ unsafe extern "system" fn vectored_exception_handler(
     // This is done instead of just fixing up fsbase and returning here to avoid
     // missing a real interrupt that arrives while resuming the guest. Go through
     // the interrupt path to ensure that any pending interrupts are also handled.
+    let faulting_address = exception_record.ExceptionInformation[1];
+    // SAFETY: Reading FS base is a side-effect-free diagnostic used to decide
+    // whether Windows cleared the LiteBox guest TEB base between guest entries.
+    let fs_base = unsafe { litebox_common_linux::rdfsbase() };
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && unsafe { litebox_common_linux::rdfsbase() } == 0
+        && faulting_address != 0
+        && fs_base == 0
         && WindowsUserland::get_thread_fs_base() != 0
     {
         set_context_to_interrupt_callback(tls, context);
