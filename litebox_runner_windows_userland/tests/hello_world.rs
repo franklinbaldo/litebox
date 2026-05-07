@@ -71,51 +71,7 @@ fn run_minimal_hello_world_pe() {
 
     let mut command =
         std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
-    command.args(["--initial-files", tar_path.to_str().unwrap(), "/hello.exe"]);
-    println!("Running `{command:?}`");
-    let output = command
-        .output()
-        .expect("failed to run litebox_runner_windows_userland");
-
-    assert!(
-        output.status.success(),
-        "runner exited with status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output
-            .stdout
-            .windows(HELLO_MESSAGE.len())
-            .any(|window| window == HELLO_MESSAGE),
-        "guest hello-world output was not observed; {REQUIRED_SUPPORT}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[test]
-#[ignore = "uses host-version-specific ntdll loader bring-up patches"]
-fn forced_ntdll_loader_runs_minimal_hello_world_pe() {
-    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("hello_world_ntdll_loader_{}", std::process::id()));
-    std::fs::create_dir_all(&test_dir).unwrap();
-    let pe_path = build_minimal_hello_world_pe(&test_dir);
-    println!("Built hello-world PE fixture at `{}`", pe_path.display());
-    let ntdll_path = build_rewritten_ntdll(&test_dir);
-    println!(
-        "Built rewritten ntdll fixture at `{}`",
-        ntdll_path.display()
-    );
-    let tar_path = test_dir.join("hello_world_ntdll_loader.tar");
-    create_tar_with_hello_exe(&test_dir, &tar_path);
-
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
     command.env("LITEBOX_LOG", "debug").args([
-        "-Z",
-        "--force-ntdll-loader",
         "--initial-files",
         tar_path.to_str().unwrap(),
         "/hello.exe",
@@ -127,22 +83,22 @@ fn forced_ntdll_loader_runs_minimal_hello_world_pe() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined_output = format!("{stdout}\n{stderr}");
 
-    assert!(!timed_out, "forced ntdll loader path timed out");
+    assert!(!timed_out, "ntdll loader path timed out");
     assert!(
         output.status.success(),
-        "forced ntdll loader path exited with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        "runner exited with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         output.status.code()
     );
     assert!(
         combined_output.contains("Starting Windows guest through ntdll!LdrInitializeThunk"),
-        "forced ntdll loader path did not reach LdrInitializeThunk\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "runner did not enter through LdrInitializeThunk\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         output
             .stdout
             .windows(HELLO_MESSAGE.len())
             .any(|window| window == HELLO_MESSAGE),
-        "forced ntdll loader path did not print hello-world output\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "guest hello-world output was not observed; {REQUIRED_SUPPORT}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
 

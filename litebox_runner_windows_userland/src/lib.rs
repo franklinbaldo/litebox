@@ -29,12 +29,6 @@ pub struct CliArgs {
     /// Forward the existing environment variables.
     #[arg(long = "forward-env")]
     pub forward_environment_variables: bool,
-    /// Allow using unstable options.
-    #[arg(short = 'Z', long = "unstable")]
-    pub unstable: bool,
-    /// Force execution through guest ntdll!LdrInitializeThunk.
-    #[arg(long = "force-ntdll-loader", requires = "unstable")]
-    pub force_ntdll_loader: bool,
     /// Tar archive containing the program and its runtime files.
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub initial_files: PathBuf,
@@ -55,12 +49,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .from_env_lossy(),
         )
         .init();
-
-    if cli_args.unstable {
-        litebox_util_log::warn!(
-            "Windows PE runner is currently a skeleton; shim functionality is not implemented yet"
-        );
-    }
 
     let tar_file = &cli_args.initial_files;
     if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
@@ -120,13 +108,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         envp
     };
 
-    let load_mode = if cli_args.force_ntdll_loader {
-        litebox_shim_windows::WindowsLoadMode::NtDllLoader
-    } else {
-        litebox_shim_windows::WindowsLoadMode::Auto
-    };
     let program = shim
-        .load_program_with_mode(initial_file_system, program_path, argv, envp, load_mode)
+        .load_program(initial_file_system, program_path, argv, envp)
         .map_err(|e| anyhow!("failed to load Windows PE program: {e}"))?;
     unsafe {
         litebox_platform_windows_userland::run_thread(

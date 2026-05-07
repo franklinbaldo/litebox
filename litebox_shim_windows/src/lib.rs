@@ -1441,65 +1441,25 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         &self,
         fs: Arc<FS>,
         path: &str,
-        argv: Vec<alloc::ffi::CString>,
-        envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
-        self.load_program_with_mode(fs, path, argv, envp, WindowsLoadMode::Auto)
-    }
-
-    /// Loads the program at `path` using an explicit Windows loader strategy.
-    pub fn load_program_with_mode(
-        &self,
-        fs: Arc<FS>,
-        path: &str,
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
-        load_mode: WindowsLoadMode,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let image = self.load_image(fs.clone(), path)?;
         let application_entry_point = image.mapping.entry_point;
-        if matches!(
-            load_mode,
-            WindowsLoadMode::Auto | WindowsLoadMode::NtDllLoader
-        ) {
-            self.resolve_initial_imports(&image)?;
+        self.resolve_initial_imports(&image)?;
+        let ntdll = self.load_ntdll(fs)?.ok_or(WindowsLoadError::MissingNtDll)?;
+        if !ntdll.has_trampoline {
+            return Err(WindowsLoadError::UnrewrittenNtDll);
         }
-        let ntdll = self.load_ntdll(fs)?;
-        let force_ntdll_loader = load_mode == WindowsLoadMode::NtDllLoader;
-        let (entry_point, mut start_mode) = if !force_ntdll_loader && !image.imports.is_empty() {
-            litebox_util_log::debug!(
-                application_entry_point:% = format_args!("{application_entry_point:#x}");
-                "Starting Windows guest through built-in import thunks"
-            );
-            (application_entry_point, WindowsStartMode::Application)
-        } else if let Some(ntdll) = &ntdll {
-            if !ntdll.has_trampoline {
-                return Err(WindowsLoadError::UnrewrittenNtDll);
-            }
-            self.patch_ntdll_builtin_exports(ntdll)?;
-            let loader_entry_point = ntdll
-                .export_address(NTDLL_LOADER_ENTRYPOINT)?
-                .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
-            litebox_util_log::debug!(
-                forced = force_ntdll_loader,
-                entry_point:% = format_args!("{loader_entry_point:#x}"),
-                application_entry_point:% = format_args!("{application_entry_point:#x}");
-                "Starting Windows guest through ntdll!LdrInitializeThunk"
-            );
-            (
-                loader_entry_point,
-                WindowsStartMode::NtDllLoader {
-                    application_entry_point,
-                    image_base: image.mapping.base_addr,
-                    initial_context: 0,
-                    system_dll_init_block: 0,
-                },
-            )
-        } else if force_ntdll_loader {
-            return Err(WindowsLoadError::MissingNtDll);
-        } else {
-            (application_entry_point, WindowsStartMode::Application)
-        };
+        self.patch_ntdll_builtin_exports(&ntdll)?;
+        let entry_point = ntdll
+            .export_address(NTDLL_LOADER_ENTRYPOINT)?
+            .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+        litebox_util_log::debug!(
+            entry_point:% = format_args!("{entry_point:#x}"),
+            application_entry_point:% = format_args!("{application_entry_point:#x}");
+            "Starting Windows guest through ntdll!LdrInitializeThunk"
+        );
 
         let length =
             NonZeroPageSize::new(INITIAL_STACK_SIZE).ok_or(PeImageAccessError::AddressOverflow)?;
@@ -1514,52 +1474,40 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .ok_or(PeImageAccessError::AddressOverflow)?;
         let process_environment = self.create_process_environment(
             &image.mapping,
-            ntdll.as_ref().map(|image| &image.mapping),
+            Some(&ntdll.mapping),
             stack_base.as_usize(),
             stack_top,
             path,
         )?;
-        if let WindowsStartMode::NtDllLoader {
-            application_entry_point,
-            image_base,
-            ..
-        } = start_mode
-        {
-            let application_stack_top = stack_top
-                .checked_sub(0x28)
-                .ok_or(PeImageAccessError::AddressOverflow)?;
-            let initial_context = initial_context_address_on_stack(application_stack_top)?;
-            write_value(
-                initial_context,
-                InitialThreadContext::new(
-                    application_entry_point,
-                    application_stack_top,
-                    image_base,
-                ),
-            )?;
-            start_mode = WindowsStartMode::NtDllLoader {
+        let application_stack_top = stack_top
+            .checked_sub(0x28)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let initial_context = initial_context_address_on_stack(application_stack_top)?;
+        write_value(
+            initial_context,
+            InitialThreadContext::new(
                 application_entry_point,
-                image_base,
-                initial_context,
-                system_dll_init_block: process_environment.system_dll_init_block,
-            };
-        }
+                application_stack_top,
+                image.mapping.base_addr,
+            ),
+        )?;
+        let start_mode = WindowsStartMode {
+            application_entry_point,
+            image_base: image.mapping.base_addr,
+            initial_context,
+            system_dll_init_block: process_environment.system_dll_init_block,
+        };
         let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
         let diagnostic_regions = guest_address_regions(
             &image.mapping,
-            ntdll.as_ref().map(|image| &image.mapping),
+            Some(&ntdll.mapping),
             stack_base.as_usize(),
             stack_top,
             &process_environment,
         );
-        let ntdll_mapping = ntdll.map(|image| image.mapping);
-        if let Some(mapping) = &ntdll_mapping {
-            GUEST_NTDLL_BASE.store(mapping.base_addr, Ordering::Relaxed);
-            GUEST_NTDLL_SIZE.store(mapping.image_size, Ordering::Relaxed);
-        } else {
-            GUEST_NTDLL_BASE.store(0, Ordering::Relaxed);
-            GUEST_NTDLL_SIZE.store(0, Ordering::Relaxed);
-        }
+        let ntdll_mapping = ntdll.mapping;
+        GUEST_NTDLL_BASE.store(ntdll_mapping.base_addr, Ordering::Relaxed);
+        GUEST_NTDLL_SIZE.store(ntdll_mapping.image_size, Ordering::Relaxed);
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
@@ -1575,7 +1523,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             },
             process: WindowsShimProcess {
                 mapping: image.mapping,
-                _ntdll_mapping: ntdll_mapping,
+                _ntdll_mapping: Some(ntdll_mapping),
                 exit_code,
             },
         })
@@ -1988,16 +1936,6 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     }
 }
 
-/// Selects how the Windows shim transfers control to the initial executable.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum WindowsLoadMode {
-    /// Use the currently supported bring-up path for the image.
-    #[default]
-    Auto,
-    /// Enter guest `ntdll!LdrInitializeThunk` instead of patching built-in imports.
-    NtDllLoader,
-}
-
 /// The shim entrypoint object passed to the platform.
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
@@ -2126,14 +2064,11 @@ fn push_region(
 }
 
 #[derive(Clone, Copy)]
-enum WindowsStartMode {
-    Application,
-    NtDllLoader {
-        application_entry_point: usize,
-        image_base: usize,
-        initial_context: usize,
-        system_dll_init_block: usize,
-    },
+struct WindowsStartMode {
+    application_entry_point: usize,
+    image_base: usize,
+    initial_context: usize,
+    system_dll_init_block: usize,
 }
 
 impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
@@ -2146,28 +2081,23 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         ctx.rip = self.entry_point;
         ctx.rsp = self.stack_top - size_of::<usize>();
         ctx.eflags = 0x202;
-        if let WindowsStartMode::NtDllLoader {
-            application_entry_point,
-            image_base,
-            initial_context,
-            system_dll_init_block,
-        } = self.start_mode
-        {
-            ctx.rcx = initial_context;
-            ctx.rsp = initial_context.saturating_sub(size_of::<usize>());
-            ctx.rdx = image_base;
-            ctx.r8 = 0;
-            ctx.r9 = 0;
-            litebox_util_log::debug!(
-                application_entry_point:% = format_args!("{application_entry_point:#x}"),
-                image_base:% = format_args!("{image_base:#x}"),
-                initial_context:% = format_args!("{initial_context:#x}"),
-                loader_parameter:% = format_args!("{:#x}", ctx.rdx),
-                system_dll_init_block:% = format_args!("{system_dll_init_block:#x}"),
-                loader_stack:% = format_args!("{:#x}", ctx.rsp);
-                "Prepared initial ntdll loader arguments"
-            );
-        }
+        ctx.rcx = self.start_mode.initial_context;
+        ctx.rsp = self
+            .start_mode
+            .initial_context
+            .saturating_sub(size_of::<usize>());
+        ctx.rdx = self.start_mode.image_base;
+        ctx.r8 = 0;
+        ctx.r9 = 0;
+        litebox_util_log::debug!(
+            application_entry_point:% = format_args!("{:#x}", self.start_mode.application_entry_point),
+            image_base:% = format_args!("{:#x}", self.start_mode.image_base),
+            initial_context:% = format_args!("{:#x}", self.start_mode.initial_context),
+            loader_parameter:% = format_args!("{:#x}", ctx.rdx),
+            system_dll_init_block:% = format_args!("{:#x}", self.start_mode.system_dll_init_block),
+            loader_stack:% = format_args!("{:#x}", ctx.rsp);
+            "Prepared initial ntdll loader arguments"
+        );
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
             stack_top:% = format_args!("{:#x}", self.stack_top),
