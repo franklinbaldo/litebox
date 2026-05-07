@@ -189,6 +189,30 @@ extern "system" fn litebox_ntdll_api_set_resolve(
     0
 }
 
+extern "system" fn litebox_ntdll_api_set_resolve_unicode(
+    api_set_map: *const c_void,
+    name: *const UnicodeString,
+    resolved_name: *mut c_void,
+    resolved_parent_name: *mut c_void,
+) -> usize {
+    let name_address = name as usize;
+    let unicode_string = read_value::<UnicodeString>(name_address).unwrap_or_default();
+    if unicode_string.buffer == 0 && unicode_string.length != 0 {
+        let _ = write_value(name_address, UnicodeString::default());
+    }
+    litebox_util_log::debug!(
+        api_set_map:% = format_args!("{api_set_map:p}"),
+        name:% = format_args!("{name:p}"),
+        length = unicode_string.length,
+        maximum_length = unicode_string.maximum_length,
+        buffer:% = format_args!("{:#x}", unicode_string.buffer),
+        resolved_name:% = format_args!("{resolved_name:p}"),
+        resolved_parent_name:% = format_args!("{resolved_parent_name:p}");
+        "Handled ntdll API-set Unicode wrapper through built-in guard"
+    );
+    STATUS_SUCCESS
+}
+
 fn ntdll_guest_heap_allocate(bytes: usize) -> *mut c_void {
     const HEADER_SIZE: usize = size_of::<usize>();
     const HEAP_ALIGNMENT: usize = 16;
@@ -286,9 +310,10 @@ const NTDLL_PATHS: &[&str] = &[
     "/ntdll.dll",
 ];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
-// Current forced-loader diagnostics use the host ntdll fixture. This helper is
-// patched so malformed API-set probes fail visibly instead of faulting first.
+// Current forced-loader diagnostics use the host ntdll fixture. These helpers
+// are patched so malformed API-set probes fail visibly instead of faulting first.
 const NTDLL_API_SET_RESOLVE_HELPER_RVA: usize = 0x135fa8;
+const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA: usize = 0x41600;
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
@@ -1608,6 +1633,21 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         litebox_util_log::debug!(
             address:% = format_args!("{api_set_helper:#x}");
             "Patched guest ntdll API-set helper to built-in guard"
+        );
+
+        let api_set_unicode_wrapper = image
+            .mapping
+            .base_addr
+            .checked_add(NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_absolute_jump(
+            &self.page_manager,
+            api_set_unicode_wrapper,
+            litebox_ntdll_api_set_resolve_unicode as *const () as usize,
+        )?;
+        litebox_util_log::debug!(
+            address:% = format_args!("{api_set_unicode_wrapper:#x}");
+            "Patched guest ntdll API-set Unicode wrapper to built-in guard"
         );
 
         Ok(())
