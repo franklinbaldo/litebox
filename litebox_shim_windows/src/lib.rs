@@ -424,6 +424,7 @@ const STATUS_SUCCESS: usize = 0;
 const STATUS_INVALID_INFO_CLASS: usize = 0xc000_0003;
 const STATUS_INFO_LENGTH_MISMATCH: usize = 0xc000_0004;
 const STATUS_ACCESS_VIOLATION: usize = 0xc000_0005;
+const STATUS_INVALID_HANDLE: usize = 0xc000_0008;
 const STATUS_INVALID_PARAMETER: usize = 0xc000_000d;
 const STATUS_NOT_MAPPED_VIEW: usize = 0xc000_0019;
 const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
@@ -2176,6 +2177,8 @@ struct WindowsHandle {
 enum WindowsHandleKind {
     File { path: String },
     Section { path: Option<String> },
+    Directory { path: String },
+    SymbolicLink { path: String },
 }
 
 struct MappedSectionView {
@@ -2792,41 +2795,15 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenDirectoryObject) => {
-                let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
-                if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
-                    ctx.rax = STATUS_ACCESS_VIOLATION;
-                    return ContinueOperation::Resume;
-                }
-
-                litebox_util_log::debug!(
-                    directory_handle_ptr:% = format_args!("{:#x}", ctx.r10),
-                    handle:% = format_args!("{handle:#x}"),
-                    desired_access:% = format_args!("{:#x}", ctx.rdx),
-                    object_attributes:% = format_args!("{:#x}", ctx.r8);
-                    "Handling NtOpenDirectoryObject syscall"
-                );
-                ctx.rax = STATUS_SUCCESS;
+                self.nt_open_directory_object(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtOpenSymbolicLinkObject) => {
-                let handle = NEXT_SYNTHETIC_HANDLE.fetch_add(4, Ordering::Relaxed);
-                if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
-                    ctx.rax = STATUS_ACCESS_VIOLATION;
-                    return ContinueOperation::Resume;
-                }
-
-                litebox_util_log::debug!(
-                    link_handle_ptr:% = format_args!("{:#x}", ctx.r10),
-                    handle:% = format_args!("{handle:#x}"),
-                    desired_access:% = format_args!("{:#x}", ctx.rdx),
-                    object_attributes:% = format_args!("{:#x}", ctx.r8);
-                    "Handling NtOpenSymbolicLinkObject syscall"
-                );
-                ctx.rax = STATUS_SUCCESS;
+                self.nt_open_symbolic_link_object(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQuerySymbolicLinkObject) => {
-                Self::nt_query_symbolic_link_object(ctx);
+                self.nt_query_symbolic_link_object(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtTraceEvent) => {
@@ -4150,6 +4127,23 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         }
     }
 
+    fn describe_handle(&self, handle: usize) -> String {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| {
+                (entry.handle == handle).then(|| match &entry.kind {
+                    WindowsHandleKind::File { path } => format!("file:{path}"),
+                    WindowsHandleKind::Section { path } => {
+                        format!("section:{}", path.as_deref().unwrap_or("<anonymous>"))
+                    }
+                    WindowsHandleKind::Directory { path } => format!("directory:{path}"),
+                    WindowsHandleKind::SymbolicLink { path } => format!("symlink:{path}"),
+                })
+            })
+            .unwrap_or_else(|| String::from("<unknown>"))
+    }
+
     fn file_path_for_handle(&self, handle: usize) -> Option<String> {
         self.handles
             .lock()
@@ -4166,6 +4160,16 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             .iter()
             .find_map(|entry| match (&entry.kind, entry.handle == handle) {
                 (WindowsHandleKind::Section { path }, true) => path.clone(),
+                _ => None,
+            })
+    }
+
+    fn symbolic_link_path_for_handle(&self, handle: usize) -> Option<String> {
+        self.handles
+            .lock()
+            .iter()
+            .find_map(|entry| match (&entry.kind, entry.handle == handle) {
+                (WindowsHandleKind::SymbolicLink { path }, true) => Some(path.clone()),
                 _ => None,
             })
     }
@@ -4203,10 +4207,12 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn nt_close(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let handle_description = self.describe_handle(ctx.r10);
         self.remove_handle(ctx.r10);
         litebox_util_log::debug!(
-            handle:% = format_args!("{:#x}", ctx.r10);
-            "Handling NtClose as no-op"
+            handle:% = format_args!("{:#x}", ctx.r10),
+            handle_description:% = handle_description;
+            "Handling NtClose syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
@@ -4316,6 +4322,48 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             object_name:% = object_name,
             guest_path:% = guest_path;
             "Handling NtOpenFile syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_directory_object(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let handle = self.insert_handle(WindowsHandleKind::Directory {
+            path: object_name.clone(),
+        });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            directory_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenDirectoryObject syscall"
+        );
+        ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn nt_open_symbolic_link_object(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let handle = self.insert_handle(WindowsHandleKind::SymbolicLink {
+            path: object_name.clone(),
+        });
+        if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
+            ctx.rax = STATUS_ACCESS_VIOLATION;
+            return;
+        }
+
+        litebox_util_log::debug!(
+            link_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+            handle:% = format_args!("{handle:#x}"),
+            desired_access:% = format_args!("{:#x}", ctx.rdx),
+            object_attributes:% = format_args!("{:#x}", ctx.r8),
+            object_name:% = object_name;
+            "Handling NtOpenSymbolicLinkObject syscall"
         );
         ctx.rax = STATUS_SUCCESS;
     }
@@ -4995,11 +5043,23 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         ctx.rax = STATUS_SUCCESS;
     }
 
-    fn nt_query_symbolic_link_object(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_query_symbolic_link_object(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        let Some(link_path) = self.symbolic_link_path_for_handle(ctx.r10) else {
+            litebox_util_log::debug!(
+                link_handle:% = format_args!("{:#x}", ctx.r10),
+                target_name:% = format_args!("{:#x}", ctx.rdx),
+                return_length:% = format_args!("{:#x}", ctx.r8);
+                "NtQuerySymbolicLinkObject received unknown handle"
+            );
+            ctx.rax = STATUS_INVALID_HANDLE;
+            return;
+        };
+
         ctx.rax = Self::write_symbolic_link_target(ctx.rdx, ctx.r8, SYMBOLIC_LINK_TARGET_PATH);
 
         litebox_util_log::debug!(
             link_handle:% = format_args!("{:#x}", ctx.r10),
+            link_path:% = link_path,
             target_name:% = format_args!("{:#x}", ctx.rdx),
             return_length:% = format_args!("{:#x}", ctx.r8),
             status:% = format_args!("{:#x}", ctx.rax),
