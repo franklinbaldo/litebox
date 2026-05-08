@@ -2596,7 +2596,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQueryAttributesFile) => {
-                Self::nt_query_attributes_file(ctx);
+                self.nt_query_attributes_file(ctx);
                 ContinueOperation::Resume
             }
             Some(NtSysno::NtQueryVolumeInformationFile) => {
@@ -5111,13 +5111,28 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         STATUS_SUCCESS
     }
 
-    fn nt_query_attributes_file(ctx: &mut litebox_common_linux::PtRegs) {
+    fn nt_query_attributes_file(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let object_name =
             read_object_attributes_name(ctx.r10).unwrap_or_else(|| String::from("<unreadable>"));
-        let file_attributes = if object_name.ends_with('\\') || object_name.ends_with(':') {
-            WINDOWS_FILE_ATTRIBUTE_DIRECTORY
-        } else {
-            WINDOWS_FILE_ATTRIBUTE_ARCHIVE
+        let guest_path = windows_object_path_to_guest_path(&object_name);
+        let file_status = match self.fs.file_status(&guest_path) {
+            Ok(status) => status,
+            Err(error) => {
+                litebox_util_log::debug!(
+                    error:?,
+                    object_attributes:% = format_args!("{:#x}", ctx.r10),
+                    file_information:% = format_args!("{:#x}", ctx.rdx),
+                    object_name:% = object_name,
+                    guest_path:% = guest_path;
+                    "NtQueryAttributesFile path not found"
+                );
+                ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                return;
+            }
+        };
+        let file_attributes = match file_status.file_type {
+            litebox::fs::FileType::Directory => WINDOWS_FILE_ATTRIBUTE_DIRECTORY,
+            _ => WINDOWS_FILE_ATTRIBUTE_ARCHIVE,
         };
 
         if ctx.rdx == 0
@@ -5138,6 +5153,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             object_attributes:% = format_args!("{:#x}", ctx.r10),
             file_information:% = format_args!("{:#x}", ctx.rdx),
             object_name:% = object_name,
+            guest_path:% = guest_path,
             file_attributes:% = format_args!("{file_attributes:#x}");
             "Handling NtQueryAttributesFile syscall"
         );
