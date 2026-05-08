@@ -675,7 +675,13 @@ struct PebLdrData {
 }
 
 impl PebLdrData {
-    fn new(address: usize, first_entry: Option<usize>, last_entry: Option<usize>) -> Self {
+    fn new(
+        address: usize,
+        first_entry: Option<usize>,
+        last_entry: Option<usize>,
+        first_initialization_entry: Option<usize>,
+        last_initialization_entry: Option<usize>,
+    ) -> Self {
         let in_load_order_module_list = module_list_head(
             address + PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET,
             first_entry,
@@ -690,8 +696,8 @@ impl PebLdrData {
         );
         let in_initialization_order_module_list = module_list_head(
             address + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
-            first_entry,
-            last_entry,
+            first_initialization_entry,
+            last_initialization_entry,
             LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET,
         );
         Self {
@@ -2426,7 +2432,13 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         }
         write_value(
             active_ldr_data_address,
-            PebLdrData::new(active_ldr_data_address, ldr_entries.first, ldr_entries.last),
+            PebLdrData::new(
+                active_ldr_data_address,
+                ldr_entries.first,
+                ldr_entries.last,
+                ldr_entries.initialization_first,
+                ldr_entries.initialization_last,
+            ),
         )?;
         let api_set_map_address = host_api_set_map_address().unwrap_or(api_set_namespace_address);
         if api_set_map_address == api_set_namespace_address {
@@ -2561,6 +2573,10 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             },
             0x0008_4000,
         );
+        let mut app_entry = app_entry;
+        if ntdll.is_some() {
+            app_entry.in_initialization_order_links = ListEntry::default();
+        }
         write_value(app_entry_address, app_entry)?;
         write_value(
             app_ddag_node_address,
@@ -2586,6 +2602,11 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 },
                 0x0008_4004,
             );
+            let mut ntdll_entry = ntdll_entry;
+            ntdll_entry.in_initialization_order_links = ListEntry {
+                flink: list_heads.initialization,
+                blink: list_heads.initialization,
+            };
             write_value(ntdll_entry_address, ntdll_entry)?;
             write_value(
                 ntdll_ddag_node_address,
@@ -2596,6 +2617,16 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         Ok(InitialLdrEntries {
             first: Some(app_entry_address),
             last: Some(last_entry),
+            initialization_first: Some(if ntdll.is_some() {
+                ntdll_entry_address
+            } else {
+                app_entry_address
+            }),
+            initialization_last: Some(if ntdll.is_some() {
+                ntdll_entry_address
+            } else {
+                app_entry_address
+            }),
         })
     }
 
@@ -8380,6 +8411,8 @@ struct WindowsProcessEnvironment {
 struct InitialLdrEntries {
     first: Option<usize>,
     last: Option<usize>,
+    initialization_first: Option<usize>,
+    initialization_last: Option<usize>,
 }
 
 impl WindowsShimProcess {
