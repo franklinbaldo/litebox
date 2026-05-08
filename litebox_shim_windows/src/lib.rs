@@ -261,12 +261,10 @@ const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 // host-version-specific guard rails for early ntdll loader bring-up.
 const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA: usize = 0x41600;
 const NTDLL_APPHELP_FAILURE_BRANCH_RVAS: &[usize] = &[0xbb56d];
-const NTDLL_APPHELP_STATUS_TEST_RVA: usize = 0xbb41a;
 const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_BYTES: &[u8] = &[
     0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x41, 0x56,
 ];
 const NTDLL_APPHELP_FAILURE_BRANCH_BYTES: &[u8] = &[0x0f, 0x88, 0x41, 0x02, 0x00, 0x00];
-const NTDLL_APPHELP_STATUS_TEST_BYTES: &[u8] = &[0x85, 0xdb];
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
@@ -1740,22 +1738,6 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 "Patched guest ntdll apphelp failure branch"
             );
         }
-
-        let apphelp_status_test = image
-            .mapping
-            .base_addr
-            .checked_add(NTDLL_APPHELP_STATUS_TEST_RVA)
-            .ok_or(PeImageAccessError::AddressOverflow)?;
-        write_checked_code_bytes(
-            &self.page_manager,
-            apphelp_status_test,
-            NTDLL_APPHELP_STATUS_TEST_BYTES,
-            &[0x31, 0xdb],
-        )?;
-        litebox_util_log::debug!(
-            address:% = format_args!("{apphelp_status_test:#x}");
-            "Patched guest ntdll apphelp cached status check"
-        );
 
         Ok(())
     }
