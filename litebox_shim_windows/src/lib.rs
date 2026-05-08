@@ -2068,6 +2068,7 @@ struct MappedSectionView {
     size: usize,
     path: Option<String>,
     region_name: &'static str,
+    release_on_unmap: bool,
 }
 
 impl MappedSectionView {
@@ -4538,6 +4539,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         size: usize,
         path: Option<String>,
         region_name: &'static str,
+        release_on_unmap: bool,
     ) {
         if size == 0 {
             return;
@@ -4547,6 +4549,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             size,
             path,
             region_name,
+            release_on_unmap,
         });
     }
 
@@ -5318,14 +5321,23 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_10_OFFSET));
 
         let section_path = self.section_path_for_handle(ctx.r10);
-        let (mapped_base, mapped_size, region_name) = match section_path.as_deref() {
+        let (mapped_base, mapped_size, region_name, release_on_unmap) = match section_path
+            .as_deref()
+        {
             Some(path) if !is_ntdll_guest_path(path) => {
-                if let Some((base_addr, image_size)) = self.loaded_module_mapping(path) {
-                    (base_addr, image_size, loaded_image_region_name(path))
-                } else {
-                    match self.load_image(self.fs.clone(), path) {
-                        Ok(image) => {
-                            let region_name = loaded_image_region_name(path);
+                let already_loaded = self.has_loaded_module(path);
+                match self.load_image(self.fs.clone(), path) {
+                    Ok(image) => {
+                        let region_name = loaded_image_region_name(path);
+                        if already_loaded {
+                            litebox_util_log::debug!(
+                                section_handle:% = format_args!("{:#x}", ctx.r10),
+                                section_path:% = path,
+                                mapped_base:% = format_args!("{:#x}", image.mapping.base_addr),
+                                mapped_size = image.mapping.image_size;
+                                "Mapped additional guest image section view"
+                            );
+                        } else {
                             self.record_named_memory_region(region_name, &image.mapping);
                             self.record_loaded_module(path, &image);
                             self.ensure_import_modules_loaded(&image.imports);
@@ -5335,22 +5347,38 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                                 path,
                             );
                             self.resolve_application_imports_from_loaded_modules();
-                            (
-                                image.mapping.base_addr,
-                                image.mapping.image_size,
-                                region_name,
-                            )
                         }
-                        Err(error) => {
-                            litebox_util_log::error!(
-                                error:%,
-                                section_handle:% = format_args!("{:#x}", ctx.r10),
-                                section_path:% = path;
-                                "NtMapViewOfSection failed to map guest image section"
-                            );
+                        (
+                            image.mapping.base_addr,
+                            image.mapping.image_size,
+                            region_name,
+                            already_loaded,
+                        )
+                    }
+                    Err(error) if already_loaded => {
+                        let Some((base_addr, image_size)) = self.loaded_module_mapping(path) else {
                             ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
                             return;
-                        }
+                        };
+                        litebox_util_log::debug!(
+                            error:%,
+                            section_handle:% = format_args!("{:#x}", ctx.r10),
+                            section_path:% = path,
+                            mapped_base:% = format_args!("{base_addr:#x}"),
+                            mapped_size = image_size;
+                            "Fell back to loaded guest module for section view"
+                        );
+                        (base_addr, image_size, loaded_image_region_name(path), false)
+                    }
+                    Err(error) => {
+                        litebox_util_log::error!(
+                            error:%,
+                            section_handle:% = format_args!("{:#x}", ctx.r10),
+                            section_path:% = path;
+                            "NtMapViewOfSection failed to map guest image section"
+                        );
+                        ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+                        return;
                     }
                 }
             }
@@ -5361,7 +5389,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     ctx.rax = STATUS_ACCESS_VIOLATION;
                     return;
                 }
-                (ntdll_base, ntdll_size, "ntdll")
+                (ntdll_base, ntdll_size, "ntdll", false)
             }
         };
 
@@ -5378,6 +5406,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             mapped_size,
             section_path.clone(),
             region_name,
+            release_on_unmap,
         );
 
         litebox_util_log::debug!(
@@ -5428,6 +5457,27 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         }
 
         if let Some(view) = self.forget_mapped_section_view(ctx.rdx) {
+            if view.release_on_unmap {
+                let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                    view.base_addr,
+                );
+                // SAFETY: This view owns a transient section mapping created for NtMapViewOfSection.
+                if let Err(error) = unsafe { self.page_manager.remove_pages(ptr, view.size) } {
+                    litebox_util_log::error!(
+                        error:? = error,
+                        process_handle:% = format_args!("{:#x}", ctx.r10),
+                        base_address:% = format_args!("{:#x}", ctx.rdx),
+                        mapped_base:% = format_args!("{:#x}", view.base_addr),
+                        mapped_size = view.size,
+                        section_path:% = view.path.as_deref().unwrap_or("<none>"),
+                        region_name = view.region_name;
+                        "NtUnmapViewOfSection failed to release transient image view"
+                    );
+                    ctx.rax = STATUS_ACCESS_VIOLATION;
+                    return;
+                }
+            }
+
             litebox_util_log::debug!(
                 process_handle:% = format_args!("{:#x}", ctx.r10),
                 base_address:% = format_args!("{:#x}", ctx.rdx),
