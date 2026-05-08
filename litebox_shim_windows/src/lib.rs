@@ -1611,6 +1611,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let start_mode = WindowsStartMode {
             application_entry_point,
             image_base: image.mapping.base_addr,
+            ntdll_base: ntdll.mapping.base_addr,
             initial_context,
             system_dll_init_block: process_environment.system_dll_init_block,
         };
@@ -2431,6 +2432,7 @@ fn loaded_image_region_name(path: &str) -> &'static str {
 struct WindowsStartMode {
     application_entry_point: usize,
     image_base: usize,
+    ntdll_base: usize,
     initial_context: usize,
     system_dll_init_block: usize,
 }
@@ -2450,12 +2452,13 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             .start_mode
             .initial_context
             .saturating_sub(size_of::<usize>());
-        ctx.rdx = self.start_mode.image_base;
+        ctx.rdx = self.start_mode.ntdll_base;
         ctx.r8 = 0;
         ctx.r9 = 0;
         litebox_util_log::debug!(
             application_entry_point:% = format_args!("{:#x}", self.start_mode.application_entry_point),
             image_base:% = format_args!("{:#x}", self.start_mode.image_base),
+            ntdll_base:% = format_args!("{:#x}", self.start_mode.ntdll_base),
             initial_context:% = format_args!("{:#x}", self.start_mode.initial_context),
             loader_parameter:% = format_args!("{:#x}", ctx.rdx),
             system_dll_init_block:% = format_args!("{:#x}", self.start_mode.system_dll_init_block),
