@@ -4745,7 +4745,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn nt_open_key(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        let object_name = read_object_attributes_name(ctx.r8).unwrap_or_default();
+        let object_name = self
+            .key_path_from_object_attributes(ctx.r8)
+            .unwrap_or_default();
         if object_name.is_empty() {
             ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
             return;
@@ -4768,6 +4770,27 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             "Handling NtOpenKey syscall"
         );
         ctx.rax = STATUS_SUCCESS;
+    }
+
+    fn key_path_from_object_attributes(&self, address: usize) -> Option<String> {
+        let object_attributes = read_value::<ObjectAttributes>(address).ok()?;
+        let object_name = if object_attributes.object_name == 0 {
+            String::new()
+        } else {
+            read_guest_unicode_string(object_attributes.object_name)?
+        };
+        if object_name.starts_with('\\') || object_attributes.root_directory == 0 {
+            return Some(object_name);
+        }
+
+        let root_path = self.key_path_for_handle(object_attributes.root_directory)?;
+        if object_name.is_empty() {
+            Some(root_path)
+        } else if root_path.ends_with('\\') {
+            Some(format!("{root_path}{object_name}"))
+        } else {
+            Some(format!("{root_path}\\{object_name}"))
+        }
     }
 
     fn nt_query_value_key(&self, ctx: &mut litebox_common_linux::PtRegs) {
