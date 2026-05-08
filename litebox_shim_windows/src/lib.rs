@@ -4171,14 +4171,28 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn record_memory_region(&self, base_address: usize, region_size: usize) {
-        if let Some(region) = GuestAddressRegion::new("allocation", base_address, region_size) {
+        self.record_memory_region_with_name("allocation", base_address, region_size);
+    }
+
+    fn record_named_memory_region(&self, name: &'static str, mapping: &MappingInfo) {
+        self.record_memory_region_with_name(name, mapping.base_addr, mapping.image_size);
+    }
+
+    fn record_memory_region_with_name(&self, name: &'static str, base_address: usize, size: usize) {
+        if let Some(region) = GuestAddressRegion::new(name, base_address, size) {
             self.diagnostic_regions.lock().push(region);
         }
     }
 
-    fn record_named_memory_region(&self, name: &'static str, mapping: &MappingInfo) {
-        if let Some(region) = GuestAddressRegion::new(name, mapping.base_addr, mapping.image_size) {
-            self.diagnostic_regions.lock().push(region);
+    fn forget_exact_memory_region(&self, name: &'static str, base_address: usize, size: usize) {
+        let Some(region_end) = base_address.checked_add(size) else {
+            return;
+        };
+        let mut regions = self.diagnostic_regions.lock();
+        if let Some(index) = regions.iter().position(|region| {
+            region.name == name && region.start == base_address && region.end == region_end
+        }) {
+            regions.remove(index);
         }
     }
 
@@ -4551,6 +4565,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             region_name,
             release_on_unmap,
         });
+        if release_on_unmap {
+            self.record_memory_region_with_name(region_name, base_addr, size);
+        }
     }
 
     fn forget_mapped_section_view(&self, base_address: usize) -> Option<MappedSectionView> {
@@ -5476,6 +5493,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     ctx.rax = STATUS_ACCESS_VIOLATION;
                     return;
                 }
+                self.forget_exact_memory_region(view.region_name, view.base_addr, view.size);
             }
 
             litebox_util_log::debug!(
