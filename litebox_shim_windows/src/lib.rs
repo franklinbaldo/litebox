@@ -33,8 +33,8 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeExportForwarder, PeImport,
-    PeImportTarget, PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt,
+    AccessMemory, Fault, MapMemory, MappingInfo, PeDataDirectory, PeExport, PeExportForwarder,
+    PeImport, PeImportTarget, PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
@@ -268,6 +268,7 @@ const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_BYTES: &[u8] = &[
 const NTDLL_APPHELP_FAILURE_BRANCH_BYTES: &[u8] = &[0x0f, 0x88, 0x41, 0x02, 0x00, 0x00];
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
 const WINDOWS_SEC_IMAGE: usize = 0x0100_0000;
+const PE_EXCEPTION_DIRECTORY_INDEX: usize = 3;
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
 const WINDOWS_NLS_CODEPAGE_KEY: &str =
@@ -1175,6 +1176,67 @@ fn patch_loaded_image_header_base(
     Ok(())
 }
 
+fn populate_ntdll_inverted_function_table(
+    page_manager: &WindowsPageManager,
+    image: &LoadedImage,
+) -> Result<(), PeImageAccessError> {
+    let Some(exception_directory) = image.exception_directory else {
+        return Ok(());
+    };
+    if exception_directory.virtual_address == 0 || exception_directory.size == 0 {
+        return Ok(());
+    }
+    let Some(table_export) = image.exports.iter().find(|export| {
+        export
+            .name
+            .eq_ignore_ascii_case(b"KiUserInvertedFunctionTable")
+    }) else {
+        return Ok(());
+    };
+
+    let table_address = image
+        .mapping
+        .base_addr
+        .checked_add(
+            usize::try_from(table_export.rva).map_err(|_| PeImageAccessError::AddressOverflow)?,
+        )
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let entry_address = checked_guest_offset(table_address, 0x10)?;
+    let exception_directory_address = image
+        .mapping
+        .base_addr
+        .checked_add(
+            usize::try_from(exception_directory.virtual_address)
+                .map_err(|_| PeImageAccessError::AddressOverflow)?,
+        )
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+
+    make_pages_writable(page_manager, entry_address, 0x18)?;
+    write_value(entry_address, exception_directory_address)?;
+    write_value(
+        checked_guest_offset(entry_address, 0x08)?,
+        image.mapping.base_addr,
+    )?;
+    write_value(
+        checked_guest_offset(entry_address, 0x10)?,
+        u32::try_from(image.mapping.image_size).map_err(|_| PeImageAccessError::AddressOverflow)?,
+    )?;
+    write_value(
+        checked_guest_offset(entry_address, 0x14)?,
+        exception_directory.size,
+    )?;
+
+    litebox_util_log::debug!(
+        table:% = format_args!("{table_address:#x}"),
+        exception_directory:% = format_args!("{exception_directory_address:#x}"),
+        image_base:% = format_args!("{:#x}", image.mapping.base_addr),
+        image_size:% = format_args!("{:#x}", image.mapping.image_size),
+        exception_size:% = format_args!("{:#x}", exception_directory.size);
+        "Populated ntdll KiUserInvertedFunctionTable"
+    );
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 struct InitialNtTib {
@@ -1842,6 +1904,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         for path in NTDLL_PATHS {
             match self.load_image(fs.clone(), path) {
                 Ok(image) => {
+                    populate_ntdll_inverted_function_table(&self.page_manager, &image)?;
                     litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
                     return Ok(Some(image));
                 }
@@ -1858,6 +1921,11 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let file = PeImageFile::open(fs, path)?;
         let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
         let preferred_base = parsed.image.image_base;
+        let exception_directory = parsed
+            .data_directories
+            .iter()
+            .copied()
+            .find(|directory| directory.index == PE_EXCEPTION_DIRECTORY_INDEX);
         let imports = parsed.imports.clone();
         let exports = parsed.exports.clone();
         parsed
@@ -1880,6 +1948,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             mapping,
             imports,
             exports,
+            exception_directory,
             has_trampoline,
         })
     }
@@ -2258,6 +2327,7 @@ struct SectionImage {
     data: Arc<Vec<u8>>,
     imports: Vec<PeImport>,
     exports: Vec<PeExport>,
+    exception_directory: Option<PeDataDirectory>,
     preferred_base: usize,
     image_size: usize,
     has_trampoline: bool,
@@ -3181,6 +3251,11 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let file = PeImageFile::open(fs, path)?;
         let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
         let preferred_base = parsed.image.image_base;
+        let exception_directory = parsed
+            .data_directories
+            .iter()
+            .copied()
+            .find(|directory| directory.index == PE_EXCEPTION_DIRECTORY_INDEX);
         let imports = parsed.imports.clone();
         let exports = parsed.exports.clone();
         parsed
@@ -3203,6 +3278,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             mapping,
             imports,
             exports,
+            exception_directory,
             has_trampoline,
         })
     }
@@ -3212,6 +3288,11 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let data = file.read_all()?;
         let mut bytes = PeImageBytes { data: &data };
         let mut parsed = PeParsedFile::parse(&mut bytes).map_err(WindowsLoadError::Parse)?;
+        let exception_directory = parsed
+            .data_directories
+            .iter()
+            .copied()
+            .find(|directory| directory.index == PE_EXCEPTION_DIRECTORY_INDEX);
         let imports = parsed.imports.clone();
         let exports = parsed.exports.clone();
         parsed
@@ -3225,6 +3306,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             data: Arc::new(data),
             imports,
             exports,
+            exception_directory,
             preferred_base: parsed.image.image_base,
             image_size: parsed.image.size_of_image,
             has_trampoline,
@@ -3253,6 +3335,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             mapping,
             imports: image.imports.clone(),
             exports: image.exports.clone(),
+            exception_directory: image.exception_directory,
             has_trampoline: image.has_trampoline,
         })
     }
@@ -7759,6 +7842,7 @@ struct LoadedImage {
     mapping: MappingInfo,
     imports: Vec<PeImport>,
     exports: Vec<PeExport>,
+    exception_directory: Option<PeDataDirectory>,
     has_trampoline: bool,
 }
 
