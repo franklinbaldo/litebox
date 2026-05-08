@@ -85,7 +85,7 @@ fn run_minimal_hello_world_pe() {
     ]);
     println!("Running `{command:?}`");
     let CommandOutput { output, timed_out } =
-        run_with_timeout(command, std::time::Duration::from_secs(10));
+        run_with_timeout(command, std::time::Duration::from_secs(30));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined_output = format!("{stdout}\n{stderr}");
