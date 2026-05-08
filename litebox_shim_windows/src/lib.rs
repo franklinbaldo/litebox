@@ -266,6 +266,7 @@ const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_BYTES: &[u8] = &[
 ];
 const NTDLL_APPHELP_FAILURE_BRANCH_BYTES: &[u8] = &[0x0f, 0x88, 0x41, 0x02, 0x00, 0x00];
 const INITIAL_CURRENT_DIRECTORY_PATH: &str = "C:\\";
+const WINDOWS_SEC_IMAGE: usize = 0x0100_0000;
 const INITIAL_DLL_SEARCH_PATH: &str = "C:\\Windows\\System32";
 const SYMBOLIC_LINK_TARGET_PATH: &str = "C:\\Windows\\System32";
 const WINDOWS_NLS_CODEPAGE_KEY: &str =
@@ -284,6 +285,7 @@ const STATUS_INVALID_HANDLE: usize = 0xc000_0008;
 const STATUS_INVALID_PARAMETER: usize = 0xc000_000d;
 const STATUS_NOT_MAPPED_VIEW: usize = 0xc000_0019;
 const STATUS_OBJECT_NAME_NOT_FOUND: usize = 0xc000_0034;
+const STATUS_INVALID_IMAGE_FORMAT: usize = 0xc000_007b;
 const STATUS_NO_TOKEN: usize = 0xc000_007c;
 const STATUS_MEMORY_NOT_ALLOCATED: usize = 0xc000_00a0;
 const STATUS_NOT_SUPPORTED: usize = 0xc000_00bb;
@@ -2039,6 +2041,7 @@ enum WindowsHandleKind {
     },
     Section {
         path: Option<String>,
+        image: Option<SectionImage>,
     },
     Directory {
         path: String,
@@ -2062,6 +2065,22 @@ enum WindowsHandleKind {
     },
     KeyedEvent,
     WaitCompletionPacket,
+}
+
+#[derive(Clone)]
+struct SectionImage {
+    data: Arc<Vec<u8>>,
+    imports: Vec<PeImport>,
+    exports: Vec<PeExport>,
+    preferred_base: usize,
+    image_size: usize,
+    has_trampoline: bool,
+}
+
+#[derive(Clone)]
+struct SectionHandleInfo {
+    path: Option<String>,
+    image: Option<SectionImage>,
 }
 
 struct MappedSectionView {
@@ -2997,6 +3016,55 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             imports,
             exports,
             has_trampoline,
+        })
+    }
+
+    fn load_section_image(&self, path: &str) -> Result<SectionImage, WindowsLoadError> {
+        let file = PeImageFile::open(self.fs.clone(), path)?;
+        let data = file.read_all()?;
+        let mut bytes = PeImageBytes { data: &data };
+        let mut parsed = PeParsedFile::parse(&mut bytes).map_err(WindowsLoadError::Parse)?;
+        let imports = parsed.imports.clone();
+        let exports = parsed.exports.clone();
+        parsed
+            .parse_trampoline(
+                &mut PeImageBytes { data: &data },
+                litebox_platform_multiplex::platform().get_syscall_entry_point(),
+            )
+            .map_err(WindowsLoadError::Parse)?;
+        let has_trampoline = parsed.has_trampoline();
+        Ok(SectionImage {
+            data: Arc::new(data),
+            imports,
+            exports,
+            preferred_base: parsed.image.image_base,
+            image_size: parsed.image.size_of_image,
+            has_trampoline,
+        })
+    }
+
+    fn map_section_image(&self, image: &SectionImage) -> Result<LoadedImage, WindowsLoadError> {
+        let mut bytes = PeImageBytes { data: &image.data };
+        let mut parsed = PeParsedFile::parse(&mut bytes).map_err(WindowsLoadError::Parse)?;
+        parsed
+            .parse_trampoline(
+                &mut PeImageBytes { data: &image.data },
+                litebox_platform_multiplex::platform().get_syscall_entry_point(),
+            )
+            .map_err(WindowsLoadError::Parse)?;
+        let mut mapper = PeImageBytesMapper {
+            data: &image.data,
+            page_manager: &self.page_manager,
+        };
+        let mut memory = PeImageMemory;
+        let mapping = parsed
+            .load(&mut mapper, &mut memory)
+            .map_err(WindowsLoadError::Load)?;
+        Ok(LoadedImage {
+            mapping,
+            imports: image.imports.clone(),
+            exports: image.exports.clone(),
+            has_trampoline: image.has_trampoline,
         })
     }
 
@@ -4324,7 +4392,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             .find_map(|entry| {
                 (entry.handle == handle).then(|| match &entry.kind {
                     WindowsHandleKind::File { path } => format!("file:{path}"),
-                    WindowsHandleKind::Section { path } => {
+                    WindowsHandleKind::Section { path, .. } => {
                         format!("section:{}", path.as_deref().unwrap_or("<anonymous>"))
                     }
                     WindowsHandleKind::Directory { path } => format!("directory:{path}"),
@@ -4520,12 +4588,15 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             })
     }
 
-    fn section_path_for_handle(&self, handle: usize) -> Option<String> {
+    fn section_for_handle(&self, handle: usize) -> Option<SectionHandleInfo> {
         self.handles
             .lock()
             .iter()
             .find_map(|entry| match (&entry.kind, entry.handle == handle) {
-                (WindowsHandleKind::Section { path }, true) => path.clone(),
+                (WindowsHandleKind::Section { path, image }, true) => Some(SectionHandleInfo {
+                    path: path.clone(),
+                    image: image.clone(),
+                }),
                 _ => None,
             })
     }
@@ -5191,8 +5262,43 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_7_OFFSET));
 
         let file_path = self.file_path_for_handle(file_handle);
+        let image = if allocation_attributes & WINDOWS_SEC_IMAGE != 0 {
+            let Some(path) = file_path.as_deref() else {
+                ctx.rax = STATUS_INVALID_HANDLE;
+                return;
+            };
+            if is_ntdll_guest_path(path) {
+                None
+            } else {
+                match self.load_section_image(path) {
+                    Ok(image) => Some(image),
+                    Err(error) if is_missing_file_error(&error) => {
+                        litebox_util_log::debug!(
+                            error:%,
+                            file_handle:% = format_args!("{file_handle:#x}"),
+                            file_path:% = path;
+                            "NtCreateSection created path-only image section for missing backing file"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        litebox_util_log::debug!(
+                            error:%,
+                            file_handle:% = format_args!("{file_handle:#x}"),
+                            file_path:% = path;
+                            "NtCreateSection failed to parse image section backing file"
+                        );
+                        ctx.rax = STATUS_INVALID_IMAGE_FORMAT;
+                        return;
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let handle = self.insert_handle(WindowsHandleKind::Section {
             path: file_path.clone(),
+            image: image.clone(),
         });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
@@ -5208,7 +5314,9 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             section_page_protection:% = format_args!("{section_page_protection:#x}"),
             allocation_attributes:% = format_args!("{allocation_attributes:#x}"),
             file_handle:% = format_args!("{file_handle:#x}"),
-            file_path:% = file_path.as_deref().unwrap_or("<none>");
+            file_path:% = file_path.as_deref().unwrap_or("<none>"),
+            image_preferred_base:% = image.as_ref().map_or(String::from("<none>"), |image| format!("{:#x}", image.preferred_base)),
+            image_size = image.as_ref().map_or(0, |image| image.image_size);
             "Handling NtCreateSection syscall"
         );
         ctx.rax = STATUS_SUCCESS;
@@ -5231,6 +5339,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         let handle = self.insert_handle(WindowsHandleKind::Section {
             path: Some(section_path.clone()),
+            image: None,
         });
         if ctx.r10 == 0 || write_value(ctx.r10, handle).is_err() {
             ctx.rax = STATUS_ACCESS_VIOLATION;
@@ -5340,13 +5449,20 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let win32_protect =
             read_usize_or_zero(ctx.rsp.saturating_add(WINDOWS_STACK_ARGUMENT_10_OFFSET));
 
-        let section_path = self.section_path_for_handle(ctx.r10);
+        let section = self.section_for_handle(ctx.r10);
+        let section_path = section.as_ref().and_then(|section| section.path.clone());
+        let section_image = section.as_ref().and_then(|section| section.image.clone());
         let (mapped_base, mapped_size, region_name, release_on_unmap) = match section_path
             .as_deref()
         {
             Some(path) if !is_ntdll_guest_path(path) => {
                 let already_loaded = self.has_loaded_module(path);
-                match self.load_image(self.fs.clone(), path) {
+                let image_result = if let Some(image) = section_image.as_ref() {
+                    self.map_section_image(image)
+                } else {
+                    self.load_image(self.fs.clone(), path)
+                };
+                match image_result {
                     Ok(image) => {
                         let region_name = loaded_image_region_name(path);
                         if already_loaded {
@@ -7963,6 +8079,13 @@ impl<FS: NtShimFS> PeImageFile<FS> {
         }
         Ok(())
     }
+
+    fn read_all(&self) -> Result<Vec<u8>, PeImageAccessError> {
+        let size = self.fs.fd_file_status(&self.fd)?.size;
+        let mut data = vec![0; size];
+        self.read_exact_at(0, &mut data)?;
+        Ok(data)
+    }
 }
 
 impl<FS: NtShimFS> Drop for PeImageFile<FS> {
@@ -7992,8 +8115,42 @@ impl<FS: NtShimFS> ReadAt for &'_ PeImageFile<FS> {
     }
 }
 
+struct PeImageBytes<'a> {
+    data: &'a [u8],
+}
+
+impl ReadAt for PeImageBytes<'_> {
+    type Error = PeImageAccessError;
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+        let offset: usize = offset
+            .try_into()
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let Some(data) = self.data.get(offset..end) else {
+            return Err(PeImageAccessError::ShortRead);
+        };
+        buf.copy_from_slice(data);
+        Ok(())
+    }
+
+    fn size(&mut self) -> Result<u64, Self::Error> {
+        self.data
+            .len()
+            .try_into()
+            .map_err(|_| PeImageAccessError::AddressOverflow)
+    }
+}
+
 struct PeImageMapper<'a, FS: NtShimFS> {
     file: &'a PeImageFile<FS>,
+    page_manager: &'a WindowsPageManager,
+}
+
+struct PeImageBytesMapper<'a> {
+    data: &'a [u8],
     page_manager: &'a WindowsPageManager,
 }
 
@@ -8063,6 +8220,88 @@ impl<FS: NtShimFS> MapMemory for PeImageMapper<'_, FS> {
         )?;
         let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
         ptr.copy_from_slice(0, &data)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+        protect_pages(self.page_manager, address, len, *prot)
+    }
+
+    fn protect(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &Protection,
+    ) -> Result<(), Self::Error> {
+        protect_pages(self.page_manager, address, len, *prot)
+    }
+}
+
+impl MapMemory for PeImageBytesMapper<'_> {
+    type Error = PeImageAccessError;
+
+    fn reserve(
+        &mut self,
+        preferred_base: usize,
+        len: usize,
+        _align: usize,
+    ) -> Result<usize, Self::Error> {
+        let length = NonZeroPageSize::new(len).ok_or(PeImageAccessError::AddressOverflow)?;
+        let suggested_address = if preferred_base == 0 {
+            None
+        } else {
+            Some(NonZeroAddress::new(preferred_base).ok_or(PeImageAccessError::AddressOverflow)?)
+        };
+
+        // SAFETY: The PE loader owns this reserved image range and maps concrete
+        // headers/sections into it before any guest execution is allowed.
+        let ptr = unsafe {
+            self.page_manager.create_inaccessible_pages(
+                suggested_address,
+                length,
+                CreatePagesFlags::empty(),
+                |_| Ok(0),
+            )?
+        };
+        Ok(ptr.as_usize())
+    }
+
+    fn map_zero(
+        &mut self,
+        address: usize,
+        len: usize,
+        prot: &Protection,
+    ) -> Result<(), Self::Error> {
+        make_pages_writable(self.page_manager, address, len)?;
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
+        for index in 0..len {
+            ptr.write_at_offset(
+                index
+                    .try_into()
+                    .map_err(|_| PeImageAccessError::AddressOverflow)?,
+                0,
+            )
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+        }
+        protect_pages(self.page_manager, address, len, *prot)
+    }
+
+    fn map_file(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &Protection,
+    ) -> Result<(), Self::Error> {
+        make_pages_writable(self.page_manager, address, len)?;
+        let offset: usize = offset
+            .try_into()
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let Some(data) = self.data.get(offset..end) else {
+            return Err(PeImageAccessError::ShortRead);
+        };
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
+        ptr.copy_from_slice(0, data)
             .ok_or(PeImageAccessError::MemoryAccess)?;
         protect_pages(self.page_manager, address, len, *prot)
     }
