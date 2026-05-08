@@ -18,7 +18,7 @@ use core::ffi::c_void;
 use core::fmt::Write as _;
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicI32, AtomicI64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 use litebox::fd::TypedFd;
 use litebox::fs::{Mode, OFlags};
@@ -329,7 +329,15 @@ const SYSTEM_PROCESSOR_CACHE_FLUSH_SIZE: u32 = 0x40;
 const PS_SYSTEM_DLL_INIT_BLOCK_V3_SIZE: u32 = 0x118;
 const LOGICAL_PROCESSOR_RELATIONSHIP_GROUP: u32 = 4;
 const PROCESS_BASIC_INFORMATION_CLASS: usize = 0;
+const PROCESS_DEBUG_PORT_CLASS: usize = 7;
+const PROCESS_DEFAULT_HARD_ERROR_MODE_CLASS: usize = 12;
+const PROCESS_HANDLE_COUNT_CLASS: usize = 20;
+const PROCESS_DEBUG_FLAGS_CLASS: usize = 31;
 const PROCESS_COOKIE_INFORMATION_CLASS: usize = 36;
+const PROCESS_HANDLE_CHECKING_MODE_CLASS: usize = 37;
+const PROCESS_IMAGE_INFORMATION_CLASS: usize = 44;
+const PROCESS_MITIGATION_POLICY_CLASS: usize = 52;
+const PROCESS_MITIGATION_POLICY2_CLASS: usize = 63;
 const PROCESS_SCHEDULER_SHARED_DATA_CLASS: usize = 112;
 const THREAD_SCHEDULER_SHARED_DATA_SLOT_CLASS: usize = 57;
 const WINDOWS_DEFAULT_LOCALE_ID: u32 = 0x0409;
@@ -2228,6 +2236,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                     exports: ntdll.exports,
                 }]),
                 api_set_hosts: litebox::sync::Mutex::new(Vec::new()),
+                default_hard_error_mode: AtomicU32::new(0),
                 diagnostic_regions: litebox::sync::Mutex::new(diagnostic_regions),
             },
             process: WindowsShimProcess {
@@ -2636,6 +2645,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     apphelp_cache: litebox::sync::Mutex<Platform, Vec<String>>,
     loaded_modules: litebox::sync::Mutex<Platform, Vec<LoadedModule>>,
     api_set_hosts: litebox::sync::Mutex<Platform, Vec<ApiSetHostCacheEntry>>,
+    default_hard_error_mode: AtomicU32,
     diagnostic_regions: litebox::sync::Mutex<Platform, Vec<GuestAddressRegion>>,
 }
 
@@ -7899,12 +7909,46 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                     ..ProcessBasicInformation::default()
                 },
             ),
+            PROCESS_DEBUG_PORT_CLASS => {
+                Self::write_memory_information(ctx.r8, ctx.r9, return_length_address, 0u64)
+            }
+            PROCESS_DEFAULT_HARD_ERROR_MODE_CLASS => Self::write_memory_information(
+                ctx.r8,
+                ctx.r9,
+                return_length_address,
+                self.default_hard_error_mode.load(Ordering::Acquire),
+            ),
+            PROCESS_HANDLE_COUNT_CLASS => {
+                Self::write_memory_information(ctx.r8, ctx.r9, return_length_address, 16u32)
+            }
+            PROCESS_DEBUG_FLAGS_CLASS => {
+                Self::write_memory_information(ctx.r8, ctx.r9, return_length_address, 1u32)
+            }
             PROCESS_COOKIE_INFORMATION_CLASS => Self::write_memory_information(
                 ctx.r8,
                 ctx.r9,
                 return_length_address,
                 0x2b99_2ddf_u32,
             ),
+            PROCESS_HANDLE_CHECKING_MODE_CLASS => {
+                Self::write_memory_information(ctx.r8, ctx.r9, return_length_address, 0u32)
+            }
+            PROCESS_IMAGE_INFORMATION_CLASS => Self::write_zero_memory_information(
+                ctx.r8,
+                ctx.r9,
+                return_length_address,
+                size_of::<u64>(),
+                ctx.r9.min(64),
+            ),
+            PROCESS_MITIGATION_POLICY_CLASS | PROCESS_MITIGATION_POLICY2_CLASS => {
+                Self::write_zero_memory_information(
+                    ctx.r8,
+                    ctx.r9,
+                    return_length_address,
+                    0,
+                    ctx.r9.min(128),
+                )
+            }
             process_information_class => {
                 litebox_util_log::error!(process_information_class; "NtQueryInformationProcess unsupported information class");
                 STATUS_INVALID_INFO_CLASS
@@ -7925,6 +7969,29 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     }
 
     fn nt_set_information_process(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if ctx.rdx == PROCESS_DEFAULT_HARD_ERROR_MODE_CLASS {
+            let status = if ctx.r8 == 0 || ctx.r9 < size_of::<u32>() {
+                STATUS_INFO_LENGTH_MISMATCH
+            } else {
+                match read_value::<u32>(ctx.r8) {
+                    Ok(mode) => {
+                        self.default_hard_error_mode.store(mode, Ordering::Release);
+                        STATUS_SUCCESS
+                    }
+                    Err(_) => STATUS_ACCESS_VIOLATION,
+                }
+            };
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", ctx.r10),
+                information:% = format_args!("{:#x}", ctx.r8),
+                status:% = format_args!("{status:#x}"),
+                len = ctx.r9;
+                "Handling NtSetInformationProcess(ProcessDefaultHardErrorMode)"
+            );
+            ctx.rax = status;
+            return;
+        }
+
         if ctx.rdx == PROCESS_SCHEDULER_SHARED_DATA_CLASS {
             let scheduler_shared_data = read_usize_or_zero(ctx.r8);
             let fallback_scheduler_shared_data = self.scheduler_shared_data_storage_address();
@@ -8076,6 +8143,37 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
 
         if information_address == 0 || write_value(information_address, value).is_err() {
             return STATUS_ACCESS_VIOLATION;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    fn write_zero_memory_information(
+        information_address: usize,
+        information_length: usize,
+        return_length_address: usize,
+        required_length: usize,
+        write_length: usize,
+    ) -> usize {
+        if return_length_address != 0 && write_value(return_length_address, write_length).is_err() {
+            return STATUS_ACCESS_VIOLATION;
+        }
+
+        if information_length < required_length {
+            return STATUS_INFO_LENGTH_MISMATCH;
+        }
+
+        if information_address == 0 || write_length == 0 {
+            return STATUS_SUCCESS;
+        }
+
+        for offset in 0..write_length {
+            let Ok(address) = checked_guest_offset(information_address, offset) else {
+                return STATUS_ACCESS_VIOLATION;
+            };
+            if write_value(address, 0u8).is_err() {
+                return STATUS_ACCESS_VIOLATION;
+            }
         }
 
         STATUS_SUCCESS
