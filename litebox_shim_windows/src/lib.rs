@@ -247,6 +247,7 @@ const INITIAL_NTDLL_SCRATCH_HEAP_SIZE: usize = 1024 * 1024;
 const NTDLL_HEAP_ALIGNMENT: usize = 16;
 const NTDLL_HEAP_HEADER_SIZE: usize = size_of::<usize>();
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
+const INITIAL_STATIC_SERVER_DATA_SIZE: usize = PAGE_SIZE;
 const INITIAL_API_SET_NAMESPACE_SIZE: usize = PAGE_SIZE * 64;
 const INITIAL_THREAD_CONTEXT_SIZE: usize = PAGE_SIZE;
 const INITIAL_SYSTEM_DLL_INIT_BLOCK_SIZE: usize = PAGE_SIZE;
@@ -407,6 +408,17 @@ const TEB_SCHEDULER_SHARED_DATA_STORAGE_OFFSET: usize = 0x1860;
 const TEB_PROCESSOR_FEATURES_BITMAP_OFFSET: usize = 0x1870;
 const HOST_TEB_PEB_OFFSET: usize = 0x60;
 const HOST_PEB_API_SET_MAP_OFFSET: usize = 0x68;
+const PEB_READ_ONLY_STATIC_SERVER_DATA_OFFSET: usize = 0x98;
+const PEB_NUMBER_OF_PROCESSORS_OFFSET: usize = 0xb8;
+const PEB_CRITICAL_SECTION_TIMEOUT_OFFSET: usize = 0xc0;
+const PEB_OS_MAJOR_VERSION_OFFSET: usize = 0x118;
+const PEB_OS_MINOR_VERSION_OFFSET: usize = 0x11c;
+const PEB_OS_BUILD_NUMBER_OFFSET: usize = 0x120;
+const PEB_OS_PLATFORM_ID_OFFSET: usize = 0x124;
+const PEB_IMAGE_SUBSYSTEM_OFFSET: usize = 0x128;
+const PEB_IMAGE_SUBSYSTEM_MAJOR_VERSION_OFFSET: usize = 0x12c;
+const PEB_IMAGE_SUBSYSTEM_MINOR_VERSION_OFFSET: usize = 0x130;
+const PEB_SESSION_ID_OFFSET: usize = 0x2c0;
 const SCHEDULER_SHARED_SLOT_ASSIGN: u32 = 0;
 const SCHEDULER_SHARED_SLOT_FREE: u32 = 1;
 const SCHEDULER_SHARED_SLOT_QUERY: u32 = 2;
@@ -431,6 +443,7 @@ const _: () = assert!(
     TEB_PROCESSOR_FEATURES_BITMAP_OFFSET + size_of::<ProcessorFeatureBitmapWords>()
         <= INITIAL_TEB_SIZE
 );
+const _: () = assert!(PEB_SESSION_ID_OFFSET + size_of::<u32>() <= INITIAL_PEB_SIZE);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
@@ -999,6 +1012,127 @@ impl ProcessEnvironmentBlock {
 
 const _: () =
     assert!(offset_of!(ProcessEnvironmentBlock, api_set_map) == HOST_PEB_API_SET_MAP_OFFSET);
+
+fn write_initial_peb_runtime_fields(
+    peb_address: usize,
+    static_server_data_address: usize,
+) -> Result<(), PeImageAccessError> {
+    write_value(
+        checked_guest_offset(peb_address, PEB_READ_ONLY_STATIC_SERVER_DATA_OFFSET)?,
+        static_server_data_address,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_NUMBER_OF_PROCESSORS_OFFSET)?,
+        1_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_CRITICAL_SECTION_TIMEOUT_OFFSET)?,
+        (-0x19DB1DED0000_i64).cast_unsigned(),
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_OS_MAJOR_VERSION_OFFSET)?,
+        10_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_OS_MINOR_VERSION_OFFSET)?,
+        0_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_OS_BUILD_NUMBER_OFFSET)?,
+        19041_u16,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_OS_PLATFORM_ID_OFFSET)?,
+        2_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_IMAGE_SUBSYSTEM_OFFSET)?,
+        3_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_IMAGE_SUBSYSTEM_MAJOR_VERSION_OFFSET)?,
+        10_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_IMAGE_SUBSYSTEM_MINOR_VERSION_OFFSET)?,
+        0_u32,
+    )?;
+    write_value(
+        checked_guest_offset(peb_address, PEB_SESSION_ID_OFFSET)?,
+        1_u32,
+    )
+}
+
+fn write_initial_static_server_data(address: usize) -> Result<(), PeImageAccessError> {
+    const BASE_STATIC_SERVER_DATA_OFFSET: usize = 0x100;
+    const WINDOWS_DIRECTORY_STRING_OFFSET: usize = 0xa00;
+    const SYSTEM_DIRECTORY_STRING_OFFSET: usize = 0xa40;
+    const ORIGINAL_SHARED_MEMORY_BASE_OFFSET: usize = 0x9e8;
+
+    let data_address = checked_guest_offset(address, BASE_STATIC_SERVER_DATA_OFFSET)?;
+    write_value(address, data_address)?;
+    write_value(
+        checked_guest_offset(address, size_of::<usize>())?,
+        data_address,
+    )?;
+
+    let windows_directory_buffer =
+        checked_guest_offset(data_address, WINDOWS_DIRECTORY_STRING_OFFSET)?;
+    let system_directory_buffer =
+        checked_guest_offset(data_address, SYSTEM_DIRECTORY_STRING_OFFSET)?;
+    let windows_directory_len = write_ascii_utf16_string(windows_directory_buffer, b"C:\\Windows")?;
+    let system_directory_len =
+        write_ascii_utf16_string(system_directory_buffer, b"C:\\Windows\\System32")?;
+    let nul_terminator_len =
+        u16::try_from(size_of::<u16>()).map_err(|_| PeImageAccessError::AddressOverflow)?;
+
+    write_value(
+        data_address,
+        UnicodeString {
+            length: windows_directory_len,
+            maximum_length: windows_directory_len
+                .checked_add(nul_terminator_len)
+                .ok_or(PeImageAccessError::AddressOverflow)?,
+            buffer: windows_directory_buffer,
+            ..Default::default()
+        },
+    )?;
+    write_value(
+        checked_guest_offset(data_address, size_of::<UnicodeString>())?,
+        UnicodeString {
+            length: system_directory_len,
+            maximum_length: system_directory_len
+                .checked_add(nul_terminator_len)
+                .ok_or(PeImageAccessError::AddressOverflow)?,
+            buffer: system_directory_buffer,
+            ..Default::default()
+        },
+    )?;
+    write_value(
+        checked_guest_offset(data_address, ORIGINAL_SHARED_MEMORY_BASE_OFFSET)?,
+        data_address,
+    )
+}
+
+fn write_ascii_utf16_string(address: usize, text: &[u8]) -> Result<u16, PeImageAccessError> {
+    for (index, byte) in text.iter().copied().enumerate() {
+        write_value(
+            checked_guest_offset(address, index.saturating_mul(size_of::<u16>()))?,
+            u16::from(byte),
+        )?;
+    }
+    write_value(
+        checked_guest_offset(address, text.len().saturating_mul(size_of::<u16>()))?,
+        0_u16,
+    )?;
+    u16::try_from(text.len().saturating_mul(size_of::<u16>()))
+        .map_err(|_| PeImageAccessError::AddressOverflow)
+}
+
+fn checked_guest_offset(base: usize, offset: usize) -> Result<usize, PeImageAccessError> {
+    base.checked_add(offset)
+        .ok_or(PeImageAccessError::AddressOverflow)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
@@ -1771,6 +1905,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         NTDLL_HEAP_LIMIT.store(process_heap_limit, Ordering::Relaxed);
         NTDLL_HEAP_FREE_LIST.store(0, Ordering::Relaxed);
         let fast_peb_lock_address = self.create_zeroed_pages(INITIAL_FAST_PEB_LOCK_SIZE)?;
+        let static_server_data_address =
+            self.create_zeroed_pages(INITIAL_STATIC_SERVER_DATA_SIZE)?;
         let api_set_namespace_address = self.create_zeroed_pages(INITIAL_API_SET_NAMESPACE_SIZE)?;
         let initial_thread_context_address =
             self.create_zeroed_pages(INITIAL_THREAD_CONTEXT_SIZE)?;
@@ -1835,6 +1971,8 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 api_set_map_address,
             ),
         )?;
+        write_initial_peb_runtime_fields(peb_address, static_server_data_address)?;
+        write_initial_static_server_data(static_server_data_address)?;
         write_value(
             teb_address,
             ThreadEnvironmentBlock::new(
@@ -1867,6 +2005,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ldr_entries:% = format_args!("{ldr_entries_address:#x}"),
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
             ntdll_scratch_heap:% = format_args!("{process_heap_address:#x}"),
+            static_server_data:% = format_args!("{static_server_data_address:#x}"),
             api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
             api_set_map:% = format_args!("{api_set_map_address:#x}"),
             initial_thread_context:% = format_args!("{initial_thread_context_address:#x}"),
