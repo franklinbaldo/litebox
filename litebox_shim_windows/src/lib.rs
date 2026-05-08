@@ -314,6 +314,7 @@ const WINDOWS_STACK_ARGUMENT_7_OFFSET: usize = 0x38;
 const WINDOWS_STACK_ARGUMENT_8_OFFSET: usize = 0x40;
 const WINDOWS_STACK_ARGUMENT_9_OFFSET: usize = 0x48;
 const WINDOWS_STACK_ARGUMENT_10_OFFSET: usize = 0x50;
+const WINDOWS_CALL_FRAME_SIZE: usize = 0x28;
 const SYSTEM_BASIC_INFORMATION_CLASS: usize = 0;
 const SYSTEM_NUMA_PROCESSOR_MAP_CLASS: usize = 55;
 const SYSTEM_EMULATION_BASIC_INFORMATION_CLASS: usize = 62;
@@ -3112,7 +3113,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         ctx.rsp = self
             .start_mode
             .initial_context
-            .saturating_sub(size_of::<usize>());
+            .saturating_sub(WINDOWS_CALL_FRAME_SIZE);
         ctx.rdx = self.start_mode.ntdll_base;
         ctx.r8 = 0;
         ctx.r9 = 0;
