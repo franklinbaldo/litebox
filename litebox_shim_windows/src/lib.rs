@@ -5280,7 +5280,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
                 self.apphelp_cache.lock().clear();
                 STATUS_NOT_FOUND
             }
-            _ => STATUS_INVALID_PARAMETER,
+            _ => STATUS_NOT_FOUND,
         };
 
         let (image_name, image_handle) = lookup
