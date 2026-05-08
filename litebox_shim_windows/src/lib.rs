@@ -397,11 +397,17 @@ const RTL_USER_PROCESS_PARAMETERS_NORMALIZED: u32 = 1;
 const PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET: usize = 0x10;
 const PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET: usize = 0x20;
 const PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET: usize = 0x30;
+const PEB_LOADER_DATA_OFFSET: usize = 0x18;
 const LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET: usize = 0x00;
 const LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET: usize = 0x10;
 const LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET: usize = 0x20;
+const LDR_DATA_TABLE_ENTRY_HASH_LINKS_OFFSET: usize = 0x70;
+const LDR_DATA_TABLE_ENTRY_BASE_NAME_HASH_VALUE_OFFSET: usize = 0x108;
 const LDR_DATA_TABLE_ENTRY_SIZE: usize = 0x120;
 const LDR_DDAG_NODE_SIZE: usize = 0x68;
+const LDRP_HASH_BUCKET_COUNT: usize = 32;
+const NTDLL_LDRP_IMAGE_ENTRY_TO_PEB_LDR_OFFSET: usize = 0x118;
+const NTDLL_LDRP_NTDLL_ENTRY_FROM_PEB_LDR_OFFSET: usize = 0x58;
 const TEB_AFTER_WIN32_THREAD_INFO_OFFSET: usize = 0x80;
 const TEB_TLS_SLOTS_OFFSET: usize = 0x1480;
 const TEB_TLS_SLOT_COUNT: usize = 64;
@@ -681,6 +687,7 @@ impl PebLdrData {
         );
         Self {
             length: u32::try_from(size_of::<Self>()).expect("PEB_LDR_DATA prefix fits in u32"),
+            initialized: 1,
             in_load_order_module_list,
             in_memory_order_module_list,
             in_initialization_order_module_list,
@@ -745,8 +752,10 @@ struct LdrDataTableEntry {
 const _: () = assert!(offset_of!(LdrDataTableEntry, dll_base) == 0x30);
 const _: () = assert!(offset_of!(LdrDataTableEntry, full_dll_name) == 0x48);
 const _: () = assert!(offset_of!(LdrDataTableEntry, base_dll_name) == 0x58);
+const _: () = assert!(offset_of!(LdrDataTableEntry, hash_links) == 0x70);
 const _: () = assert!(offset_of!(LdrDataTableEntry, ddag_node) == 0x98);
 const _: () = assert!(offset_of!(LdrDataTableEntry, node_module_link) == 0xa0);
+const _: () = assert!(offset_of!(LdrDataTableEntry, base_name_hash_value) == 0x108);
 const _: () = assert!(size_of::<LdrDataTableEntry>() == LDR_DATA_TABLE_ENTRY_SIZE);
 
 #[repr(C)]
@@ -801,47 +810,48 @@ struct LdrEntryAddresses {
 
 impl LdrDataTableEntry {
     fn new(
-        previous_entry: Option<usize>,
-        next_entry: Option<usize>,
-        list_heads: LdrListHeads,
+        links: LdrEntryLinks,
         mapping: &MappingInfo,
         addresses: LdrEntryAddresses,
-        full_dll_name: UnicodeString,
-        base_dll_name: UnicodeString,
+        names: LdrEntryNames<'_>,
+        flags: u32,
     ) -> Self {
         Self {
             in_load_order_links: module_list_entry(
-                previous_entry,
-                next_entry,
-                list_heads.load,
+                links.previous_entry,
+                links.next_entry,
+                links.list_heads.load,
                 LDR_DATA_TABLE_ENTRY_IN_LOAD_ORDER_LINKS_OFFSET,
             ),
             in_memory_order_links: module_list_entry(
-                previous_entry,
-                next_entry,
-                list_heads.memory,
+                links.previous_entry,
+                links.next_entry,
+                links.list_heads.memory,
                 LDR_DATA_TABLE_ENTRY_IN_MEMORY_ORDER_LINKS_OFFSET,
             ),
             in_initialization_order_links: module_list_entry(
-                previous_entry,
-                next_entry,
-                list_heads.initialization,
+                links.previous_entry,
+                links.next_entry,
+                links.list_heads.initialization,
                 LDR_DATA_TABLE_ENTRY_IN_INITIALIZATION_ORDER_LINKS_OFFSET,
             ),
             dll_base: mapping.base_addr,
             entry_point: mapping.entry_point,
             size_of_image: u32::try_from(mapping.image_size).expect("image size fits u32"),
-            full_dll_name,
-            base_dll_name,
-            flags: 0x22,
+            full_dll_name: names.full,
+            base_dll_name: names.base,
+            flags,
             load_count: 0xffff,
-            hash_links: ListEntry::new_self(addresses.entry + 0x70),
+            hash_links: ListEntry::new_self(
+                addresses.entry + LDR_DATA_TABLE_ENTRY_HASH_LINKS_OFFSET,
+            ),
             ddag_node: addresses.ddag_node,
             node_module_link: ListEntry {
                 flink: addresses.ddag_node,
                 blink: addresses.ddag_node,
             },
             original_base: mapping.base_addr,
+            base_name_hash_value: ldr_hash_name(names.hash_source),
             load_reason: 4,
             reference_count: 1,
             ..Self::default()
@@ -850,10 +860,23 @@ impl LdrDataTableEntry {
 }
 
 #[derive(Clone, Copy)]
+struct LdrEntryLinks {
+    previous_entry: Option<usize>,
+    next_entry: Option<usize>,
+    list_heads: LdrListHeads,
+}
+
+#[derive(Clone, Copy)]
 struct LdrListHeads {
     load: usize,
     memory: usize,
     initialization: usize,
+}
+
+struct LdrEntryNames<'a> {
+    full: UnicodeString,
+    base: UnicodeString,
+    hash_source: &'a str,
 }
 
 fn module_list_entry(
@@ -1235,6 +1258,264 @@ fn populate_ntdll_inverted_function_table(
         exception_size:% = format_args!("{:#x}", exception_directory.size);
         "Populated ntdll KiUserInvertedFunctionTable"
     );
+    Ok(())
+}
+
+fn find_ntdll_loader_globals(
+    image: &LoadedImage,
+) -> Result<Option<NtdllLoaderGlobals>, PeImageAccessError> {
+    const LDRP_HASH_TABLE_PATTERN: &[Option<u8>] = &[
+        Some(0x41),
+        Some(0x83),
+        Some(0xe5),
+        Some(0x1f),
+        Some(0x48),
+        Some(0x8d),
+        Some(0x05),
+        None,
+        None,
+        None,
+        None,
+        Some(0x49),
+        Some(0xc1),
+        Some(0xe5),
+        Some(0x04),
+        Some(0x4c),
+        Some(0x03),
+        Some(0xe8),
+        Some(0x4d),
+        Some(0x8b),
+        Some(0x7d),
+        Some(0x00),
+        Some(0x4d),
+        Some(0x3b),
+        Some(0xfd),
+    ];
+    const PEB_LDR_PATTERN: &[Option<u8>] = &[
+        Some(0x48),
+        Some(0x8b),
+        Some(0x3d),
+        None,
+        None,
+        None,
+        None,
+        Some(0xbb),
+        Some(0x01),
+        Some(0x00),
+        Some(0x00),
+        Some(0x00),
+        Some(0x83),
+        Some(0x64),
+        Some(0x24),
+        Some(0x60),
+        Some(0x00),
+        Some(0x48),
+        Some(0x8d),
+        Some(0x05),
+        None,
+        None,
+        None,
+        None,
+        Some(0x48),
+        Some(0x3b),
+        Some(0xf8),
+    ];
+
+    let Some(hash_match) = find_unique_image_pattern(image, LDRP_HASH_TABLE_PATTERN)? else {
+        litebox_util_log::debug!("Could not locate ntdll LdrpHashTable signature");
+        return Ok(None);
+    };
+    let hash_displacement = isize::try_from(read_i32_le(checked_guest_offset(hash_match, 7)?)?)
+        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let hash_next_rip = isize::try_from(checked_guest_offset(hash_match, 11)?)
+        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let ldrp_hash_table = usize::try_from(hash_next_rip + hash_displacement)
+        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+
+    let Some(peb_ldr_match) = find_unique_image_pattern(image, PEB_LDR_PATTERN)? else {
+        litebox_util_log::debug!("Could not locate ntdll PebLdr signature");
+        return Ok(None);
+    };
+    let load_displacement = isize::try_from(read_i32_le(checked_guest_offset(peb_ldr_match, 3)?)?)
+        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let lea_displacement = isize::try_from(read_i32_le(checked_guest_offset(peb_ldr_match, 20)?)?)
+        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let head_from_load = usize::try_from(
+        isize::try_from(checked_guest_offset(peb_ldr_match, 7)?)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?
+            + load_displacement,
+    )
+    .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let head_from_lea = usize::try_from(
+        isize::try_from(checked_guest_offset(peb_ldr_match, 24)?)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?
+            + lea_displacement,
+    )
+    .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    if head_from_load != head_from_lea {
+        litebox_util_log::debug!(
+            load:% = format_args!("{head_from_load:#x}"),
+            lea:% = format_args!("{head_from_lea:#x}");
+            "Ignoring mismatched ntdll PebLdr signature"
+        );
+        return Ok(None);
+    }
+    let peb_ldr = head_from_load
+        .checked_sub(PEB_LDR_IN_LOAD_ORDER_MODULE_LIST_OFFSET)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+
+    litebox_util_log::debug!(
+        ldrp_hash_table:% = format_args!("{ldrp_hash_table:#x}"),
+        peb_ldr:% = format_args!("{peb_ldr:#x}");
+        "Located ntdll loader globals"
+    );
+    Ok(Some(NtdllLoaderGlobals {
+        ldrp_hash_table,
+        peb_ldr,
+    }))
+}
+
+fn find_unique_image_pattern(
+    image: &LoadedImage,
+    pattern: &[Option<u8>],
+) -> Result<Option<usize>, PeImageAccessError> {
+    if pattern.is_empty() || image.mapping.image_size < pattern.len() {
+        return Ok(None);
+    }
+
+    let mut match_address = None;
+    let last_offset = image.mapping.image_size - pattern.len();
+    for offset in 0..=last_offset {
+        let address = checked_guest_offset(image.mapping.base_addr, offset)?;
+        if !guest_pattern_matches(address, pattern)? {
+            continue;
+        }
+        if match_address.is_some() {
+            litebox_util_log::debug!(
+                base:% = format_args!("{:#x}", image.mapping.base_addr),
+                pattern_len = pattern.len();
+                "Ignoring non-unique ntdll loader-global signature"
+            );
+            return Ok(None);
+        }
+        match_address = Some(address);
+    }
+    Ok(match_address)
+}
+
+fn guest_pattern_matches(
+    address: usize,
+    pattern: &[Option<u8>],
+) -> Result<bool, PeImageAccessError> {
+    for (offset, expected) in pattern.iter().enumerate() {
+        let Some(expected) = expected else {
+            continue;
+        };
+        if read_value::<u8>(checked_guest_offset(address, offset)?)? != *expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn read_i32_le(address: usize) -> Result<i32, PeImageAccessError> {
+    let mut bytes = [0u8; 4];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        *byte = read_value::<u8>(checked_guest_offset(address, offset)?)?;
+    }
+    Ok(i32::from_le_bytes(bytes))
+}
+
+fn seed_ntdll_loader_globals(
+    page_manager: &WindowsPageManager,
+    peb_address: usize,
+    ldr_entries: &InitialLdrEntries,
+    globals: NtdllLoaderGlobals,
+) -> Result<(), PeImageAccessError> {
+    let Some(app_entry) = ldr_entries.first else {
+        return Ok(());
+    };
+    let Some(ntdll_entry) = ldr_entries.last else {
+        return Ok(());
+    };
+
+    let ldrp_image_entry = globals
+        .peb_ldr
+        .checked_sub(NTDLL_LDRP_IMAGE_ENTRY_TO_PEB_LDR_OFFSET)
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    let ldrp_ntdll_entry =
+        checked_guest_offset(globals.peb_ldr, NTDLL_LDRP_NTDLL_ENTRY_FROM_PEB_LDR_OFFSET)?;
+    make_pages_writable(page_manager, ldrp_image_entry, size_of::<usize>())?;
+    make_pages_writable(page_manager, ldrp_ntdll_entry, size_of::<usize>())?;
+    write_value(ldrp_image_entry, app_entry)?;
+    write_value(ldrp_ntdll_entry, ntdll_entry)?;
+
+    write_value(
+        checked_guest_offset(peb_address, PEB_LOADER_DATA_OFFSET)?,
+        globals.peb_ldr,
+    )?;
+    seed_ntdll_loader_hash_table(
+        page_manager,
+        globals.ldrp_hash_table,
+        &[app_entry, ntdll_entry],
+    )?;
+
+    litebox_util_log::debug!(
+        peb_ldr:% = format_args!("{:#x}", globals.peb_ldr),
+        ldrp_hash_table:% = format_args!("{:#x}", globals.ldrp_hash_table),
+        app_entry:% = format_args!("{app_entry:#x}"),
+        ntdll_entry:% = format_args!("{ntdll_entry:#x}");
+        "Seeded ntdll loader globals"
+    );
+    Ok(())
+}
+
+fn seed_ntdll_loader_hash_table(
+    page_manager: &WindowsPageManager,
+    hash_table: usize,
+    entries: &[usize],
+) -> Result<(), PeImageAccessError> {
+    let table_size = LDRP_HASH_BUCKET_COUNT
+        .checked_mul(size_of::<ListEntry>())
+        .ok_or(PeImageAccessError::AddressOverflow)?;
+    make_pages_writable(page_manager, hash_table, table_size)?;
+    for bucket in 0..LDRP_HASH_BUCKET_COUNT {
+        let head = checked_guest_offset(hash_table, bucket * size_of::<ListEntry>())?;
+        write_value(head, ListEntry::new_self(head))?;
+    }
+
+    for &entry in entries {
+        let hash = read_value::<u32>(checked_guest_offset(
+            entry,
+            LDR_DATA_TABLE_ENTRY_BASE_NAME_HASH_VALUE_OFFSET,
+        )?)?;
+        let bucket = usize::try_from(hash).map_err(|_| PeImageAccessError::AddressOverflow)?
+            & (LDRP_HASH_BUCKET_COUNT - 1);
+        let head = checked_guest_offset(hash_table, bucket * size_of::<ListEntry>())?;
+        let hash_links = checked_guest_offset(entry, LDR_DATA_TABLE_ENTRY_HASH_LINKS_OFFSET)?;
+        let mut head_link = read_value::<ListEntry>(head)?;
+        let previous_tail = head_link.blink;
+        write_value(
+            hash_links,
+            ListEntry {
+                flink: head,
+                blink: previous_tail,
+            },
+        )?;
+        write_value(
+            previous_tail,
+            ListEntry {
+                flink: hash_links,
+                blink: read_value::<ListEntry>(previous_tail)?.blink,
+            },
+        )?;
+        head_link.blink = hash_links;
+        if head_link.flink == head {
+            head_link.flink = hash_links;
+        }
+        write_value(head, head_link)?;
+    }
+
     Ok(())
 }
 
@@ -1884,7 +2165,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .ok_or(PeImageAccessError::AddressOverflow)?;
         let process_environment = self.create_process_environment(
             &image.mapping,
-            Some(&ntdll.mapping),
+            Some(&ntdll),
             stack_base.as_usize(),
             stack_top,
             path,
@@ -1959,8 +2240,9 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     fn load_ntdll(&self, fs: Arc<FS>) -> Result<Option<LoadedImage>, WindowsLoadError> {
         for path in NTDLL_PATHS {
             match self.load_image(fs.clone(), path) {
-                Ok(image) => {
+                Ok(mut image) => {
                     populate_ntdll_inverted_function_table(&self.page_manager, &image)?;
+                    image.ntdll_loader_globals = find_ntdll_loader_globals(&image)?;
                     litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
                     return Ok(Some(image));
                 }
@@ -2006,6 +2288,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             exports,
             exception_directory,
             has_trampoline,
+            ntdll_loader_globals: None,
         })
     }
 
@@ -2050,7 +2333,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     fn create_process_environment(
         &self,
         image: &MappingInfo,
-        ntdll: Option<&MappingInfo>,
+        ntdll: Option<&LoadedImage>,
         stack_base: usize,
         stack_top: usize,
         image_path: &str,
@@ -2111,17 +2394,29 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         process_parameters.command_line =
             write_utf16_string(&mut process_parameters_string_cursor, &process_image_path)?;
 
+        let ntdll_mapping = ntdll.map(|image| &image.mapping);
+        let ntdll_loader_globals = ntdll.and_then(|image| image.ntdll_loader_globals);
+        let active_ldr_data_address =
+            ntdll_loader_globals.map_or(ldr_data_address, |globals| globals.peb_ldr);
+
         let ldr_entries = Self::write_initial_ldr_entries(
             ldr_entries_address,
-            ldr_data_address,
+            active_ldr_data_address,
             image,
-            ntdll,
+            ntdll_mapping,
             &process_image_path,
             &mut process_parameters_string_cursor,
         )?;
+        if active_ldr_data_address != ldr_data_address {
+            make_pages_writable(
+                &self.page_manager,
+                active_ldr_data_address,
+                size_of::<PebLdrData>(),
+            )?;
+        }
         write_value(
-            ldr_data_address,
-            PebLdrData::new(ldr_data_address, ldr_entries.first, ldr_entries.last),
+            active_ldr_data_address,
+            PebLdrData::new(active_ldr_data_address, ldr_entries.first, ldr_entries.last),
         )?;
         let api_set_map_address = host_api_set_map_address().unwrap_or(api_set_namespace_address);
         if api_set_map_address == api_set_namespace_address {
@@ -2132,13 +2427,21 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             peb_address,
             ProcessEnvironmentBlock::new(
                 image.base_addr,
-                ldr_data_address,
+                active_ldr_data_address,
                 process_parameters_address,
                 0,
                 fast_peb_lock_address,
                 api_set_map_address,
             ),
         )?;
+        if let Some(loader_globals) = ntdll_loader_globals {
+            seed_ntdll_loader_globals(
+                &self.page_manager,
+                peb_address,
+                &ldr_entries,
+                loader_globals,
+            )?;
+        }
         write_initial_peb_runtime_fields(peb_address, static_server_data_address)?;
         write_initial_static_server_data(static_server_data_address)?;
         write_value(
@@ -2170,6 +2473,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             peb:% = format_args!("{peb_address:#x}"),
             teb:% = format_args!("{teb_address:#x}"),
             ldr:% = format_args!("{ldr_data_address:#x}"),
+            active_ldr:% = format_args!("{active_ldr_data_address:#x}"),
             ldr_entries:% = format_args!("{ldr_entries_address:#x}"),
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
             ntdll_scratch_heap:% = format_args!("{process_heap_address:#x}"),
@@ -2187,7 +2491,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 
         Ok(WindowsProcessEnvironment {
             peb: peb_address,
-            ldr_data: ldr_data_address,
+            ldr_data: active_ldr_data_address,
             ldr_entries: ldr_entries_address,
             ldr_tail_entry: ldr_entries.last,
             process_parameters: process_parameters_address,
@@ -2228,17 +2532,24 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             memory: ldr_data_address + PEB_LDR_IN_MEMORY_ORDER_MODULE_LIST_OFFSET,
             initialization: ldr_data_address + PEB_LDR_IN_INITIALIZATION_ORDER_MODULE_LIST_OFFSET,
         };
+        let app_base_name = initial_image_base_name(process_image_path);
         let app_entry = LdrDataTableEntry::new(
-            None,
-            ntdll.map(|_| ntdll_entry_address),
-            list_heads,
+            LdrEntryLinks {
+                previous_entry: None,
+                next_entry: ntdll.map(|_| ntdll_entry_address),
+                list_heads,
+            },
             image,
             LdrEntryAddresses {
                 entry: app_entry_address,
                 ddag_node: app_ddag_node_address,
             },
-            write_utf16_string(string_cursor, process_image_path)?,
-            write_utf16_string(string_cursor, initial_image_base_name(process_image_path))?,
+            LdrEntryNames {
+                full: write_utf16_string(string_cursor, process_image_path)?,
+                base: write_utf16_string(string_cursor, app_base_name)?,
+                hash_source: app_base_name,
+            },
+            0x0008_4000,
         );
         write_value(app_entry_address, app_entry)?;
         write_value(
@@ -2248,16 +2559,22 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 
         if let Some(ntdll) = ntdll {
             let ntdll_entry = LdrDataTableEntry::new(
-                Some(app_entry_address),
-                None,
-                list_heads,
+                LdrEntryLinks {
+                    previous_entry: Some(app_entry_address),
+                    next_entry: None,
+                    list_heads,
+                },
                 ntdll,
                 LdrEntryAddresses {
                     entry: ntdll_entry_address,
                     ddag_node: ntdll_ddag_node_address,
                 },
-                write_utf16_string(string_cursor, "C:\\Windows\\System32\\ntdll.dll")?,
-                write_utf16_string(string_cursor, "ntdll.dll")?,
+                LdrEntryNames {
+                    full: write_utf16_string(string_cursor, "C:\\Windows\\System32\\ntdll.dll")?,
+                    base: write_utf16_string(string_cursor, "ntdll.dll")?,
+                    hash_source: "ntdll.dll",
+                },
+                0x0008_4004,
             );
             write_value(ntdll_entry_address, ntdll_entry)?;
             write_value(
@@ -2643,6 +2960,19 @@ fn module_name_matches(module_name: &str, library_name: &str) -> bool {
         .filter(|(_, extension)| extension.eq_ignore_ascii_case("dll"))
         .map_or(module_name, |(stem, _)| stem)
         .eq_ignore_ascii_case(library_name)
+}
+
+fn ldr_hash_name(name: &str) -> u32 {
+    let mut hash = 0u32;
+    for code_unit in name.encode_utf16() {
+        let upper = if (u16::from(b'a')..=u16::from(b'z')).contains(&code_unit) {
+            code_unit - 0x20
+        } else {
+            code_unit
+        };
+        hash = hash.wrapping_mul(65_599).wrapping_add(u32::from(upper));
+    }
+    hash
 }
 
 fn import_name(import: &PeImport) -> alloc::borrow::Cow<'_, str> {
@@ -3336,6 +3666,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             exports,
             exception_directory,
             has_trampoline,
+            ntdll_loader_globals: None,
         })
     }
 
@@ -3393,6 +3724,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
             exports: image.exports.clone(),
             exception_directory: image.exception_directory,
             has_trampoline: image.has_trampoline,
+            ntdll_loader_globals: None,
         })
     }
 
@@ -3528,16 +3860,22 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let mut tail = self.ldr_tail_entry.lock();
         let previous_entry = *tail;
         let entry = LdrDataTableEntry::new(
-            previous_entry,
-            None,
-            list_heads,
+            LdrEntryLinks {
+                previous_entry,
+                next_entry: None,
+                list_heads,
+            },
             mapping,
             LdrEntryAddresses {
                 entry: entry_address,
                 ddag_node: ddag_node_address,
             },
-            write_utf16_string(&mut string_cursor, &guest_path_to_dos_path(path))?,
-            write_utf16_string(&mut string_cursor, module_basename(path))?,
+            LdrEntryNames {
+                full: write_utf16_string(&mut string_cursor, &guest_path_to_dos_path(path))?,
+                base: write_utf16_string(&mut string_cursor, module_basename(path))?,
+                hash_source: module_basename(path),
+            },
+            0x0008_4004,
         );
         write_value(entry_address, entry)?;
         write_value(
@@ -7900,6 +8238,13 @@ struct LoadedImage {
     exports: Vec<PeExport>,
     exception_directory: Option<PeDataDirectory>,
     has_trampoline: bool,
+    ntdll_loader_globals: Option<NtdllLoaderGlobals>,
+}
+
+#[derive(Clone, Copy)]
+struct NtdllLoaderGlobals {
+    ldrp_hash_table: usize,
+    peb_ldr: usize,
 }
 
 impl LoadedImage {
