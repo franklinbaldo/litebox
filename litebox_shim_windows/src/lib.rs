@@ -54,89 +54,6 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-extern "system" fn litebox_ntdll_rtl_allocate_heap(
-    _heap: *mut c_void,
-    flags: u32,
-    bytes: usize,
-) -> *mut c_void {
-    let memory = ntdll_guest_heap_allocate(bytes);
-    litebox_util_log::debug!(
-        flags:% = format_args!("{flags:#x}"),
-        bytes,
-        memory:% = format_args!("{memory:p}");
-        "Handled ntdll!RtlAllocateHeap through built-in thunk"
-    );
-    memory
-}
-
-extern "system" fn litebox_ntdll_rtl_free_heap(
-    _heap: *mut c_void,
-    flags: u32,
-    memory: *mut c_void,
-) -> u8 {
-    let free_result = ntdll_guest_heap_free(memory);
-    litebox_util_log::debug!(
-        flags:% = format_args!("{flags:#x}"),
-        memory:% = format_args!("{memory:p}"),
-        reclaimed_top = free_result.unwrap_or(false);
-        "Handled ntdll!RtlFreeHeap through built-in thunk"
-    );
-    u8::from(free_result.is_some())
-}
-
-extern "system" fn litebox_ntdll_rtl_reallocate_heap(
-    _heap: *mut c_void,
-    flags: u32,
-    memory: *mut c_void,
-    bytes: usize,
-) -> *mut c_void {
-    let new_memory = ntdll_guest_heap_reallocate(memory, bytes);
-    litebox_util_log::debug!(
-        flags:% = format_args!("{flags:#x}"),
-        memory:% = format_args!("{memory:p}"),
-        bytes,
-        new_memory:% = format_args!("{new_memory:p}");
-        "Handled ntdll!RtlReAllocateHeap through built-in thunk"
-    );
-    new_memory
-}
-
-extern "system" fn litebox_ntdll_rtl_size_heap(
-    _heap: *mut c_void,
-    flags: u32,
-    memory: *const c_void,
-) -> usize {
-    let size = ntdll_guest_heap_size(memory);
-    litebox_util_log::debug!(
-        flags:% = format_args!("{flags:#x}"),
-        memory:% = format_args!("{memory:p}"),
-        size;
-        "Handled ntdll!RtlSizeHeap through built-in thunk"
-    );
-    size
-}
-
-extern "system" fn litebox_ntdll_rtl_create_heap(
-    _flags: u32,
-    _heap_base: *mut c_void,
-    _reserve_size: usize,
-    _commit_size: usize,
-    _lock: *mut c_void,
-    _parameters: *mut c_void,
-) -> *mut c_void {
-    let heap = NTDLL_HEAP_HANDLE.load(Ordering::Relaxed) as *mut c_void;
-    litebox_util_log::debug!(
-        heap:% = format_args!("{heap:p}");
-        "Handled ntdll!RtlCreateHeap through built-in thunk"
-    );
-    heap
-}
-
-extern "system" fn litebox_ntdll_rtl_destroy_heap(_heap: *mut c_void) -> *mut c_void {
-    litebox_util_log::debug!("Handled ntdll!RtlDestroyHeap through built-in thunk");
-    core::ptr::null_mut()
-}
-
 extern "system" fn litebox_ntdll_api_set_resolve_unicode(
     api_set_map: *const c_void,
     name: *const UnicodeString,
@@ -284,48 +201,6 @@ fn ntdll_guest_heap_requested_size(memory: *const c_void) -> Option<usize> {
     Some(unsafe { (header as *const usize).read() })
 }
 
-fn ntdll_guest_heap_free(memory: *mut c_void) -> Option<bool> {
-    if memory.is_null() {
-        return Some(false);
-    }
-    let header = (memory as usize).checked_sub(NTDLL_HEAP_HEADER_SIZE)?;
-    let heap_base = NTDLL_HEAP_HANDLE.load(Ordering::Relaxed);
-    let heap_limit = NTDLL_HEAP_LIMIT.load(Ordering::Relaxed);
-    if heap_base == 0 || header < heap_base || header >= heap_limit {
-        return None;
-    }
-    let requested_size = ntdll_guest_heap_requested_size(memory.cast_const())?;
-    let allocation_end = header.checked_add(ntdll_guest_heap_total_size(requested_size)?)?;
-    if allocation_end > heap_limit {
-        return None;
-    }
-
-    loop {
-        let current = NTDLL_HEAP_BUMP.load(Ordering::Relaxed);
-        if current != allocation_end {
-            break;
-        }
-        if NTDLL_HEAP_BUMP
-            .compare_exchange(current, header, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Some(true);
-        }
-    }
-
-    let free_memory = header.checked_add(NTDLL_HEAP_HEADER_SIZE)?;
-    loop {
-        let next_free = NTDLL_HEAP_FREE_LIST.load(Ordering::Relaxed);
-        write_value(free_memory, next_free).ok()?;
-        if NTDLL_HEAP_FREE_LIST
-            .compare_exchange(next_free, header, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Some(false);
-        }
-    }
-}
-
 fn ntdll_guest_heap_utf16_string(text: &str) -> Option<UnicodeString> {
     let code_units = text.encode_utf16().count();
     let byte_len = code_units.checked_mul(size_of::<u16>())?;
@@ -349,33 +224,6 @@ fn ntdll_guest_heap_utf16_string(text: &str) -> Option<UnicodeString> {
     })
 }
 
-fn ntdll_guest_heap_reallocate(memory: *mut c_void, bytes: usize) -> *mut c_void {
-    if memory.is_null() {
-        return ntdll_guest_heap_allocate(bytes);
-    }
-
-    let old_size = ntdll_guest_heap_size(memory.cast_const());
-    if bytes <= old_size {
-        return memory;
-    }
-
-    let new_memory = ntdll_guest_heap_allocate(bytes);
-    if new_memory.is_null() {
-        return core::ptr::null_mut();
-    }
-
-    let copy_size = old_size.min(bytes);
-    // SAFETY: Both pointers are allocations from the shim bump heap and do not overlap.
-    unsafe {
-        core::ptr::copy_nonoverlapping(memory.cast::<u8>(), new_memory.cast::<u8>(), copy_size);
-    }
-    new_memory
-}
-
-fn ntdll_guest_heap_size(memory: *const c_void) -> usize {
-    ntdll_guest_heap_requested_size(memory).unwrap_or(usize::MAX)
-}
-
 fn align_up_power_of_two(value: usize, alignment: usize) -> Option<usize> {
     let mask = alignment.checked_sub(1)?;
     value.checked_add(mask).map(|value| value & !mask)
@@ -395,7 +243,7 @@ const INITIAL_LDR_DATA_SIZE: usize = PAGE_SIZE;
 const INITIAL_LDR_ENTRIES_SIZE: usize = PAGE_SIZE;
 const DYNAMIC_LDR_ENTRY_SIZE: usize = PAGE_SIZE;
 const INITIAL_PROCESS_PARAMETERS_SIZE: usize = PAGE_SIZE;
-const INITIAL_PROCESS_HEAP_SIZE: usize = 1024 * 1024;
+const INITIAL_NTDLL_SCRATCH_HEAP_SIZE: usize = 1024 * 1024;
 const NTDLL_HEAP_ALIGNMENT: usize = 16;
 const NTDLL_HEAP_HEADER_SIZE: usize = size_of::<usize>();
 const INITIAL_FAST_PEB_LOCK_SIZE: usize = PAGE_SIZE;
@@ -1859,46 +1707,6 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     }
 
     fn patch_ntdll_builtin_exports(&self, image: &LoadedImage) -> Result<(), WindowsLoadError> {
-        let thunks: &[(&[u8], usize)] = &[
-            (
-                b"RtlAllocateHeap".as_slice(),
-                litebox_ntdll_rtl_allocate_heap as *const () as usize,
-            ),
-            (
-                b"RtlFreeHeap".as_slice(),
-                litebox_ntdll_rtl_free_heap as *const () as usize,
-            ),
-            (
-                b"RtlReAllocateHeap".as_slice(),
-                litebox_ntdll_rtl_reallocate_heap as *const () as usize,
-            ),
-            (
-                b"RtlSizeHeap".as_slice(),
-                litebox_ntdll_rtl_size_heap as *const () as usize,
-            ),
-            (
-                b"RtlCreateHeap".as_slice(),
-                litebox_ntdll_rtl_create_heap as *const () as usize,
-            ),
-            (
-                b"RtlDestroyHeap".as_slice(),
-                litebox_ntdll_rtl_destroy_heap as *const () as usize,
-            ),
-        ];
-
-        for &(name, target) in thunks {
-            let Some(address) = image.export_address(name)? else {
-                continue;
-            };
-            write_absolute_jump(&self.page_manager, address, target)?;
-            litebox_util_log::debug!(
-                name:% = String::from_utf8_lossy(name),
-                address:% = format_args!("{address:#x}"),
-                target:% = format_args!("{target:#x}");
-                "Patched guest ntdll export to built-in thunk"
-            );
-        }
-
         let api_set_unicode_wrapper = image
             .mapping
             .base_addr
@@ -1966,12 +1774,12 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let ldr_entries_address = self.create_zeroed_pages(INITIAL_LDR_ENTRIES_SIZE)?;
         let process_parameters_address =
             self.create_zeroed_pages(INITIAL_PROCESS_PARAMETERS_SIZE)?;
-        let process_heap_address = self.create_zeroed_pages(INITIAL_PROCESS_HEAP_SIZE)?;
+        let process_heap_address = self.create_zeroed_pages(INITIAL_NTDLL_SCRATCH_HEAP_SIZE)?;
         let process_heap_bump = process_heap_address
             .checked_add(PAGE_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
         let process_heap_limit = process_heap_address
-            .checked_add(INITIAL_PROCESS_HEAP_SIZE)
+            .checked_add(INITIAL_NTDLL_SCRATCH_HEAP_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
         NTDLL_HEAP_HANDLE.store(process_heap_address, Ordering::Relaxed);
         NTDLL_HEAP_BUMP.store(process_heap_bump, Ordering::Relaxed);
@@ -2034,7 +1842,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 image.base_addr,
                 ldr_data_address,
                 process_parameters_address,
-                process_heap_address,
+                0,
                 fast_peb_lock_address,
                 api_set_namespace_address,
             ),
@@ -2070,7 +1878,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ldr:% = format_args!("{ldr_data_address:#x}"),
             ldr_entries:% = format_args!("{ldr_entries_address:#x}"),
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
-            process_heap:% = format_args!("{process_heap_address:#x}"),
+            ntdll_scratch_heap:% = format_args!("{process_heap_address:#x}"),
             api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
             initial_thread_context:% = format_args!("{initial_thread_context_address:#x}"),
             system_dll_init_block:% = format_args!("{system_dll_init_block_address:#x}"),
@@ -2363,9 +2171,9 @@ fn guest_address_regions(
     );
     push_region(
         &mut regions,
-        "process-heap",
+        "ntdll-scratch-heap",
         process_environment.process_heap,
-        INITIAL_PROCESS_HEAP_SIZE,
+        INITIAL_NTDLL_SCRATCH_HEAP_SIZE,
     );
     push_region(
         &mut regions,
