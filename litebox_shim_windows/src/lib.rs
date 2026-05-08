@@ -1134,6 +1134,47 @@ fn checked_guest_offset(base: usize, offset: usize) -> Result<usize, PeImageAcce
         .ok_or(PeImageAccessError::AddressOverflow)
 }
 
+fn patch_loaded_image_header_base(
+    page_manager: &WindowsPageManager,
+    mapping: &MappingInfo,
+    preferred_base: usize,
+) -> Result<(), PeImageAccessError> {
+    if mapping.base_addr == preferred_base {
+        return Ok(());
+    }
+
+    let pe_offset = usize::try_from(read_value::<u32>(checked_guest_offset(
+        mapping.base_addr,
+        0x3c,
+    )?)?)
+    .map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let optional_header =
+        checked_guest_offset(checked_guest_offset(mapping.base_addr, pe_offset)?, 0x18)?;
+    let image_base_field = checked_guest_offset(optional_header, 0x18)?;
+    make_pages_writable(page_manager, image_base_field, size_of::<u64>())?;
+    write_value(
+        image_base_field,
+        u64::try_from(mapping.base_addr).map_err(|_| PeImageAccessError::AddressOverflow)?,
+    )?;
+    protect_pages(
+        page_manager,
+        image_base_field,
+        size_of::<u64>(),
+        Protection {
+            read: true,
+            write: false,
+            execute: false,
+        },
+    )?;
+    litebox_util_log::debug!(
+        image_base:% = format_args!("{:#x}", mapping.base_addr),
+        preferred_base:% = format_args!("{preferred_base:#x}"),
+        header_field:% = format_args!("{image_base_field:#x}");
+        "Patched loaded Windows image header base"
+    );
+    Ok(())
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
 struct InitialNtTib {
@@ -1816,6 +1857,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<LoadedImage, WindowsLoadError> {
         let file = PeImageFile::open(fs, path)?;
         let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let preferred_base = parsed.image.image_base;
         let imports = parsed.imports.clone();
         let exports = parsed.exports.clone();
         parsed
@@ -1833,6 +1875,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let mapping = parsed
             .load(&mut mapper, &mut memory)
             .map_err(WindowsLoadError::Load)?;
+        patch_loaded_image_header_base(&self.page_manager, &mapping, preferred_base)?;
         Ok(LoadedImage {
             mapping,
             imports,
@@ -3137,6 +3180,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
     fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<LoadedImage, WindowsLoadError> {
         let file = PeImageFile::open(fs, path)?;
         let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        let preferred_base = parsed.image.image_base;
         let imports = parsed.imports.clone();
         let exports = parsed.exports.clone();
         parsed
@@ -3154,6 +3198,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let mapping = parsed
             .load(&mut mapper, &mut memory)
             .map_err(WindowsLoadError::Load)?;
+        patch_loaded_image_header_base(&self.page_manager, &mapping, preferred_base)?;
         Ok(LoadedImage {
             mapping,
             imports,
@@ -3203,6 +3248,7 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let mapping = parsed
             .load(&mut mapper, &mut memory)
             .map_err(WindowsLoadError::Load)?;
+        patch_loaded_image_header_base(&self.page_manager, &mapping, image.preferred_base)?;
         Ok(LoadedImage {
             mapping,
             imports: image.imports.clone(),
