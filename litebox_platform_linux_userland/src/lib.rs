@@ -314,7 +314,7 @@ impl LinuxUserland {
         // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
-        let path = "/proc/self/maps";
+        let path = c"/proc/self/maps";
         let fd = unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::open,
