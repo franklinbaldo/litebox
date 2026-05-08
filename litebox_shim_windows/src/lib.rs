@@ -1819,7 +1819,10 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ldr_data_address,
             PebLdrData::new(ldr_data_address, ldr_entries.first, ldr_entries.last),
         )?;
-        write_initial_api_set_namespace(api_set_namespace_address)?;
+        let api_set_map_address = host_api_set_map_address().unwrap_or(api_set_namespace_address);
+        if api_set_map_address == api_set_namespace_address {
+            write_initial_api_set_namespace(api_set_namespace_address)?;
+        }
         write_value(process_parameters_address, process_parameters)?;
         write_value(
             peb_address,
@@ -1829,7 +1832,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 process_parameters_address,
                 0,
                 fast_peb_lock_address,
-                api_set_namespace_address,
+                api_set_map_address,
             ),
         )?;
         write_value(
@@ -1855,7 +1858,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         )?;
         write_value(system_dll_init_block_address, PsSystemDllInitBlockV3::new())?;
         GUEST_PEB_ADDRESS.store(peb_address, Ordering::Relaxed);
-        GUEST_API_SET_MAP.store(api_set_namespace_address, Ordering::Relaxed);
+        GUEST_API_SET_MAP.store(api_set_map_address, Ordering::Relaxed);
 
         litebox_util_log::debug!(
             peb:% = format_args!("{peb_address:#x}"),
@@ -1865,6 +1868,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             process_parameters:% = format_args!("{process_parameters_address:#x}"),
             ntdll_scratch_heap:% = format_args!("{process_heap_address:#x}"),
             api_set_namespace:% = format_args!("{api_set_namespace_address:#x}"),
+            api_set_map:% = format_args!("{api_set_map_address:#x}"),
             initial_thread_context:% = format_args!("{initial_thread_context_address:#x}"),
             system_dll_init_block:% = format_args!("{system_dll_init_block_address:#x}"),
             tls_slots:% = format_args!("{tls_slots_address:#x}"),
@@ -7880,11 +7884,7 @@ fn read_host_api_set_namespace_header(
 }
 
 fn host_api_set_namespace() -> Option<&'static [u8]> {
-    let peb = host_peb_address()?;
-    // SAFETY: `peb` is read from the current host TEB, and ApiSetMap is a pointer-sized
-    // field at a fixed x64 PEB offset for the Windows process hosting this runner.
-    let api_set_map_address =
-        unsafe { (peb.checked_add(HOST_PEB_API_SET_MAP_OFFSET)? as *const usize).read_unaligned() };
+    let api_set_map_address = host_api_set_map_address()?;
     if api_set_map_address == 0 {
         return None;
     }
@@ -7899,6 +7899,15 @@ fn host_api_set_namespace() -> Option<&'static [u8]> {
     // SAFETY: The size was read from the host API-set namespace header and capped to the
     // guest allocation size before exposing the immutable byte range.
     Some(unsafe { core::slice::from_raw_parts(api_set_map_address as *const u8, size) })
+}
+
+fn host_api_set_map_address() -> Option<usize> {
+    let peb = host_peb_address()?;
+    // SAFETY: `peb` is read from the current host TEB, and ApiSetMap is a pointer-sized
+    // field at a fixed x64 PEB offset for the Windows process hosting this runner.
+    Some(unsafe {
+        (peb.checked_add(HOST_PEB_API_SET_MAP_OFFSET)? as *const usize).read_unaligned()
+    })
 }
 
 fn host_peb_address() -> Option<usize> {
