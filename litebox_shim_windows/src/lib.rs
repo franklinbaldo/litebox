@@ -258,6 +258,7 @@ const NTDLL_PATHS: &[&str] = &[
     "/ntdll.dll",
 ];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
+const NTDLL_USER_THREAD_START: &[u8] = b"RtlUserThreadStart";
 // Current forced-loader diagnostics use the host ntdll fixture. These RVAs are
 // host-version-specific guard rails for early ntdll loader bring-up.
 const NTDLL_API_SET_RESOLVE_UNICODE_WRAPPER_RVA: usize = 0x41600;
@@ -297,7 +298,7 @@ const STATUS_DEBUGGER_INACTIVE: usize = 0xc000_0354;
 const WINDOWS_CONTEXT_AMD64: u32 = 0x0010_0000;
 const WINDOWS_CONTEXT_CONTROL: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0001;
 const WINDOWS_CONTEXT_INTEGER: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0002;
-const WINDOWS_CONTEXT_SEGMENTS: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0004;
+const WINDOWS_CONTEXT_FLOATING_POINT: u32 = WINDOWS_CONTEXT_AMD64 | 0x0000_0008;
 const WINDOWS_INITIAL_MXCSR: u32 = 0x1f80;
 const WINDOWS_INITIAL_CS: u16 = 0x33;
 const WINDOWS_INITIAL_SS: u16 = 0x2b;
@@ -1266,7 +1267,7 @@ struct InitialClientId {
 }
 
 #[repr(C, align(16))]
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, FromBytes, IntoBytes)]
 struct InitialThreadContext {
     p1_home: u64,
     p2_home: u64,
@@ -1306,10 +1307,14 @@ struct InitialThreadContext {
     r14: u64,
     r15: u64,
     rip: u64,
+    flt_save: [u8; 0x200],
+    _remaining: [u8; 0x1d0],
 }
 
 const _: () = assert!(offset_of!(InitialThreadContext, rax) == 0x78);
 const _: () = assert!(offset_of!(InitialThreadContext, rip) == 0xf8);
+const _: () = assert!(offset_of!(InitialThreadContext, flt_save) == 0x100);
+const _: () = assert!(size_of::<InitialThreadContext>() == 0x4d0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes)]
@@ -1352,20 +1357,65 @@ const _: () =
     assert!(size_of::<PsSystemDllInitBlockV3>() == PS_SYSTEM_DLL_INIT_BLOCK_V3_SIZE as usize);
 
 impl InitialThreadContext {
-    fn new(entry_point: usize, stack_top: usize, image_base: usize) -> Self {
+    fn empty() -> Self {
         Self {
-            context_flags: WINDOWS_CONTEXT_CONTROL
-                | WINDOWS_CONTEXT_INTEGER
-                | WINDOWS_CONTEXT_SEGMENTS,
-            mx_csr: WINDOWS_INITIAL_MXCSR,
-            seg_cs: WINDOWS_INITIAL_CS,
-            seg_ss: WINDOWS_INITIAL_SS,
-            eflags: 0x202,
-            rcx: u64::try_from(image_base).expect("image base fits in Windows context"),
-            rsp: u64::try_from(stack_top).expect("stack top fits in Windows context"),
-            rip: u64::try_from(entry_point).expect("entry point fits in Windows context"),
-            ..Self::default()
+            p1_home: 0,
+            p2_home: 0,
+            p3_home: 0,
+            p4_home: 0,
+            p5_home: 0,
+            p6_home: 0,
+            context_flags: 0,
+            mx_csr: 0,
+            seg_cs: 0,
+            seg_ds: 0,
+            seg_es: 0,
+            seg_fs: 0,
+            seg_gs: 0,
+            seg_ss: 0,
+            eflags: 0,
+            dr0: 0,
+            dr1: 0,
+            dr2: 0,
+            dr3: 0,
+            dr6: 0,
+            dr7: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            flt_save: [0; 0x200],
+            _remaining: [0; 0x1d0],
         }
+    }
+
+    fn new(thread_start: usize, stack_top: usize, user_thread_start: usize) -> Self {
+        let mut context = Self::empty();
+        context.context_flags =
+            WINDOWS_CONTEXT_CONTROL | WINDOWS_CONTEXT_INTEGER | WINDOWS_CONTEXT_FLOATING_POINT;
+        context.mx_csr = WINDOWS_INITIAL_MXCSR;
+        context.seg_cs = WINDOWS_INITIAL_CS;
+        context.seg_ss = WINDOWS_INITIAL_SS;
+        context.eflags = 0x202;
+        context.rcx = u64::try_from(thread_start).expect("thread start fits in Windows context");
+        context.rsp = u64::try_from(stack_top).expect("stack top fits in Windows context");
+        context.rip =
+            u64::try_from(user_thread_start).expect("user thread start fits in Windows context");
+        context.flt_save[24..28].copy_from_slice(&WINDOWS_INITIAL_MXCSR.to_le_bytes());
+        context
     }
 
     fn apply_to(self, ctx: &mut litebox_common_linux::PtRegs) {
@@ -1811,9 +1861,13 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let entry_point = ntdll
             .export_address(NTDLL_LOADER_ENTRYPOINT)?
             .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+        let user_thread_start = ntdll
+            .export_address(NTDLL_USER_THREAD_START)?
+            .ok_or(WindowsLoadError::MissingNtDllUserThreadStart)?;
         litebox_util_log::debug!(
             entry_point:% = format_args!("{entry_point:#x}"),
-            application_entry_point:% = format_args!("{application_entry_point:#x}");
+            application_entry_point:% = format_args!("{application_entry_point:#x}"),
+            user_thread_start:% = format_args!("{user_thread_start:#x}");
             "Starting Windows guest through ntdll!LdrInitializeThunk"
         );
 
@@ -1843,8 +1897,10 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             initial_context,
             InitialThreadContext::new(
                 application_entry_point,
-                application_stack_top,
-                image.mapping.base_addr,
+                initial_context
+                    .checked_sub(0x1f8)
+                    .ok_or(PeImageAccessError::AddressOverflow)?,
+                user_thread_start,
             ),
         )?;
         let start_mode = WindowsStartMode {
@@ -7912,6 +7968,9 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll does not export LdrInitializeThunk.
     #[error("guest ntdll.dll does not export LdrInitializeThunk")]
     MissingNtDllLoaderEntrypoint,
+    /// Guest ntdll.dll does not export RtlUserThreadStart.
+    #[error("guest ntdll.dll does not export RtlUserThreadStart")]
+    MissingNtDllUserThreadStart,
     /// Guest ntdll.dll is required for the selected load mode but was not found.
     #[error("guest ntdll.dll is required for the selected Windows load mode")]
     MissingNtDll,
