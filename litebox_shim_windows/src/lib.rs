@@ -4742,6 +4742,36 @@ impl<FS: NtShimFS> WindowsShimEntrypoints<FS> {
         let object_name =
             read_object_attributes_name(ctx.r8).unwrap_or_else(|| String::from("<unreadable>"));
         let guest_path = windows_object_path_to_guest_path(&object_name);
+        if let Err(error) = self.fs.file_status(&guest_path) {
+            if ctx.r9 != 0
+                && write_value(
+                    ctx.r9,
+                    IoStatusBlock {
+                        status: STATUS_OBJECT_NAME_NOT_FOUND,
+                        information: 0,
+                    },
+                )
+                .is_err()
+            {
+                ctx.rax = STATUS_ACCESS_VIOLATION;
+                return;
+            }
+
+            litebox_util_log::debug!(
+                error:?,
+                file_handle_ptr:% = format_args!("{:#x}", ctx.r10),
+                desired_access:% = format_args!("{:#x}", ctx.rdx),
+                object_attributes:% = format_args!("{:#x}", ctx.r8),
+                io_status:% = format_args!("{:#x}", ctx.r9),
+                share_access:% = format_args!("{share_access:#x}"),
+                open_options:% = format_args!("{open_options:#x}"),
+                object_name:% = object_name,
+                guest_path:% = guest_path;
+                "NtOpenFile path not found"
+            );
+            ctx.rax = STATUS_OBJECT_NAME_NOT_FOUND;
+            return;
+        }
         let handle = self.insert_handle(WindowsHandleKind::File {
             path: guest_path.clone(),
         });
