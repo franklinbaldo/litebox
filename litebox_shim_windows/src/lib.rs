@@ -15,6 +15,7 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicI32, Ordering};
 
 use litebox::fd::TypedFd;
 use litebox::fs::{Mode, OFlags};
@@ -22,7 +23,7 @@ use litebox::mm::PageManager;
 use litebox::mm::linux::{
     CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
 };
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{LiteBox, platform::RawPointerProvider};
 use litebox_common_windows::loader::{
@@ -122,16 +123,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
-        let file = PeImageFile::open(fs, path)?;
-        let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
-        let mut mapper = PeImageMapper {
-            file: &file,
-            page_manager: &self.page_manager,
-        };
-        let mut memory = PeImageMemory;
-        let mapping = parsed
-            .load(&mut mapper, &mut memory)
-            .map_err(WindowsLoadError::Load)?;
+        let mapping = self.load_image(fs.clone(), path)?;
         let entry_point = mapping.entry_point;
 
         let length =
@@ -145,15 +137,36 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             .as_usize()
             .checked_add(INITIAL_STACK_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
+        let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 entry_point,
                 stack_top,
+                exit_code: exit_code.clone(),
                 _fs: PhantomData,
             },
-            process: WindowsShimProcess { mapping },
+            process: WindowsShimProcess { mapping, exit_code },
         })
+    }
+
+    fn load_image(&self, fs: Arc<FS>, path: &str) -> Result<MappingInfo, WindowsLoadError> {
+        let file = PeImageFile::open(fs, path)?;
+        let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+        parsed
+            .parse_trampoline(
+                &mut &file,
+                litebox_platform_multiplex::platform().get_syscall_entry_point(),
+            )
+            .map_err(WindowsLoadError::Parse)?;
+        let mut mapper = PeImageMapper {
+            file: &file,
+            page_manager: &self.page_manager,
+        };
+        let mut memory = PeImageMemory;
+        parsed
+            .load(&mut mapper, &mut memory)
+            .map_err(WindowsLoadError::Load)
     }
 
     /// Returns the LiteBox object for the shim.
@@ -167,6 +180,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
+    exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
 }
 
@@ -185,8 +199,16 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         ContinueOperation::Resume
     }
 
-    fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        // TODO: Decode and dispatch NT syscalls.
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        // TODO: Decode the NT syscall number and dispatch only NtTerminateProcess here.
+        litebox_util_log::debug!(
+            syscall_number = ctx.orig_rax,
+            process_handle:% = format_args!("{:#x}", ctx.r10),
+            exit_status:% = format_args!("{:#x}", ctx.rdx);
+            "Handling temporary NtTerminateProcess syscall"
+        );
+        self.exit_code
+            .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
         ContinueOperation::Terminate
     }
 
@@ -211,6 +233,11 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     }
 }
 
+fn windows_exit_status_to_i32(status: usize) -> i32 {
+    let low_bits = u32::try_from(status & 0xffff_ffff).unwrap_or_default();
+    i32::from_ne_bytes(low_bits.to_ne_bytes())
+}
+
 /// A loaded Windows program and the process handle used to wait for it.
 pub struct LoadedProgram<FS: NtShimFS> {
     pub entrypoints: WindowsShimEntrypoints<FS>,
@@ -220,6 +247,7 @@ pub struct LoadedProgram<FS: NtShimFS> {
 /// A placeholder handle to a process loaded via [`WindowsShim::load_program`].
 pub struct WindowsShimProcess {
     mapping: MappingInfo,
+    exit_code: Arc<AtomicI32>,
 }
 
 impl WindowsShimProcess {
@@ -233,7 +261,7 @@ impl WindowsShimProcess {
     #[must_use]
     pub fn wait(&self) -> i32 {
         // TODO: Wait for the NT process object once process lifecycle exists.
-        DEFAULT_PROCESS_EXIT_CODE
+        self.exit_code.load(Ordering::Relaxed)
     }
 }
 

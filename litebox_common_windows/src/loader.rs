@@ -9,6 +9,7 @@
 
 use alloc::vec::Vec;
 use core::cmp;
+use core::mem::size_of;
 
 use object::endian::LittleEndian as LE;
 use object::pe::{self, ImageNtHeaders64};
@@ -32,6 +33,7 @@ pub struct PeParsedFile {
     pub imports: Vec<PeImport>,
     /// Base relocation entries from the `.reloc` directory.
     pub relocations: Vec<Relocation>,
+    trampoline: Option<PeTrampolineInfo>,
 }
 
 /// Basic PE image metadata needed by the Windows shim loader.
@@ -78,6 +80,25 @@ pub struct MappingInfo {
     /// The entry point, where execution begins.
     pub entry_point: usize,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeTrampolineInfo {
+    rva: usize,
+    size: usize,
+    file_offset: u64,
+    syscall_entry_point: usize,
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy)]
+struct TrampolineHeader64 {
+    magic: [u8; 8],
+    file_offset: u64,
+    rva: u64,
+    trampoline_size: u64,
+}
+
+const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
 
 /// A PE data directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +150,12 @@ pub enum PeParseError<E> {
     /// The file is not a supported Windows executable image.
     #[error("unsupported PE image")]
     UnsupportedImage,
+    /// The LiteBox trampoline footer is malformed.
+    #[error("bad LiteBox trampoline")]
+    BadTrampoline,
+    /// The LiteBox trampoline footer has an unsupported version.
+    #[error("invalid LiteBox trampoline version")]
+    BadTrampolineVersion,
     /// A PE field overflowed the host representation used by this parser.
     #[error("PE field overflow")]
     Overflow,
@@ -186,15 +213,17 @@ impl PeParsedFile {
         if image_size == 0 {
             return Err(PeLoadError::InvalidImage);
         }
+        let mapping_size = self.mapping_size::<M::Error>(image_size)?;
 
         let base_addr = mapper
-            .reserve(preferred_base, image_size, PAGE_SIZE)
+            .reserve(preferred_base, mapping_size, PAGE_SIZE)
             .map_err(PeLoadError::Map)?;
         let image_end = base_addr
             .checked_add(image_size)
             .ok_or(PeLoadError::InvalidImage)?;
 
         let headers_size = self.image.size_of_headers;
+
         if headers_size > image_size {
             return Err(PeLoadError::InvalidImage);
         }
@@ -306,15 +335,142 @@ impl PeParsedFile {
                 .map_err(PeLoadError::Map)?;
         }
 
+        if self.trampoline.is_some() {
+            self.load_trampoline(mapper, mem, base_addr)?;
+        }
+
         let entry_point = base_addr
             .checked_add(self.image.entry_point_rva)
             .ok_or(PeLoadError::InvalidImage)?;
 
         Ok(MappingInfo {
             base_addr,
-            image_size,
+            image_size: mapping_size,
             entry_point,
         })
+    }
+
+    /// Parse the LiteBox PE trampoline footer, if present.
+    ///
+    /// The trampoline RVA is relative to the image base. The first pointer-sized
+    /// word of the mapped trampoline is patched with `syscall_entry_point` when
+    /// the image is loaded.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "cannot panic: array slices are always the correct size"
+    )]
+    pub fn parse_trampoline<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+    ) -> Result<(), PeParseError<F::Error>> {
+        if syscall_entry_point == 0 {
+            return Ok(());
+        }
+
+        let file_size = file.size().map_err(PeParseError::Io)?;
+        let header_size = size_of::<TrampolineHeader64>();
+        if file_size < header_size as u64 {
+            return Ok(());
+        }
+
+        let header_offset = file_size - header_size as u64;
+        let mut header_buf = [0u8; size_of::<TrampolineHeader64>()];
+        file.read_at(header_offset, &mut header_buf)
+            .map_err(PeParseError::Io)?;
+
+        let magic: [u8; 8] = header_buf[0..8].try_into().unwrap();
+        if magic != TRAMPOLINE_MAGIC {
+            if &header_buf[0..7] == b"LITEBOX" {
+                return Err(PeParseError::BadTrampolineVersion);
+            }
+            return Ok(());
+        }
+
+        let file_offset = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+        let rva: usize = u64::from_le_bytes(header_buf[16..24].try_into().unwrap())
+            .try_into()
+            .map_err(|_| PeParseError::BadTrampoline)?;
+        let trampoline_size: usize = u64::from_le_bytes(header_buf[24..32].try_into().unwrap())
+            .try_into()
+            .map_err(|_| PeParseError::BadTrampoline)?;
+        let image_size =
+            page_align_up(self.image.size_of_image).ok_or(PeParseError::BadTrampoline)?;
+
+        if trampoline_size == 0
+            || !file_offset.is_multiple_of(PAGE_SIZE as u64)
+            || !rva.is_multiple_of(PAGE_SIZE)
+            || rva < image_size
+            || file_offset
+                .checked_add(trampoline_size as u64)
+                .ok_or(PeParseError::BadTrampoline)?
+                != header_offset
+        {
+            return Err(PeParseError::BadTrampoline);
+        }
+
+        self.trampoline = Some(PeTrampolineInfo {
+            rva,
+            size: trampoline_size,
+            file_offset,
+            syscall_entry_point,
+        });
+        Ok(())
+    }
+
+    fn mapping_size<E>(&self, image_size: usize) -> Result<usize, PeLoadError<E>> {
+        let Some(trampoline) = &self.trampoline else {
+            return Ok(image_size);
+        };
+
+        trampoline
+            .rva
+            .checked_add(trampoline.size)
+            .and_then(page_align_up)
+            .map(|trampoline_end| image_size.max(trampoline_end))
+            .ok_or(PeLoadError::InvalidImage)
+    }
+
+    fn load_trampoline<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        base_addr: usize,
+    ) -> Result<(), PeLoadError<M::Error>> {
+        let trampoline = self.trampoline.as_ref().unwrap();
+        let trampoline_start = base_addr
+            .checked_add(trampoline.rva)
+            .ok_or(PeLoadError::InvalidImage)?;
+        let trampoline_size = page_align_up(trampoline.size).ok_or(PeLoadError::InvalidImage)?;
+        mapper
+            .map_file(
+                trampoline_start,
+                trampoline_size,
+                trampoline.file_offset,
+                &Protection {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+            )
+            .map_err(PeLoadError::Map)?;
+
+        mem.write(
+            trampoline_start,
+            &trampoline.syscall_entry_point.to_ne_bytes(),
+        )?;
+
+        mapper
+            .protect(
+                trampoline_start,
+                trampoline_size,
+                &Protection {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .map_err(PeLoadError::Map)
     }
 
     fn apply_base_relocations<E>(
@@ -422,6 +578,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
         data_directories,
         imports,
         relocations,
+        trampoline: None,
     })
 }
 
