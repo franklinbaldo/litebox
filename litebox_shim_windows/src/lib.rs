@@ -42,7 +42,7 @@ use nt_sysno::NtSysno;
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
-const NTDLL_PATHS: &[&str] = &["/windows/system32/ntdll.dll", "/Windows/System32/ntdll.dll"];
+const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 
 type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
