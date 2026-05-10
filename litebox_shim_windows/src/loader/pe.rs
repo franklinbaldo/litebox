@@ -17,8 +17,10 @@ use litebox_common_windows::loader::{
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
+use zerocopy::FromZeros;
 
-use crate::{NtShimFS, WindowsPageManager};
+use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock};
+use crate::{NtShimFS, WindowsPageManager, write_value};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
@@ -29,6 +31,7 @@ const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 pub(crate) struct PeLoadInfo {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
+    pub(crate) environment: WindowsProcessEnvironment,
     pub(crate) application_mapping: MappingInfo,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
 }
@@ -83,8 +86,40 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             stack_top,
             application_mapping: image.mapping,
             ntdll_mapping: ntdll.map(|image| image.mapping),
+            environment: self.create_process_environment()?,
         })
     }
+
+    fn create_process_environment(&self) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
+        let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
+            let aligned_length = size.next_multiple_of(PAGE_SIZE);
+            let length =
+                NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
+            let ptr = unsafe {
+                self.page_manager.create_writable_pages(
+                    None,
+                    length,
+                    CreatePagesFlags::empty(),
+                    |_| Ok(0),
+                )
+            }?;
+            Ok(ptr.as_usize())
+        };
+        let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
+        let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
+        let mut teb = ThreadEnvironmentBlock::new_zeroed();
+        teb.nt_tib.self_pointer = teb_ptr;
+        write_value(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
+        Ok(WindowsProcessEnvironment {
+            _peb: peb_ptr,
+            teb: teb_ptr,
+        })
+    }
+}
+
+pub(crate) struct WindowsProcessEnvironment {
+    pub(crate) _peb: usize,
+    pub(crate) teb: usize,
 }
 
 pub(crate) struct LoadedImage {

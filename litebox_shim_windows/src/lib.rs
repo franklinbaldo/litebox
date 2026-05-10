@@ -16,15 +16,20 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, Ordering};
+use zerocopy::{FromBytes, IntoBytes};
 
 use litebox::LiteBox;
 use litebox::mm::PageManager;
+use litebox::platform::PunchthroughToken as _;
+use litebox::platform::{
+    PunchthroughProvider as _, RawConstPointer as _, RawMutPointer, RawPointerProvider,
+};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox_common_windows::loader::MappingInfo;
 use litebox_platform_multiplex::Platform;
 
 pub mod loader;
-
+pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
 mod nt_sysno {
@@ -53,6 +58,31 @@ type WindowsFS = litebox::fs::layered::FileSystem<
 /// A trait required for file systems to be used by the Windows shim.
 pub trait NtShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
 impl<T: litebox::fs::FileSystem + Send + Sync + 'static> NtShimFS for T {}
+
+fn write_value<GuestValue>(address: usize, value: GuestValue) -> Option<()>
+where
+    GuestValue: FromBytes + IntoBytes,
+{
+    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<GuestValue>::from_usize(address);
+    ptr.write_at_offset(0, value)
+}
+
+fn set_guest_teb(teb_address: usize) -> bool {
+    let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr: teb_address };
+    let Some(token) =
+        litebox_platform_multiplex::platform().get_punchthrough_token_for(punchthrough)
+    else {
+        litebox_util_log::warn!(teb:% = format_args!("{teb_address:#x}"); "Failed to get punchthrough token for Windows TEB base");
+        return false;
+    };
+
+    if let Err(error) = token.execute() {
+        litebox_util_log::warn!(error:? = error, teb:% = format_args!("{teb_address:#x}"); "Failed to set Windows TEB base");
+        return false;
+    }
+
+    true
+}
 
 /// Builds a Windows NT shim instance.
 pub struct WindowsShimBuilder {
@@ -129,6 +159,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             entrypoints: WindowsShimEntrypoints {
                 entry_point: load_info.entry_point,
                 stack_top: load_info.stack_top,
+                teb_address: load_info.environment.teb,
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
             },
@@ -151,6 +182,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
+    teb_address: usize,
     exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
 }
@@ -174,6 +206,9 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             stack_top:% = format_args!("{:#x}", self.stack_top);
             "Starting initial Windows guest thread"
         );
+
+        set_guest_teb(self.teb_address);
+
         ContinueOperation::Resume
     }
 
