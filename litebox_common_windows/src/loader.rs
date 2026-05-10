@@ -13,7 +13,6 @@ use core::mem::size_of;
 
 use object::endian::LittleEndian as LE;
 use object::pe::{self, ImageNtHeaders64};
-use object::read::Object as _;
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64, Relocation};
 use thiserror::Error;
 
@@ -31,6 +30,8 @@ pub struct PeParsedFile {
     pub data_directories: Vec<PeDataDirectory>,
     /// Import lookup table entries grouped only by their source DLL name in each entry.
     pub imports: Vec<PeImport>,
+    /// Named exports from the PE export directory.
+    pub exports: Vec<PeExport>,
     /// Base relocation entries from the `.reloc` directory.
     pub relocations: Vec<Relocation>,
     trampoline: Option<PeTrampolineInfo>,
@@ -138,6 +139,15 @@ pub enum PeImportTarget {
     },
 }
 
+/// A named PE export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeExport {
+    /// Export name.
+    pub name: Vec<u8>,
+    /// Export target RVA.
+    pub rva: u32,
+}
+
 /// Errors that can occur when parsing a PE file.
 #[derive(Debug, Error)]
 pub enum PeParseError<E> {
@@ -194,6 +204,12 @@ impl PeParsedFile {
     /// Parse a PE32+ x86-64 image from file bytes.
     pub fn parse_bytes(data: &[u8]) -> Result<Self, PeParseError<core::convert::Infallible>> {
         parse_bytes(data)
+    }
+
+    /// Returns whether the image has a parsed LiteBox syscall trampoline.
+    #[must_use]
+    pub fn has_trampoline(&self) -> bool {
+        self.trampoline.is_some()
     }
 
     /// Load the PE image into memory.
@@ -526,8 +542,11 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
     let file_header = nt_headers.file_header();
     let optional_header = nt_headers.optional_header();
     let machine = file_header.machine.get(LE);
+    let characteristics = file_header.characteristics.get(LE);
 
-    if machine != pe::IMAGE_FILE_MACHINE_AMD64 || pe.kind() != object::ObjectKind::Executable {
+    if machine != pe::IMAGE_FILE_MACHINE_AMD64
+        || characteristics & pe::IMAGE_FILE_EXECUTABLE_IMAGE == 0
+    {
         return Err(PeParseError::UnsupportedImage);
     }
 
@@ -535,7 +554,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
     let entry_point_rva = usize_from_u32(optional_header.address_of_entry_point())?;
     let image = PeImageInfo {
         machine,
-        characteristics: file_header.characteristics.get(LE),
+        characteristics,
         image_base,
         entry_point_rva,
         entry_point: image_base
@@ -570,6 +589,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
         .collect();
 
     let imports = parse_imports(&pe)?;
+    let exports = parse_exports(&pe)?;
     let relocations = parse_relocations(&pe)?;
 
     Ok(PeParsedFile {
@@ -577,6 +597,7 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
         sections,
         data_directories,
         imports,
+        exports,
         relocations,
         trampoline: None,
     })
@@ -725,6 +746,26 @@ fn parse_imports(pe: &PeFile64<'_>) -> Result<Vec<PeImport>, object::read::Error
     }
 
     Ok(imports)
+}
+
+fn parse_exports(pe: &PeFile64<'_>) -> Result<Vec<PeExport>, object::read::Error> {
+    let Some(export_table) = pe.export_table()? else {
+        return Ok(Vec::new());
+    };
+
+    let mut exports = Vec::new();
+    for (name_pointer, address_index) in export_table.name_iter() {
+        let rva = export_table.address_by_index(u32::from(address_index))?;
+        if export_table.is_forward(rva) {
+            continue;
+        }
+        exports.push(PeExport {
+            name: export_table.name_from_pointer(name_pointer)?.to_vec(),
+            rva,
+        });
+    }
+
+    Ok(exports)
 }
 
 fn parse_relocations(pe: &PeFile64<'_>) -> Result<Vec<Relocation>, object::read::Error> {
