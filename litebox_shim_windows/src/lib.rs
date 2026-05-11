@@ -16,6 +16,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, Ordering};
+use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, IntoBytes};
 
 use litebox::LiteBox;
@@ -219,7 +220,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             );
             return ContinueOperation::Terminate;
         };
-        let ret: Result<usize, i32> = match req {
+        let (result, op) = match req {
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
@@ -231,12 +232,12 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                     "Handling NtTerminateProcess syscall"
                 );
                 self.exit_code.store(exit_status, Ordering::Relaxed);
-                Ok(0)
+                (NtStatus::SUCCESS, ContinueOperation::Terminate)
             }
         };
 
-        ctx.rax = ret.unwrap_or_else(|e| e as usize);
-        ContinueOperation::Resume
+        ctx.rax = result.as_raw().cast_unsigned() as usize;
+        op
     }
 
     fn exception(
