@@ -36,7 +36,7 @@ pub mod syscalls;
 pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
-use crate::syscalls::{NtSysno, SyscallRequest, sysinfo};
+use crate::syscalls::{NtSysno, SyscallRequest, mm, sysinfo};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -160,6 +160,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 entry_point: load_info.entry_point,
                 stack_top: load_info.stack_top,
                 teb_address: load_info.environment.teb,
+                page_manager: self.page_manager.clone(),
                 qpc_boot_instant: litebox_platform_multiplex::platform().now(),
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
@@ -184,6 +185,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
     teb_address: usize,
+    page_manager: Arc<WindowsPageManager>,
     qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
     exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
@@ -228,6 +230,76 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             "Handling Windows"
         );
         let (result, op) = match req {
+            SyscallRequest::NtAllocateVirtualMemory {
+                process_handle,
+                base_address,
+                zero_bits,
+                region_size,
+                allocation_type,
+                protect,
+            } => {
+                let status = mm::handle_nt_allocate_virtual_memory(
+                    &self.page_manager,
+                    process_handle,
+                    base_address,
+                    zero_bits,
+                    region_size,
+                    allocation_type,
+                    protect,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtFreeVirtualMemory {
+                process_handle,
+                base_address,
+                region_size,
+                free_type,
+            } => {
+                let status = mm::handle_nt_free_virtual_memory(
+                    &self.page_manager,
+                    process_handle,
+                    base_address,
+                    region_size,
+                    free_type,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtProtectVirtualMemory {
+                process_handle,
+                base_address,
+                region_size,
+                new_protect,
+                old_protect,
+            } => {
+                let status = mm::handle_nt_protect_virtual_memory(
+                    &self.page_manager,
+                    process_handle,
+                    base_address,
+                    region_size,
+                    new_protect,
+                    old_protect,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryVirtualMemory {
+                process_handle,
+                base_address,
+                memory_information_class,
+                memory_information,
+                memory_information_length,
+                return_length,
+            } => {
+                let status = mm::handle_nt_query_virtual_memory(
+                    &self.page_manager,
+                    process_handle,
+                    base_address,
+                    memory_information_class,
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
