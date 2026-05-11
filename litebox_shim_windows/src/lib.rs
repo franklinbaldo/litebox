@@ -29,14 +29,12 @@ use litebox_common_windows::loader::MappingInfo;
 use litebox_platform_multiplex::Platform;
 
 pub mod loader;
+pub mod syscalls;
+
 pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
-mod nt_sysno {
-    include!(concat!(env!("OUT_DIR"), "/nt_sysno.rs"));
-}
-
-use nt_sysno::NtSysno;
+use crate::syscalls::{NtSysno, SyscallRequest};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -213,23 +211,32 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        if NtSysno::from_raw(ctx.orig_rax) == Some(NtSysno::NtTerminateProcess) {
-            litebox_util_log::debug!(
-                syscall_number = ctx.orig_rax,
-                process_handle:% = format_args!("{:#x}", ctx.r10),
-                exit_status:% = format_args!("{:#x}", ctx.rdx);
-                "Handling NtTerminateProcess syscall"
-            );
-            self.exit_code
-                .store(windows_exit_status_to_i32(ctx.rdx), Ordering::Relaxed);
-        } else {
+        let Some(req) = SyscallRequest::try_from_raw(ctx) else {
             litebox_util_log::debug!(
                 syscall:? = NtSysno::from_raw(ctx.orig_rax),
                 process_handle:% = format_args!("{:#x}", ctx.r10);
                 "Unsupported Windows syscall"
             );
-        }
-        ContinueOperation::Terminate
+            return ContinueOperation::Terminate;
+        };
+        let ret: Result<usize, i32> = match req {
+            SyscallRequest::NtTerminateProcess {
+                process_handle,
+                exit_status,
+            } => {
+                litebox_util_log::debug!(
+                    syscall_number = ctx.orig_rax,
+                    process_handle:% = format_args!("{:#x}", process_handle),
+                    exit_status = exit_status;
+                    "Handling NtTerminateProcess syscall"
+                );
+                self.exit_code.store(exit_status, Ordering::Relaxed);
+                Ok(0)
+            }
+        };
+
+        ctx.rax = ret.unwrap_or_else(|e| e as usize);
+        ContinueOperation::Resume
     }
 
     fn exception(
@@ -251,11 +258,6 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         // TODO: Handle host interrupts for Windows guest waits/APCs.
         ContinueOperation::Terminate
     }
-}
-
-fn windows_exit_status_to_i32(status: usize) -> i32 {
-    let low_bits = u32::try_from(status & 0xffff_ffff).unwrap_or_default();
-    i32::from_ne_bytes(low_bits.to_ne_bytes())
 }
 
 fn default_fs(
