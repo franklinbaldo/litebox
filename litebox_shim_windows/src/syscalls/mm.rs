@@ -60,6 +60,10 @@ pub(crate) fn handle_nt_allocate_virtual_memory(
     allocation_type: u32,
     protect: u32,
 ) -> NtStatus {
+    if !super::is_current_process_handle(process_handle) {
+        return NtStatus::INVALID_HANDLE;
+    }
+
     let Some(base) = base_address.read_at_offset(0) else {
         return NtStatus::ACCESS_VIOLATION;
     };
@@ -120,6 +124,10 @@ pub(crate) fn handle_nt_free_virtual_memory(
     region_size: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     free_type: u32,
 ) -> NtStatus {
+    if !super::is_current_process_handle(process_handle) {
+        return NtStatus::INVALID_HANDLE;
+    }
+
     let Some(base) = base_address.read_at_offset(0) else {
         return NtStatus::ACCESS_VIOLATION;
     };
@@ -170,6 +178,10 @@ pub(crate) fn handle_nt_protect_virtual_memory(
     new_protect: u32,
     old_protect: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>,
 ) -> NtStatus {
+    if !super::is_current_process_handle(process_handle) {
+        return NtStatus::INVALID_HANDLE;
+    }
+
     let Some(base) = base_address.read_at_offset(0) else {
         return NtStatus::ACCESS_VIOLATION;
     };
@@ -233,6 +245,10 @@ pub(crate) fn handle_nt_query_virtual_memory(
         <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     >,
 ) -> NtStatus {
+    if !super::is_current_process_handle(process_handle) {
+        return NtStatus::INVALID_HANDLE;
+    }
+
     if memory_information_class != MEMORY_BASIC_INFORMATION_CLASS {
         return NtStatus::INVALID_INFO_CLASS;
     }
@@ -503,6 +519,7 @@ fn query_memory_basic_information(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syscalls::NT_CURRENT_PROCESS;
     use litebox::{LiteBox, platform::RawPointerProvider};
 
     extern crate std;
@@ -514,6 +531,7 @@ mod tests {
     const PROTECT_TEST_BASE: usize = 0x1200_0000;
     const QUERY_TEST_BASE: usize = 0x1300_0000;
     const FREE_TEST_BASE: usize = 0x1400_0000;
+    const OTHER_PROCESS_HANDLE: usize = 0x1234;
 
     fn init_platform() {
         static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
@@ -530,11 +548,11 @@ mod tests {
     }
 
     fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<T> {
-        MutPtr::from_usize((value as *mut T).cast::<u8>() as usize)
+        MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
     fn mut_byte_ptr<T>(value: &mut T) -> MutPtr<u8> {
-        MutPtr::from_usize((value as *mut T).cast::<u8>() as usize)
+        MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
     fn empty_memory_basic_information() -> MemoryBasicInformation {
@@ -558,7 +576,7 @@ mod tests {
         assert_eq!(
             handle_nt_free_virtual_memory(
                 page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 mut_ptr(&mut size),
                 MEM_RELEASE,
@@ -582,7 +600,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -620,7 +638,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -636,7 +654,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut overlapping_base),
                 0,
                 mut_ptr(&mut overlapping_size),
@@ -657,7 +675,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -673,7 +691,7 @@ mod tests {
         assert_eq!(
             handle_nt_protect_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut protect_base),
                 mut_ptr(&mut protect_size),
                 PAGE_READONLY,
@@ -696,7 +714,7 @@ mod tests {
         assert_eq!(
             handle_nt_protect_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut protect_base),
                 mut_ptr(&mut protect_size),
                 PAGE_EXECUTE_READ,
@@ -724,7 +742,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -739,7 +757,7 @@ mod tests {
         assert_eq!(
             handle_nt_query_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 base + 0x10,
                 MEMORY_BASIC_INFORMATION_CLASS,
                 mut_byte_ptr(&mut info),
@@ -763,7 +781,7 @@ mod tests {
         assert_eq!(
             handle_nt_query_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 base,
                 MEMORY_BASIC_INFORMATION_CLASS,
                 mut_byte_ptr(&mut free_info),
@@ -786,7 +804,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -801,7 +819,7 @@ mod tests {
         assert_eq!(
             handle_nt_free_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut free_base),
                 mut_ptr(&mut free_size),
                 MEM_DECOMMIT,
@@ -830,7 +848,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 1,
                 mut_ptr(&mut size),
@@ -842,7 +860,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -854,7 +872,7 @@ mod tests {
         assert_eq!(
             handle_nt_protect_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 mut_ptr(&mut base),
                 mut_ptr(&mut size),
                 PAGE_READONLY,
@@ -865,7 +883,7 @@ mod tests {
         assert_eq!(
             handle_nt_query_virtual_memory(
                 &page_manager,
-                usize::MAX,
+                NT_CURRENT_PROCESS,
                 base,
                 1,
                 mut_byte_ptr(&mut info),
@@ -873,6 +891,61 @@ mod tests {
                 None,
             ),
             NtStatus::INVALID_INFO_CLASS
+        );
+    }
+
+    #[test]
+    fn memory_syscalls_reject_non_current_process_handles() {
+        let page_manager = page_manager();
+        let mut base = ALLOC_TEST_BASE;
+        let mut size = PAGE_SIZE;
+        let mut old_protect = 0u32;
+        let mut info = empty_memory_basic_information();
+
+        assert_eq!(
+            handle_nt_allocate_virtual_memory(
+                &page_manager,
+                OTHER_PROCESS_HANDLE,
+                mut_ptr(&mut base),
+                0,
+                mut_ptr(&mut size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            handle_nt_free_virtual_memory(
+                &page_manager,
+                OTHER_PROCESS_HANDLE,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                MEM_DECOMMIT,
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            handle_nt_protect_virtual_memory(
+                &page_manager,
+                OTHER_PROCESS_HANDLE,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                PAGE_READONLY,
+                mut_ptr(&mut old_protect),
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            handle_nt_query_virtual_memory(
+                &page_manager,
+                OTHER_PROCESS_HANDLE,
+                base,
+                MEMORY_BASIC_INFORMATION_CLASS,
+                mut_byte_ptr(&mut info),
+                size_of::<MemoryBasicInformation>(),
+                None,
+            ),
+            NtStatus::INVALID_HANDLE
         );
     }
 }

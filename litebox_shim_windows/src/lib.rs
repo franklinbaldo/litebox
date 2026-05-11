@@ -304,11 +304,14 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 process_handle,
                 exit_status,
             } => {
-                if process_handle == 0 {
-                    // TODO: Terminate all threads except the calling one
+                if process_handle != 0 && !syscalls::is_current_process_handle(process_handle) {
+                    // TODO: allow terminating other processes
+                    (NtStatus::INVALID_HANDLE, ContinueOperation::Resume)
+                } else {
+                    // TODO: Terminate all threads except the calling one if process_handle is zero.
+                    self.exit_code.store(exit_status, Ordering::Relaxed);
+                    (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
-                self.exit_code.store(exit_status, Ordering::Relaxed);
-                (NtStatus::SUCCESS, ContinueOperation::Terminate)
             }
             SyscallRequest::NtQueryPerformanceCounter {
                 performance_counter,

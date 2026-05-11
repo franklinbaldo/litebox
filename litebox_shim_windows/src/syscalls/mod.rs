@@ -10,6 +10,12 @@ pub(crate) mod sysinfo;
 
 pub(crate) use nt_sysno::NtSysno;
 
+pub(crate) const NT_CURRENT_PROCESS: usize = usize::MAX;
+
+pub(crate) fn is_current_process_handle(process_handle: usize) -> bool {
+    process_handle == NT_CURRENT_PROCESS
+}
+
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 
