@@ -24,6 +24,7 @@ use litebox::mm::PageManager;
 use litebox::platform::PunchthroughToken as _;
 use litebox::platform::{
     PunchthroughProvider as _, RawConstPointer as _, RawMutPointer, RawPointerProvider,
+    TimeProvider as _,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox_common_windows::loader::MappingInfo;
@@ -35,7 +36,7 @@ pub mod syscalls;
 pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
-use crate::syscalls::{NtSysno, SyscallRequest};
+use crate::syscalls::{NtSysno, SyscallRequest, sysinfo};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -159,6 +160,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                 entry_point: load_info.entry_point,
                 stack_top: load_info.stack_top,
                 teb_address: load_info.environment.teb,
+                qpc_boot_instant: litebox_platform_multiplex::platform().now(),
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
             },
@@ -182,6 +184,7 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
     teb_address: usize,
+    qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
     exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
 }
@@ -212,7 +215,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        let Some(req) = SyscallRequest::try_from_raw(ctx) else {
+        let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             litebox_util_log::debug!(
                 syscall:? = NtSysno::from_raw(ctx.orig_rax),
                 process_handle:% = format_args!("{:#x}", ctx.r10);
@@ -220,19 +223,31 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             );
             return ContinueOperation::Terminate;
         };
+        litebox_util_log::debug!(
+            syscall:? = req;
+            "Handling Windows"
+        );
         let (result, op) = match req {
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
             } => {
-                litebox_util_log::debug!(
-                    syscall_number = ctx.orig_rax,
-                    process_handle:% = format_args!("{:#x}", process_handle),
-                    exit_status = exit_status;
-                    "Handling NtTerminateProcess syscall"
-                );
+                if process_handle == 0 {
+                    // TODO: Terminate all threads except the calling one
+                }
                 self.exit_code.store(exit_status, Ordering::Relaxed);
                 (NtStatus::SUCCESS, ContinueOperation::Terminate)
+            }
+            SyscallRequest::NtQueryPerformanceCounter {
+                performance_counter,
+                performance_frequency,
+            } => {
+                let status = sysinfo::handle_nt_query_performance_counter(
+                    performance_counter,
+                    performance_frequency,
+                    self.qpc_boot_instant,
+                );
+                (status, ContinueOperation::Resume)
             }
         };
 
