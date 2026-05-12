@@ -19,7 +19,9 @@ use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 use zerocopy::FromZeros;
 
-use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock};
+use crate::nt_types::{
+    ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters, ThreadEnvironmentBlock,
+};
 use crate::{NtShimFS, WindowsPageManager, write_value};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
@@ -107,11 +109,25 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         };
         let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
+        let process_parameters_ptr =
+            create_pages(core::mem::size_of::<RtlUserProcessParameters>())?;
+
+        let mut process_parameters = RtlUserProcessParameters::new_zeroed();
+        process_parameters.flags = RtlUserProcFlags::NORMALIZED;
+        write_value(process_parameters_ptr, process_parameters)
+            .ok_or(PeImageAccessError::MemoryAccess)?;
+
+        let mut peb = ProcessEnvironmentBlock::new_zeroed();
+        peb.process_parameters = process_parameters_ptr;
+        write_value(peb_ptr, peb).ok_or(PeImageAccessError::MemoryAccess)?;
+
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
         teb.nt_tib.self_pointer = teb_ptr;
+        teb.process_environment_block = peb_ptr;
         write_value(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
         Ok(WindowsProcessEnvironment {
             _peb: peb_ptr,
+            _process_parameters: process_parameters_ptr,
             teb: teb_ptr,
         })
     }
@@ -119,6 +135,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
 
 pub(crate) struct WindowsProcessEnvironment {
     pub(crate) _peb: usize,
+    pub(crate) _process_parameters: usize,
     pub(crate) teb: usize,
 }
 
