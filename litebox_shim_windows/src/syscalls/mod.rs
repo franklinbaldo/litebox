@@ -26,6 +26,17 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         event_type: u32,
         initial_state: u8,
     },
+    NtClearEvent {
+        event_handle: Handle,
+    },
+    NtResetEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtSetEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
     NtTerminateProcess {
         process_handle: ProcessHandle,
         exit_status: i32,
@@ -95,6 +106,17 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 event_type,
                 initial_state,
+            })),
+            NtSysno::NtClearEvent => Some(sys_req!(NtClearEvent {
+                event_handle: { Handle::from_raw },
+            })),
+            NtSysno::NtResetEvent => Some(sys_req!(NtResetEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtSetEvent => Some(sys_req!(NtSetEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle:{ProcessHandle::from_raw},

@@ -132,6 +132,19 @@ pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
     Ok(handle)
 }
 
+pub(crate) fn raw_handle_entry<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    handle: Handle,
+) -> Option<litebox::fd::EntryHandle<Platform, Subsystem>> {
+    let raw_fd = handle.raw_fd()?;
+    let typed = {
+        let handles = handles.read();
+        handles.fd_from_raw_integer::<Subsystem>(raw_fd).ok()
+    }?;
+    litebox.descriptor_table().entry_handle(&typed)
+}
+
 pub(crate) fn remove_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore,
@@ -370,6 +383,38 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                     object_attributes,
                     event_type,
                     initial_state,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtClearEvent { event_handle } => {
+                let status = event::handle_nt_clear_event(
+                    self.litebox.as_ref(),
+                    &self.handles,
+                    event_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtResetEvent {
+                event_handle,
+                previous_state,
+            } => {
+                let status = event::handle_nt_reset_event(
+                    self.litebox.as_ref(),
+                    &self.handles,
+                    event_handle,
+                    previous_state,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetEvent {
+                event_handle,
+                previous_state,
+            } => {
+                let status = event::handle_nt_set_event(
+                    self.litebox.as_ref(),
+                    &self.handles,
+                    event_handle,
+                    previous_state,
                 );
                 (status, ContinueOperation::Resume)
             }

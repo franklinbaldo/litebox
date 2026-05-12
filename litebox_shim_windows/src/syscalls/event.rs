@@ -11,7 +11,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable};
 
-use crate::{Handle, WindowsHandleStore, insert_raw_handle, remove_raw_handle};
+use crate::{Handle, WindowsHandleStore, insert_raw_handle, raw_handle_entry, remove_raw_handle};
 
 // See <https://ntdoc.m417z.com/object_attributes> for more details
 #[repr(C)]
@@ -41,6 +41,7 @@ impl FdEnabledSubsystem for EventSubsystem {
 impl FdEnabledSubsystemEntry for EventObject<Platform> {}
 
 pub(crate) struct EventObject<P: RawSyncPrimitivesProvider + TimeProvider> {
+    #[expect(dead_code)]
     event_type: EventType,
     signaled: litebox::sync::Mutex<P, bool>,
     pollee: Pollee<P>,
@@ -53,6 +54,24 @@ impl<P: RawSyncPrimitivesProvider + TimeProvider> EventObject<P> {
             signaled: litebox::sync::Mutex::new(initial_state),
             pollee: Pollee::new(),
         }
+    }
+
+    fn clear(&self) -> bool {
+        let mut signaled = self.signaled.lock();
+        let previous = *signaled;
+        *signaled = false;
+        previous
+    }
+
+    fn set(&self) -> bool {
+        let mut signaled = self.signaled.lock();
+        let previous = *signaled;
+        *signaled = true;
+        drop(signaled);
+        if !previous {
+            self.pollee.notify_observers(Events::IN);
+        }
+        previous
     }
 }
 
@@ -128,6 +147,78 @@ pub(crate) fn handle_nt_create_event(
     NtStatus::SUCCESS
 }
 
+pub(crate) fn handle_nt_clear_event(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    event_handle: Handle,
+) -> NtStatus {
+    let Some(event) = raw_handle_entry::<EventSubsystem>(litebox, handles, event_handle) else {
+        return NtStatus::INVALID_HANDLE;
+    };
+    event.with_entry(EventObject::clear);
+
+    litebox_util_log::debug!(
+        handle:% = format_args!("{:#x}", event_handle.as_raw());
+        "Handled NtClearEvent syscall"
+    );
+
+    NtStatus::SUCCESS
+}
+
+pub(crate) fn handle_nt_reset_event(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    event_handle: Handle,
+    previous_state: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<i32>>,
+) -> NtStatus {
+    let Some(event) = raw_handle_entry::<EventSubsystem>(litebox, handles, event_handle) else {
+        return NtStatus::INVALID_HANDLE;
+    };
+    let was_signaled = event.with_entry(EventObject::clear);
+    if let Some(previous_state) = previous_state
+        && previous_state
+            .write_at_offset(0, i32::from(was_signaled))
+            .is_none()
+    {
+        return NtStatus::ACCESS_VIOLATION;
+    }
+
+    litebox_util_log::debug!(
+        handle:% = format_args!("{:#x}", event_handle.as_raw()),
+        previous_state = was_signaled;
+        "Handled NtResetEvent syscall"
+    );
+
+    NtStatus::SUCCESS
+}
+
+pub(crate) fn handle_nt_set_event(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    event_handle: Handle,
+    previous_state: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<i32>>,
+) -> NtStatus {
+    let Some(event) = raw_handle_entry::<EventSubsystem>(litebox, handles, event_handle) else {
+        return NtStatus::INVALID_HANDLE;
+    };
+    let was_signaled = event.with_entry(EventObject::set);
+    if let Some(previous_state) = previous_state
+        && previous_state
+            .write_at_offset(0, i32::from(was_signaled))
+            .is_none()
+    {
+        return NtStatus::ACCESS_VIOLATION;
+    }
+
+    litebox_util_log::debug!(
+        handle:% = format_args!("{:#x}", event_handle.as_raw()),
+        previous_state = was_signaled;
+        "Handled NtSetEvent syscall"
+    );
+
+    NtStatus::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +249,37 @@ mod tests {
             LiteBox::new(litebox_platform_multiplex::platform()),
             WindowsHandleStore::new(RawDescriptorStorage::new()),
         )
+    }
+
+    fn create_test_event(
+        litebox: &LiteBox<Platform>,
+        handles: &WindowsHandleStore,
+        initial_state: bool,
+    ) -> Handle {
+        let mut handle = Handle::from_raw(0);
+        assert_eq!(
+            handle_nt_create_event(
+                litebox,
+                handles,
+                mut_ptr(&mut handle),
+                0,
+                None,
+                EventType::Notification.into(),
+                u8::from(initial_state),
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
+    fn events_for_handle(
+        litebox: &LiteBox<Platform>,
+        handles: &WindowsHandleStore,
+        handle: Handle,
+    ) -> Events {
+        raw_handle_entry::<EventSubsystem>(litebox, handles, handle)
+            .unwrap()
+            .with_entry(IOPollable::check_io_events)
     }
 
     #[test]
@@ -226,5 +348,111 @@ mod tests {
         );
         assert_eq!(handle, Handle::from_raw(usize::MAX));
         assert!(handles.read().iter_alive().next().is_none());
+    }
+
+    #[test]
+    fn nt_clear_event_clears_signaled_event() {
+        let (litebox, handles) = test_context();
+        let handle = create_test_event(&litebox, &handles, true);
+        assert_eq!(events_for_handle(&litebox, &handles, handle), Events::IN);
+
+        assert_eq!(
+            handle_nt_clear_event(&litebox, &handles, handle),
+            NtStatus::SUCCESS
+        );
+        assert!(events_for_handle(&litebox, &handles, handle).is_empty());
+    }
+
+    #[test]
+    fn nt_reset_event_clears_and_returns_previous_state() {
+        let (litebox, handles) = test_context();
+        let handle = create_test_event(&litebox, &handles, true);
+        let mut previous_state = -1;
+
+        assert_eq!(
+            handle_nt_reset_event(
+                &litebox,
+                &handles,
+                handle,
+                Some(mut_ptr(&mut previous_state)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(previous_state, 1);
+        assert!(events_for_handle(&litebox, &handles, handle).is_empty());
+
+        previous_state = -1;
+        assert_eq!(
+            handle_nt_reset_event(
+                &litebox,
+                &handles,
+                handle,
+                Some(mut_ptr(&mut previous_state)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(previous_state, 0);
+    }
+
+    #[test]
+    fn nt_set_event_signals_and_returns_previous_state() {
+        let (litebox, handles) = test_context();
+        let handle = create_test_event(&litebox, &handles, false);
+        let mut previous_state = -1;
+
+        assert_eq!(
+            handle_nt_set_event(
+                &litebox,
+                &handles,
+                handle,
+                Some(mut_ptr(&mut previous_state)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(previous_state, 0);
+        assert_eq!(events_for_handle(&litebox, &handles, handle), Events::IN);
+
+        previous_state = -1;
+        assert_eq!(
+            handle_nt_set_event(
+                &litebox,
+                &handles,
+                handle,
+                Some(mut_ptr(&mut previous_state)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(previous_state, 1);
+    }
+
+    #[test]
+    fn event_state_syscalls_reject_invalid_handles() {
+        let (litebox, handles) = test_context();
+        let invalid_handle = Handle::from_raw_fd(0).unwrap();
+        let mut previous_state = -1;
+
+        assert_eq!(
+            handle_nt_clear_event(&litebox, &handles, invalid_handle),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            handle_nt_reset_event(
+                &litebox,
+                &handles,
+                invalid_handle,
+                Some(mut_ptr(&mut previous_state)),
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            handle_nt_set_event(
+                &litebox,
+                &handles,
+                invalid_handle,
+                Some(mut_ptr(&mut previous_state)),
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(previous_state, -1);
     }
 }
