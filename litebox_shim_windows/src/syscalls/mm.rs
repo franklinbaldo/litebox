@@ -10,7 +10,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::{PAGE_SIZE, WindowsPageManager};
+use crate::{PAGE_SIZE, ProcessHandle, WindowsPageManager};
 
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
@@ -53,14 +53,14 @@ struct MemoryBasicInformation {
 
 pub(crate) fn handle_nt_allocate_virtual_memory(
     page_manager: &WindowsPageManager,
-    process_handle: usize,
+    process_handle: ProcessHandle,
     base_address: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     zero_bits: usize,
     region_size: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     allocation_type: u32,
     protect: u32,
 ) -> NtStatus {
-    if !super::is_current_process_handle(process_handle) {
+    if !process_handle.is_current() {
         return NtStatus::INVALID_HANDLE;
     }
 
@@ -105,7 +105,7 @@ pub(crate) fn handle_nt_allocate_virtual_memory(
     }
 
     litebox_util_log::debug!(
-        process_handle:% = format_args!("{:#x}", process_handle),
+        process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
         base:% = format_args!("{:#x}", base),
         aligned_base:% = format_args!("{:#x}", ptr.as_usize()),
         aligned_len = aligned_len,
@@ -119,12 +119,12 @@ pub(crate) fn handle_nt_allocate_virtual_memory(
 
 pub(crate) fn handle_nt_free_virtual_memory(
     page_manager: &WindowsPageManager,
-    process_handle: usize,
+    process_handle: ProcessHandle,
     base_address: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     region_size: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     free_type: u32,
 ) -> NtStatus {
-    if !super::is_current_process_handle(process_handle) {
+    if !process_handle.is_current() {
         return NtStatus::INVALID_HANDLE;
     }
 
@@ -158,7 +158,7 @@ pub(crate) fn handle_nt_free_virtual_memory(
     }
 
     litebox_util_log::debug!(
-        process_handle:% = format_args!("{:#x}", process_handle),
+        process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
         base:% = format_args!("{:#x}", base),
         size = size,
         aligned_base:% = format_args!("{:#x}", aligned_base),
@@ -172,13 +172,13 @@ pub(crate) fn handle_nt_free_virtual_memory(
 
 pub(crate) fn handle_nt_protect_virtual_memory(
     page_manager: &WindowsPageManager,
-    process_handle: usize,
+    process_handle: ProcessHandle,
     base_address: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     region_size: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     new_protect: u32,
     old_protect: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>,
 ) -> NtStatus {
-    if !super::is_current_process_handle(process_handle) {
+    if !process_handle.is_current() {
         return NtStatus::INVALID_HANDLE;
     }
 
@@ -216,7 +216,7 @@ pub(crate) fn handle_nt_protect_virtual_memory(
         && region_size.write_at_offset(0, aligned_len).is_some();
 
     litebox_util_log::debug!(
-        process_handle:% = format_args!("{:#x}", process_handle),
+        process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
         base:% = format_args!("{:#x}", base),
         size = size,
         aligned_base:% = format_args!("{:#x}", aligned_base),
@@ -236,7 +236,7 @@ pub(crate) fn handle_nt_protect_virtual_memory(
 
 pub(crate) fn handle_nt_query_virtual_memory(
     page_manager: &WindowsPageManager,
-    process_handle: usize,
+    process_handle: ProcessHandle,
     base_address: usize,
     memory_information_class: u32,
     memory_information: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u8>,
@@ -245,7 +245,7 @@ pub(crate) fn handle_nt_query_virtual_memory(
         <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
     >,
 ) -> NtStatus {
-    if !super::is_current_process_handle(process_handle) {
+    if !process_handle.is_current() {
         return NtStatus::INVALID_HANDLE;
     }
 
@@ -275,7 +275,7 @@ pub(crate) fn handle_nt_query_virtual_memory(
     }
 
     litebox_util_log::debug!(
-        process_handle:% = format_args!("{:#x}", process_handle),
+        process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
         base:% = format_args!("{:#x}", base_address),
         result_base:% = format_args!("{:#x}", info.base_address),
         region_size = info.region_size,
@@ -519,7 +519,6 @@ fn query_memory_basic_information(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::syscalls::NT_CURRENT_PROCESS;
     use litebox::{LiteBox, platform::RawPointerProvider};
 
     extern crate std;
@@ -531,14 +530,10 @@ mod tests {
     const PROTECT_TEST_BASE: usize = 0x1200_0000;
     const QUERY_TEST_BASE: usize = 0x1300_0000;
     const FREE_TEST_BASE: usize = 0x1400_0000;
-    const OTHER_PROCESS_HANDLE: usize = 0x1234;
+    const OTHER_PROCESS_HANDLE: ProcessHandle = ProcessHandle::from_raw(0x1234);
 
     fn init_platform() {
-        static PLATFORM_INIT: std::sync::Once = std::sync::Once::new();
-        PLATFORM_INIT.call_once(|| {
-            let platform = Platform::new();
-            litebox_platform_multiplex::set_platform(platform);
-        });
+        crate::tests::init_platform();
     }
 
     fn page_manager() -> WindowsPageManager {
@@ -576,7 +571,7 @@ mod tests {
         assert_eq!(
             handle_nt_free_virtual_memory(
                 page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 mut_ptr(&mut size),
                 MEM_RELEASE,
@@ -600,7 +595,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -638,7 +633,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -654,7 +649,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut overlapping_base),
                 0,
                 mut_ptr(&mut overlapping_size),
@@ -675,7 +670,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -691,7 +686,7 @@ mod tests {
         assert_eq!(
             handle_nt_protect_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut protect_base),
                 mut_ptr(&mut protect_size),
                 PAGE_READONLY,
@@ -714,7 +709,7 @@ mod tests {
         assert_eq!(
             handle_nt_protect_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut protect_base),
                 mut_ptr(&mut protect_size),
                 PAGE_EXECUTE_READ,
@@ -742,7 +737,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -757,7 +752,7 @@ mod tests {
         assert_eq!(
             handle_nt_query_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 base + 0x10,
                 MEMORY_BASIC_INFORMATION_CLASS,
                 mut_byte_ptr(&mut info),
@@ -781,7 +776,7 @@ mod tests {
         assert_eq!(
             handle_nt_query_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 base,
                 MEMORY_BASIC_INFORMATION_CLASS,
                 mut_byte_ptr(&mut free_info),
@@ -804,7 +799,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -819,7 +814,7 @@ mod tests {
         assert_eq!(
             handle_nt_free_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut free_base),
                 mut_ptr(&mut free_size),
                 MEM_DECOMMIT,
@@ -848,7 +843,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 1,
                 mut_ptr(&mut size),
@@ -860,7 +855,7 @@ mod tests {
         assert_eq!(
             handle_nt_allocate_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 0,
                 mut_ptr(&mut size),
@@ -872,7 +867,7 @@ mod tests {
         assert_eq!(
             handle_nt_protect_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 mut_ptr(&mut base),
                 mut_ptr(&mut size),
                 PAGE_READONLY,
@@ -883,7 +878,7 @@ mod tests {
         assert_eq!(
             handle_nt_query_virtual_memory(
                 &page_manager,
-                NT_CURRENT_PROCESS,
+                ProcessHandle::CURRENT,
                 base,
                 1,
                 mut_byte_ptr(&mut info),

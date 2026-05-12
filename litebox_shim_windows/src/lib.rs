@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicI32, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use litebox::LiteBox;
 use litebox::mm::PageManager;
@@ -33,15 +33,122 @@ use litebox_platform_multiplex::Platform;
 pub mod loader;
 pub mod syscalls;
 
+#[cfg(test)]
+mod tests;
+
 pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
+use crate::syscalls::event;
 use crate::syscalls::{NtSysno, SyscallRequest, mm, sysinfo};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
+const HANDLE_SHIFT: u32 = 2;
+const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
+
+#[repr(transparent)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub(crate) struct Handle(usize);
+
+impl Handle {
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub(crate) fn from_raw_fd(raw_fd: usize) -> Option<Self> {
+        raw_fd
+            .checked_add(1)?
+            .checked_mul(1usize << HANDLE_SHIFT)
+            .map(Self)
+    }
+
+    #[must_use]
+    pub(crate) fn raw_fd(self) -> Option<usize> {
+        if self.0 & HANDLE_TAG_MASK != 0 {
+            return None;
+        }
+        (self.0 >> HANDLE_SHIFT).checked_sub(1)
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProcessHandle(Handle);
+
+impl ProcessHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0.as_raw()
+    }
+
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.as_raw() == 0
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+}
 
 pub(crate) type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
+pub(crate) type WindowsHandleStore =
+    litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
+
+pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    typed: litebox::fd::TypedFd<Subsystem>,
+) -> Result<Handle, NtStatus> {
+    let mut handles = handles.write();
+    let raw_fd = handles.fd_into_raw_integer(typed);
+    let Some(handle) = Handle::from_raw_fd(raw_fd) else {
+        let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
+        drop(handles);
+        if let Some(typed) = typed {
+            let removed = litebox.descriptor_table_mut().remove(&typed);
+            debug_assert!(removed.is_some());
+        }
+        return Err(NtStatus::QUOTA_EXCEEDED);
+    };
+    Ok(handle)
+}
+
+pub(crate) fn remove_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore,
+    handle: Handle,
+) {
+    let Some(raw_fd) = handle.raw_fd() else {
+        return;
+    };
+    let typed = {
+        let mut handles = handles.write();
+        handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
+    };
+    if let Some(typed) = typed {
+        let removed = litebox.descriptor_table_mut().remove(&typed);
+        debug_assert!(removed.is_some());
+    }
+}
 
 pub type DefaultFS = WindowsFS;
 
@@ -165,13 +272,18 @@ impl<FS: NtShimFS> WindowsShim<FS> {
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
         let load_info = loader::PeLoader::new(fs, &self.page_manager).load(path)?;
         let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
+        let handles = Arc::new(WindowsHandleStore::new(
+            litebox::fd::RawDescriptorStorage::new(),
+        ));
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 entry_point: load_info.entry_point,
                 stack_top: load_info.stack_top,
                 teb_address: load_info.environment.teb,
+                litebox: self.litebox.clone(),
                 page_manager: self.page_manager.clone(),
+                handles,
                 qpc_boot_instant: litebox_platform_multiplex::platform().now(),
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
@@ -196,7 +308,9 @@ pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
     teb_address: usize,
+    litebox: Arc<LiteBox<Platform>>,
     page_manager: Arc<WindowsPageManager>,
+    handles: Arc<WindowsHandleStore>,
     qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
     exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
@@ -241,6 +355,24 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             "Handling Windows"
         );
         let (result, op) = match req {
+            SyscallRequest::NtCreateEvent {
+                event_handle,
+                desired_access,
+                object_attributes,
+                event_type,
+                initial_state,
+            } => {
+                let status = event::handle_nt_create_event(
+                    self.litebox.as_ref(),
+                    &self.handles,
+                    event_handle,
+                    desired_access,
+                    object_attributes,
+                    event_type,
+                    initial_state,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtAllocateVirtualMemory {
                 process_handle,
                 base_address,
@@ -315,7 +447,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 process_handle,
                 exit_status,
             } => {
-                if process_handle != 0 && !syscalls::is_current_process_handle(process_handle) {
+                if !process_handle.is_null() && !process_handle.is_current() {
                     // TODO: allow terminating other processes
                     (NtStatus::INVALID_HANDLE, ContinueOperation::Resume)
                 } else {

@@ -5,29 +5,33 @@ mod nt_sysno {
     include!(concat!(env!("OUT_DIR"), "/nt_sysno.rs"));
 }
 
+pub(crate) mod event;
 pub(crate) mod mm;
 pub(crate) mod sysinfo;
 
 pub(crate) use nt_sysno::NtSysno;
 
-pub(crate) const NT_CURRENT_PROCESS: usize = usize::MAX;
-
-pub(crate) fn is_current_process_handle(process_handle: usize) -> bool {
-    process_handle == NT_CURRENT_PROCESS
-}
-
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
+
+use crate::{Handle, ProcessHandle};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
+    NtCreateEvent {
+        event_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<event::ObjectAttributes>>,
+        event_type: u32,
+        initial_state: u8,
+    },
     NtTerminateProcess {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         exit_status: i32,
     },
     NtAllocateVirtualMemory {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
         zero_bits: usize,
         region_size: Platform::RawMutPointer<usize>,
@@ -35,20 +39,20 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         protect: u32,
     },
     NtFreeVirtualMemory {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
         region_size: Platform::RawMutPointer<usize>,
         free_type: u32,
     },
     NtProtectVirtualMemory {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
         region_size: Platform::RawMutPointer<usize>,
         new_protect: u32,
         old_protect: Platform::RawMutPointer<u32>,
     },
     NtQueryVirtualMemory {
-        process_handle: usize,
+        process_handle: ProcessHandle,
         base_address: usize,
         memory_information_class: u32,
         memory_information: Platform::RawMutPointer<u8>,
@@ -85,8 +89,15 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         }
 
         match NtSysno::from_raw(pt_regs.orig_rax)? {
+            NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
+                event_handle:*,
+                desired_access,
+                object_attributes:*,
+                event_type,
+                initial_state,
+            })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
-                process_handle,
+                process_handle:{ProcessHandle::from_raw},
                 base_address:*,
                 zero_bits,
                 region_size:*,
@@ -94,24 +105,24 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 protect,
             })),
             NtSysno::NtFreeVirtualMemory => Some(sys_req!(NtFreeVirtualMemory {
-                process_handle,
+                process_handle:{ProcessHandle::from_raw},
                 base_address:*,
                 region_size:*,
                 free_type,
             })),
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
-                process_handle,
+                process_handle: { ProcessHandle::from_raw },
                 exit_status,
             })),
             NtSysno::NtProtectVirtualMemory => Some(sys_req!(NtProtectVirtualMemory {
-                process_handle,
+                process_handle:{ProcessHandle::from_raw},
                 base_address:*,
                 region_size:*,
                 new_protect,
                 old_protect:*,
             })),
             NtSysno::NtQueryVirtualMemory => Some(sys_req!(NtQueryVirtualMemory {
-                process_handle,
+                process_handle:{ProcessHandle::from_raw},
                 base_address,
                 memory_information_class,
                 memory_information:*,
