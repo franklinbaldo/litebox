@@ -74,6 +74,8 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         performance_counter: Platform::RawMutPointer<i64>,
         performance_frequency: Platform::RawMutPointer<i64>,
     },
+    /// TODO: not supported yet
+    NtManageHotPatch,
 }
 
 impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
@@ -155,6 +157,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 performance_counter:*,
                 performance_frequency:*,
             })),
+            NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
         }
     }

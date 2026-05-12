@@ -512,6 +512,9 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtManageHotPatch => {
+                (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
+            }
         };
 
         ctx.rax = result.as_raw().cast_unsigned() as usize;
