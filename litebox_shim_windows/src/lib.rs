@@ -67,6 +67,17 @@ where
     ptr.write_at_offset(0, value)
 }
 
+fn write_slice<GuestValue>(address: usize, values: &[GuestValue]) -> Option<()>
+where
+    GuestValue: Copy + FromBytes + IntoBytes,
+{
+    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<GuestValue>::from_usize(address);
+    for (index, value) in values.iter().copied().enumerate() {
+        ptr.write_at_offset(index.try_into().ok()?, value)?;
+    }
+    Some(())
+}
+
 fn set_guest_teb(teb_address: usize) -> bool {
     let punchthrough = litebox_common_linux::PunchthroughSyscall::SetFsBase { addr: teb_address };
     let Some(token) =

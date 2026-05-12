@@ -12,22 +12,27 @@ use litebox::mm::linux::{
 use litebox::platform::RawPointerProvider;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeExport, PeLoadError, PeParseError, PeParsedFile,
-    Protection, ReadAt,
+    AccessMemory, Fault, MapMemory, MappingInfo, PeDataDirectory, PeExport, PeLoadError,
+    PeParseError, PeParsedFile, Protection, ReadAt,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 use zerocopy::FromZeros;
 
 use crate::nt_types::{
-    ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters, ThreadEnvironmentBlock,
+    KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
+    MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, ProcessEnvironmentBlock, RtlUserProcFlags,
+    RtlUserProcessParameters, ThreadEnvironmentBlock,
 };
-use crate::{NtShimFS, WindowsPageManager, write_value};
+use crate::{NtShimFS, WindowsPageManager, write_slice, write_value};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
+const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
+const KI_USER_INVERTED_FUNCTION_TABLE: &[u8] = b"KiUserInvertedFunctionTable";
+const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 
 /// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
@@ -58,6 +63,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             if !ntdll.has_trampoline {
                 return Err(WindowsLoadError::UnrewrittenNtDll);
             }
+            Self::initialize_ki_user_inverted_function_table(ntdll)?;
             let loader_entry_point = ntdll
                 .export_address(NTDLL_LOADER_ENTRYPOINT)?
                 .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
@@ -131,6 +137,47 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             teb: teb_ptr,
         })
     }
+
+    fn initialize_ki_user_inverted_function_table(
+        ntdll: &LoadedImage,
+    ) -> Result<(), WindowsLoadError> {
+        let Some(table_address) = ntdll.export_address(KI_USER_INVERTED_FUNCTION_TABLE)? else {
+            litebox_util_log::debug!("Guest ntdll.dll does not export KiUserInvertedFunctionTable");
+            return Ok(());
+        };
+
+        let mut entries = Vec::new();
+        if let Some(entry) = ntdll.inverted_function_table_entry()? {
+            entries.push(entry);
+        }
+        entries.sort_by_key(|entry| entry.image_base);
+
+        let current_size =
+            u32::try_from(entries.len()).map_err(|_| PeImageAccessError::AddressOverflow)?;
+        let header = KiUserInvertedFunctionTableHeader {
+            current_size,
+            maximum_size: MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE,
+            epoch: 0,
+            overflow: 0,
+            padding_0: [0; 3],
+        };
+
+        // `KI_USER_INVERTED_FUNCTION_TABLE` lives in ntdll's writable `.mrdata` section.
+        write_value(table_address, header).ok_or(PeImageAccessError::MemoryAccess)?;
+
+        let entries_address = table_address
+            .checked_add(core::mem::size_of::<KiUserInvertedFunctionTableHeader>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_slice(entries_address, &entries).ok_or(PeImageAccessError::MemoryAccess)?;
+
+        litebox_util_log::debug!(
+            table:% = format_args!("{table_address:#x}"),
+            current_size = current_size;
+            "Initialized ntdll!KiUserInvertedFunctionTable"
+        );
+
+        Ok(())
+    }
 }
 
 pub(crate) struct WindowsProcessEnvironment {
@@ -141,6 +188,8 @@ pub(crate) struct WindowsProcessEnvironment {
 
 pub(crate) struct LoadedImage {
     pub(crate) mapping: MappingInfo,
+    image_size: usize,
+    data_directories: Vec<PeDataDirectory>,
     exports: Vec<PeExport>,
     pub(crate) has_trampoline: bool,
 }
@@ -157,6 +206,35 @@ impl LoadedImage {
             .ok_or(PeImageAccessError::AddressOverflow)
             .map(Some)
     }
+
+    fn inverted_function_table_entry(
+        &self,
+    ) -> Result<Option<KiUserInvertedFunctionTableEntry>, PeImageAccessError> {
+        let Some(exception_directory) = self.data_directories.get(IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+        else {
+            return Ok(None);
+        };
+        if exception_directory.size == 0 {
+            return Ok(None);
+        }
+
+        let size_of_table = exception_directory.size;
+        let exception_directory_rva = exception_directory.virtual_address as usize;
+        let exception_directory = self
+            .mapping
+            .base_addr
+            .checked_add(exception_directory_rva)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let image_size =
+            u32::try_from(self.image_size).map_err(|_| PeImageAccessError::AddressOverflow)?;
+
+        Ok(Some(KiUserInvertedFunctionTableEntry {
+            exception_directory,
+            image_base: self.mapping.base_addr,
+            image_size,
+            size_of_table,
+        }))
+    }
 }
 
 pub(crate) fn load_ntdll<FS: NtShimFS>(
@@ -165,7 +243,12 @@ pub(crate) fn load_ntdll<FS: NtShimFS>(
     ntdll_paths: &[&str],
 ) -> Result<Option<LoadedImage>, WindowsLoadError> {
     for path in ntdll_paths {
-        match load_image(fs.clone(), path, page_manager) {
+        match load_image_with_writable_sections(
+            fs.clone(),
+            path,
+            page_manager,
+            NTDLL_WRITABLE_SECTIONS,
+        ) {
             Ok(image) => {
                 litebox_util_log::debug!(path:% = path; "Loaded guest ntdll.dll");
                 return Ok(Some(image));
@@ -184,8 +267,19 @@ pub(crate) fn load_image<FS: NtShimFS>(
     path: &str,
     page_manager: &WindowsPageManager,
 ) -> Result<LoadedImage, WindowsLoadError> {
+    load_image_with_writable_sections(fs, path, page_manager, &[])
+}
+
+fn load_image_with_writable_sections<FS: NtShimFS>(
+    fs: Arc<FS>,
+    path: &str,
+    page_manager: &WindowsPageManager,
+    writable_section_names: &[&[u8]],
+) -> Result<LoadedImage, WindowsLoadError> {
     let file = PeImageFile::open(fs, path)?;
     let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
+    let image_size = parsed.image.size_of_image;
+    let data_directories = parsed.data_directories.clone();
     let exports = parsed.exports.clone();
     parsed
         .parse_trampoline(
@@ -200,10 +294,12 @@ pub(crate) fn load_image<FS: NtShimFS>(
     };
     let mut memory = PeImageMemory;
     let mapping = parsed
-        .load(&mut mapper, &mut memory)
+        .load_with_writable_sections(&mut mapper, &mut memory, writable_section_names)
         .map_err(WindowsLoadError::Load)?;
     Ok(LoadedImage {
         mapping,
+        image_size,
+        data_directories,
         exports,
         has_trampoline,
     })

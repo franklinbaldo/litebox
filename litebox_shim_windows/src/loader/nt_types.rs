@@ -239,6 +239,36 @@ impl core::ops::BitOrAssign for RtlUserProcFlags {
     }
 }
 
+pub(crate) const MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE: u32 = 512;
+
+/// Memory layout of this struct:
+///
+/// ```text
+/// +-----------------------------------+
+/// | KiUserInvertedFunctionTableHeader |
+/// +-------------------------------+++++
+/// | KiUserInvertedFunctionTableEntry[MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE] |
+/// +-----------------------------------+
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct KiUserInvertedFunctionTableHeader {
+    pub current_size: u32,
+    pub maximum_size: u32,
+    pub epoch: u32,
+    pub overflow: u8,
+    pub padding_0: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct KiUserInvertedFunctionTableEntry {
+    pub exception_directory: usize,
+    pub image_base: usize,
+    pub image_size: u32,
+    pub size_of_table: u32,
+}
+
 /// Memory layout of this struct:
 ///
 /// ```text

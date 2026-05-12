@@ -104,8 +104,6 @@ const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
 /// A PE data directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeDataDirectory {
-    /// Directory index, one of the `IMAGE_DIRECTORY_ENTRY_*` constants.
-    pub index: usize,
     /// Directory RVA.
     pub virtual_address: u32,
     /// Directory byte size.
@@ -222,6 +220,18 @@ impl PeParsedFile {
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
+    ) -> Result<MappingInfo, PeLoadError<M::Error>> {
+        self.load_with_writable_sections(mapper, mem, &[])
+    }
+
+    /// Load the PE image into memory, keeping selected sections writable.
+    ///
+    /// This is intended for target-specific loader data such as ntdll's `.mrdata`.
+    pub fn load_with_writable_sections<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        writable_section_names: &[&[u8]],
     ) -> Result<MappingInfo, PeLoadError<M::Error>> {
         let preferred_base = self.image.image_base;
         let image_size =
@@ -346,7 +356,7 @@ impl PeParsedFile {
                 .protect(
                     protect_start,
                     protect_end - protect_start,
-                    &Protection::from_section_characteristics(section.characteristics.get(LE)),
+                    &Protection::from_section(section, writable_section_names),
                 )
                 .map_err(PeLoadError::Map)?;
         }
@@ -576,15 +586,14 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
 
     let data_directories = pe
         .data_directories()
-        .enumerate()
-        .filter_map(|(index, directory)| {
+        .iter()
+        .map(|directory| {
             let virtual_address = directory.virtual_address.get(LE);
             let size = directory.size.get(LE);
-            (virtual_address != 0).then_some(PeDataDirectory {
-                index,
+            PeDataDirectory {
                 virtual_address,
                 size,
-            })
+            }
         })
         .collect();
 
@@ -702,13 +711,31 @@ pub struct Protection {
 }
 
 impl Protection {
-    fn from_section_characteristics(characteristics: u32) -> Self {
-        Self {
+    fn from_section(section: &pe::ImageSectionHeader, writable_section_names: &[&[u8]]) -> Self {
+        let characteristics = section.characteristics.get(LE);
+        let mut protection = Self {
             read: characteristics & pe::IMAGE_SCN_MEM_READ != 0,
             write: characteristics & pe::IMAGE_SCN_MEM_WRITE != 0,
             execute: characteristics & pe::IMAGE_SCN_MEM_EXECUTE != 0,
+        };
+        if writable_section_names
+            .iter()
+            .any(|name| section_name_eq(section, name))
+        {
+            protection.write = true;
         }
+
+        protection
     }
+}
+
+fn section_name_eq(section: &pe::ImageSectionHeader, name: &[u8]) -> bool {
+    let end = section
+        .name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(section.name.len());
+    &section.name[..end] == name
 }
 
 fn parse_imports(pe: &PeFile64<'_>) -> Result<Vec<PeImport>, object::read::Error> {
