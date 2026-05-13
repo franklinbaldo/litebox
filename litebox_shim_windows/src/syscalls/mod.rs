@@ -22,6 +22,9 @@ use crate::{Handle, ProcessHandle};
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
+    NtClose {
+        handle: Handle,
+    },
     NtCreateEvent {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -131,6 +134,9 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         }
 
         match NtSysno::from_raw(pt_regs.orig_rax)? {
+            NtSysno::NtClose => Some(sys_req!(NtClose {
+                handle: { Handle::from_raw },
+            })),
             NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
                 event_handle:*,
                 desired_access,

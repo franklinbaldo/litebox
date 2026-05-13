@@ -1045,6 +1045,29 @@ mod tests {
     }
 
     #[test]
+    fn nt_close_removes_registry_key_handle() {
+        let task = test_task();
+        let key_handle = open_code_page_key(&task);
+        let value_name: std::vec::Vec<u16> = "ACP".encode_utf16().collect();
+        let value_name = unicode_string(&value_name);
+        let mut information = [0u8; 64];
+        let mut result_length = 0;
+
+        assert_eq!(task.handle_nt_close(key_handle), NtStatus::SUCCESS);
+        assert_eq!(
+            task.handle_nt_query_value_key(
+                key_handle,
+                const_ptr(&value_name),
+                class_value(KeyValueInformationClass::Partial),
+                mut_byte_ptr(&mut information),
+                u32::try_from(information.len()).unwrap(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+    }
+
+    #[test]
     fn nt_query_value_key_rejects_invalid_arguments() {
         let task = test_task();
         let key_handle = open_code_page_key(&task);

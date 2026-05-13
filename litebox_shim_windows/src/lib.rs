@@ -118,6 +118,9 @@ impl ProcessHandle {
 pub(crate) type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
+type WindowsEventHandle = alloc::sync::Arc<litebox::fd::TypedFd<event::EventSubsystem>>;
+type WindowsRegistryKeyHandle =
+    alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
 
 pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
@@ -440,6 +443,10 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtClose { handle } => {
+                let status = self.handle_nt_close(handle);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClearEvent { event_handle } => {
                 let status = event::handle_nt_clear_event(
                     &self.global.litebox,
@@ -629,6 +636,63 @@ impl<FS: NtShimFS> Task<FS> {
 
         ctx.rax = result.as_raw().cast_unsigned() as usize;
         op
+    }
+
+    pub(crate) fn handle_nt_close(&self, handle: Handle) -> NtStatus {
+        let status = self
+            .run_on_raw_handle(
+                handle,
+                |raw_fd, _event| self.close_raw_handle::<event::EventSubsystem>(raw_fd),
+                |raw_fd, _key| self.close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd),
+            )
+            .unwrap_or(NtStatus::INVALID_HANDLE);
+
+        if status == NtStatus::SUCCESS {
+            litebox_util_log::debug!(
+                handle:% = format_args!("{:#x}", handle.as_raw());
+                "Handled NtClose syscall"
+            );
+        }
+
+        status
+    }
+
+    pub(crate) fn run_on_raw_handle<R>(
+        &self,
+        handle: Handle,
+        event: impl FnOnce(usize, WindowsEventHandle) -> R,
+        registry_key: impl FnOnce(usize, WindowsRegistryKeyHandle) -> R,
+    ) -> Result<R, NtStatus> {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return Err(NtStatus::INVALID_HANDLE);
+        };
+        let handles = self.process.handles.read();
+        if let Ok(fd) = handles.fd_from_raw_integer::<event::EventSubsystem>(raw_fd) {
+            drop(handles);
+            return Ok(event(raw_fd, fd));
+        }
+        if let Ok(fd) = handles.fd_from_raw_integer::<registry::RegistryKeySubsystem>(raw_fd) {
+            drop(handles);
+            return Ok(registry_key(raw_fd, fd));
+        }
+
+        Err(NtStatus::INVALID_HANDLE)
+    }
+
+    fn close_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+        &self,
+        raw_fd: usize,
+    ) -> NtStatus {
+        let typed = {
+            let mut handles = self.process.handles.write();
+            handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
+        };
+        let Some(typed) = typed else {
+            return NtStatus::INVALID_HANDLE;
+        };
+        let removed = self.global.litebox.descriptor_table_mut().remove(&typed);
+        debug_assert!(removed.is_some());
+        NtStatus::SUCCESS
     }
 
     fn handle_exception_request(
