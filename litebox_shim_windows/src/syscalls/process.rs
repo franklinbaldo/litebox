@@ -178,6 +178,7 @@ mod tests {
         Task {
             global: Arc::new(GlobalState {
                 platform,
+                registry: crate::syscalls::registry::RegistryStore::new(&litebox),
                 litebox,
                 page_manager,
                 qpc_boot_instant: platform.now(),

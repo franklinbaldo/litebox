@@ -41,7 +41,7 @@ pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
-use crate::syscalls::{NtSysno, SyscallRequest, mm, sysinfo};
+use crate::syscalls::{NtSysno, SyscallRequest, mm, registry, sysinfo};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -79,6 +79,11 @@ impl Handle {
     #[must_use]
     pub(crate) const fn as_raw(self) -> usize {
         self.0
+    }
+
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.as_raw() == 0
     }
 }
 
@@ -261,6 +266,7 @@ impl WindowsShimBuilder {
             platform,
             page_manager: PageManager::new(&self.litebox),
             qpc_boot_instant: platform.now(),
+            registry: registry::RegistryStore::new(&self.litebox),
             litebox: self.litebox,
             _fs: PhantomData,
         });
@@ -327,6 +333,7 @@ struct GlobalState<FS: NtShimFS> {
     litebox: LiteBox<Platform>,
     page_manager: WindowsPageManager,
     qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
+    registry: registry::RegistryStore,
     _fs: PhantomData<FS>,
 }
 
@@ -438,6 +445,32 @@ impl<FS: NtShimFS> Task<FS> {
                     &self.global.litebox,
                     &self.process.handles,
                     event_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenKey {
+                key_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.handle_nt_open_key(key_handle, desired_access, object_attributes);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryValueKey {
+                key_handle,
+                value_name,
+                key_value_information_class,
+                key_value_information,
+                length,
+                result_length,
+            } => {
+                let status = self.handle_nt_query_value_key(
+                    key_handle,
+                    value_name,
+                    key_value_information_class,
+                    key_value_information,
+                    length,
+                    result_length,
                 );
                 (status, ContinueOperation::Resume)
             }

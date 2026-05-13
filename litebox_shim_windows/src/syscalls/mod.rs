@@ -7,7 +7,9 @@ mod nt_sysno {
 
 pub(crate) mod event;
 pub(crate) mod mm;
+pub(crate) mod object;
 pub(crate) mod process;
+pub(crate) mod registry;
 pub(crate) mod sysinfo;
 
 pub(crate) use nt_sysno::NtSysno;
@@ -23,9 +25,22 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtCreateEvent {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
-        object_attributes: Option<Platform::RawConstPointer<event::ObjectAttributes>>,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
         event_type: u32,
         initial_state: u8,
+    },
+    NtOpenKey {
+        key_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+    },
+    NtQueryValueKey {
+        key_handle: Handle,
+        value_name: Platform::RawConstPointer<crate::loader::nt_types::UnicodeString>,
+        key_value_information_class: u32,
+        key_value_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        result_length: Platform::RawMutPointer<u32>,
     },
     NtClearEvent {
         event_handle: Handle,
@@ -122,6 +137,19 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 event_type,
                 initial_state,
+            })),
+            NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
+                key_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
+                key_handle:{Handle::from_raw},
+                value_name:*,
+                key_value_information_class,
+                key_value_information:*,
+                length,
+                result_length:*,
             })),
             NtSysno::NtClearEvent => Some(sys_req!(NtClearEvent {
                 event_handle: { Handle::from_raw },

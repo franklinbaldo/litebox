@@ -5,25 +5,14 @@ use int_enum::IntEnum;
 use litebox::LiteBox;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, TimeProvider};
+use litebox::platform::{RawMutPointer as _, TimeProvider};
 use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::nt_status::NtStatus;
 use litebox_platform_multiplex::Platform;
-use zerocopy::{FromBytes, Immutable};
 
 use crate::{Handle, WindowsHandleStore, insert_raw_handle, raw_handle_entry, remove_raw_handle};
 
-// See <https://ntdoc.m417z.com/object_attributes> for more details
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
-pub(crate) struct ObjectAttributes {
-    length: u32,
-    root_directory: usize,
-    object_name: usize,
-    attributes: u32,
-    security_descriptor: usize,
-    security_quality_of_service: usize,
-}
+use super::object::{ObjectAttributes, read_object_attributes};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -106,15 +95,13 @@ pub(crate) fn handle_nt_create_event(
     };
 
     if let Some(object_attributes) = object_attributes {
-        let Some(object_attributes) = object_attributes.read_at_offset(0) else {
-            return NtStatus::ACCESS_VIOLATION;
+        let object_attributes = match read_object_attributes(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
         };
-        if object_attributes.length as usize != core::mem::size_of::<ObjectAttributes>() {
-            return NtStatus::INVALID_PARAMETER;
-        }
-        if object_attributes.root_directory != 0 || object_attributes.object_name != 0 {
+        if !object_attributes.root_directory.is_null() || object_attributes.object_name != 0 {
             litebox_util_log::warn!(
-                root_directory = object_attributes.root_directory,
+                root_directory = object_attributes.root_directory.as_raw(),
                 object_name = object_attributes.object_name;
                 "NtCreateEvent: root_directory and object_name are not supported"
             );
@@ -222,9 +209,10 @@ pub(crate) fn handle_nt_set_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::syscalls::object::ObjectAttributes;
     use litebox::fd::RawDescriptorStorage;
-    use litebox::platform::RawPointerProvider;
-    use zerocopy::IntoBytes;
+    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+    use zerocopy::{FromBytes, IntoBytes};
 
     extern crate std;
 
@@ -315,7 +303,7 @@ mod tests {
         let mut handle = Handle::from_raw(usize::MAX);
         let object_attributes = ObjectAttributes {
             length: u32::try_from(core::mem::size_of::<ObjectAttributes>()).unwrap(),
-            root_directory: 0,
+            root_directory: Handle::default(),
             object_name: 0,
             attributes: 0,
             security_descriptor: 0,
