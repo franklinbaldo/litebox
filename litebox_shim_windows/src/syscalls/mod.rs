@@ -7,6 +7,7 @@ mod nt_sysno {
 
 pub(crate) mod event;
 pub(crate) mod mm;
+pub(crate) mod process;
 pub(crate) mod sysinfo;
 
 pub(crate) use nt_sysno::NtSysno;
@@ -69,6 +70,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         memory_information: Platform::RawMutPointer<u8>,
         memory_information_length: usize,
         return_length: Option<Platform::RawMutPointer<usize>>,
+    },
+    NtQueryInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawMutPointer<u8>,
+        process_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtQueryPerformanceCounter {
         performance_counter: Platform::RawMutPointer<i64>,
@@ -157,6 +165,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 memory_information_class,
                 memory_information:*,
                 memory_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQueryInformationProcess => Some(sys_req!(NtQueryInformationProcess {
+                process_handle:{ProcessHandle::from_raw},
+                process_information_class,
+                process_information:*,
+                process_information_length,
                 return_length:*,
             })),
             NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {

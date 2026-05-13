@@ -21,6 +21,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use litebox::LiteBox;
 use litebox::mm::PageManager;
+use litebox::platform::CrngProvider as _;
 use litebox::platform::PunchthroughToken as _;
 use litebox::platform::{
     PunchthroughProvider as _, RawConstPointer as _, RawMutPointer, RawPointerProvider,
@@ -40,7 +41,7 @@ pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
-use crate::syscalls::{NtSysno, SyscallRequest, mm, sysinfo};
+use crate::syscalls::{NtSysno, SyscallRequest, mm, process, sysinfo};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -288,16 +289,19 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let handles = Arc::new(WindowsHandleStore::new(
             litebox::fd::RawDescriptorStorage::new(),
         ));
+        let process_cookie = generate_process_cookie(litebox_platform_multiplex::platform());
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 entry_point: load_info.entry_point,
                 stack_top: load_info.stack_top,
+                peb_address: load_info.environment.peb,
                 teb_address: load_info.environment.teb,
                 litebox: self.litebox.clone(),
                 page_manager: self.page_manager.clone(),
                 handles,
                 qpc_boot_instant: litebox_platform_multiplex::platform().now(),
+                process_cookie,
                 exit_code: exit_code.clone(),
                 _fs: PhantomData,
             },
@@ -320,11 +324,13 @@ impl<FS: NtShimFS> WindowsShim<FS> {
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
     entry_point: usize,
     stack_top: usize,
+    peb_address: usize,
     teb_address: usize,
     litebox: Arc<LiteBox<Platform>>,
     page_manager: Arc<WindowsPageManager>,
     handles: Arc<WindowsHandleStore>,
     qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
+    process_cookie: u32,
     exit_code: Arc<AtomicI32>,
     _fs: PhantomData<FS>,
 }
@@ -488,6 +494,24 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+                return_length,
+            } => {
+                let status = process::handle_nt_query_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
+                    return_length,
+                    self.peb_address,
+                    self.process_cookie,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
@@ -554,6 +578,13 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         // TODO: Handle host interrupts for Windows guest waits/APCs.
         ContinueOperation::Terminate
     }
+}
+
+fn generate_process_cookie(platform: &Platform) -> u32 {
+    let mut bytes = [0; size_of::<u32>()];
+    platform.fill_bytes_crng(&mut bytes);
+    let cookie = u32::from_ne_bytes(bytes);
+    if cookie == 0 { 1 } else { cookie }
 }
 
 fn default_fs(

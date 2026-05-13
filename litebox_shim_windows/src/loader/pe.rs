@@ -132,7 +132,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         teb.process_environment_block = peb_ptr;
         write_value(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
         Ok(WindowsProcessEnvironment {
-            _peb: peb_ptr,
+            peb: peb_ptr,
             _process_parameters: process_parameters_ptr,
             teb: teb_ptr,
         })
@@ -181,7 +181,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
 }
 
 pub(crate) struct WindowsProcessEnvironment {
-    pub(crate) _peb: usize,
+    pub(crate) peb: usize,
     pub(crate) _process_parameters: usize,
     pub(crate) teb: usize,
 }
