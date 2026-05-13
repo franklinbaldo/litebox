@@ -512,6 +512,20 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySystemInformation {
+                system_information_class,
+                system_information,
+                system_information_length,
+                return_length,
+            } => {
+                let status = sysinfo::handle_nt_query_system_information(
+                    system_information_class,
+                    system_information,
+                    system_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtManageHotPatch => {
                 (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
             }

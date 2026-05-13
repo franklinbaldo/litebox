@@ -74,6 +74,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         performance_counter: Platform::RawMutPointer<i64>,
         performance_frequency: Platform::RawMutPointer<i64>,
     },
+    NtQuerySystemInformation {
+        system_information_class: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     /// TODO: not supported yet
     NtManageHotPatch,
 }
@@ -156,6 +162,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
                 performance_counter:*,
                 performance_frequency:*,
+            })),
+            NtSysno::NtQuerySystemInformation => Some(sys_req!(NtQuerySystemInformation {
+                system_information_class,
+                system_information:*,
+                system_information_length,
+                return_length:*,
             })),
             NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
