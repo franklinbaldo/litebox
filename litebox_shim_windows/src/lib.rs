@@ -41,7 +41,7 @@ pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
-use crate::syscalls::{NtSysno, SyscallRequest, mm, process, sysinfo};
+use crate::syscalls::{NtSysno, SyscallRequest, mm, sysinfo};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -256,20 +256,25 @@ impl WindowsShimBuilder {
     /// Build the shim.
     #[must_use]
     pub fn build<FS: NtShimFS>(self) -> WindowsShim<FS> {
-        let page_manager = Arc::new(PageManager::new(&self.litebox));
-        WindowsShim {
-            litebox: Arc::new(self.litebox),
-            page_manager,
+        let platform = litebox_platform_multiplex::platform();
+        let global = Arc::new(GlobalState {
+            platform,
+            page_manager: PageManager::new(&self.litebox),
+            qpc_boot_instant: platform.now(),
+            litebox: self.litebox,
             _fs: PhantomData,
-        }
+        });
+        WindowsShim(global)
     }
 }
 
 /// A placeholder Windows shim.
-pub struct WindowsShim<FS: NtShimFS> {
-    litebox: Arc<LiteBox<Platform>>,
-    page_manager: Arc<WindowsPageManager>,
-    _fs: PhantomData<FS>,
+pub struct WindowsShim<FS: NtShimFS>(Arc<GlobalState<FS>>);
+
+impl<FS: NtShimFS> Clone for WindowsShim<FS> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
 impl<FS: NtShimFS> WindowsShim<FS> {
@@ -284,61 +289,97 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
-        let load_info = loader::PeLoader::new(fs, &self.page_manager).load(path)?;
-        let exit_code = Arc::new(AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE));
-        let handles = Arc::new(WindowsHandleStore::new(
-            litebox::fd::RawDescriptorStorage::new(),
-        ));
-        let process_cookie = generate_process_cookie(litebox_platform_multiplex::platform());
+        let load_info = loader::PeLoader::new(fs, &self.0.page_manager).load(path)?;
+        let process = Arc::new(Process {
+            mapping: load_info.application_mapping,
+            _ntdll_mapping: load_info.ntdll_mapping,
+            handles: WindowsHandleStore::new(litebox::fd::RawDescriptorStorage::new()),
+            peb_address: load_info.environment.peb,
+            cookie: generate_process_cookie(self.0.platform),
+            exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
+        });
 
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
-                entry_point: load_info.entry_point,
-                stack_top: load_info.stack_top,
-                peb_address: load_info.environment.peb,
-                teb_address: load_info.environment.teb,
-                litebox: self.litebox.clone(),
-                page_manager: self.page_manager.clone(),
-                handles,
-                qpc_boot_instant: litebox_platform_multiplex::platform().now(),
-                process_cookie,
-                exit_code: exit_code.clone(),
-                _fs: PhantomData,
+                task: Task {
+                    global: self.0.clone(),
+                    process: process.clone(),
+                    entry_point: load_info.entry_point,
+                    stack_top: load_info.stack_top,
+                    teb_address: load_info.environment.teb,
+                },
+                _not_send: PhantomData,
             },
-            process: WindowsShimProcess {
-                mapping: load_info.application_mapping,
-                _ntdll_mapping: load_info.ntdll_mapping,
-                exit_code,
-            },
+            process: WindowsShimProcess(process),
         })
     }
 
     /// Returns the LiteBox object for the shim.
     #[must_use]
     pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.litebox
+        &self.0.litebox
     }
+}
+
+/// Global shim state shared by all Windows tasks loaded by this shim.
+struct GlobalState<FS: NtShimFS> {
+    platform: &'static Platform,
+    litebox: LiteBox<Platform>,
+    page_manager: WindowsPageManager,
+    qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
+    _fs: PhantomData<FS>,
+}
+
+/// Per-process Windows state shared by every thread in the process.
+struct Process {
+    mapping: MappingInfo,
+    _ntdll_mapping: Option<MappingInfo>,
+    handles: WindowsHandleStore,
+    peb_address: usize,
+    cookie: u32,
+    exit_code: AtomicI32,
+}
+
+struct Task<FS: NtShimFS> {
+    global: Arc<GlobalState<FS>>,
+    process: Arc<Process>,
+    entry_point: usize,
+    stack_top: usize,
+    teb_address: usize,
 }
 
 /// The shim entrypoint object passed to the platform.
 pub struct WindowsShimEntrypoints<FS: NtShimFS> {
-    entry_point: usize,
-    stack_top: usize,
-    peb_address: usize,
-    teb_address: usize,
-    litebox: Arc<LiteBox<Platform>>,
-    page_manager: Arc<WindowsPageManager>,
-    handles: Arc<WindowsHandleStore>,
-    qpc_boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
-    process_cookie: u32,
-    exit_code: Arc<AtomicI32>,
-    _fs: PhantomData<FS>,
+    task: Task<FS>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.task.init(ctx)
+    }
+
+    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.task.handle_syscall_request(ctx)
+    }
+
+    fn exception(
+        &self,
+        ctx: &mut Self::ExecutionContext,
+        info: &ExceptionInfo,
+    ) -> ContinueOperation {
+        self.task.handle_exception_request(ctx, info)
+    }
+
+    fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+        self.task.handle_interrupt_request(ctx)
+    }
+}
+
+impl<FS: NtShimFS> Task<FS> {
+    fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         ctx.rip = self.entry_point;
         ctx.rsp = self.stack_top;
         ctx.eflags = 0x202;
@@ -360,7 +401,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         ContinueOperation::Resume
     }
 
-    fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             litebox_util_log::debug!(
                 syscall:? = NtSysno::from_raw(ctx.orig_rax),
@@ -382,8 +423,8 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 initial_state,
             } => {
                 let status = event::handle_nt_create_event(
-                    self.litebox.as_ref(),
-                    &self.handles,
+                    &self.global.litebox,
+                    &self.process.handles,
                     event_handle,
                     desired_access,
                     object_attributes,
@@ -394,8 +435,8 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
             }
             SyscallRequest::NtClearEvent { event_handle } => {
                 let status = event::handle_nt_clear_event(
-                    self.litebox.as_ref(),
-                    &self.handles,
+                    &self.global.litebox,
+                    &self.process.handles,
                     event_handle,
                 );
                 (status, ContinueOperation::Resume)
@@ -405,8 +446,8 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 previous_state,
             } => {
                 let status = event::handle_nt_reset_event(
-                    self.litebox.as_ref(),
-                    &self.handles,
+                    &self.global.litebox,
+                    &self.process.handles,
                     event_handle,
                     previous_state,
                 );
@@ -417,8 +458,8 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 previous_state,
             } => {
                 let status = event::handle_nt_set_event(
-                    self.litebox.as_ref(),
-                    &self.handles,
+                    &self.global.litebox,
+                    &self.process.handles,
                     event_handle,
                     previous_state,
                 );
@@ -433,7 +474,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 protect,
             } => {
                 let status = mm::handle_nt_allocate_virtual_memory(
-                    &self.page_manager,
+                    &self.global.page_manager,
                     process_handle,
                     base_address,
                     zero_bits,
@@ -450,7 +491,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 free_type,
             } => {
                 let status = mm::handle_nt_free_virtual_memory(
-                    &self.page_manager,
+                    &self.global.page_manager,
                     process_handle,
                     base_address,
                     region_size,
@@ -466,7 +507,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 old_protect,
             } => {
                 let status = mm::handle_nt_protect_virtual_memory(
-                    &self.page_manager,
+                    &self.global.page_manager,
                     process_handle,
                     base_address,
                     region_size,
@@ -484,7 +525,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 return_length,
             } => {
                 let status = mm::handle_nt_query_virtual_memory(
-                    &self.page_manager,
+                    &self.global.page_manager,
                     process_handle,
                     base_address,
                     memory_information_class,
@@ -501,14 +542,12 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 process_information_length,
                 return_length,
             } => {
-                let status = process::handle_nt_query_information_process(
+                let status = self.handle_nt_query_information_process(
                     process_handle,
                     process_information_class,
                     process_information,
                     process_information_length,
                     return_length,
-                    self.peb_address,
-                    self.process_cookie,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -521,7 +560,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                     (NtStatus::INVALID_HANDLE, ContinueOperation::Resume)
                 } else {
                     // TODO: Terminate all threads except the calling one if process_handle is zero.
-                    self.exit_code.store(exit_status, Ordering::Relaxed);
+                    self.process.exit_code.store(exit_status, Ordering::Relaxed);
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
@@ -532,7 +571,7 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
                 let status = sysinfo::handle_nt_query_performance_counter(
                     performance_counter,
                     performance_frequency,
-                    self.qpc_boot_instant,
+                    self.global.qpc_boot_instant,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -559,22 +598,30 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
         op
     }
 
-    fn exception(
+    fn handle_exception_request(
         &self,
-        ctx: &mut Self::ExecutionContext,
+        ctx: &mut litebox_common_linux::PtRegs,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
         litebox_util_log::debug!(
             exception:? = info.exception,
             rip:% = format_args!("{:#x}", ctx.rip),
-            cr2:% = format_args!("{:#x}", info.cr2);
+            cr2:% = format_args!("{:#x}", info.cr2),
+            teb:% = format_args!("{:#x}", self.teb_address);
             "Windows guest exception"
         );
         // TODO: Translate hardware exceptions into Windows SEH where appropriate.
         ContinueOperation::Terminate
     }
 
-    fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+    fn handle_interrupt_request(
+        &self,
+        _ctx: &mut litebox_common_linux::PtRegs,
+    ) -> ContinueOperation {
+        litebox_util_log::debug!(
+            teb:% = format_args!("{:#x}", self.teb_address);
+            "Windows guest interrupt"
+        );
         // TODO: Handle host interrupts for Windows guest waits/APCs.
         ContinueOperation::Terminate
     }
@@ -613,23 +660,19 @@ pub struct LoadedProgram<FS: NtShimFS> {
 }
 
 /// A placeholder handle to a process loaded via [`WindowsShim::load_program`].
-pub struct WindowsShimProcess {
-    mapping: MappingInfo,
-    _ntdll_mapping: Option<MappingInfo>,
-    exit_code: Arc<AtomicI32>,
-}
+pub struct WindowsShimProcess(Arc<Process>);
 
 impl WindowsShimProcess {
     /// Returns information about the loaded PE image mapping.
     #[must_use]
     pub fn mapping(&self) -> &MappingInfo {
-        &self.mapping
+        &self.0.mapping
     }
 
     /// Wait for the process to exit, returning its exit code.
     #[must_use]
     pub fn wait(&self) -> i32 {
         // TODO: Wait for the NT process object once process lifecycle exists.
-        self.exit_code.load(Ordering::Relaxed)
+        self.0.exit_code.load(Ordering::Relaxed)
     }
 }

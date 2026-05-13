@@ -9,7 +9,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::ProcessHandle;
+use crate::{NtShimFS, ProcessHandle, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
@@ -41,56 +41,59 @@ struct ProcessBasicInformation {
     inherited_from_unique_process_id: usize,
 }
 
-pub(crate) fn handle_nt_query_information_process(
-    process_handle: ProcessHandle,
-    process_information_class: u32,
-    process_information: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u8>,
-    process_information_length: u32,
-    return_length: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>>,
-    peb_address: usize,
-    process_cookie: u32,
-) -> NtStatus {
-    if !process_handle.is_current() {
-        return NtStatus::INVALID_HANDLE;
-    }
+impl<FS: NtShimFS> Task<FS> {
+    pub(crate) fn handle_nt_query_information_process(
+        &self,
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u8>,
+        process_information_length: u32,
+        return_length: Option<
+            <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>,
+        >,
+    ) -> NtStatus {
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
 
-    let Ok(process_information_class) =
-        ProcessInformationClass::try_from(process_information_class)
-    else {
-        litebox_util_log::debug!(
-            process_information_class = process_information_class;
-            "Unsupported NtQueryInformationProcess class"
-        );
-        return NtStatus::INVALID_INFO_CLASS;
-    };
+        let Ok(process_information_class) =
+            ProcessInformationClass::try_from(process_information_class)
+        else {
+            litebox_util_log::debug!(
+                process_information_class = process_information_class;
+                "Unsupported NtQueryInformationProcess class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
 
-    match process_information_class {
-        ProcessInformationClass::BasicInformation => write_fixed_information(
-            process_information,
-            process_information_length,
-            return_length,
-            process_basic_information(peb_address),
-        ),
-        ProcessInformationClass::DebugPort | ProcessInformationClass::Wow64Information => {
-            write_fixed_information(
+        match process_information_class {
+            ProcessInformationClass::BasicInformation => write_fixed_information(
                 process_information,
                 process_information_length,
                 return_length,
-                0usize,
-            )
+                process_basic_information(self.process.peb_address),
+            ),
+            ProcessInformationClass::DebugPort | ProcessInformationClass::Wow64Information => {
+                write_fixed_information(
+                    process_information,
+                    process_information_length,
+                    return_length,
+                    0usize,
+                )
+            }
+            ProcessInformationClass::DebugFlags => write_fixed_information(
+                process_information,
+                process_information_length,
+                return_length,
+                PROCESS_DEBUG_FLAGS_NO_DEBUGGER,
+            ),
+            ProcessInformationClass::Cookie => write_fixed_information(
+                process_information,
+                process_information_length,
+                return_length,
+                self.process.cookie,
+            ),
         }
-        ProcessInformationClass::DebugFlags => write_fixed_information(
-            process_information,
-            process_information_length,
-            return_length,
-            PROCESS_DEBUG_FLAGS_NO_DEBUGGER,
-        ),
-        ProcessInformationClass::Cookie => write_fixed_information(
-            process_information,
-            process_information_length,
-            return_length,
-            process_cookie,
-        ),
     }
 }
 
@@ -138,7 +141,14 @@ fn process_basic_information(peb_address: usize) -> ProcessBasicInformation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox::platform::RawPointerProvider;
+    use crate::{GlobalState, Process, WindowsHandleStore, WindowsPageManager};
+    use alloc::sync::Arc;
+    use core::marker::PhantomData;
+    use core::sync::atomic::AtomicI32;
+    use litebox::LiteBox;
+    use litebox::fd::RawDescriptorStorage;
+    use litebox::platform::{RawPointerProvider, TimeProvider as _};
+    use litebox_common_windows::loader::MappingInfo;
 
     extern crate std;
 
@@ -158,6 +168,37 @@ mod tests {
 
     fn class_value(class: ProcessInformationClass) -> u32 {
         class as u32
+    }
+
+    fn test_task(peb_address: usize, cookie: u32) -> Task<crate::DefaultFS> {
+        init_platform();
+        let platform = litebox_platform_multiplex::platform();
+        let litebox = LiteBox::new(platform);
+        let page_manager = WindowsPageManager::new(&litebox);
+        Task {
+            global: Arc::new(GlobalState {
+                platform,
+                litebox,
+                page_manager,
+                qpc_boot_instant: platform.now(),
+                _fs: PhantomData,
+            }),
+            process: Arc::new(Process {
+                mapping: MappingInfo {
+                    base_addr: 0,
+                    image_size: 0,
+                    entry_point: 0,
+                },
+                _ntdll_mapping: None,
+                handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
+                peb_address,
+                cookie,
+                exit_code: AtomicI32::new(0),
+            }),
+            entry_point: 0,
+            stack_top: 0,
+            teb_address: 0,
+        }
     }
 
     #[test]
@@ -181,16 +222,15 @@ mod tests {
             inherited_from_unique_process_id: usize::MAX,
         };
         let mut return_length = 0;
+        let task = test_task(peb_address, 0);
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 class_value(ProcessInformationClass::BasicInformation),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<ProcessBasicInformation>()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
-                peb_address,
-                0,
             ),
             NtStatus::SUCCESS
         );
@@ -218,58 +258,51 @@ mod tests {
         let mut wow64_information = usize::MAX;
         let mut debug_flags = 0;
         let mut cookie = 0;
+        let task = test_task(0, process_cookie);
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 class_value(ProcessInformationClass::DebugPort),
                 mut_byte_ptr(&mut debug_port),
                 u32::try_from(size_of::<usize>()).unwrap(),
                 None,
-                0,
-                process_cookie,
             ),
             NtStatus::SUCCESS
         );
         assert_eq!(debug_port, 0);
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 class_value(ProcessInformationClass::Wow64Information),
                 mut_byte_ptr(&mut wow64_information),
                 u32::try_from(size_of::<usize>()).unwrap(),
                 None,
-                0,
-                process_cookie,
             ),
             NtStatus::SUCCESS
         );
         assert_eq!(wow64_information, 0);
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 class_value(ProcessInformationClass::DebugFlags),
                 mut_byte_ptr(&mut debug_flags),
                 u32::try_from(size_of::<u32>()).unwrap(),
                 None,
-                0,
-                process_cookie,
             ),
             NtStatus::SUCCESS
         );
         assert_eq!(debug_flags, PROCESS_DEBUG_FLAGS_NO_DEBUGGER);
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 class_value(ProcessInformationClass::Cookie),
                 mut_byte_ptr(&mut cookie),
                 u32::try_from(size_of::<u32>()).unwrap(),
                 None,
-                0,
-                process_cookie,
             ),
             NtStatus::SUCCESS
         );
@@ -281,16 +314,15 @@ mod tests {
         init_platform();
         let mut info = [0u8; size_of::<ProcessBasicInformation>()];
         let mut return_length = 0;
+        let task = test_task(0, 0);
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 class_value(ProcessInformationClass::BasicInformation),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<ProcessBasicInformation>() - 1).unwrap(),
                 Some(mut_ptr(&mut return_length)),
-                0,
-                0,
             ),
             NtStatus::INFO_LENGTH_MISMATCH
         );
@@ -300,27 +332,23 @@ mod tests {
         );
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::from_raw(0x1234),
                 class_value(ProcessInformationClass::BasicInformation),
                 mut_byte_ptr(&mut info),
                 u32::try_from(info.len()).unwrap(),
                 None,
-                0,
-                0,
             ),
             NtStatus::INVALID_HANDLE
         );
 
         assert_eq!(
-            handle_nt_query_information_process(
+            task.handle_nt_query_information_process(
                 ProcessHandle::CURRENT,
                 0xffff,
                 mut_byte_ptr(&mut info),
                 u32::try_from(info.len()).unwrap(),
                 None,
-                0,
-                0,
             ),
             NtStatus::INVALID_INFO_CLASS
         );
