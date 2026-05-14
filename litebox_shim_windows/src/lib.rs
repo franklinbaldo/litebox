@@ -42,7 +42,7 @@ pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
-use crate::syscalls::{NtSysno, SyscallRequest, mm, registry, sysinfo, trace};
+use crate::syscalls::{NtSysno, SyscallRequest, hard_error, mm, registry, sysinfo, trace};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -690,6 +690,24 @@ impl<FS: NtShimFS> Task<FS> {
                 fields,
             } => {
                 let status = trace::handle_nt_trace_event(trace_handle, flags, field_size, fields);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtRaiseHardError {
+                error_status,
+                number_of_parameters,
+                unicode_string_parameter_mask,
+                parameters,
+                valid_response_options,
+                response,
+            } => {
+                let status = hard_error::handle_nt_raise_hard_error(
+                    error_status,
+                    number_of_parameters,
+                    unicode_string_parameter_mask,
+                    parameters,
+                    valid_response_options,
+                    response,
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtManageHotPatch => {

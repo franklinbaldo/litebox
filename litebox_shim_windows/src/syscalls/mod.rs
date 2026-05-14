@@ -6,6 +6,7 @@ mod nt_sysno {
 }
 
 pub(crate) mod event;
+pub(crate) mod hard_error;
 pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod object;
@@ -18,6 +19,7 @@ pub(crate) use nt_sysno::NtSysno;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
+use litebox_common_windows::nt_status::NtStatus;
 
 use crate::{Handle, ProcessHandle};
 
@@ -129,6 +131,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         flags: u32,
         field_size: u32,
         fields: Option<Platform::RawConstPointer<u8>>,
+    },
+    NtRaiseHardError {
+        error_status: NtStatus,
+        number_of_parameters: u32,
+        unicode_string_parameter_mask: u32,
+        parameters: Option<Platform::RawConstPointer<usize>>,
+        valid_response_options: u32,
+        response: Platform::RawMutPointer<u32>,
     },
     /// TODO: not supported yet
     NtManageHotPatch,
@@ -264,6 +274,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 field_size,
                 fields:*,
             })),
+            NtSysno::NtRaiseHardError => Some(sys_req!(NtRaiseHardError {
+                error_status,
+                number_of_parameters,
+                unicode_string_parameter_mask,
+                parameters:*,
+                valid_response_options,
+                response:*,
+            })),
             NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
         }
@@ -329,6 +347,12 @@ impl ReinterpretTruncatedFromUsize for u64 {
 impl ReinterpretTruncatedFromUsize for isize {
     fn reinterpret_truncated_from_usize(value: usize) -> Self {
         value.cast_signed()
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for NtStatus {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        Self::from_raw(value.truncate())
     }
 }
 
