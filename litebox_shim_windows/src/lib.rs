@@ -42,6 +42,7 @@ pub use loader::nt_types;
 pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
+use crate::syscalls::wait_completion_packet;
 use crate::syscalls::{NtSysno, SyscallRequest, hard_error, mm, registry, sysinfo, trace};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
@@ -122,6 +123,8 @@ pub(crate) type WindowsHandleStore =
 type WindowsEventHandle = alloc::sync::Arc<litebox::fd::TypedFd<event::EventSubsystem>>;
 type WindowsRegistryKeyHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
+type WindowsWaitCompletionPacketHandle =
+    alloc::sync::Arc<litebox::fd::TypedFd<wait_completion_packet::WaitCompletionPacketSubsystem>>;
 type WindowsNlsSectionMappings =
     litebox::sync::Mutex<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 
@@ -458,6 +461,18 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtCreateWaitCompletionPacket {
+                wait_completion_packet_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.handle_nt_create_wait_completion_packet(
+                    wait_completion_packet_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
                 (status, ContinueOperation::Resume)
@@ -743,6 +758,11 @@ impl<FS: NtShimFS> Task<FS> {
                 handle,
                 |raw_fd, _event| self.close_raw_handle::<event::EventSubsystem>(raw_fd),
                 |raw_fd, _key| self.close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd),
+                |raw_fd, _packet| {
+                    self.close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(
+                        raw_fd,
+                    )
+                },
             )
             .unwrap_or(NtStatus::INVALID_HANDLE);
 
@@ -761,6 +781,7 @@ impl<FS: NtShimFS> Task<FS> {
         handle: Handle,
         event: impl FnOnce(usize, WindowsEventHandle) -> R,
         registry_key: impl FnOnce(usize, WindowsRegistryKeyHandle) -> R,
+        wait_completion_packet: impl FnOnce(usize, WindowsWaitCompletionPacketHandle) -> R,
     ) -> Result<R, NtStatus> {
         let Some(raw_fd) = handle.raw_fd() else {
             return Err(NtStatus::INVALID_HANDLE);
@@ -773,6 +794,12 @@ impl<FS: NtShimFS> Task<FS> {
         if let Ok(fd) = handles.fd_from_raw_integer::<registry::RegistryKeySubsystem>(raw_fd) {
             drop(handles);
             return Ok(registry_key(raw_fd, fd));
+        }
+        if let Ok(fd) = handles
+            .fd_from_raw_integer::<wait_completion_packet::WaitCompletionPacketSubsystem>(raw_fd)
+        {
+            drop(handles);
+            return Ok(wait_completion_packet(raw_fd, fd));
         }
 
         Err(NtStatus::INVALID_HANDLE)

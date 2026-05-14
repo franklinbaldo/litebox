@@ -14,6 +14,7 @@ pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
 pub(crate) mod trace;
+pub(crate) mod wait_completion_packet;
 
 pub(crate) use nt_sysno::NtSysno;
 
@@ -35,6 +36,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
         event_type: u32,
         initial_state: u8,
+    },
+    NtCreateWaitCompletionPacket {
+        wait_completion_packet_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
     },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
@@ -185,6 +191,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 event_type,
                 initial_state,
+            })),
+            NtSysno::NtCreateWaitCompletionPacket => Some(sys_req!(NtCreateWaitCompletionPacket {
+                wait_completion_packet_handle:*,
+                desired_access,
+                object_attributes:*,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
