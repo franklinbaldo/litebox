@@ -141,14 +141,7 @@ fn process_basic_information(peb_address: usize) -> ProcessBasicInformation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlobalState, Process, WindowsHandleStore, WindowsPageManager};
-    use alloc::sync::Arc;
-    use core::marker::PhantomData;
-    use core::sync::atomic::AtomicI32;
-    use litebox::LiteBox;
-    use litebox::fd::RawDescriptorStorage;
-    use litebox::platform::{RawPointerProvider, TimeProvider as _};
-    use litebox_common_windows::loader::MappingInfo;
+    use litebox::platform::RawPointerProvider;
 
     extern crate std;
 
@@ -168,38 +161,6 @@ mod tests {
 
     fn class_value(class: ProcessInformationClass) -> u32 {
         class as u32
-    }
-
-    fn test_task(peb_address: usize, cookie: u32) -> Task<crate::DefaultFS> {
-        init_platform();
-        let platform = litebox_platform_multiplex::platform();
-        let litebox = LiteBox::new(platform);
-        let page_manager = WindowsPageManager::new(&litebox);
-        Task {
-            global: Arc::new(GlobalState {
-                platform,
-                registry: crate::syscalls::registry::RegistryStore::new(&litebox),
-                litebox,
-                page_manager,
-                qpc_boot_instant: platform.now(),
-                _fs: PhantomData,
-            }),
-            process: Arc::new(Process {
-                mapping: MappingInfo {
-                    base_addr: 0,
-                    image_size: 0,
-                    entry_point: 0,
-                },
-                _ntdll_mapping: None,
-                handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
-                peb_address,
-                cookie,
-                exit_code: AtomicI32::new(0),
-            }),
-            entry_point: 0,
-            stack_top: 0,
-            teb_address: 0,
-        }
     }
 
     #[test]
@@ -223,7 +184,7 @@ mod tests {
             inherited_from_unique_process_id: usize::MAX,
         };
         let mut return_length = 0;
-        let task = test_task(peb_address, 0);
+        let task = crate::tests::test_task_with_process(peb_address, 0);
 
         assert_eq!(
             task.handle_nt_query_information_process(
@@ -259,7 +220,7 @@ mod tests {
         let mut wow64_information = usize::MAX;
         let mut debug_flags = 0;
         let mut cookie = 0;
-        let task = test_task(0, process_cookie);
+        let task = crate::tests::test_task_with_process(0, process_cookie);
 
         assert_eq!(
             task.handle_nt_query_information_process(
@@ -315,7 +276,7 @@ mod tests {
         init_platform();
         let mut info = [0u8; size_of::<ProcessBasicInformation>()];
         let mut return_length = 0;
-        let task = test_task(0, 0);
+        let task = crate::tests::test_task_with_process(0, 0);
 
         assert_eq!(
             task.handle_nt_query_information_process(

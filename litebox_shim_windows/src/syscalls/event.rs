@@ -210,13 +210,8 @@ pub(crate) fn handle_nt_set_event(
 mod tests {
     use super::*;
     use crate::syscalls::object::ObjectAttributes;
-    use crate::{GlobalState, Process, Task, WindowsPageManager};
-    use alloc::sync::Arc;
-    use core::marker::PhantomData;
-    use core::sync::atomic::AtomicI32;
     use litebox::fd::RawDescriptorStorage;
     use litebox::platform::{RawConstPointer as _, RawPointerProvider};
-    use litebox_common_windows::loader::MappingInfo;
     use zerocopy::{FromBytes, IntoBytes};
 
     extern crate std;
@@ -242,38 +237,6 @@ mod tests {
             LiteBox::new(litebox_platform_multiplex::platform()),
             WindowsHandleStore::new(RawDescriptorStorage::new()),
         )
-    }
-
-    fn test_task() -> Task<crate::DefaultFS> {
-        init_platform();
-        let platform = litebox_platform_multiplex::platform();
-        let litebox = LiteBox::new(platform);
-        let page_manager = WindowsPageManager::new(&litebox);
-        Task {
-            global: Arc::new(GlobalState {
-                platform,
-                registry: crate::syscalls::registry::RegistryStore::new(&litebox),
-                litebox,
-                page_manager,
-                qpc_boot_instant: platform.now(),
-                _fs: PhantomData,
-            }),
-            process: Arc::new(Process {
-                mapping: MappingInfo {
-                    base_addr: 0,
-                    image_size: 0,
-                    entry_point: 0,
-                },
-                _ntdll_mapping: None,
-                handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
-                peb_address: 0,
-                cookie: 1,
-                exit_code: AtomicI32::new(0),
-            }),
-            entry_point: 0,
-            stack_top: 0,
-            teb_address: 0,
-        }
     }
 
     fn create_test_event(
@@ -452,7 +415,7 @@ mod tests {
 
     #[test]
     fn nt_close_removes_event_handle() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let handle = create_test_event(&task.global.litebox, &task.process.handles, false);
 
         assert_eq!(task.handle_nt_close(handle), NtStatus::SUCCESS);

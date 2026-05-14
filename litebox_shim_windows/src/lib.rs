@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -121,6 +122,8 @@ pub(crate) type WindowsHandleStore =
 type WindowsEventHandle = alloc::sync::Arc<litebox::fd::TypedFd<event::EventSubsystem>>;
 type WindowsRegistryKeyHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
+type WindowsNlsSectionMappings =
+    litebox::sync::Mutex<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 
 pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
@@ -298,11 +301,12 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         _argv: Vec<alloc::ffi::CString>,
         _envp: Vec<alloc::ffi::CString>,
     ) -> Result<LoadedProgram<FS>, WindowsLoadError> {
-        let load_info = loader::PeLoader::new(fs, &self.0.page_manager).load(path)?;
+        let load_info = loader::PeLoader::new(fs.clone(), &self.0.page_manager).load(path)?;
         let process = Arc::new(Process {
             mapping: load_info.application_mapping,
             _ntdll_mapping: load_info.ntdll_mapping,
             handles: WindowsHandleStore::new(litebox::fd::RawDescriptorStorage::new()),
+            nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
             peb_address: load_info.environment.peb,
             cookie: generate_process_cookie(self.0.platform),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
@@ -312,6 +316,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             entrypoints: WindowsShimEntrypoints {
                 task: Task {
                     global: self.0.clone(),
+                    fs,
                     process: process.clone(),
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
@@ -345,6 +350,7 @@ struct Process {
     mapping: MappingInfo,
     _ntdll_mapping: Option<MappingInfo>,
     handles: WindowsHandleStore,
+    nls_section_mappings: WindowsNlsSectionMappings,
     peb_address: usize,
     cookie: u32,
     exit_code: AtomicI32,
@@ -352,6 +358,7 @@ struct Process {
 
 struct Task<FS: NtShimFS> {
     global: Arc<GlobalState<FS>>,
+    fs: Arc<FS>,
     process: Arc<Process>,
     entry_point: usize,
     stack_top: usize,
@@ -588,6 +595,22 @@ impl<FS: NtShimFS> Task<FS> {
                     process_information,
                     process_information_length,
                     return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtGetNlsSectionPtr {
+                section_type,
+                section_data,
+                context_data,
+                section_pointer,
+                section_size,
+            } => {
+                let status = self.handle_nt_get_nls_section_ptr(
+                    section_type,
+                    section_data,
+                    context_data,
+                    section_pointer,
+                    section_size,
                 );
                 (status, ContinueOperation::Resume)
             }

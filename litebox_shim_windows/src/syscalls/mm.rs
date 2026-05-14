@@ -3,7 +3,7 @@
 
 use core::mem::size_of;
 
-use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
+use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
@@ -11,6 +11,8 @@ use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::{PAGE_SIZE, ProcessHandle, WindowsPageManager};
+
+type GuestMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
@@ -93,7 +95,14 @@ pub(crate) fn handle_nt_allocate_virtual_memory(
         CreatePagesFlags::empty()
     };
 
-    let allocation = create_pages(page_manager, suggested_address, length, flags, permissions);
+    let allocation = create_pages(
+        page_manager,
+        suggested_address,
+        length,
+        flags,
+        permissions,
+        |_| Ok(0),
+    );
     let ptr = match allocation {
         Ok(ptr) => ptr,
         Err(status) => return status,
@@ -352,36 +361,38 @@ fn page_protect_to_permissions(protect: u32) -> Option<MemoryRegionPermissions> 
     }
 }
 
-fn create_pages(
+pub(crate) fn create_pages(
     page_manager: &WindowsPageManager,
     suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
     length: NonZeroPageSize<PAGE_SIZE>,
     flags: CreatePagesFlags,
     permissions: MemoryRegionPermissions,
-) -> Result<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u8>, NtStatus> {
-    // SAFETY: This creates guest-requested anonymous pages through the LiteBox page manager. The
-    // range is page-aligned, and fixed-address replacement is disabled for this syscall path.
+    op: impl FnOnce(GuestMutPointer<u8>) -> Result<usize, MappingError>,
+) -> Result<GuestMutPointer<u8>, NtStatus> {
+    // SAFETY: This creates page-aligned guest mappings through the LiteBox page manager. The
+    // caller chooses fixed-address behavior via `flags`, and the initializer only writes to the
+    // newly-created mapping before it is exposed with the requested final permissions.
     unsafe {
         match permissions {
             permissions if permissions.is_empty() => page_manager
-                .create_inaccessible_pages(suggested_address, length, flags, |_| Ok(0))
+                .create_inaccessible_pages(suggested_address, length, flags, op)
                 .map_err(|_| NtStatus::NO_MEMORY),
             MemoryRegionPermissions::READ => page_manager
-                .create_readable_pages(suggested_address, length, flags, |_| Ok(0))
+                .create_readable_pages(suggested_address, length, flags, op)
                 .map_err(|_| NtStatus::NO_MEMORY),
             permissions
                 if permissions
                     == MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE =>
             {
                 page_manager
-                    .create_writable_pages(suggested_address, length, flags, |_| Ok(0))
+                    .create_writable_pages(suggested_address, length, flags, op)
                     .map_err(|_| NtStatus::NO_MEMORY)
             }
             permissions
                 if permissions == MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC =>
             {
                 page_manager
-                    .create_executable_pages(suggested_address, length, flags, |_| Ok(0))
+                    .create_executable_pages(suggested_address, length, flags, op)
                     .map_err(|_| NtStatus::NO_MEMORY)
             }
             permissions
@@ -391,7 +402,7 @@ fn create_pages(
                         | MemoryRegionPermissions::EXEC =>
             {
                 let ptr = page_manager
-                    .create_writable_pages(suggested_address, length, flags, |_| Ok(0))
+                    .create_writable_pages(suggested_address, length, flags, op)
                     .map_err(|_| NtStatus::NO_MEMORY)?;
                 page_manager
                     .make_pages_rwx(ptr, length.as_usize())

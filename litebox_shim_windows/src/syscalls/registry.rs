@@ -711,15 +711,9 @@ fn map_read_error(error: ReadError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlobalState, Process, WindowsHandleStore, WindowsPageManager};
-    use alloc::sync::Arc;
-    use core::marker::PhantomData;
     use core::mem::size_of;
-    use core::sync::atomic::AtomicI32;
     use litebox::LiteBox;
-    use litebox::fd::RawDescriptorStorage;
-    use litebox::platform::{RawPointerProvider, TimeProvider as _};
-    use litebox_common_windows::loader::MappingInfo;
+    use litebox::platform::RawPointerProvider;
     use zerocopy::{FromBytes, IntoBytes};
 
     extern crate std;
@@ -769,38 +763,6 @@ mod tests {
         let litebox = LiteBox::new(litebox_platform_multiplex::platform());
         let registry = RegistryStore::new(&litebox);
         (litebox, registry)
-    }
-
-    fn test_task() -> Task<crate::DefaultFS> {
-        init_platform();
-        let platform = litebox_platform_multiplex::platform();
-        let litebox = LiteBox::new(platform);
-        let page_manager = WindowsPageManager::new(&litebox);
-        Task {
-            global: Arc::new(GlobalState {
-                platform,
-                registry: RegistryStore::new(&litebox),
-                litebox,
-                page_manager,
-                qpc_boot_instant: platform.now(),
-                _fs: PhantomData,
-            }),
-            process: Arc::new(Process {
-                mapping: MappingInfo {
-                    base_addr: 0,
-                    image_size: 0,
-                    entry_point: 0,
-                },
-                _ntdll_mapping: None,
-                handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
-                peb_address: 0,
-                cookie: 1,
-                exit_code: AtomicI32::new(0),
-            }),
-            entry_point: 0,
-            stack_top: 0,
-            teb_address: 0,
-        }
     }
 
     fn open_key(
@@ -862,7 +824,7 @@ mod tests {
 
     #[test]
     fn nt_open_key_opens_existing_absolute_and_relative_keys() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let nls_name: std::vec::Vec<u16> =
             "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls"
                 .encode_utf16()
@@ -892,7 +854,7 @@ mod tests {
 
     #[test]
     fn nt_open_key_reports_missing_absolute_key() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let name: std::vec::Vec<u16> = "\\Registry\\Machine\\Software".encode_utf16().collect();
         let name = unicode_string(&name);
         let object_attributes = object_attributes(&name);
@@ -907,7 +869,7 @@ mod tests {
 
     #[test]
     fn nt_open_key_rejects_invalid_object_attributes() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let name: std::vec::Vec<u16> = "\\Registry\\Machine".encode_utf16().collect();
         let name = unicode_string(&name);
         let mut object_attributes = object_attributes(&name);
@@ -927,7 +889,7 @@ mod tests {
 
     #[test]
     fn nt_open_key_rejects_invalid_relative_root() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let name: std::vec::Vec<u16> = "Child".encode_utf16().collect();
         let name = unicode_string(&name);
         let mut object_attributes = object_attributes(&name);
@@ -942,7 +904,7 @@ mod tests {
 
     #[test]
     fn nt_query_value_key_reports_partial_information() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let key_handle = open_code_page_key(&task);
         let value_name: std::vec::Vec<u16> = "ACP".encode_utf16().collect();
         let value_name = unicode_string(&value_name);
@@ -977,7 +939,7 @@ mod tests {
 
     #[test]
     fn nt_query_value_key_reports_basic_and_full_information() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let key_handle = open_code_page_key(&task);
         let value_name: std::vec::Vec<u16> = "OEMCP".encode_utf16().collect();
         let value_name = unicode_string(&value_name);
@@ -1046,7 +1008,7 @@ mod tests {
 
     #[test]
     fn nt_close_removes_registry_key_handle() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let key_handle = open_code_page_key(&task);
         let value_name: std::vec::Vec<u16> = "ACP".encode_utf16().collect();
         let value_name = unicode_string(&value_name);
@@ -1069,7 +1031,7 @@ mod tests {
 
     #[test]
     fn nt_query_value_key_rejects_invalid_arguments() {
-        let task = test_task();
+        let task = crate::tests::test_task();
         let key_handle = open_code_page_key(&task);
         let value_name: std::vec::Vec<u16> = "ACP".encode_utf16().collect();
         let value_name = unicode_string(&value_name);

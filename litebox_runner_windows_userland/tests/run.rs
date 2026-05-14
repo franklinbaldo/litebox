@@ -26,6 +26,10 @@ fn loads_minimal_pe_without_imports() {
             dll_path.display()
         );
     }
+    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls"] {
+        let nls_path = copy_host_system32_file(&test_dir, nls_name);
+        println!("Copied {nls_name} fixture at `{}`", nls_path.display());
+    }
     let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
@@ -189,7 +193,7 @@ fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std
     let system32_dir = test_dir.join("Windows").join("System32");
     std::fs::create_dir_all(&system32_dir).unwrap();
     let dll_path = system32_dir.join(dll_name);
-    let host_dll = std::fs::read(host_system32_dll_path(dll_name))
+    let host_dll = std::fs::read(host_system32_file_path(dll_name))
         .unwrap_or_else(|error| panic!("failed to read host {dll_name}: {error}"));
     let rewritten = match litebox_syscall_rewriter::rewrite_binary(&host_dll, None) {
         Ok(rewritten) => rewritten,
@@ -202,14 +206,23 @@ fn build_rewritten_system_dll(test_dir: &std::path::Path, dll_name: &str) -> std
     dll_path
 }
 
-fn host_system32_dll_path(dll_name: &str) -> std::path::PathBuf {
+fn copy_host_system32_file(test_dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
+    let system32_dir = test_dir.join("Windows").join("System32");
+    std::fs::create_dir_all(&system32_dir).unwrap();
+    let fixture_path = system32_dir.join(file_name);
+    std::fs::copy(host_system32_file_path(file_name), &fixture_path)
+        .unwrap_or_else(|error| panic!("failed to copy host {file_name}: {error}"));
+    fixture_path
+}
+
+fn host_system32_file_path(file_name: &str) -> std::path::PathBuf {
     std::env::var_os("SystemRoot")
         .map_or_else(
             || std::path::PathBuf::from(r"C:\Windows"),
             std::path::PathBuf::from,
         )
         .join("System32")
-        .join(dll_name)
+        .join(file_name)
 }
 
 fn create_tar_with_dir(test_dir: &std::path::Path, tar_path: &std::path::Path) {
