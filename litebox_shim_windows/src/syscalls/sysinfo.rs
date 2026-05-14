@@ -15,10 +15,13 @@ use crate::PAGE_SIZE;
 
 const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
 const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
+const SYSTEM_FLUSH_INFORMATION_CLASS: u32 = 192;
 const TIMER_RESOLUTION_100NS: u32 = 156_250;
 const ALLOCATION_GRANULARITY: u32 = 0x1_0000;
 const DEFAULT_PHYSICAL_PAGES: u32 = 1024 * 1024;
 const NUMBER_OF_PROCESSORS: u8 = 1;
+const SUPPORTED_FLUSH_METHODS: u32 = 0x7;
+const SUPPORTED_FLUSH_PROCESSOR_FEATURES: u32 = 0x40;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -36,6 +39,14 @@ struct SystemBasicInformation {
     active_processors_affinity_mask: usize,
     number_of_processors: u8,
     _padding1: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct SystemFlushInformation {
+    supported_flush_methods: u32,
+    processor_features: u32,
+    reserved: [u32; 6],
 }
 
 pub(crate) fn handle_nt_query_performance_counter(
@@ -69,16 +80,47 @@ pub(crate) fn handle_nt_query_system_information(
     system_information_length: u32,
     return_length: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>>,
 ) -> NtStatus {
-    if system_information_class != SYSTEM_BASIC_INFORMATION_CLASS {
+    let status = match system_information_class {
+        SYSTEM_BASIC_INFORMATION_CLASS => write_system_information(
+            system_information,
+            system_information_length,
+            return_length,
+            &system_basic_information(),
+        ),
+        SYSTEM_FLUSH_INFORMATION_CLASS => write_system_information(
+            system_information,
+            system_information_length,
+            return_length,
+            &system_flush_information(),
+        ),
+        _ => {
+            litebox_util_log::debug!(
+                system_information_class = system_information_class;
+                "Unsupported NtQuerySystemInformation class"
+            );
+            NtStatus::INVALID_INFO_CLASS
+        }
+    };
+
+    if status == NtStatus::SUCCESS {
         litebox_util_log::debug!(
-            system_information_class = system_information_class;
-            "Unsupported NtQuerySystemInformation class"
+            system_information_class = system_information_class,
+            system_information_length = system_information_length;
+            "Handled NtQuerySystemInformation syscall"
         );
-        return NtStatus::INVALID_INFO_CLASS;
     }
 
-    let required_len = u32::try_from(size_of::<SystemBasicInformation>())
-        .expect("SYSTEM_BASIC_INFORMATION length fits in ULONG");
+    status
+}
+
+fn write_system_information<T: Immutable + IntoBytes>(
+    system_information: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u8>,
+    system_information_length: u32,
+    return_length: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>>,
+    information: &T,
+) -> NtStatus {
+    let required_len =
+        u32::try_from(size_of::<T>()).expect("system information length fits in ULONG");
     if let Some(return_length) = return_length
         && return_length.write_at_offset(0, required_len).is_none()
     {
@@ -88,22 +130,12 @@ pub(crate) fn handle_nt_query_system_information(
         return NtStatus::INFO_LENGTH_MISMATCH;
     }
 
-    let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
-        SystemBasicInformation,
-    >::from_usize(system_information.as_usize());
-    if output
-        .write_at_offset(0, system_basic_information())
+    if system_information
+        .write_slice_at_offset(0, information.as_bytes())
         .is_none()
     {
         return NtStatus::ACCESS_VIOLATION;
     }
-
-    litebox_util_log::debug!(
-        system_information_class = system_information_class,
-        system_information_length = system_information_length,
-        return_length = required_len;
-        "Handled NtQuerySystemInformation syscall"
-    );
 
     NtStatus::SUCCESS
 }
@@ -125,6 +157,14 @@ fn system_basic_information() -> SystemBasicInformation {
         active_processors_affinity_mask: usize::from(NUMBER_OF_PROCESSORS),
         number_of_processors: NUMBER_OF_PROCESSORS,
         _padding1: [0; 7],
+    }
+}
+
+fn system_flush_information() -> SystemFlushInformation {
+    SystemFlushInformation {
+        supported_flush_methods: SUPPORTED_FLUSH_METHODS,
+        processor_features: SUPPORTED_FLUSH_PROCESSOR_FEATURES,
+        reserved: [0; 6],
     }
 }
 
@@ -153,6 +193,12 @@ mod tests {
     fn system_basic_information_matches_windows_x64_layout() {
         assert_eq!(size_of::<SystemBasicInformation>(), 64);
         assert_eq!(align_of::<SystemBasicInformation>(), 8);
+    }
+
+    #[test]
+    fn system_flush_information_matches_windows_x64_layout() {
+        assert_eq!(size_of::<SystemFlushInformation>(), 32);
+        assert_eq!(align_of::<SystemFlushInformation>(), 4);
     }
 
     #[test]
@@ -230,6 +276,56 @@ mod tests {
                 None,
             ),
             NtStatus::INVALID_INFO_CLASS
+        );
+    }
+
+    #[test]
+    fn nt_query_system_information_reports_flush_information() {
+        init_platform();
+        let mut info = SystemFlushInformation {
+            supported_flush_methods: 0,
+            processor_features: 0,
+            reserved: [u32::MAX; 6],
+        };
+        let mut return_length = 0;
+
+        assert_eq!(
+            handle_nt_query_system_information(
+                SYSTEM_FLUSH_INFORMATION_CLASS,
+                mut_byte_ptr(&mut info),
+                u32::try_from(size_of::<SystemFlushInformation>()).unwrap(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(
+            return_length,
+            u32::try_from(size_of::<SystemFlushInformation>()).unwrap()
+        );
+        assert_eq!(info.supported_flush_methods, SUPPORTED_FLUSH_METHODS);
+        assert_eq!(info.processor_features, SUPPORTED_FLUSH_PROCESSOR_FEATURES);
+        assert_eq!(info.reserved, [0; 6]);
+    }
+
+    #[test]
+    fn nt_query_system_information_rejects_short_flush_information_buffer() {
+        init_platform();
+        let mut info = [0u8; size_of::<SystemFlushInformation>() - 1];
+        let mut return_length = 0;
+
+        assert_eq!(
+            handle_nt_query_system_information(
+                SYSTEM_FLUSH_INFORMATION_CLASS,
+                mut_byte_ptr(&mut info),
+                u32::try_from(info.len()).unwrap(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(
+            return_length,
+            u32::try_from(size_of::<SystemFlushInformation>()).unwrap()
         );
     }
 }
