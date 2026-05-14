@@ -304,7 +304,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
         let load_info = loader::PeLoader::new(fs.clone(), &self.0.page_manager).load(path)?;
         let process = Arc::new(Process {
             mapping: load_info.application_mapping,
-            _ntdll_mapping: load_info.ntdll_mapping,
+            ntdll_mapping: load_info.ntdll_mapping,
             handles: WindowsHandleStore::new(litebox::fd::RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
             peb_address: load_info.environment.peb,
@@ -348,7 +348,7 @@ struct GlobalState<FS: NtShimFS> {
 /// Per-process Windows state shared by every thread in the process.
 struct Process {
     mapping: MappingInfo,
-    _ntdll_mapping: Option<MappingInfo>,
+    ntdll_mapping: Option<MappingInfo>,
     handles: WindowsHandleStore,
     nls_section_mappings: WindowsNlsSectionMappings,
     peb_address: usize,
@@ -398,13 +398,21 @@ impl<FS: NtShimFS> EnterShim for WindowsShimEntrypoints<FS> {
 impl<FS: NtShimFS> Task<FS> {
     fn init(&self, ctx: &mut litebox_common_linux::PtRegs) -> ContinueOperation {
         ctx.rip = self.entry_point;
-        ctx.rsp = self.stack_top;
+        let stack_top_alignment = self.stack_top % 16;
+        debug_assert!(stack_top_alignment == 0 || stack_top_alignment == 8);
+        ctx.rsp = if stack_top_alignment == 0 {
+            self.stack_top - core::mem::size_of::<usize>()
+        } else {
+            self.stack_top
+        };
         ctx.eflags = 0x202;
-        // TODO: Build the initial CONTEXT/loader parameter contract expected by
-        // LdrInitializeThunk. For now this deliberately transfers control to
-        // ntdll so the next missing pieces are visible at runtime.
+        // TODO: Build the initial CONTEXT
         ctx.rcx = 0;
-        ctx.rdx = 0;
+        ctx.rdx = if self.process.ntdll_mapping.is_some() {
+            self.process.mapping.base_addr
+        } else {
+            0
+        };
         ctx.r8 = 0;
         ctx.r9 = 0;
         litebox_util_log::debug!(

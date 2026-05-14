@@ -88,7 +88,7 @@ fn test_task_with_nls_files_and_process(
                 image_size: 0,
                 entry_point: 0,
             },
-            _ntdll_mapping: None,
+            ntdll_mapping: None,
             handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
             peb_address,

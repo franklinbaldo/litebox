@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 
@@ -22,7 +23,7 @@ use zerocopy::FromZeros;
 use crate::nt_types::{
     KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, ProcessEnvironmentBlock, RtlUserProcFlags,
-    RtlUserProcessParameters, ThreadEnvironmentBlock,
+    RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString,
 };
 use crate::{NtShimFS, WindowsPageManager, write_slice, write_value};
 
@@ -57,6 +58,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
     pub(crate) fn load(&self, path: &str) -> Result<PeLoadInfo, WindowsLoadError> {
         let image = load_image(self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
+        let image_base_address = image.mapping.base_addr;
         let ntdll = load_ntdll(self.fs.clone(), self.page_manager, NTDLL_PATHS)?;
 
         let entry_point = if let Some(ntdll) = &ntdll {
@@ -94,11 +96,15 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             stack_top,
             application_mapping: image.mapping,
             ntdll_mapping: ntdll.map(|image| image.mapping),
-            environment: self.create_process_environment()?,
+            environment: self.create_process_environment(image_base_address, path)?,
         })
     }
 
-    fn create_process_environment(&self) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
+    fn create_process_environment(
+        &self,
+        image_base_address: usize,
+        image_path: &str,
+    ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
             let aligned_length = size.next_multiple_of(PAGE_SIZE);
             let length =
@@ -115,15 +121,78 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         };
         let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
-        let process_parameters_ptr =
-            create_pages(core::mem::size_of::<RtlUserProcessParameters>())?;
+
+        let dos_image_path = dos_image_path(image_path);
+        let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
+        let dll_path = Utf16StringBuffer::new(r"C:\Windows\System32;C:\")?;
+        let image_path_name = Utf16StringBuffer::new(&dos_image_path)?;
+        let command_line = Utf16StringBuffer::new(&dos_image_path)?;
+        let window_title = Utf16StringBuffer::new(&dos_image_path)?;
+        let desktop_info = Utf16StringBuffer::new("")?;
+        let shell_info = Utf16StringBuffer::new("")?;
+        let runtime_data = Utf16StringBuffer::new("")?;
+        let redirection_dll_name = Utf16StringBuffer::new("")?;
+        let process_parameter_strings = [
+            &current_directory_path,
+            &dll_path,
+            &image_path_name,
+            &command_line,
+            &window_title,
+            &desktop_info,
+            &shell_info,
+            &runtime_data,
+            &redirection_dll_name,
+        ];
+        let process_parameters_length = process_parameter_strings.iter().try_fold(
+            core::mem::size_of::<RtlUserProcessParameters>(),
+            |length, string| {
+                length
+                    .checked_add(usize::from(string.maximum_length))
+                    .ok_or(PeImageAccessError::AddressOverflow)
+            },
+        )?;
+        let process_parameters_allocation_length =
+            process_parameters_length.next_multiple_of(PAGE_SIZE);
+        let process_parameters_ptr = create_pages(process_parameters_length)?;
 
         let mut process_parameters = RtlUserProcessParameters::new_zeroed();
+        process_parameters.maximum_length = u32::try_from(process_parameters_allocation_length)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        process_parameters.length = u32::try_from(process_parameters_length)
+            .map_err(|_| PeImageAccessError::AddressOverflow)?;
         process_parameters.flags = RtlUserProcFlags::NORMALIZED;
+        let mut process_parameter_tail = process_parameters_ptr
+            .checked_add(core::mem::size_of::<RtlUserProcessParameters>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        let mut write_parameter_string =
+            |string: &Utf16StringBuffer| -> Result<UnicodeString, PeImageAccessError> {
+                let buffer = process_parameter_tail;
+                write_slice(buffer, &string.units).ok_or(PeImageAccessError::MemoryAccess)?;
+                process_parameter_tail = process_parameter_tail
+                    .checked_add(usize::from(string.maximum_length))
+                    .ok_or(PeImageAccessError::AddressOverflow)?;
+                Ok(UnicodeString {
+                    length: string.length,
+                    maximum_length: string.maximum_length,
+                    padding_0: [0; 4],
+                    buffer,
+                })
+            };
+        process_parameters.current_directory.dos_path =
+            write_parameter_string(&current_directory_path)?;
+        process_parameters.dll_path = write_parameter_string(&dll_path)?;
+        process_parameters.image_path_name = write_parameter_string(&image_path_name)?;
+        process_parameters.command_line = write_parameter_string(&command_line)?;
+        process_parameters.window_title = write_parameter_string(&window_title)?;
+        process_parameters.desktop_info = write_parameter_string(&desktop_info)?;
+        process_parameters.shell_info = write_parameter_string(&shell_info)?;
+        process_parameters.runtime_data = write_parameter_string(&runtime_data)?;
+        process_parameters.redirection_dll_name = write_parameter_string(&redirection_dll_name)?;
         write_value(process_parameters_ptr, process_parameters)
             .ok_or(PeImageAccessError::MemoryAccess)?;
 
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
+        peb.image_base_address = image_base_address;
         peb.process_parameters = process_parameters_ptr;
         write_value(peb_ptr, peb).ok_or(PeImageAccessError::MemoryAccess)?;
 
@@ -178,6 +247,44 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
 
         Ok(())
     }
+}
+
+struct Utf16StringBuffer {
+    units: Vec<u16>,
+    length: u16,
+    maximum_length: u16,
+}
+
+impl Utf16StringBuffer {
+    fn new(value: &str) -> Result<Self, PeImageAccessError> {
+        let mut units: Vec<u16> = value.encode_utf16().collect();
+        let length = units
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        units.push(0);
+        let maximum_length = units
+            .len()
+            .checked_mul(size_of::<u16>())
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        Ok(Self {
+            units,
+            length: u16::try_from(length).map_err(|_| PeImageAccessError::AddressOverflow)?,
+            maximum_length: u16::try_from(maximum_length)
+                .map_err(|_| PeImageAccessError::AddressOverflow)?,
+        })
+    }
+}
+
+fn dos_image_path(path: &str) -> String {
+    let mut dos_path = String::from(r"\??\C:");
+    if !path.starts_with('/') && !path.starts_with('\\') {
+        dos_path.push('\\');
+    }
+    for ch in path.chars() {
+        dos_path.push(if ch == '/' { '\\' } else { ch });
+    }
+    dos_path
 }
 
 pub(crate) struct WindowsProcessEnvironment {
