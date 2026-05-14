@@ -12,6 +12,7 @@ pub(crate) mod object;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
+pub(crate) mod trace;
 
 pub(crate) use nt_sysno::NtSysno;
 
@@ -122,6 +123,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         system_information: Platform::RawMutPointer<u8>,
         system_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtTraceEvent {
+        trace_handle: Handle,
+        flags: u32,
+        field_size: u32,
+        fields: Option<Platform::RawConstPointer<u8>>,
     },
     /// TODO: not supported yet
     NtManageHotPatch,
@@ -250,6 +257,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 system_information:*,
                 system_information_length,
                 return_length:*,
+            })),
+            NtSysno::NtTraceEvent => Some(sys_req!(NtTraceEvent {
+                trace_handle:{Handle::from_raw},
+                flags,
+                field_size,
+                fields:*,
             })),
             NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
