@@ -13,6 +13,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::{PAGE_SIZE, ProcessHandle, WindowsPageManager};
 
 type GuestMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+type GuestConstPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_READONLY: u32 = 0x02;
@@ -37,6 +38,18 @@ const MEM_TOP_DOWN: u32 = 0x100000;
 const SUPPORTED_ALLOCATION_TYPES: u32 = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN;
 
 const MEMORY_BASIC_INFORMATION_CLASS: u32 = 0;
+const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
+const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
+const MEM_EXTENDED_PARAMETER_NUMA_NODE: u64 = 2;
+const MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: u64 = 5;
+const MEM_EXTENDED_PARAMETER_NONPAGED: usize = 0x02;
+const MEM_EXTENDED_PARAMETER_NONPAGED_LARGE: usize = 0x08;
+const MEM_EXTENDED_PARAMETER_NONPAGED_HUGE: usize = 0x10;
+const MEM_EXTENDED_PARAMETER_EC_CODE: usize = 0x40;
+const SUPPORTED_MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: usize = MEM_EXTENDED_PARAMETER_NONPAGED
+    | MEM_EXTENDED_PARAMETER_NONPAGED_LARGE
+    | MEM_EXTENDED_PARAMETER_NONPAGED_HUGE
+    | MEM_EXTENDED_PARAMETER_EC_CODE;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -53,6 +66,35 @@ struct MemoryBasicInformation {
     _padding1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct MemoryExtendedParameter {
+    type_: u64,
+    value: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct MemoryAddressRequirements {
+    lowest_starting_address: usize,
+    highest_ending_address: usize,
+    alignment: usize,
+}
+
+pub(crate) struct MemoryExtendedParameters {
+    pub(crate) parameters: Option<GuestConstPointer<MemoryExtendedParameter>>,
+    pub(crate) count: u32,
+}
+
+struct VirtualMemoryAllocationRequest {
+    process_handle: ProcessHandle,
+    base_address: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
+    zero_bits: usize,
+    region_size: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
+    allocation_type: u32,
+    protect: u32,
+}
+
 pub(crate) fn handle_nt_allocate_virtual_memory(
     page_manager: &WindowsPageManager,
     process_handle: ProcessHandle,
@@ -62,6 +104,62 @@ pub(crate) fn handle_nt_allocate_virtual_memory(
     allocation_type: u32,
     protect: u32,
 ) -> NtStatus {
+    allocate_virtual_memory(
+        page_manager,
+        VirtualMemoryAllocationRequest {
+            process_handle,
+            base_address,
+            zero_bits,
+            region_size,
+            allocation_type,
+            protect,
+        },
+    )
+}
+
+pub(crate) fn handle_nt_allocate_virtual_memory_ex(
+    page_manager: &WindowsPageManager,
+    process_handle: ProcessHandle,
+    base_address: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
+    region_size: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<usize>,
+    allocation_type: u32,
+    protect: u32,
+    extended_parameters: MemoryExtendedParameters,
+) -> NtStatus {
+    if !process_handle.is_current() {
+        return NtStatus::INVALID_HANDLE;
+    }
+
+    if let Err(status) = validate_memory_extended_parameters(extended_parameters) {
+        return status;
+    }
+
+    allocate_virtual_memory(
+        page_manager,
+        VirtualMemoryAllocationRequest {
+            process_handle,
+            base_address,
+            zero_bits: 0,
+            region_size,
+            allocation_type,
+            protect,
+        },
+    )
+}
+
+fn allocate_virtual_memory(
+    page_manager: &WindowsPageManager,
+    request: VirtualMemoryAllocationRequest,
+) -> NtStatus {
+    let VirtualMemoryAllocationRequest {
+        process_handle,
+        base_address,
+        zero_bits,
+        region_size,
+        allocation_type,
+        protect,
+    } = request;
+
     if !process_handle.is_current() {
         return NtStatus::INVALID_HANDLE;
     }
@@ -120,10 +218,63 @@ pub(crate) fn handle_nt_allocate_virtual_memory(
         aligned_len = aligned_len,
         allocation_type:% = format_args!("{:#x}", allocation_type),
         protect:% = format_args!("{:#x}", protect);
-        "Handled NtAllocateVirtualMemory syscall"
+        "Handled virtual memory allocation syscall"
     );
 
     NtStatus::SUCCESS
+}
+
+fn validate_memory_extended_parameters(
+    extended_parameters: MemoryExtendedParameters,
+) -> Result<(), NtStatus> {
+    if extended_parameters.count == 0 {
+        return Ok(());
+    }
+
+    let Some(parameters) = extended_parameters.parameters else {
+        return Err(NtStatus::ACCESS_VIOLATION);
+    };
+    let count =
+        usize::try_from(extended_parameters.count).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    for index in 0..count {
+        let index = isize::try_from(index).map_err(|_| NtStatus::INVALID_PARAMETER)?;
+        let parameter = parameters
+            .read_at_offset(index)
+            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+        validate_memory_extended_parameter(parameter)?;
+    }
+
+    Ok(())
+}
+
+fn validate_memory_extended_parameter(parameter: MemoryExtendedParameter) -> Result<(), NtStatus> {
+    if parameter.type_ & !MEM_EXTENDED_PARAMETER_TYPE_MASK != 0 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+
+    match parameter.type_ & MEM_EXTENDED_PARAMETER_TYPE_MASK {
+        MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS => {
+            let address_requirements =
+                GuestConstPointer::<MemoryAddressRequirements>::from_usize(parameter.value)
+                    .read_at_offset(0)
+                    .ok_or(NtStatus::ACCESS_VIOLATION)?;
+            if address_requirements.lowest_starting_address != 0
+                || address_requirements.highest_ending_address != 0
+                || address_requirements.alignment != 0
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        }
+        MEM_EXTENDED_PARAMETER_NUMA_NODE => Ok(()),
+        MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS => {
+            if parameter.value & !SUPPORTED_MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS != 0 {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        }
+        _ => Err(NtStatus::INVALID_PARAMETER),
+    }
 }
 
 pub(crate) fn handle_nt_free_virtual_memory(
@@ -598,6 +749,14 @@ mod tests {
     }
 
     #[test]
+    fn memory_extended_parameter_matches_windows_x64_layout() {
+        assert_eq!(size_of::<MemoryExtendedParameter>(), 16);
+        assert_eq!(align_of::<MemoryExtendedParameter>(), 8);
+        assert_eq!(size_of::<MemoryAddressRequirements>(), 24);
+        assert_eq!(align_of::<MemoryAddressRequirements>(), 8);
+    }
+
+    #[test]
     fn nt_allocate_virtual_memory_allocates_writable_pages() {
         let page_manager = page_manager();
         let mut base = ALLOC_TEST_BASE;
@@ -634,6 +793,121 @@ mod tests {
         );
 
         release_mapping(&page_manager, base);
+    }
+
+    #[test]
+    fn nt_allocate_virtual_memory_ex_allocates_writable_pages() {
+        let page_manager = page_manager();
+        let mut base = ALLOC_TEST_BASE + 0x10_0000;
+        let mut size = PAGE_SIZE + 1;
+
+        assert_eq!(
+            handle_nt_allocate_virtual_memory_ex(
+                &page_manager,
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+                MemoryExtendedParameters {
+                    parameters: None,
+                    count: 0,
+                },
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(base, ALLOC_TEST_BASE + 0x10_0000);
+        assert_eq!(size, PAGE_SIZE * 2);
+
+        let data = MutPtr::<u8>::from_usize(base);
+        data.write_slice_at_offset(0, &[0xcd; PAGE_SIZE * 2])
+            .unwrap();
+        assert_eq!(
+            data.read_at_offset(PAGE_SIZE.try_into().unwrap()),
+            Some(0xcd)
+        );
+
+        release_mapping(&page_manager, base);
+    }
+
+    #[test]
+    fn nt_allocate_virtual_memory_ex_accepts_supported_extended_parameter_hints() {
+        let page_manager = page_manager();
+        let mut base = ALLOC_TEST_BASE + 0x20_0000;
+        let mut size = PAGE_SIZE;
+        let address_requirements = MemoryAddressRequirements {
+            lowest_starting_address: 0,
+            highest_ending_address: 0,
+            alignment: 0,
+        };
+        let extended_parameters = [
+            MemoryExtendedParameter {
+                type_: MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS,
+                value: core::ptr::from_ref(&address_requirements) as usize,
+            },
+            MemoryExtendedParameter {
+                type_: MEM_EXTENDED_PARAMETER_NUMA_NODE,
+                value: 0,
+            },
+            MemoryExtendedParameter {
+                type_: MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS,
+                value: MEM_EXTENDED_PARAMETER_EC_CODE,
+            },
+        ];
+
+        assert_eq!(
+            handle_nt_allocate_virtual_memory_ex(
+                &page_manager,
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+                MemoryExtendedParameters {
+                    parameters: Some(GuestConstPointer::<MemoryExtendedParameter>::from_usize(
+                        extended_parameters.as_ptr() as usize,
+                    )),
+                    count: u32::try_from(extended_parameters.len()).unwrap(),
+                },
+            ),
+            NtStatus::SUCCESS
+        );
+
+        release_mapping(&page_manager, base);
+    }
+
+    #[test]
+    fn nt_allocate_virtual_memory_ex_rejects_unsupported_address_requirements() {
+        let page_manager = page_manager();
+        let mut base = ALLOC_TEST_BASE + 0x30_0000;
+        let mut size = PAGE_SIZE;
+        let address_requirements = MemoryAddressRequirements {
+            lowest_starting_address: 0,
+            highest_ending_address: 0x7fff_ffff,
+            alignment: 0,
+        };
+        let extended_parameters = [MemoryExtendedParameter {
+            type_: MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS,
+            value: core::ptr::from_ref(&address_requirements) as usize,
+        }];
+
+        assert_eq!(
+            handle_nt_allocate_virtual_memory_ex(
+                &page_manager,
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+                MemoryExtendedParameters {
+                    parameters: Some(GuestConstPointer::<MemoryExtendedParameter>::from_usize(
+                        extended_parameters.as_ptr() as usize,
+                    )),
+                    count: u32::try_from(extended_parameters.len()).unwrap(),
+                },
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
     }
 
     #[test]
@@ -917,6 +1191,21 @@ mod tests {
                 mut_ptr(&mut size),
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            handle_nt_allocate_virtual_memory_ex(
+                &page_manager,
+                OTHER_PROCESS_HANDLE,
+                mut_ptr(&mut base),
+                mut_ptr(&mut size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+                MemoryExtendedParameters {
+                    parameters: None,
+                    count: 0,
+                },
             ),
             NtStatus::INVALID_HANDLE
         );

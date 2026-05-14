@@ -539,6 +539,29 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtAllocateVirtualMemoryEx {
+                process_handle,
+                base_address,
+                region_size,
+                allocation_type,
+                protect,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = mm::handle_nt_allocate_virtual_memory_ex(
+                    &self.global.page_manager,
+                    process_handle,
+                    base_address,
+                    region_size,
+                    allocation_type,
+                    protect,
+                    mm::MemoryExtendedParameters {
+                        parameters: extended_parameters,
+                        count: extended_parameter_count,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtFreeVirtualMemory {
                 process_handle,
                 base_address,
