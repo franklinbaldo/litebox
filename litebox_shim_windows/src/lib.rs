@@ -683,6 +683,24 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySystemInformationEx {
+                system_information_class,
+                input_buffer,
+                input_buffer_length,
+                system_information,
+                system_information_length,
+                return_length,
+            } => {
+                let status = sysinfo::handle_nt_query_system_information_ex(
+                    system_information_class,
+                    input_buffer,
+                    input_buffer_length,
+                    system_information,
+                    system_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTraceEvent {
                 trace_handle,
                 flags,

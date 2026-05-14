@@ -126,6 +126,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         system_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtQuerySystemInformationEx {
+        system_information_class: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_length: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtTraceEvent {
         trace_handle: Handle,
         flags: u32,
@@ -264,6 +272,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             })),
             NtSysno::NtQuerySystemInformation => Some(sys_req!(NtQuerySystemInformation {
                 system_information_class,
+                system_information:*,
+                system_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySystemInformationEx => Some(sys_req!(NtQuerySystemInformationEx {
+                system_information_class,
+                input_buffer:*,
+                input_buffer_length,
                 system_information:*,
                 system_information_length,
                 return_length:*,
