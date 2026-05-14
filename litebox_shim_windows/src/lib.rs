@@ -845,8 +845,7 @@ impl<FS: NtShimFS> Task<FS> {
             teb:% = format_args!("{:#x}", self.teb_address);
             "Windows guest interrupt"
         );
-        // TODO: Handle host interrupts for Windows guest waits/APCs.
-        ContinueOperation::Terminate
+        ContinueOperation::Resume
     }
 }
 
