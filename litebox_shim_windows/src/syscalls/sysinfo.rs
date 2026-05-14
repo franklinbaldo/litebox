@@ -15,6 +15,7 @@ use crate::PAGE_SIZE;
 
 const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
 const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
+const SYSTEM_EMULATION_BASIC_INFORMATION_CLASS: u32 = 62;
 const SYSTEM_FLUSH_INFORMATION_CLASS: u32 = 192;
 const TIMER_RESOLUTION_100NS: u32 = 156_250;
 const ALLOCATION_GRANULARITY: u32 = 0x1_0000;
@@ -81,12 +82,14 @@ pub(crate) fn handle_nt_query_system_information(
     return_length: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>>,
 ) -> NtStatus {
     let status = match system_information_class {
-        SYSTEM_BASIC_INFORMATION_CLASS => write_system_information(
-            system_information,
-            system_information_length,
-            return_length,
-            &system_basic_information(),
-        ),
+        SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_EMULATION_BASIC_INFORMATION_CLASS => {
+            write_system_information(
+                system_information,
+                system_information_length,
+                return_length,
+                &system_basic_information(),
+            )
+        }
         SYSTEM_FLUSH_INFORMATION_CLASS => write_system_information(
             system_information,
             system_information_length,
@@ -246,6 +249,45 @@ mod tests {
             info.maximum_user_mode_address,
             <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX - 1
         );
+    }
+
+    #[test]
+    fn nt_query_system_information_reports_emulation_basic_information() {
+        init_platform();
+        let mut info = SystemBasicInformation {
+            reserved: u32::MAX,
+            timer_resolution: 0,
+            page_size: 0,
+            number_of_physical_pages: 0,
+            lowest_physical_page_number: 0,
+            highest_physical_page_number: 0,
+            allocation_granularity: 0,
+            _padding0: 0,
+            minimum_user_mode_address: 0,
+            maximum_user_mode_address: 0,
+            active_processors_affinity_mask: 0,
+            number_of_processors: 0,
+            _padding1: [0; 7],
+        };
+        let mut return_length = 0;
+
+        assert_eq!(
+            handle_nt_query_system_information(
+                SYSTEM_EMULATION_BASIC_INFORMATION_CLASS,
+                mut_byte_ptr(&mut info),
+                u32::try_from(size_of::<SystemBasicInformation>()).unwrap(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(
+            return_length,
+            u32::try_from(size_of::<SystemBasicInformation>()).unwrap()
+        );
+        assert_eq!(info.page_size, u32::try_from(PAGE_SIZE).unwrap());
+        assert_eq!(info.allocation_granularity, ALLOCATION_GRANULARITY);
+        assert_eq!(info.number_of_processors, NUMBER_OF_PROCESSORS);
     }
 
     #[test]
