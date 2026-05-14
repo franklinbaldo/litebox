@@ -183,6 +183,33 @@ fn allocate_virtual_memory(
     let Some(permissions) = page_protect_to_permissions(protect) else {
         return NtStatus::INVALID_PAGE_PROTECTION;
     };
+
+    if allocation_type & MEM_RESERVE == 0 {
+        if base == 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if update_permissions(page_manager, aligned_base, aligned_len, permissions).is_err() {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if base_address.write_at_offset(0, aligned_base).is_none()
+            || region_size.write_at_offset(0, aligned_len).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
+            base:% = format_args!("{:#x}", base),
+            aligned_base:% = format_args!("{:#x}", aligned_base),
+            aligned_len = aligned_len,
+            allocation_type:% = format_args!("{:#x}", allocation_type),
+            protect:% = format_args!("{:#x}", protect);
+            "Handled virtual memory commit syscall"
+        );
+
+        return NtStatus::SUCCESS;
+    }
+
     let suggested_address = NonZeroAddress::new(aligned_base);
     let Some(length) = NonZeroPageSize::new(aligned_len) else {
         return NtStatus::INVALID_PARAMETER;
@@ -692,6 +719,7 @@ mod tests {
     const PROTECT_TEST_BASE: usize = 0x1200_0000;
     const QUERY_TEST_BASE: usize = 0x1300_0000;
     const FREE_TEST_BASE: usize = 0x1400_0000;
+    const COMMIT_TEST_BASE: usize = 0x1500_0000;
     const OTHER_PROCESS_HANDLE: ProcessHandle = ProcessHandle::from_raw(0x1234);
 
     fn init_platform() {
@@ -908,6 +936,48 @@ mod tests {
             ),
             NtStatus::INVALID_PARAMETER
         );
+    }
+
+    #[test]
+    fn nt_allocate_virtual_memory_commits_existing_range() {
+        let page_manager = page_manager();
+        let mut base = COMMIT_TEST_BASE;
+        let mut size = PAGE_SIZE;
+
+        assert_eq!(
+            handle_nt_allocate_virtual_memory(
+                &page_manager,
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                0,
+                mut_ptr(&mut size),
+                MEM_RESERVE,
+                PAGE_READONLY,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut commit_base = COMMIT_TEST_BASE;
+        let mut commit_size = 1usize;
+        assert_eq!(
+            handle_nt_allocate_virtual_memory(
+                &page_manager,
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut commit_base),
+                0,
+                mut_ptr(&mut commit_size),
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(commit_base, COMMIT_TEST_BASE);
+        assert_eq!(commit_size, PAGE_SIZE);
+
+        let info = query_memory_basic_information(&page_manager, COMMIT_TEST_BASE).unwrap();
+        assert_eq!(info.protect, PAGE_READWRITE);
+
+        release_mapping(&page_manager, base);
     }
 
     #[test]
