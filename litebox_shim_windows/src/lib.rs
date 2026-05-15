@@ -531,6 +531,32 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenFile {
+                file_handle,
+                desired_access,
+                object_attributes,
+                io_status_block,
+                share_access,
+                open_options,
+            } => {
+                let status = self.handle_nt_open_file(
+                    file_handle,
+                    desired_access,
+                    object_attributes,
+                    io_status_block,
+                    share_access,
+                    open_options,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryAttributesFile {
+                object_attributes,
+                file_information,
+            } => {
+                let status =
+                    self.handle_nt_query_attributes_file(object_attributes, file_information);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
                 (status, ContinueOperation::Resume)
@@ -823,7 +849,12 @@ impl<FS: NtShimFS> Task<FS> {
                     )
                 },
             )
-            .unwrap_or(NtStatus::INVALID_HANDLE);
+            .unwrap_or_else(|_| {
+                let Some(raw_fd) = handle.raw_fd() else {
+                    return NtStatus::INVALID_HANDLE;
+                };
+                self.close_raw_handle::<FS>(raw_fd)
+            });
 
         if status == NtStatus::SUCCESS {
             litebox_util_log::debug!(
@@ -874,7 +905,6 @@ impl<FS: NtShimFS> Task<FS> {
             drop(handles);
             return Ok(wait_completion_packet(raw_fd, fd));
         }
-
         Err(NtStatus::INVALID_HANDLE)
     }
 

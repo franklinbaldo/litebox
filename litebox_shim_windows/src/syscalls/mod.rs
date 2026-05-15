@@ -6,6 +6,7 @@ mod nt_sysno {
 }
 
 pub(crate) mod event;
+pub(crate) mod file;
 pub(crate) mod hard_error;
 pub(crate) mod mm;
 pub(crate) mod nls;
@@ -56,6 +57,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         link_handle: Handle,
         link_target: Platform::RawMutPointer<crate::loader::nt_types::UnicodeString>,
         returned_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtOpenFile {
+        file_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+        io_status_block: Platform::RawMutPointer<file::IoStatusBlock>,
+        share_access: u32,
+        open_options: u32,
+    },
+    NtQueryAttributesFile {
+        object_attributes: Platform::RawConstPointer<object::ObjectAttributes>,
+        file_information: Platform::RawMutPointer<file::FileBasicInformation>,
     },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
@@ -226,6 +239,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 link_handle:{Handle::from_raw},
                 link_target:*,
                 returned_length:*,
+            })),
+            NtSysno::NtOpenFile => Some(sys_req!(NtOpenFile {
+                file_handle:*,
+                desired_access,
+                object_attributes:*,
+                io_status_block:*,
+                share_access,
+                open_options,
+            })),
+            NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
+                object_attributes:*,
+                file_information:*,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,

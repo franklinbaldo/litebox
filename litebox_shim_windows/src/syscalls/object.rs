@@ -353,7 +353,11 @@ impl<FS: NtShimFS> Task<FS> {
         NtStatus::SUCCESS
     }
 
-    fn resolve_object_path(&self, root_directory: Handle, name: &str) -> Result<String, NtStatus> {
+    pub(crate) fn resolve_object_path(
+        &self,
+        root_directory: Handle,
+        name: &str,
+    ) -> Result<String, NtStatus> {
         if name.starts_with('\\') {
             return Ok(normalize_absolute_object_path(name));
         }
