@@ -123,6 +123,8 @@ pub(crate) type WindowsHandleStore =
 type WindowsEventHandle = alloc::sync::Arc<litebox::fd::TypedFd<event::EventSubsystem>>;
 type WindowsObjectDirectoryHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<syscalls::object::ObjectDirectorySubsystem>>;
+type WindowsSymbolicLinkHandle =
+    alloc::sync::Arc<litebox::fd::TypedFd<syscalls::object::SymbolicLinkSubsystem>>;
 type WindowsRegistryKeyHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
 type WindowsWaitCompletionPacketHandle =
@@ -505,6 +507,18 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.handle_nt_open_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
                 (status, ContinueOperation::Resume)
@@ -787,6 +801,9 @@ impl<FS: NtShimFS> Task<FS> {
                 |raw_fd, _directory| {
                     self.close_raw_handle::<syscalls::object::ObjectDirectorySubsystem>(raw_fd)
                 },
+                |raw_fd, _symbolic_link| {
+                    self.close_raw_handle::<syscalls::object::SymbolicLinkSubsystem>(raw_fd)
+                },
                 |raw_fd, _key| self.close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd),
                 |raw_fd, _packet| {
                     self.close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(
@@ -811,6 +828,7 @@ impl<FS: NtShimFS> Task<FS> {
         handle: Handle,
         event: impl FnOnce(usize, WindowsEventHandle) -> R,
         object_directory: impl FnOnce(usize, WindowsObjectDirectoryHandle) -> R,
+        symbolic_link: impl FnOnce(usize, WindowsSymbolicLinkHandle) -> R,
         registry_key: impl FnOnce(usize, WindowsRegistryKeyHandle) -> R,
         wait_completion_packet: impl FnOnce(usize, WindowsWaitCompletionPacketHandle) -> R,
     ) -> Result<R, NtStatus> {
@@ -827,6 +845,12 @@ impl<FS: NtShimFS> Task<FS> {
         {
             drop(handles);
             return Ok(object_directory(raw_fd, fd));
+        }
+        if let Ok(fd) =
+            handles.fd_from_raw_integer::<syscalls::object::SymbolicLinkSubsystem>(raw_fd)
+        {
+            drop(handles);
+            return Ok(symbolic_link(raw_fd, fd));
         }
         if let Ok(fd) = handles.fd_from_raw_integer::<registry::RegistryKeySubsystem>(raw_fd) {
             drop(handles);

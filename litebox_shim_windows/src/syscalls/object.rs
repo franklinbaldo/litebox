@@ -25,6 +25,15 @@ const KNOWN_OBJECT_DIRECTORIES: &[&str] = &[
     r"\Sessions",
 ];
 
+const KNOWN_SYMBOLIC_LINKS: &[(&str, &str)] = &[
+    (r"\KnownDlls\KnownDllPath", r"C:\Windows\System32"),
+    (r"\KnownDlls32\KnownDllPath", r"C:\Windows\SysWOW64"),
+    (r"\??\C:", r"\Device\HarddiskVolume1"),
+    (r"\Global??\C:", r"\Device\HarddiskVolume1"),
+    (r"\??\NUL", r"\Device\Null"),
+    (r"\Global??\NUL", r"\Device\Null"),
+];
+
 pub(crate) struct ObjectDirectorySubsystem;
 
 impl FdEnabledSubsystem for ObjectDirectorySubsystem {
@@ -40,6 +49,29 @@ pub(crate) struct ObjectDirectoryObject {
 impl ObjectDirectoryObject {
     pub(crate) fn path(&self) -> &str {
         &self.path
+    }
+}
+
+pub(crate) struct SymbolicLinkSubsystem;
+
+impl FdEnabledSubsystem for SymbolicLinkSubsystem {
+    type Entry = SymbolicLinkObject;
+}
+
+impl FdEnabledSubsystemEntry for SymbolicLinkObject {}
+
+pub(crate) struct SymbolicLinkObject {
+    path: String,
+    target: String,
+}
+
+impl SymbolicLinkObject {
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        &self.target
     }
 }
 
@@ -153,8 +185,7 @@ impl<FS: NtShimFS> Task<FS> {
             Ok(name) => name,
             Err(status) => return status,
         };
-        let path = match self.resolve_directory_object_path(object_attributes.root_directory, &name)
-        {
+        let path = match self.resolve_object_path(object_attributes.root_directory, &name) {
             Ok(path) => path,
             Err(status) => return status,
         };
@@ -191,11 +222,73 @@ impl<FS: NtShimFS> Task<FS> {
         NtStatus::SUCCESS
     }
 
-    fn resolve_directory_object_path(
+    pub(crate) fn handle_nt_open_symbolic_link_object(
         &self,
-        root_directory: Handle,
-        name: &str,
-    ) -> Result<String, NtStatus> {
+        link_handle: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<
+            <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<ObjectAttributes>,
+        >,
+    ) -> NtStatus {
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let object_attributes = match read_object_attributes(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
+        };
+        if object_attributes.object_name == 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let name = match read_unicode_string(object_attributes.object_name) {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
+        let path = match self.resolve_object_path(object_attributes.root_directory, &name) {
+            Ok(path) => path,
+            Err(status) => return status,
+        };
+        let Some(target) = known_symbolic_link_target(&path) else {
+            return NtStatus::OBJECT_NAME_NOT_FOUND;
+        };
+
+        let link = SymbolicLinkObject {
+            path: path.clone(),
+            target: String::from(target),
+        };
+        let log_path = String::from(link.path());
+        let log_target = String::from(link.target());
+        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
+        let typed = descriptor_table.insert::<SymbolicLinkSubsystem>(link);
+        drop(descriptor_table);
+        let handle = match insert_raw_handle(&self.global.litebox, &self.process.handles, typed) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+
+        if link_handle.write_at_offset(0, handle).is_none() {
+            remove_raw_handle::<SymbolicLinkSubsystem>(
+                &self.global.litebox,
+                &self.process.handles,
+                handle,
+            );
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", handle.as_raw()),
+            desired_access:% = format_args!("{desired_access:#x}"),
+            root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+            path:% = log_path,
+            target:% = log_target;
+            "Handled NtOpenSymbolicLinkObject syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    fn resolve_object_path(&self, root_directory: Handle, name: &str) -> Result<String, NtStatus> {
         if name.starts_with('\\') {
             return Ok(normalize_absolute_object_path(name));
         }
@@ -255,6 +348,12 @@ fn is_known_object_directory(path: &str) -> bool {
     KNOWN_OBJECT_DIRECTORIES
         .iter()
         .any(|known| path.eq_ignore_ascii_case(known))
+}
+
+fn known_symbolic_link_target(path: &str) -> Option<&'static str> {
+    KNOWN_SYMBOLIC_LINKS
+        .iter()
+        .find_map(|(known_path, target)| path.eq_ignore_ascii_case(known_path).then_some(*target))
 }
 
 #[cfg(test)]
@@ -402,6 +501,128 @@ mod tests {
 
         assert_eq!(
             task.handle_nt_open_directory_object(
+                mut_ptr(&mut handle),
+                0,
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(task.handle_nt_close(handle), NtStatus::SUCCESS);
+        assert_eq!(task.handle_nt_close(handle), NtStatus::INVALID_HANDLE);
+    }
+
+    #[test]
+    fn nt_open_symbolic_link_object_opens_known_link() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let name_buffer = r"\KnownDlls\KnownDllPath"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let name = unicode_string(&name_buffer);
+        let object_attributes = object_attributes(&name);
+        let mut handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_open_symbolic_link_object(
+                mut_ptr(&mut handle),
+                0x0001,
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_ne!(handle, Handle::default());
+        let link = raw_handle_entry::<SymbolicLinkSubsystem>(
+            &task.global.litebox,
+            &task.process.handles,
+            handle,
+        )
+        .unwrap();
+        assert_eq!(
+            link.with_entry(|link| String::from(link.path())),
+            r"\KnownDlls\KnownDllPath"
+        );
+        assert_eq!(
+            link.with_entry(|link| String::from(link.target())),
+            r"C:\Windows\System32"
+        );
+    }
+
+    #[test]
+    fn nt_open_symbolic_link_object_resolves_relative_link() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let root_name_buffer = r"\KnownDlls".encode_utf16().collect::<Vec<_>>();
+        let root_name = unicode_string(&root_name_buffer);
+        let root_attributes = object_attributes(&root_name);
+        let mut root_handle = Handle::default();
+        assert_eq!(
+            task.handle_nt_open_directory_object(
+                mut_ptr(&mut root_handle),
+                0,
+                Some(const_ptr(&root_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let relative_name_buffer = "KnownDllPath".encode_utf16().collect::<Vec<_>>();
+        let relative_name = unicode_string(&relative_name_buffer);
+        let mut relative_attributes = object_attributes(&relative_name);
+        relative_attributes.root_directory = root_handle;
+        let mut handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_open_symbolic_link_object(
+                mut_ptr(&mut handle),
+                0,
+                Some(const_ptr(&relative_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let link = raw_handle_entry::<SymbolicLinkSubsystem>(
+            &task.global.litebox,
+            &task.process.handles,
+            handle,
+        )
+        .unwrap();
+        assert_eq!(
+            link.with_entry(|link| String::from(link.path())),
+            r"\KnownDlls\KnownDllPath"
+        );
+    }
+
+    #[test]
+    fn nt_open_symbolic_link_object_rejects_unknown_link() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let name_buffer = r"\KnownDlls\Missing".encode_utf16().collect::<Vec<_>>();
+        let name = unicode_string(&name_buffer);
+        let object_attributes = object_attributes(&name);
+        let mut handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_open_symbolic_link_object(
+                mut_ptr(&mut handle),
+                0,
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(handle, Handle::default());
+    }
+
+    #[test]
+    fn nt_close_removes_symbolic_link_object_handle() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let name_buffer = r"\KnownDlls\KnownDllPath"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let name = unicode_string(&name_buffer);
+        let object_attributes = object_attributes(&name);
+        let mut handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_open_symbolic_link_object(
                 mut_ptr(&mut handle),
                 0,
                 Some(const_ptr(&object_attributes)),
