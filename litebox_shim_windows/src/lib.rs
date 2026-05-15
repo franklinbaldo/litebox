@@ -519,6 +519,18 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySymbolicLinkObject {
+                link_handle,
+                link_target,
+                returned_length,
+            } => {
+                let status = self.handle_nt_query_symbolic_link_object(
+                    link_handle,
+                    link_target,
+                    returned_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
                 (status, ContinueOperation::Resume)

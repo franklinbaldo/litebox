@@ -288,6 +288,71 @@ impl<FS: NtShimFS> Task<FS> {
         NtStatus::SUCCESS
     }
 
+    pub(crate) fn handle_nt_query_symbolic_link_object(
+        &self,
+        link_handle: Handle,
+        link_target: <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<
+            UnicodeString,
+        >,
+        returned_length: Option<
+            <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>,
+        >,
+    ) -> NtStatus {
+        let Some(link) = raw_handle_entry::<SymbolicLinkSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            link_handle,
+        ) else {
+            return NtStatus::INVALID_HANDLE;
+        };
+        let target = link.with_entry(|link| String::from(link.target()));
+        let Ok(required_len) = u32::try_from(target.encode_utf16().count() * size_of::<u16>())
+        else {
+            return NtStatus::BUFFER_TOO_SMALL;
+        };
+
+        if let Some(returned_length) = returned_length
+            && returned_length.write_at_offset(0, required_len).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let Some(mut link_target_value) = link_target.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if u32::from(link_target_value.maximum_length) < required_len {
+            return NtStatus::BUFFER_TOO_SMALL;
+        }
+        if required_len != 0 && link_target_value.buffer == 0 {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let buffer =
+            <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<u16>::from_usize(
+                link_target_value.buffer,
+            );
+        let target_units = target.encode_utf16().collect::<alloc::vec::Vec<_>>();
+        if buffer.write_slice_at_offset(0, &target_units).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Ok(length) = u16::try_from(required_len) else {
+            return NtStatus::BUFFER_TOO_SMALL;
+        };
+        link_target_value.length = length;
+        if link_target.write_at_offset(0, link_target_value).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", link_handle.as_raw()),
+            target:% = target,
+            required_len = required_len;
+            "Handled NtQuerySymbolicLinkObject syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+
     fn resolve_object_path(&self, root_directory: Handle, name: &str) -> Result<String, NtStatus> {
         if name.starts_with('\\') {
             return Ok(normalize_absolute_object_path(name));
@@ -394,6 +459,33 @@ mod tests {
             attributes: 0,
             security_descriptor: 0,
             security_quality_of_service: 0,
+        }
+    }
+
+    fn open_known_dll_path_link(task: &Task<crate::DefaultFS>) -> Handle {
+        let name_buffer = r"\KnownDlls\KnownDllPath"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let name = unicode_string(&name_buffer);
+        let object_attributes = object_attributes(&name);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.handle_nt_open_symbolic_link_object(
+                mut_ptr(&mut handle),
+                0,
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
+    fn output_unicode_string(buffer: &mut [u16]) -> UnicodeString {
+        UnicodeString {
+            length: 0,
+            maximum_length: u16::try_from(core::mem::size_of_val(buffer)).unwrap(),
+            padding_0: [0; 4],
+            buffer: buffer.as_mut_ptr() as usize,
         }
     }
 
@@ -631,5 +723,83 @@ mod tests {
         );
         assert_eq!(task.handle_nt_close(handle), NtStatus::SUCCESS);
         assert_eq!(task.handle_nt_close(handle), NtStatus::INVALID_HANDLE);
+    }
+
+    #[test]
+    fn nt_query_symbolic_link_object_writes_target() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let handle = open_known_dll_path_link(&task);
+        let expected = r"C:\Windows\System32".encode_utf16().collect::<Vec<_>>();
+        let mut buffer = [0u16; 64];
+        let mut link_target = output_unicode_string(&mut buffer);
+        let mut returned_length = 0u32;
+
+        assert_eq!(
+            task.handle_nt_query_symbolic_link_object(
+                handle,
+                mut_ptr(&mut link_target),
+                Some(mut_ptr(&mut returned_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let expected_bytes = u32::try_from(core::mem::size_of_val(&*expected)).unwrap();
+        assert_eq!(returned_length, expected_bytes);
+        assert_eq!(u32::from(link_target.length), expected_bytes);
+        assert_eq!(&buffer[..expected.len()], &expected);
+    }
+
+    #[test]
+    fn nt_query_symbolic_link_object_reports_small_buffer() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let handle = open_known_dll_path_link(&task);
+        let mut buffer = [0u16; 2];
+        let mut link_target = output_unicode_string(&mut buffer);
+        let mut returned_length = 0u32;
+
+        assert_eq!(
+            task.handle_nt_query_symbolic_link_object(
+                handle,
+                mut_ptr(&mut link_target),
+                Some(mut_ptr(&mut returned_length)),
+            ),
+            NtStatus::BUFFER_TOO_SMALL
+        );
+        assert_eq!(
+            returned_length,
+            u32::try_from(r"C:\Windows\System32".encode_utf16().count() * size_of::<u16>())
+                .unwrap()
+        );
+        assert_eq!(link_target.length, 0);
+    }
+
+    #[test]
+    fn nt_query_symbolic_link_object_rejects_non_link_handle() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let name_buffer = r"\KnownDlls".encode_utf16().collect::<Vec<_>>();
+        let name = unicode_string(&name_buffer);
+        let object_attributes = object_attributes(&name);
+        let mut directory_handle = Handle::default();
+        assert_eq!(
+            task.handle_nt_open_directory_object(
+                mut_ptr(&mut directory_handle),
+                0,
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+        let mut buffer = [0u16; 64];
+        let mut link_target = output_unicode_string(&mut buffer);
+
+        assert_eq!(
+            task.handle_nt_query_symbolic_link_object(
+                directory_handle,
+                mut_ptr(&mut link_target),
+                None,
+            ),
+            NtStatus::INVALID_HANDLE
+        );
     }
 }

@@ -52,6 +52,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
     },
+    NtQuerySymbolicLinkObject {
+        link_handle: Handle,
+        link_target: Platform::RawMutPointer<crate::loader::nt_types::UnicodeString>,
+        returned_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -216,6 +221,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 link_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
+                link_handle:{Handle::from_raw},
+                link_target:*,
+                returned_length:*,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
