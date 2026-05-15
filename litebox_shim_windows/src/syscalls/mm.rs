@@ -3,10 +3,11 @@
 
 use core::mem::size_of;
 
+use int_enum::IntEnum;
 use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
-use litebox_common_windows::nt_status::NtStatus;
+use litebox_common_windows::{loader::MappingInfo, nt_status::NtStatus};
 use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -42,7 +43,7 @@ const MEM_PRIVATE: u32 = 0x20000;
 const MEM_TOP_DOWN: u32 = 0x100000;
 const SUPPORTED_ALLOCATION_TYPES: u32 = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN;
 
-const MEMORY_BASIC_INFORMATION_CLASS: u32 = 0;
+const MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE: usize = 24;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
 const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
 const MEM_EXTENDED_PARAMETER_NUMA_NODE: u64 = 2;
@@ -55,6 +56,14 @@ const SUPPORTED_MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: usize = MEM_EXTENDED_PAR
     | MEM_EXTENDED_PARAMETER_NONPAGED_LARGE
     | MEM_EXTENDED_PARAMETER_NONPAGED_HUGE
     | MEM_EXTENDED_PARAMETER_EC_CODE;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum MemoryInformationClass {
+    Basic = 0,
+    Image = 6,
+    ImageExtension = 14,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -69,6 +78,15 @@ struct MemoryBasicInformation {
     protect: u32,
     type_: u32,
     _padding1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct MemoryImageInformation {
+    image_base: usize,
+    size_of_image: usize,
+    image_flags: u32,
+    _padding: u32,
 }
 
 #[repr(C)]
@@ -470,8 +488,32 @@ impl<FS: NtShimFS> Task<FS> {
             return NtStatus::INVALID_HANDLE;
         }
 
-        if memory_information_class != MEMORY_BASIC_INFORMATION_CLASS {
+        let Ok(memory_information_class) =
+            MemoryInformationClass::try_from(memory_information_class)
+        else {
             return NtStatus::INVALID_INFO_CLASS;
+        };
+
+        match memory_information_class {
+            MemoryInformationClass::Image => {
+                return self.handle_nt_query_virtual_memory_image_information(
+                    process_handle,
+                    base_address,
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+            }
+            MemoryInformationClass::ImageExtension => {
+                return handle_nt_query_virtual_memory_image_extension_information(
+                    process_handle,
+                    base_address,
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+            }
+            MemoryInformationClass::Basic => {}
         }
 
         let required_len = size_of::<MemoryBasicInformation>();
@@ -511,6 +553,108 @@ impl<FS: NtShimFS> Task<FS> {
 
         NtStatus::SUCCESS
     }
+
+    fn handle_nt_query_virtual_memory_image_information(
+        &self,
+        process_handle: ProcessHandle,
+        base_address: usize,
+        memory_information: GuestMutPointer<u8>,
+        memory_information_length: usize,
+        return_length: Option<GuestMutPointer<usize>>,
+    ) -> NtStatus {
+        let required_len = size_of::<MemoryImageInformation>();
+        if let Some(return_length) = return_length
+            && return_length.write_at_offset(0, required_len).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if memory_information_length < required_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        let Some(mapping) = image_mapping_for_address(
+            &self.process.mapping,
+            self.process.ntdll_mapping.as_ref(),
+            base_address,
+        ) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+
+        let info = MemoryImageInformation {
+            image_base: mapping.base_addr,
+            size_of_image: mapping.image_size,
+            image_flags: 0,
+            _padding: 0,
+        };
+        let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
+            MemoryImageInformation,
+        >::from_usize(memory_information.as_usize());
+        if output.write_at_offset(0, info).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
+            base:% = format_args!("{:#x}", base_address),
+            image_base:% = format_args!("{:#x}", mapping.base_addr),
+            image_size = mapping.image_size;
+            "Handled NtQueryVirtualMemory MemoryImageInformation syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+}
+
+fn image_mapping_for_address<'a>(
+    application_mapping: &'a MappingInfo,
+    ntdll_mapping: Option<&'a MappingInfo>,
+    address: usize,
+) -> Option<&'a MappingInfo> {
+    [Some(application_mapping), ntdll_mapping]
+        .into_iter()
+        .flatten()
+        .find(|mapping| {
+            mapping.image_size != 0
+                && address >= mapping.base_addr
+                && address < mapping.base_addr.saturating_add(mapping.image_size)
+        })
+}
+
+fn handle_nt_query_virtual_memory_image_extension_information(
+    process_handle: ProcessHandle,
+    base_address: usize,
+    memory_information: GuestMutPointer<u8>,
+    memory_information_length: usize,
+    return_length: Option<GuestMutPointer<usize>>,
+) -> NtStatus {
+    if let Some(return_length) = return_length
+        && return_length
+            .write_at_offset(0, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE)
+            .is_none()
+    {
+        return NtStatus::ACCESS_VIOLATION;
+    }
+    if memory_information_length < MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE {
+        return NtStatus::INFO_LENGTH_MISMATCH;
+    }
+    let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
+        [u8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE],
+    >::from_usize(memory_information.as_usize());
+    if output
+        .write_at_offset(0, [0; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE])
+        .is_none()
+    {
+        return NtStatus::ACCESS_VIOLATION;
+    }
+
+    litebox_util_log::debug!(
+        process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
+        base:% = format_args!("{:#x}", base_address),
+        required_len = MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE;
+        "Handled NtQueryVirtualMemory MemoryImageExtensionInformation syscall"
+    );
+
+    NtStatus::SUCCESS
 }
 
 fn page_aligned_region(base: usize, size: usize) -> Option<(usize, usize)> {
@@ -856,6 +1000,7 @@ mod tests {
     const QUERY_TEST_BASE: usize = 0x1300_0000;
     const FREE_TEST_BASE: usize = 0x1400_0000;
     const COMMIT_TEST_BASE: usize = 0x1500_0000;
+    const IMAGE_EXTENSION_TEST_BASE: usize = 0x1600_0000;
     const OTHER_PROCESS_HANDLE: ProcessHandle = ProcessHandle::from_raw(0x1234);
 
     fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<T> {
@@ -864,6 +1009,10 @@ mod tests {
 
     fn mut_byte_ptr<T>(value: &mut T) -> MutPtr<u8> {
         MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+    }
+
+    fn class_value(class: MemoryInformationClass) -> u32 {
+        class as u32
     }
 
     fn empty_memory_basic_information() -> MemoryBasicInformation {
@@ -902,11 +1051,113 @@ mod tests {
     }
 
     #[test]
+    fn memory_image_information_matches_windows_x64_layout() {
+        assert_eq!(size_of::<MemoryImageInformation>(), 24);
+        assert_eq!(align_of::<MemoryImageInformation>(), 8);
+    }
+
+    #[test]
     fn memory_extended_parameter_matches_windows_x64_layout() {
         assert_eq!(size_of::<MemoryExtendedParameter>(), 16);
         assert_eq!(align_of::<MemoryExtendedParameter>(), 8);
         assert_eq!(size_of::<MemoryAddressRequirements>(), 24);
         assert_eq!(align_of::<MemoryAddressRequirements>(), 8);
+    }
+
+    #[test]
+    fn nt_query_virtual_memory_image_extension_information_returns_zeroed_info() {
+        let task = crate::tests::test_task();
+        let mut output_base = IMAGE_EXTENSION_TEST_BASE;
+        let mut output_size = PAGE_SIZE;
+        assert_eq!(
+            task.handle_nt_allocate_virtual_memory(
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut output_base),
+                0,
+                mut_ptr(&mut output_size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let output = MutPtr::<u8>::from_usize(output_base);
+        output
+            .write_slice_at_offset(0, &[0xff; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE])
+            .unwrap();
+        let mut return_length = 0usize;
+
+        assert_eq!(
+            task.handle_nt_query_virtual_memory(
+                ProcessHandle::CURRENT,
+                QUERY_TEST_BASE,
+                class_value(MemoryInformationClass::ImageExtension),
+                output,
+                MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE,
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(return_length, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE);
+        let information = core::array::from_fn(|index| {
+            output
+                .read_at_offset(index.try_into().unwrap())
+                .expect("test output byte is readable")
+        });
+        assert_eq!(information, [0; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE]);
+
+        release_mapping(&task, output_base);
+    }
+
+    #[test]
+    fn nt_query_virtual_memory_image_extension_information_rejects_short_buffer() {
+        let task = crate::tests::test_task();
+        let mut information = [0xff; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE - 1];
+        let mut return_length = 0usize;
+        let information_len = information.len();
+
+        assert_eq!(
+            task.handle_nt_query_virtual_memory(
+                ProcessHandle::CURRENT,
+                QUERY_TEST_BASE,
+                class_value(MemoryInformationClass::ImageExtension),
+                mut_byte_ptr(&mut information),
+                information_len,
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(return_length, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE);
+        assert_eq!(
+            information,
+            [0xff; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE - 1]
+        );
+    }
+
+    #[test]
+    fn nt_query_virtual_memory_image_information_rejects_unknown_image_address() {
+        let task = crate::tests::test_task();
+        let mut information = MemoryImageInformation {
+            image_base: usize::MAX,
+            size_of_image: usize::MAX,
+            image_flags: u32::MAX,
+            _padding: u32::MAX,
+        };
+        let mut return_length = 0usize;
+
+        assert_eq!(
+            task.handle_nt_query_virtual_memory(
+                ProcessHandle::CURRENT,
+                QUERY_TEST_BASE,
+                class_value(MemoryInformationClass::Image),
+                mut_byte_ptr(&mut information),
+                size_of::<MemoryImageInformation>(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(return_length, size_of::<MemoryImageInformation>());
+        assert_eq!(information.image_base, usize::MAX);
     }
 
     #[test]
@@ -1285,7 +1536,7 @@ mod tests {
             task.handle_nt_query_virtual_memory(
                 ProcessHandle::CURRENT,
                 base,
-                MEMORY_BASIC_INFORMATION_CLASS,
+                class_value(MemoryInformationClass::Basic),
                 mut_byte_ptr(&mut info),
                 size_of::<MemoryBasicInformation>(),
                 None,
@@ -1322,7 +1573,7 @@ mod tests {
             task.handle_nt_query_virtual_memory(
                 ProcessHandle::CURRENT,
                 base + 0x10,
-                MEMORY_BASIC_INFORMATION_CLASS,
+                class_value(MemoryInformationClass::Basic),
                 mut_byte_ptr(&mut info),
                 size_of::<MemoryBasicInformation>(),
                 Some(mut_ptr(&mut return_length)),
@@ -1345,7 +1596,7 @@ mod tests {
             task.handle_nt_query_virtual_memory(
                 ProcessHandle::CURRENT,
                 base,
-                MEMORY_BASIC_INFORMATION_CLASS,
+                class_value(MemoryInformationClass::Basic),
                 mut_byte_ptr(&mut free_info),
                 size_of::<MemoryBasicInformation>(),
                 None,
@@ -1479,7 +1730,7 @@ mod tests {
             task.handle_nt_query_virtual_memory(
                 ProcessHandle::CURRENT,
                 second_base,
-                MEMORY_BASIC_INFORMATION_CLASS,
+                class_value(MemoryInformationClass::Basic),
                 mut_byte_ptr(&mut second_info),
                 size_of::<MemoryBasicInformation>(),
                 None,
@@ -1618,7 +1869,7 @@ mod tests {
             task.handle_nt_query_virtual_memory(
                 OTHER_PROCESS_HANDLE,
                 base,
-                MEMORY_BASIC_INFORMATION_CLASS,
+                class_value(MemoryInformationClass::Basic),
                 mut_byte_ptr(&mut info),
                 size_of::<MemoryBasicInformation>(),
                 None,
