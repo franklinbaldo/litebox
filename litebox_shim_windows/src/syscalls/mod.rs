@@ -42,6 +42,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
     },
+    NtOpenDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+    },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -194,6 +199,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             })),
             NtSysno::NtCreateWaitCompletionPacket => Some(sys_req!(NtCreateWaitCompletionPacket {
                 wait_completion_packet_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
+                directory_handle:*,
                 desired_access,
                 object_attributes:*,
             })),

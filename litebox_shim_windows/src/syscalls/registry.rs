@@ -19,7 +19,9 @@ use litebox_platform_multiplex::Platform;
 use crate::loader::nt_types::UnicodeString;
 use crate::{Handle, NtShimFS, Task, insert_raw_handle, raw_handle_entry, remove_raw_handle};
 
-use super::object::{ObjectAttributes, read_object_attributes};
+use super::object::{
+    ObjectAttributes, read_object_attributes, read_unicode_string, read_unicode_string_pointer,
+};
 
 pub(crate) struct RegistryKeySubsystem;
 
@@ -316,65 +318,6 @@ impl<FS: NtShimFS> Task<FS> {
 
         status
     }
-}
-
-fn read_unicode_string(unicode_string: usize) -> Result<String, NtStatus> {
-    let unicode_string = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<
-        UnicodeString,
-    >::from_usize(unicode_string);
-    read_unicode_string_pointer(unicode_string)
-}
-
-fn read_unicode_string_pointer(
-    unicode_string: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<
-        UnicodeString,
-    >,
-) -> Result<String, NtStatus> {
-    let Some(unicode_string) = unicode_string.read_at_offset(0) else {
-        return Err(NtStatus::ACCESS_VIOLATION);
-    };
-    if unicode_string.length % 2 != 0 {
-        return Err(NtStatus::INVALID_PARAMETER);
-    }
-    if unicode_string.length == 0 {
-        return Ok(String::new());
-    }
-    if unicode_string.buffer == 0 {
-        return Err(NtStatus::ACCESS_VIOLATION);
-    }
-
-    let chars = usize::from(unicode_string.length / 2);
-    let buffer =
-        <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<u16>::from_usize(
-            unicode_string.buffer,
-        );
-    let mut string = String::new();
-    let mut index = 0;
-    while index < chars {
-        let offset = isize::try_from(index).expect("UNICODE_STRING length fits in isize");
-        let Some(unit) = buffer.read_at_offset(offset) else {
-            return Err(NtStatus::ACCESS_VIOLATION);
-        };
-        if (0xd800..=0xdbff).contains(&unit) && index + 1 < chars {
-            let next_offset =
-                isize::try_from(index + 1).expect("UNICODE_STRING length fits in isize");
-            let Some(next_unit) = buffer.read_at_offset(next_offset) else {
-                return Err(NtStatus::ACCESS_VIOLATION);
-            };
-            if (0xdc00..=0xdfff).contains(&next_unit) {
-                let high = u32::from(unit) - 0xd800;
-                let low = u32::from(next_unit) - 0xdc00;
-                if let Some(ch) = char::from_u32(0x1_0000 + ((high << 10) | low)) {
-                    string.push(ch);
-                    index += 2;
-                    continue;
-                }
-            }
-        }
-        string.push(char::from_u32(u32::from(unit)).unwrap_or(char::REPLACEMENT_CHARACTER));
-        index += 1;
-    }
-    Ok(string)
 }
 
 fn write_key_value_basic_information(

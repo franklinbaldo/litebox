@@ -121,6 +121,8 @@ pub(crate) type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 type WindowsEventHandle = alloc::sync::Arc<litebox::fd::TypedFd<event::EventSubsystem>>;
+type WindowsObjectDirectoryHandle =
+    alloc::sync::Arc<litebox::fd::TypedFd<syscalls::object::ObjectDirectorySubsystem>>;
 type WindowsRegistryKeyHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
 type WindowsWaitCompletionPacketHandle =
@@ -491,6 +493,18 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.handle_nt_open_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
                 (status, ContinueOperation::Resume)
@@ -770,6 +784,9 @@ impl<FS: NtShimFS> Task<FS> {
             .run_on_raw_handle(
                 handle,
                 |raw_fd, _event| self.close_raw_handle::<event::EventSubsystem>(raw_fd),
+                |raw_fd, _directory| {
+                    self.close_raw_handle::<syscalls::object::ObjectDirectorySubsystem>(raw_fd)
+                },
                 |raw_fd, _key| self.close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd),
                 |raw_fd, _packet| {
                     self.close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(
@@ -793,6 +810,7 @@ impl<FS: NtShimFS> Task<FS> {
         &self,
         handle: Handle,
         event: impl FnOnce(usize, WindowsEventHandle) -> R,
+        object_directory: impl FnOnce(usize, WindowsObjectDirectoryHandle) -> R,
         registry_key: impl FnOnce(usize, WindowsRegistryKeyHandle) -> R,
         wait_completion_packet: impl FnOnce(usize, WindowsWaitCompletionPacketHandle) -> R,
     ) -> Result<R, NtStatus> {
@@ -803,6 +821,12 @@ impl<FS: NtShimFS> Task<FS> {
         if let Ok(fd) = handles.fd_from_raw_integer::<event::EventSubsystem>(raw_fd) {
             drop(handles);
             return Ok(event(raw_fd, fd));
+        }
+        if let Ok(fd) =
+            handles.fd_from_raw_integer::<syscalls::object::ObjectDirectorySubsystem>(raw_fd)
+        {
+            drop(handles);
+            return Ok(object_directory(raw_fd, fd));
         }
         if let Ok(fd) = handles.fd_from_raw_integer::<registry::RegistryKeySubsystem>(raw_fd) {
             drop(handles);
