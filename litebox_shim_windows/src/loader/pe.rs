@@ -25,7 +25,7 @@ use crate::nt_types::{
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, ProcessEnvironmentBlock, RtlUserProcFlags,
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString,
 };
-use crate::{NtShimFS, WindowsPageManager, write_slice, write_value};
+use crate::{NtShimFS, WindowsPageManager, WindowsVirtualAllocation, write_slice, write_value};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
@@ -34,6 +34,7 @@ const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 const KI_USER_INVERTED_FUNCTION_TABLE: &[u8] = b"KiUserInvertedFunctionTable";
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
+const PROCESS_ENVIRONMENT_ALLOCATION_PROTECT: u32 = 0x04;
 
 /// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
@@ -105,7 +106,8 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         image_base_address: usize,
         image_path: &str,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
-        let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
+        let mut virtual_allocations = Vec::new();
+        let mut create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
             let aligned_length = size.next_multiple_of(PAGE_SIZE);
             let length =
                 NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
@@ -117,7 +119,13 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
                     |_| Ok(0),
                 )
             }?;
-            Ok(ptr.as_usize())
+            let base = ptr.as_usize();
+            virtual_allocations.push(WindowsVirtualAllocation {
+                base,
+                size: aligned_length,
+                allocation_protect: PROCESS_ENVIRONMENT_ALLOCATION_PROTECT,
+            });
+            Ok(base)
         };
         let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
@@ -204,6 +212,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             peb: peb_ptr,
             _process_parameters: process_parameters_ptr,
             teb: teb_ptr,
+            virtual_allocations,
         })
     }
 
@@ -291,6 +300,7 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) _process_parameters: usize,
     pub(crate) teb: usize,
+    pub(crate) virtual_allocations: Vec<WindowsVirtualAllocation>,
 }
 
 pub(crate) struct LoadedImage {

@@ -15,7 +15,7 @@ use litebox_common_windows::loader::MappingInfo;
 
 use crate::{
     DefaultFS, GlobalState, Process, Task, WindowsHandleStore, WindowsNlsSectionMappings,
-    WindowsPageManager,
+    WindowsPageManager, WindowsVirtualAllocations,
 };
 
 pub(crate) fn init_platform() {
@@ -91,6 +91,7 @@ fn test_task_with_nls_files_and_process(
             ntdll_mapping: None,
             handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
+            virtual_allocations: WindowsVirtualAllocations::new(BTreeMap::new()),
             peb_address,
             cookie,
             exit_code: AtomicI32::new(0),

@@ -127,6 +127,15 @@ type WindowsWaitCompletionPacketHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<wait_completion_packet::WaitCompletionPacketSubsystem>>;
 type WindowsNlsSectionMappings =
     litebox::sync::Mutex<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
+pub(crate) type WindowsVirtualAllocations =
+    litebox::sync::Mutex<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsVirtualAllocation {
+    pub(crate) base: usize,
+    pub(crate) size: usize,
+    pub(crate) allocation_protect: u32,
+}
 
 pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
@@ -310,6 +319,14 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ntdll_mapping: load_info.ntdll_mapping,
             handles: WindowsHandleStore::new(litebox::fd::RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
+            virtual_allocations: WindowsVirtualAllocations::new(
+                load_info
+                    .environment
+                    .virtual_allocations
+                    .into_iter()
+                    .map(|allocation| (allocation.base, allocation))
+                    .collect(),
+            ),
             peb_address: load_info.environment.peb,
             cookie: generate_process_cookie(self.0.platform),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
@@ -354,6 +371,7 @@ struct Process {
     ntdll_mapping: Option<MappingInfo>,
     handles: WindowsHandleStore,
     nls_section_mappings: WindowsNlsSectionMappings,
+    virtual_allocations: WindowsVirtualAllocations,
     peb_address: usize,
     cookie: u32,
     exit_code: AtomicI32,
@@ -543,8 +561,7 @@ impl<FS: NtShimFS> Task<FS> {
                 allocation_type,
                 protect,
             } => {
-                let status = mm::handle_nt_allocate_virtual_memory(
-                    &self.global.page_manager,
+                let status = self.handle_nt_allocate_virtual_memory(
                     process_handle,
                     base_address,
                     zero_bits,
@@ -563,8 +580,7 @@ impl<FS: NtShimFS> Task<FS> {
                 extended_parameters,
                 extended_parameter_count,
             } => {
-                let status = mm::handle_nt_allocate_virtual_memory_ex(
-                    &self.global.page_manager,
+                let status = self.handle_nt_allocate_virtual_memory_ex(
                     process_handle,
                     base_address,
                     region_size,
@@ -583,8 +599,7 @@ impl<FS: NtShimFS> Task<FS> {
                 region_size,
                 free_type,
             } => {
-                let status = mm::handle_nt_free_virtual_memory(
-                    &self.global.page_manager,
+                let status = self.handle_nt_free_virtual_memory(
                     process_handle,
                     base_address,
                     region_size,
@@ -599,8 +614,7 @@ impl<FS: NtShimFS> Task<FS> {
                 new_protect,
                 old_protect,
             } => {
-                let status = mm::handle_nt_protect_virtual_memory(
-                    &self.global.page_manager,
+                let status = self.handle_nt_protect_virtual_memory(
                     process_handle,
                     base_address,
                     region_size,
@@ -617,8 +631,7 @@ impl<FS: NtShimFS> Task<FS> {
                 memory_information_length,
                 return_length,
             } => {
-                let status = mm::handle_nt_query_virtual_memory(
-                    &self.global.page_manager,
+                let status = self.handle_nt_query_virtual_memory(
                     process_handle,
                     base_address,
                     memory_information_class,
