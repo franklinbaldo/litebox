@@ -107,6 +107,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         allocation_type: u32,
         page_protection: u32,
     },
+    NtUnmapViewOfSection {
+        process_handle: ProcessHandle,
+        base_address: usize,
+    },
     NtQueryValueKey {
         key_handle: Handle,
         value_name: Platform::RawConstPointer<crate::loader::nt_types::UnicodeString>,
@@ -324,6 +328,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 inherit_disposition,
                 allocation_type,
                 page_protection,
+            })),
+            NtSysno::NtUnmapViewOfSection => Some(sys_req!(NtUnmapViewOfSection {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
             })),
             NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
                 key_handle:{Handle::from_raw},
@@ -627,5 +635,27 @@ mod tests {
         assert_eq!(inherit_disposition, 2);
         assert_eq!(allocation_type, 0x4000_0000);
         assert_eq!(page_protection, 0x02);
+    }
+
+    #[test]
+    fn nt_unmap_view_of_section_decodes_arguments() {
+        crate::tests::init_platform();
+        let pt_regs = litebox_common_linux::PtRegs {
+            r10: ProcessHandle::CURRENT.as_raw(),
+            rdx: 0x1234_5000,
+            orig_rax: 0x2a,
+            ..Default::default()
+        };
+
+        let Some(SyscallRequest::NtUnmapViewOfSection {
+            process_handle,
+            base_address,
+        }) = SyscallRequest::<Platform>::try_from_raw(&pt_regs)
+        else {
+            panic!("NtUnmapViewOfSection did not decode");
+        };
+
+        assert!(process_handle.is_current());
+        assert_eq!(base_address, 0x1234_5000);
     }
 }

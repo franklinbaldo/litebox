@@ -156,6 +156,7 @@ type WindowsWaitCompletionPacketHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<wait_completion_packet::WaitCompletionPacketSubsystem>>;
 type WindowsNlsSectionMappings =
     litebox::sync::Mutex<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
+type WindowsSectionViews = litebox::sync::Mutex<Platform, BTreeMap<usize, usize>>;
 pub(crate) type WindowsVirtualAllocations =
     litebox::sync::Mutex<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 
@@ -348,6 +349,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ntdll_mapping: load_info.ntdll_mapping,
             handles: WindowsHandleStore::new(litebox::fd::RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
+            section_views: WindowsSectionViews::new(BTreeMap::new()),
             virtual_allocations: WindowsVirtualAllocations::new(
                 load_info
                     .environment
@@ -401,6 +403,7 @@ struct Process {
     ntdll_mapping: Option<MappingInfo>,
     handles: WindowsHandleStore,
     nls_section_mappings: WindowsNlsSectionMappings,
+    section_views: WindowsSectionViews,
     virtual_allocations: WindowsVirtualAllocations,
     peb_address: usize,
     cookie: u32,
@@ -667,6 +670,13 @@ impl<FS: NtShimFS> Task<FS> {
                     allocation_type,
                     page_protection,
                 });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUnmapViewOfSection {
+                process_handle,
+                base_address,
+            } => {
+                let status = self.handle_nt_unmap_view_of_section(process_handle, base_address);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtQueryValueKey {

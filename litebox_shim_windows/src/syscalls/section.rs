@@ -5,14 +5,15 @@ use alloc::string::String;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::{Mode, OFlags};
+use litebox::mm::linux::NonZeroPageSize;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::ProcessHandle;
 use crate::loader::WindowsLoadError;
 use crate::loader::pe;
 use crate::syscalls::object::{ObjectAttributes, read_object_attributes, read_unicode_string};
 use crate::{Handle, NtShimFS, Platform, Task, insert_raw_handle, remove_raw_handle};
+use crate::{PAGE_SIZE, ProcessHandle};
 
 type GuestMutPointer<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
 
@@ -198,8 +199,18 @@ impl<FS: NtShimFS> Task<FS> {
                 .write_at_offset(0, image.mapping.image_size)
                 .is_none()
         {
+            let _ = remove_section_view_pages(
+                &self.global.page_manager,
+                image.mapping.base_addr,
+                image.mapping.image_size,
+            );
             return NtStatus::ACCESS_VIOLATION;
         }
+
+        self.process
+            .section_views
+            .lock()
+            .insert(image.mapping.base_addr, image.mapping.image_size);
 
         litebox_util_log::debug!(
             section_handle:% = format_args!("{:#x}", request.section_handle.as_raw()),
@@ -216,6 +227,70 @@ impl<FS: NtShimFS> Task<FS> {
 
         NtStatus::SUCCESS
     }
+
+    pub(crate) fn handle_nt_unmap_view_of_section(
+        &self,
+        process_handle: ProcessHandle,
+        base_address: usize,
+    ) -> NtStatus {
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let Some((view_base, view_size)) =
+            remove_section_view_for_address(&self.process.section_views, base_address)
+        else {
+            return NtStatus::NOT_MAPPED_VIEW;
+        };
+
+        if remove_section_view_pages(&self.global.page_manager, view_base, view_size).is_err() {
+            self.process
+                .section_views
+                .lock()
+                .insert(view_base, view_size);
+            return NtStatus::UNABLE_TO_FREE_VM;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
+            base_address:% = format_args!("{base_address:#x}"),
+            view_base:% = format_args!("{view_base:#x}"),
+            view_size = view_size;
+            "Handled NtUnmapViewOfSection syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+}
+
+fn remove_section_view_for_address(
+    section_views: &crate::WindowsSectionViews,
+    base_address: usize,
+) -> Option<(usize, usize)> {
+    let mut views = section_views.lock();
+    let (&view_base, &view_size) = views.range(..=base_address).next_back()?;
+    let view_end = view_base.checked_add(view_size)?;
+    if base_address < view_end {
+        views.remove(&view_base);
+        Some((view_base, view_size))
+    } else {
+        None
+    }
+}
+
+fn remove_section_view_pages(
+    page_manager: &crate::WindowsPageManager,
+    view_base: usize,
+    view_size: usize,
+) -> Result<(), ()> {
+    if view_base == 0 || NonZeroPageSize::<PAGE_SIZE>::new(view_size).is_none() {
+        return Err(());
+    }
+
+    let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(view_base);
+    // SAFETY: Section views are ranges previously created by this shim's section mapper and
+    // tracked in `section_views`; removing them implements the guest's explicit unmap request.
+    unsafe { page_manager.remove_pages(ptr, view_size) }.map_err(|_| ())
 }
 
 fn map_section_load_error(error: &WindowsLoadError) -> NtStatus {
@@ -257,7 +332,9 @@ fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
 mod tests {
     use core::mem::size_of;
 
+    use litebox::mm::linux::CreatePagesFlags;
     use litebox::platform::RawConstPointer as _;
+    use litebox::platform::page_mgmt::MemoryRegionPermissions;
     use litebox_common_windows::nt_status::NtStatus;
     use zerocopy::{FromBytes, IntoBytes};
 
@@ -498,5 +575,43 @@ mod tests {
         );
         assert_eq!(base_address, 0);
         assert_eq!(view_size, 0);
+    }
+
+    #[test]
+    fn nt_unmap_view_of_section_removes_tracked_view() {
+        let task = crate::tests::test_task();
+        let mapping = crate::syscalls::mm::create_pages(
+            &task.global.page_manager,
+            None,
+            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::READ,
+            |_| Ok(0),
+        )
+        .unwrap();
+        let view_base = mapping.as_usize();
+        task.process
+            .section_views
+            .lock()
+            .insert(view_base, PAGE_SIZE);
+
+        assert_eq!(
+            task.handle_nt_unmap_view_of_section(ProcessHandle::CURRENT, view_base + 0x20),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.handle_nt_unmap_view_of_section(ProcessHandle::CURRENT, view_base),
+            NtStatus::NOT_MAPPED_VIEW
+        );
+    }
+
+    #[test]
+    fn nt_unmap_view_of_section_rejects_unknown_view() {
+        let task = crate::tests::test_task();
+
+        assert_eq!(
+            task.handle_nt_unmap_view_of_section(ProcessHandle::CURRENT, 0x1234_5000),
+            NtStatus::NOT_MAPPED_VIEW
+        );
     }
 }

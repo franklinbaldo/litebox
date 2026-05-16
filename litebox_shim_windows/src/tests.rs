@@ -91,6 +91,7 @@ fn test_task_with_nls_files_and_process(
             ntdll_mapping: None,
             handles: WindowsHandleStore::new(RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::new(BTreeMap::new()),
+            section_views: crate::WindowsSectionViews::new(BTreeMap::new()),
             virtual_allocations: WindowsVirtualAllocations::new(BTreeMap::new()),
             peb_address,
             cookie,
