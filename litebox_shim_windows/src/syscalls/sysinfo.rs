@@ -3,6 +3,7 @@
 
 use core::mem::size_of;
 
+use int_enum::IntEnum;
 use litebox::platform::Instant as _;
 use litebox::platform::{
     PageManagementProvider, RawConstPointer as _, RawMutPointer as _, TimeProvider as _,
@@ -14,13 +15,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::{PAGE_SIZE, loader::nt_types::GroupAffinity};
 
 const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
-const SYSTEM_BASIC_INFORMATION_CLASS: u32 = 0;
-const SYSTEM_NUMA_PROCESSOR_MAP_CLASS: u32 = 55;
-const SYSTEM_EMULATION_BASIC_INFORMATION_CLASS: u32 = 62;
-const SYSTEM_FLUSH_INFORMATION_CLASS: u32 = 192;
-const SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION_CLASS: u32 = 197;
-const SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS: u32 = 107;
-const SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS: u32 = 211;
 const SYSTEM_FEATURE_CONFIGURATION_SECTION_TYPE_COUNT: usize = 4;
 const MAXIMUM_NODE_COUNT: usize = 0x40;
 const RELATION_PROCESSOR_CORE: u32 = 0;
@@ -34,6 +28,19 @@ const DEFAULT_PHYSICAL_PAGES: u32 = 1024 * 1024;
 const NUMBER_OF_PROCESSORS: u8 = 1;
 const SUPPORTED_FLUSH_METHODS: u32 = 0x7;
 const SUPPORTED_FLUSH_PROCESSOR_FEATURES: u32 = 0x40;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum SystemInformationClass {
+    Basic = 0,
+    NumaProcessorMap = 55,
+    EmulationBasic = 62,
+    LogicalProcessorAndGroup = 107,
+    Flush = 192,
+    HypervisorSharedPage = 197,
+    FeatureConfigurationSection = 211,
+    ProcessorFeaturesBitMap = 250,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -73,6 +80,12 @@ struct SystemFlushInformation {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct SystemHypervisorSharedPageInformation {
     hypervisor_shared_user_va: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct SystemProcessorFeaturesBitMapInformation {
+    feature_bits: [u64; 2],
 }
 
 #[repr(C)]
@@ -189,8 +202,17 @@ pub(crate) fn handle_nt_query_system_information(
     system_information_length: u32,
     return_length: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>>,
 ) -> NtStatus {
+    let Ok(system_information_class) = SystemInformationClass::try_from(system_information_class)
+    else {
+        litebox_util_log::debug!(
+            system_information_class = system_information_class;
+            "Unsupported NtQuerySystemInformation class"
+        );
+        return NtStatus::INVALID_INFO_CLASS;
+    };
+
     let status = match system_information_class {
-        SYSTEM_BASIC_INFORMATION_CLASS | SYSTEM_EMULATION_BASIC_INFORMATION_CLASS => {
+        SystemInformationClass::Basic | SystemInformationClass::EmulationBasic => {
             write_system_information(
                 system_information,
                 system_information_length,
@@ -198,27 +220,33 @@ pub(crate) fn handle_nt_query_system_information(
                 &system_basic_information(),
             )
         }
-        SYSTEM_NUMA_PROCESSOR_MAP_CLASS => write_system_information(
+        SystemInformationClass::NumaProcessorMap => write_system_information(
             system_information,
             system_information_length,
             return_length,
             &system_numa_information(),
         ),
-        SYSTEM_FLUSH_INFORMATION_CLASS => write_system_information(
+        SystemInformationClass::Flush => write_system_information(
             system_information,
             system_information_length,
             return_length,
             &system_flush_information(),
         ),
-        SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION_CLASS => write_system_information(
+        SystemInformationClass::HypervisorSharedPage => write_system_information(
             system_information,
             system_information_length,
             return_length,
             &system_hypervisor_shared_page_information(),
         ),
+        SystemInformationClass::ProcessorFeaturesBitMap => write_system_information(
+            system_information,
+            system_information_length,
+            return_length,
+            &system_processor_features_bitmap_information(),
+        ),
         _ => {
             litebox_util_log::debug!(
-                system_information_class = system_information_class;
+                system_information_class:? = system_information_class;
                 "Unsupported NtQuerySystemInformation class"
             );
             NtStatus::INVALID_INFO_CLASS
@@ -227,7 +255,7 @@ pub(crate) fn handle_nt_query_system_information(
 
     if status == NtStatus::SUCCESS {
         litebox_util_log::debug!(
-            system_information_class = system_information_class,
+            system_information_class:? = system_information_class,
             system_information_length = system_information_length;
             "Handled NtQuerySystemInformation syscall"
         );
@@ -244,8 +272,17 @@ pub(crate) fn handle_nt_query_system_information_ex(
     system_information_length: u32,
     return_length: Option<<Platform as litebox::platform::RawPointerProvider>::RawMutPointer<u32>>,
 ) -> NtStatus {
+    let Ok(system_information_class) = SystemInformationClass::try_from(system_information_class)
+    else {
+        litebox_util_log::debug!(
+            system_information_class = system_information_class;
+            "Unsupported NtQuerySystemInformationEx class"
+        );
+        return NtStatus::INVALID_INFO_CLASS;
+    };
+
     let status = match system_information_class {
-        SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS => {
+        SystemInformationClass::LogicalProcessorAndGroup => {
             write_system_logical_processor_and_group_information(
                 input_buffer,
                 input_buffer_length,
@@ -254,7 +291,7 @@ pub(crate) fn handle_nt_query_system_information_ex(
                 return_length,
             )
         }
-        SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS => {
+        SystemInformationClass::FeatureConfigurationSection => {
             write_system_feature_configuration_sections_information(
                 input_buffer,
                 input_buffer_length,
@@ -265,7 +302,7 @@ pub(crate) fn handle_nt_query_system_information_ex(
         }
         _ => {
             litebox_util_log::debug!(
-                system_information_class = system_information_class;
+                system_information_class:? = system_information_class;
                 "Unsupported NtQuerySystemInformationEx class"
             );
             NtStatus::INVALID_INFO_CLASS
@@ -274,7 +311,7 @@ pub(crate) fn handle_nt_query_system_information_ex(
 
     if status == NtStatus::SUCCESS {
         litebox_util_log::debug!(
-            system_information_class = system_information_class,
+            system_information_class:? = system_information_class,
             input_buffer_length = input_buffer_length,
             system_information_length = system_information_length;
             "Handled NtQuerySystemInformationEx syscall"
@@ -493,6 +530,12 @@ fn system_hypervisor_shared_page_information() -> SystemHypervisorSharedPageInfo
     }
 }
 
+fn system_processor_features_bitmap_information() -> SystemProcessorFeaturesBitMapInformation {
+    SystemProcessorFeaturesBitMapInformation {
+        feature_bits: [0; 2],
+    }
+}
+
 fn active_processors_group_affinity() -> GroupAffinity {
     GroupAffinity {
         mask: usize::from(NUMBER_OF_PROCESSORS),
@@ -589,6 +632,34 @@ mod tests {
         ConstPtr::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
 
+    fn class_value(class: SystemInformationClass) -> u32 {
+        class as u32
+    }
+
+    #[test]
+    fn system_information_class_matches_windows_values() {
+        assert_eq!(class_value(SystemInformationClass::Basic), 0);
+        assert_eq!(class_value(SystemInformationClass::NumaProcessorMap), 55);
+        assert_eq!(class_value(SystemInformationClass::EmulationBasic), 62);
+        assert_eq!(
+            class_value(SystemInformationClass::LogicalProcessorAndGroup),
+            107
+        );
+        assert_eq!(class_value(SystemInformationClass::Flush), 192);
+        assert_eq!(
+            class_value(SystemInformationClass::HypervisorSharedPage),
+            197
+        );
+        assert_eq!(
+            class_value(SystemInformationClass::FeatureConfigurationSection),
+            211
+        );
+        assert_eq!(
+            class_value(SystemInformationClass::ProcessorFeaturesBitMap),
+            250
+        );
+    }
+
     #[test]
     fn system_basic_information_matches_windows_x64_layout() {
         assert_eq!(size_of::<SystemBasicInformation>(), 64);
@@ -613,6 +684,12 @@ mod tests {
     fn system_hypervisor_shared_page_information_matches_windows_x64_layout() {
         assert_eq!(size_of::<SystemHypervisorSharedPageInformation>(), 8);
         assert_eq!(align_of::<SystemHypervisorSharedPageInformation>(), 8);
+    }
+
+    #[test]
+    fn system_processor_features_bitmap_information_matches_windows_x64_layout() {
+        assert_eq!(size_of::<SystemProcessorFeaturesBitMapInformation>(), 16);
+        assert_eq!(align_of::<SystemProcessorFeaturesBitMapInformation>(), 8);
     }
 
     #[test]
@@ -683,7 +760,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_BASIC_INFORMATION_CLASS,
+                class_value(SystemInformationClass::Basic),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<SystemBasicInformation>()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -730,7 +807,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_EMULATION_BASIC_INFORMATION_CLASS,
+                class_value(SystemInformationClass::EmulationBasic),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<SystemBasicInformation>()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -763,7 +840,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_NUMA_PROCESSOR_MAP_CLASS,
+                class_value(SystemInformationClass::NumaProcessorMap),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<SystemNumaInformation>()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -799,7 +876,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_HYPERVISOR_SHARED_PAGE_INFORMATION_CLASS,
+                class_value(SystemInformationClass::HypervisorSharedPage),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<SystemHypervisorSharedPageInformation>()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -815,6 +892,31 @@ mod tests {
     }
 
     #[test]
+    fn nt_query_system_information_reports_processor_features_bitmap() {
+        init_platform();
+        let mut info = SystemProcessorFeaturesBitMapInformation {
+            feature_bits: [u64::MAX; 2],
+        };
+        let mut return_length = 0;
+
+        assert_eq!(
+            handle_nt_query_system_information(
+                class_value(SystemInformationClass::ProcessorFeaturesBitMap),
+                mut_byte_ptr(&mut info),
+                u32::try_from(size_of::<SystemProcessorFeaturesBitMapInformation>()).unwrap(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(
+            return_length,
+            u32::try_from(size_of::<SystemProcessorFeaturesBitMapInformation>()).unwrap()
+        );
+        assert_eq!(info.feature_bits, [0; 2]);
+    }
+
+    #[test]
     fn nt_query_system_information_rejects_invalid_arguments() {
         init_platform();
         let mut info = [0u8; size_of::<SystemBasicInformation>()];
@@ -822,7 +924,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_BASIC_INFORMATION_CLASS,
+                class_value(SystemInformationClass::Basic),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<SystemBasicInformation>() - 1).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -857,7 +959,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_FLUSH_INFORMATION_CLASS,
+                class_value(SystemInformationClass::Flush),
                 mut_byte_ptr(&mut info),
                 u32::try_from(size_of::<SystemFlushInformation>()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -882,7 +984,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information(
-                SYSTEM_FLUSH_INFORMATION_CLASS,
+                class_value(SystemInformationClass::Flush),
                 mut_byte_ptr(&mut info),
                 u32::try_from(info.len()).unwrap(),
                 Some(mut_ptr(&mut return_length)),
@@ -913,7 +1015,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS,
+                class_value(SystemInformationClass::FeatureConfigurationSection),
                 Some(const_byte_ptr(&request)),
                 u32::try_from(size_of::<SystemFeatureConfigurationSectionsRequest>()).unwrap(),
                 mut_byte_ptr(&mut info),
@@ -958,7 +1060,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS,
+                class_value(SystemInformationClass::LogicalProcessorAndGroup),
                 Some(const_byte_ptr(&relationship)),
                 u32::try_from(size_of::<u32>()).unwrap(),
                 mut_byte_ptr(&mut info),
@@ -998,7 +1100,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_LOGICAL_PROCESSOR_AND_GROUP_INFORMATION_CLASS,
+                class_value(SystemInformationClass::LogicalProcessorAndGroup),
                 Some(const_byte_ptr(&relationship)),
                 u32::try_from(size_of::<u32>()).unwrap(),
                 mut_byte_ptr(&mut info),
@@ -1029,7 +1131,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS,
+                class_value(SystemInformationClass::FeatureConfigurationSection),
                 None,
                 u32::try_from(size_of::<SystemFeatureConfigurationSectionsRequest>()).unwrap(),
                 mut_byte_ptr(&mut info),
@@ -1041,7 +1143,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS,
+                class_value(SystemInformationClass::FeatureConfigurationSection),
                 Some(const_byte_ptr(&request)),
                 u32::try_from(size_of::<SystemFeatureConfigurationSectionsRequest>() - 1).unwrap(),
                 mut_byte_ptr(&mut info),
@@ -1063,7 +1165,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS,
+                class_value(SystemInformationClass::FeatureConfigurationSection),
                 Some(const_byte_ptr(&request)),
                 u32::try_from(size_of::<SystemFeatureConfigurationSectionsRequest>()).unwrap(),
                 mut_byte_ptr(&mut info),
@@ -1085,7 +1187,7 @@ mod tests {
 
         assert_eq!(
             handle_nt_query_system_information_ex(
-                SYSTEM_FEATURE_CONFIGURATION_SECTION_INFORMATION_CLASS + 1,
+                class_value(SystemInformationClass::FeatureConfigurationSection) + 1,
                 None,
                 0,
                 mut_byte_ptr(&mut info),
