@@ -117,6 +117,29 @@ impl ProcessHandle {
     }
 }
 
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ThreadHandle(Handle);
+
+impl ThreadHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX - 1);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0.as_raw()
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+}
+
 pub(crate) type WindowsPageManager = PageManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
@@ -127,6 +150,7 @@ type WindowsSymbolicLinkHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<syscalls::object::SymbolicLinkSubsystem>>;
 type WindowsRegistryKeyHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
+type WindowsTokenHandle = alloc::sync::Arc<litebox::fd::TypedFd<syscalls::token::TokenSubsystem>>;
 type WindowsWaitCompletionPacketHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<wait_completion_packet::WaitCompletionPacketSubsystem>>;
 type WindowsNlsSectionMappings =
@@ -595,6 +619,20 @@ impl<FS: NtShimFS> Task<FS> {
                 let status = self.handle_nt_open_key(key_handle, desired_access, object_attributes);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenThreadToken {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                token_handle,
+            } => {
+                let status = self.handle_nt_open_thread_token(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,
@@ -865,22 +903,7 @@ impl<FS: NtShimFS> Task<FS> {
 
     pub(crate) fn handle_nt_close(&self, handle: Handle) -> NtStatus {
         let status = self
-            .run_on_raw_handle(
-                handle,
-                |raw_fd, _event| self.close_raw_handle::<event::EventSubsystem>(raw_fd),
-                |raw_fd, _directory| {
-                    self.close_raw_handle::<syscalls::object::ObjectDirectorySubsystem>(raw_fd)
-                },
-                |raw_fd, _symbolic_link| {
-                    self.close_raw_handle::<syscalls::object::SymbolicLinkSubsystem>(raw_fd)
-                },
-                |raw_fd, _key| self.close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd),
-                |raw_fd, _packet| {
-                    self.close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(
-                        raw_fd,
-                    )
-                },
-            )
+            .run_on_raw_handle(handle, CloseRawHandleVisitor { task: self })
             .unwrap_or_else(|_| {
                 let Some(raw_fd) = handle.raw_fd() else {
                     return NtStatus::INVALID_HANDLE;
@@ -901,11 +924,7 @@ impl<FS: NtShimFS> Task<FS> {
     pub(crate) fn run_on_raw_handle<R>(
         &self,
         handle: Handle,
-        event: impl FnOnce(usize, WindowsEventHandle) -> R,
-        object_directory: impl FnOnce(usize, WindowsObjectDirectoryHandle) -> R,
-        symbolic_link: impl FnOnce(usize, WindowsSymbolicLinkHandle) -> R,
-        registry_key: impl FnOnce(usize, WindowsRegistryKeyHandle) -> R,
-        wait_completion_packet: impl FnOnce(usize, WindowsWaitCompletionPacketHandle) -> R,
+        visitor: impl RawHandleVisitor<R>,
     ) -> Result<R, NtStatus> {
         let Some(raw_fd) = handle.raw_fd() else {
             return Err(NtStatus::INVALID_HANDLE);
@@ -913,29 +932,33 @@ impl<FS: NtShimFS> Task<FS> {
         let handles = self.process.handles.read();
         if let Ok(fd) = handles.fd_from_raw_integer::<event::EventSubsystem>(raw_fd) {
             drop(handles);
-            return Ok(event(raw_fd, fd));
+            return Ok(visitor.event(raw_fd, fd));
         }
         if let Ok(fd) =
             handles.fd_from_raw_integer::<syscalls::object::ObjectDirectorySubsystem>(raw_fd)
         {
             drop(handles);
-            return Ok(object_directory(raw_fd, fd));
+            return Ok(visitor.object_directory(raw_fd, fd));
         }
         if let Ok(fd) =
             handles.fd_from_raw_integer::<syscalls::object::SymbolicLinkSubsystem>(raw_fd)
         {
             drop(handles);
-            return Ok(symbolic_link(raw_fd, fd));
+            return Ok(visitor.symbolic_link(raw_fd, fd));
         }
         if let Ok(fd) = handles.fd_from_raw_integer::<registry::RegistryKeySubsystem>(raw_fd) {
             drop(handles);
-            return Ok(registry_key(raw_fd, fd));
+            return Ok(visitor.registry_key(raw_fd, fd));
+        }
+        if let Ok(fd) = handles.fd_from_raw_integer::<syscalls::token::TokenSubsystem>(raw_fd) {
+            drop(handles);
+            return Ok(visitor.token(raw_fd, fd));
         }
         if let Ok(fd) = handles
             .fd_from_raw_integer::<wait_completion_packet::WaitCompletionPacketSubsystem>(raw_fd)
         {
             drop(handles);
-            return Ok(wait_completion_packet(raw_fd, fd));
+            return Ok(visitor.wait_completion_packet(raw_fd, fd));
         }
         Err(NtStatus::INVALID_HANDLE)
     }
@@ -981,6 +1004,59 @@ impl<FS: NtShimFS> Task<FS> {
             "Windows guest interrupt"
         );
         ContinueOperation::Resume
+    }
+}
+
+pub(crate) trait RawHandleVisitor<R> {
+    fn event(self, raw_fd: usize, handle: WindowsEventHandle) -> R;
+
+    fn object_directory(self, raw_fd: usize, handle: WindowsObjectDirectoryHandle) -> R;
+
+    fn symbolic_link(self, raw_fd: usize, handle: WindowsSymbolicLinkHandle) -> R;
+
+    fn registry_key(self, raw_fd: usize, handle: WindowsRegistryKeyHandle) -> R;
+
+    fn token(self, raw_fd: usize, handle: WindowsTokenHandle) -> R;
+
+    fn wait_completion_packet(self, raw_fd: usize, handle: WindowsWaitCompletionPacketHandle) -> R;
+}
+
+struct CloseRawHandleVisitor<'task, FS: NtShimFS> {
+    task: &'task Task<FS>,
+}
+
+impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for CloseRawHandleVisitor<'_, FS> {
+    fn event(self, raw_fd: usize, _handle: WindowsEventHandle) -> NtStatus {
+        self.task.close_raw_handle::<event::EventSubsystem>(raw_fd)
+    }
+
+    fn object_directory(self, raw_fd: usize, _handle: WindowsObjectDirectoryHandle) -> NtStatus {
+        self.task
+            .close_raw_handle::<syscalls::object::ObjectDirectorySubsystem>(raw_fd)
+    }
+
+    fn symbolic_link(self, raw_fd: usize, _handle: WindowsSymbolicLinkHandle) -> NtStatus {
+        self.task
+            .close_raw_handle::<syscalls::object::SymbolicLinkSubsystem>(raw_fd)
+    }
+
+    fn registry_key(self, raw_fd: usize, _handle: WindowsRegistryKeyHandle) -> NtStatus {
+        self.task
+            .close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd)
+    }
+
+    fn token(self, raw_fd: usize, _handle: WindowsTokenHandle) -> NtStatus {
+        self.task
+            .close_raw_handle::<syscalls::token::TokenSubsystem>(raw_fd)
+    }
+
+    fn wait_completion_packet(
+        self,
+        raw_fd: usize,
+        _handle: WindowsWaitCompletionPacketHandle,
+    ) -> NtStatus {
+        self.task
+            .close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(raw_fd)
     }
 }
 

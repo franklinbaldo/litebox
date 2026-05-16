@@ -14,6 +14,7 @@ pub(crate) mod object;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
+pub(crate) mod token;
 pub(crate) mod trace;
 pub(crate) mod wait_completion_packet;
 
@@ -23,7 +24,7 @@ use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::{Handle, ProcessHandle};
+use crate::{Handle, ProcessHandle, ThreadHandle};
 
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
@@ -81,6 +82,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         key_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+    },
+    NtOpenThreadToken {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u8,
+        token_handle: Platform::RawMutPointer<Handle>,
     },
     NtQueryValueKey {
         key_handle: Handle,
@@ -276,6 +283,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 key_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
+                thread_handle:{ThreadHandle::from_raw},
+                desired_access,
+                open_as_self,
+                token_handle:*,
             })),
             NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
                 key_handle:{Handle::from_raw},

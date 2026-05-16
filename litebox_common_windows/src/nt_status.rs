@@ -150,6 +150,7 @@ impl NtStatus {
             0xC000005F => "STATUS_NO_SUCH_LOGON_SESSION: No such logon session",
             0xC0000060 => "STATUS_NO_SUCH_PRIVILEGE: No such privilege",
             0xC0000061 => "STATUS_PRIVILEGE_NOT_HELD: Privilege not held",
+            0xC000007C => "STATUS_NO_TOKEN: No token",
             0xC000007D => "STATUS_BAD_INHERITANCE_ACL: Bad inheritance ACL",
             0xC000007E => "STATUS_RANGE_NOT_LOCKED: Range not locked",
             0xC000007F => "STATUS_DISK_FULL: Disk full",
@@ -424,6 +425,9 @@ impl NtStatus {
 
     /// STATUS_PRIVILEGE_NOT_HELD
     pub const PRIVILEGE_NOT_HELD: Self = Self::from_raw(0xC0000061);
+
+    /// STATUS_NO_TOKEN
+    pub const NO_TOKEN: Self = Self::from_raw(0xC000007C);
 
     /// STATUS_BAD_INHERITANCE_ACL
     pub const BAD_INHERITANCE_ACL: Self = Self::from_raw(0xC000007D);
