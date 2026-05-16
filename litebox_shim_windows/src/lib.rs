@@ -643,6 +643,32 @@ impl<FS: NtShimFS> Task<FS> {
                     self.handle_nt_open_section(section_handle, desired_access, object_attributes);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtMapViewOfSection {
+                section_handle,
+                process_handle,
+                base_address,
+                zero_bits,
+                commit_size,
+                section_offset,
+                view_size,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+            } => {
+                let status = self.handle_nt_map_view_of_section(section::MapViewOfSectionRequest {
+                    section_handle,
+                    process_handle,
+                    base_address,
+                    zero_bits,
+                    commit_size,
+                    section_offset,
+                    view_size,
+                    inherit_disposition,
+                    allocation_type,
+                    page_protection,
+                });
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,

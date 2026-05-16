@@ -95,6 +95,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
     },
+    NtMapViewOfSection {
+        section_handle: Handle,
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        zero_bits: usize,
+        commit_size: usize,
+        section_offset: Option<Platform::RawMutPointer<i64>>,
+        view_size: Platform::RawMutPointer<usize>,
+        inherit_disposition: u32,
+        allocation_type: u32,
+        page_protection: u32,
+    },
     NtQueryValueKey {
         key_handle: Handle,
         value_name: Platform::RawConstPointer<crate::loader::nt_types::UnicodeString>,
@@ -219,7 +231,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         // Additional arguments are read from the user stack below.
         macro_rules! sys_req {
             ($id:ident { $( $field:ident $(:$star:tt)? ),* $(,)? }) => {
-                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ 0, 1, 2, 3, 4, 5, 6 ] [ ])
+                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 ] [ ])
             };
             (@[$id:ident] [ $f:ident $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: win_sys_req_arg::<Platform, _>(pt_regs, $n)?, ])
@@ -300,6 +312,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 section_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtMapViewOfSection => Some(sys_req!(NtMapViewOfSection {
+                section_handle:{Handle::from_raw},
+                process_handle:{ProcessHandle::from_raw},
+                base_address:*,
+                zero_bits,
+                commit_size,
+                section_offset:*,
+                view_size:*,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
             })),
             NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
                 key_handle:{Handle::from_raw},
@@ -536,5 +560,72 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
         } else {
             Some(P::from_usize(value))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Platform;
+
+    #[test]
+    fn nt_map_view_of_section_decodes_stack_arguments() {
+        crate::tests::init_platform();
+        let mut base_address = 0usize;
+        let mut section_offset = 0i64;
+        let mut view_size = 0usize;
+        let stack_args = [
+            0x10usize,
+            core::ptr::from_mut(&mut section_offset) as usize,
+            core::ptr::from_mut(&mut view_size) as usize,
+            2,
+            0x4000_0000,
+            0x02,
+        ];
+        let pt_regs = litebox_common_linux::PtRegs {
+            r10: 0x20,
+            rdx: ProcessHandle::CURRENT.as_raw(),
+            r8: core::ptr::from_mut(&mut base_address) as usize,
+            r9: 3,
+            orig_rax: 0x28,
+            rsp: stack_args.as_ptr() as usize - 0x28,
+            ..Default::default()
+        };
+
+        let Some(SyscallRequest::NtMapViewOfSection {
+            section_handle,
+            process_handle,
+            base_address: decoded_base_address,
+            zero_bits,
+            commit_size,
+            section_offset: decoded_section_offset,
+            view_size: decoded_view_size,
+            inherit_disposition,
+            allocation_type,
+            page_protection,
+        }) = SyscallRequest::<Platform>::try_from_raw(&pt_regs)
+        else {
+            panic!("NtMapViewOfSection did not decode");
+        };
+
+        assert_eq!(section_handle, Handle::from_raw(0x20));
+        assert!(process_handle.is_current());
+        assert_eq!(
+            decoded_base_address.as_usize(),
+            core::ptr::from_mut(&mut base_address) as usize
+        );
+        assert_eq!(zero_bits, 3);
+        assert_eq!(commit_size, 0x10);
+        assert_eq!(
+            decoded_section_offset.unwrap().as_usize(),
+            core::ptr::from_mut(&mut section_offset) as usize
+        );
+        assert_eq!(
+            decoded_view_size.as_usize(),
+            core::ptr::from_mut(&mut view_size) as usize
+        );
+        assert_eq!(inherit_disposition, 2);
+        assert_eq!(allocation_type, 0x4000_0000);
+        assert_eq!(page_protection, 0x02);
     }
 }
