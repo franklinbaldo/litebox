@@ -43,7 +43,7 @@ pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
 use crate::syscalls::wait_completion_packet;
-use crate::syscalls::{NtSysno, SyscallRequest, hard_error, mm, registry, sysinfo, trace};
+use crate::syscalls::{NtSysno, SyscallRequest, hard_error, mm, registry, section, sysinfo, trace};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -150,6 +150,7 @@ type WindowsSymbolicLinkHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<syscalls::object::SymbolicLinkSubsystem>>;
 type WindowsRegistryKeyHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<registry::RegistryKeySubsystem>>;
+type WindowsSectionHandle = alloc::sync::Arc<litebox::fd::TypedFd<section::SectionSubsystem>>;
 type WindowsTokenHandle = alloc::sync::Arc<litebox::fd::TypedFd<syscalls::token::TokenSubsystem>>;
 type WindowsWaitCompletionPacketHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<wait_completion_packet::WaitCompletionPacketSubsystem>>;
@@ -633,6 +634,15 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenSection {
+                section_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status =
+                    self.handle_nt_open_section(section_handle, desired_access, object_attributes);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,
@@ -950,6 +960,10 @@ impl<FS: NtShimFS> Task<FS> {
             drop(handles);
             return Ok(visitor.registry_key(raw_fd, fd));
         }
+        if let Ok(fd) = handles.fd_from_raw_integer::<section::SectionSubsystem>(raw_fd) {
+            drop(handles);
+            return Ok(visitor.section(raw_fd, fd));
+        }
         if let Ok(fd) = handles.fd_from_raw_integer::<syscalls::token::TokenSubsystem>(raw_fd) {
             drop(handles);
             return Ok(visitor.token(raw_fd, fd));
@@ -1016,6 +1030,8 @@ pub(crate) trait RawHandleVisitor<R> {
 
     fn registry_key(self, raw_fd: usize, handle: WindowsRegistryKeyHandle) -> R;
 
+    fn section(self, raw_fd: usize, handle: WindowsSectionHandle) -> R;
+
     fn token(self, raw_fd: usize, handle: WindowsTokenHandle) -> R;
 
     fn wait_completion_packet(self, raw_fd: usize, handle: WindowsWaitCompletionPacketHandle) -> R;
@@ -1043,6 +1059,11 @@ impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for CloseRawHandleVisitor<'_, FS> 
     fn registry_key(self, raw_fd: usize, _handle: WindowsRegistryKeyHandle) -> NtStatus {
         self.task
             .close_raw_handle::<registry::RegistryKeySubsystem>(raw_fd)
+    }
+
+    fn section(self, raw_fd: usize, _handle: WindowsSectionHandle) -> NtStatus {
+        self.task
+            .close_raw_handle::<section::SectionSubsystem>(raw_fd)
     }
 
     fn token(self, raw_fd: usize, _handle: WindowsTokenHandle) -> NtStatus {

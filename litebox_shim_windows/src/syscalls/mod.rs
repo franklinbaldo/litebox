@@ -13,6 +13,7 @@ pub(crate) mod nls;
 pub(crate) mod object;
 pub(crate) mod process;
 pub(crate) mod registry;
+pub(crate) mod section;
 pub(crate) mod sysinfo;
 pub(crate) mod token;
 pub(crate) mod trace;
@@ -88,6 +89,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         open_as_self: u8,
         token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
     },
     NtQueryValueKey {
         key_handle: Handle,
@@ -289,6 +295,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 open_as_self,
                 token_handle:*,
+            })),
+            NtSysno::NtOpenSection => Some(sys_req!(NtOpenSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
             })),
             NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
                 key_handle:{Handle::from_raw},
