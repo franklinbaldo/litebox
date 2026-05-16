@@ -43,7 +43,9 @@ pub use loader::{PeImageAccessError, WindowsLoadError};
 
 use crate::syscalls::event;
 use crate::syscalls::wait_completion_packet;
-use crate::syscalls::{NtSysno, SyscallRequest, hard_error, mm, registry, section, sysinfo, trace};
+use crate::syscalls::{
+    NtSysno, SyscallRequest, hard_error, mm, registry, section, sysinfo, thread, trace,
+};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
@@ -634,6 +636,20 @@ impl<FS: NtShimFS> Task<FS> {
                     desired_access,
                     open_as_self,
                     token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+            } => {
+                let status = thread::handle_nt_set_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
                 );
                 (status, ContinueOperation::Resume)
             }

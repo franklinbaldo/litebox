@@ -15,6 +15,7 @@ pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod section;
 pub(crate) mod sysinfo;
+pub(crate) mod thread;
 pub(crate) mod token;
 pub(crate) mod trace;
 pub(crate) mod wait_completion_packet;
@@ -184,6 +185,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_information_class: u32,
         process_information: Platform::RawConstPointer<u8>,
         process_information_length: u32,
+    },
+    NtSetInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawConstPointer<u8>,
+        thread_information_length: u32,
     },
     NtGetNlsSectionPtr {
         section_type: u32,
@@ -406,6 +413,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_information_class,
                 process_information:*,
                 process_information_length,
+            })),
+            NtSysno::NtSetInformationThread => Some(sys_req!(NtSetInformationThread {
+                thread_handle:{ThreadHandle::from_raw},
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
             })),
             NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
                 section_type,
