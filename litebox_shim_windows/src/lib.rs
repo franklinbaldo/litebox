@@ -557,6 +557,22 @@ impl<FS: NtShimFS> Task<FS> {
                     self.handle_nt_query_attributes_file(object_attributes, file_information);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryVolumeInformationFile {
+                file_handle,
+                io_status_block,
+                fs_information,
+                fs_information_length,
+                fs_information_class,
+            } => {
+                let status = self.handle_nt_query_volume_information_file(
+                    file_handle,
+                    io_status_block,
+                    fs_information,
+                    fs_information_length,
+                    fs_information_class,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
                 (status, ContinueOperation::Resume)

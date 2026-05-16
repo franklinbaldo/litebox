@@ -70,6 +70,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Platform::RawConstPointer<object::ObjectAttributes>,
         file_information: Platform::RawMutPointer<file::FileBasicInformation>,
     },
+    NtQueryVolumeInformationFile {
+        file_handle: Handle,
+        io_status_block: Platform::RawMutPointer<file::IoStatusBlock>,
+        fs_information: Platform::RawMutPointer<u8>,
+        fs_information_length: u32,
+        fs_information_class: u32,
+    },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -251,6 +258,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
                 object_attributes:*,
                 file_information:*,
+            })),
+            NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(NtQueryVolumeInformationFile {
+                file_handle:{Handle::from_raw},
+                io_status_block:*,
+                fs_information:*,
+                fs_information_length,
+                fs_information_class,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
