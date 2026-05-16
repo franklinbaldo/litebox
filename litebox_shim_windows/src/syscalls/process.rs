@@ -28,6 +28,7 @@ enum ProcessInformationClass {
     Wow64Information = 26,
     DebugFlags = 31,
     Cookie = 36,
+    SchedulerSharedData = 112,
 }
 
 #[repr(C)]
@@ -112,6 +113,13 @@ impl<FS: NtShimFS> Task<FS> {
                 return_length,
                 self.process.cookie,
             ),
+            ProcessInformationClass::SchedulerSharedData => {
+                litebox_util_log::debug!(
+                    process_information_class:? = process_information_class;
+                    "Unsupported NtQueryInformationProcess class"
+                );
+                NtStatus::INVALID_INFO_CLASS
+            }
         }
     }
 
@@ -138,24 +146,28 @@ impl<FS: NtShimFS> Task<FS> {
             return NtStatus::INVALID_INFO_CLASS;
         };
 
-        let status = if process_information_class == ProcessInformationClass::DefaultHardErrorMode {
-            let mode = match read_fixed_information::<ProcessDefaultHardErrorMode>(
-                process_information,
-                process_information_length,
-            ) {
-                Ok(mode) => mode,
-                Err(status) => return status,
-            };
-            self.process
-                .default_hard_error_mode
-                .store(mode.default_hard_error_mode, Ordering::Release);
-            NtStatus::SUCCESS
-        } else {
-            litebox_util_log::debug!(
-                process_information_class:? = process_information_class;
-                "Unsupported NtSetInformationProcess class"
-            );
-            NtStatus::INVALID_INFO_CLASS
+        let status = match process_information_class {
+            ProcessInformationClass::DefaultHardErrorMode => {
+                let mode = match read_fixed_information::<ProcessDefaultHardErrorMode>(
+                    process_information,
+                    process_information_length,
+                ) {
+                    Ok(mode) => mode,
+                    Err(status) => return status,
+                };
+                self.process
+                    .default_hard_error_mode
+                    .store(mode.default_hard_error_mode, Ordering::Release);
+                NtStatus::SUCCESS
+            }
+            ProcessInformationClass::SchedulerSharedData => NtStatus::SUCCESS,
+            _ => {
+                litebox_util_log::debug!(
+                    process_information_class:? = process_information_class;
+                    "Unsupported NtSetInformationProcess class"
+                );
+                NtStatus::INVALID_INFO_CLASS
+            }
         };
 
         if status == NtStatus::SUCCESS {
@@ -410,6 +422,23 @@ mod tests {
         assert_eq!(
             return_length,
             u32::try_from(size_of::<ProcessDefaultHardErrorMode>()).unwrap()
+        );
+    }
+
+    #[test]
+    fn nt_set_information_process_accepts_scheduler_shared_data() {
+        init_platform();
+        let task = crate::tests::test_task_with_process(0, 0);
+        let scheduler_slot = 0usize;
+
+        assert_eq!(
+            task.handle_nt_set_information_process(
+                ProcessHandle::CURRENT,
+                class_value(ProcessInformationClass::SchedulerSharedData),
+                const_byte_ptr(&scheduler_slot),
+                u32::try_from(size_of::<usize>()).unwrap(),
+            ),
+            NtStatus::SUCCESS
         );
     }
 
