@@ -150,6 +150,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtSetInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawConstPointer<u8>,
+        process_information_length: u32,
+    },
     NtGetNlsSectionPtr {
         section_type: u32,
         section_data: u32,
@@ -338,6 +344,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_information:*,
                 process_information_length,
                 return_length:*,
+            })),
+            NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {
+                process_handle:{ProcessHandle::from_raw},
+                process_information_class,
+                process_information:*,
+                process_information_length,
             })),
             NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
                 section_type,

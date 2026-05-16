@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 
 use int_enum::IntEnum;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
@@ -23,6 +24,7 @@ const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 enum ProcessInformationClass {
     BasicInformation = 0,
     DebugPort = 7,
+    DefaultHardErrorMode = 12,
     Wow64Information = 26,
     DebugFlags = 31,
     Cookie = 36,
@@ -39,6 +41,12 @@ struct ProcessBasicInformation {
     _padding1: u32,
     unique_process_id: usize,
     inherited_from_unique_process_id: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessDefaultHardErrorMode {
+    default_hard_error_mode: u32,
 }
 
 impl<FS: NtShimFS> Task<FS> {
@@ -87,6 +95,17 @@ impl<FS: NtShimFS> Task<FS> {
                 return_length,
                 PROCESS_DEBUG_FLAGS_NO_DEBUGGER,
             ),
+            ProcessInformationClass::DefaultHardErrorMode => write_fixed_information(
+                process_information,
+                process_information_length,
+                return_length,
+                ProcessDefaultHardErrorMode {
+                    default_hard_error_mode: self
+                        .process
+                        .default_hard_error_mode
+                        .load(Ordering::Acquire),
+                },
+            ),
             ProcessInformationClass::Cookie => write_fixed_information(
                 process_information,
                 process_information_length,
@@ -95,6 +114,77 @@ impl<FS: NtShimFS> Task<FS> {
             ),
         }
     }
+
+    pub(crate) fn handle_nt_set_information_process(
+        &self,
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<
+            u8,
+        >,
+        process_information_length: u32,
+    ) -> NtStatus {
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let Ok(process_information_class) =
+            ProcessInformationClass::try_from(process_information_class)
+        else {
+            litebox_util_log::debug!(
+                process_information_class = process_information_class;
+                "Unsupported NtSetInformationProcess class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+
+        let status = if process_information_class == ProcessInformationClass::DefaultHardErrorMode {
+            let mode = match read_fixed_information::<ProcessDefaultHardErrorMode>(
+                process_information,
+                process_information_length,
+            ) {
+                Ok(mode) => mode,
+                Err(status) => return status,
+            };
+            self.process
+                .default_hard_error_mode
+                .store(mode.default_hard_error_mode, Ordering::Release);
+            NtStatus::SUCCESS
+        } else {
+            litebox_util_log::debug!(
+                process_information_class:? = process_information_class;
+                "Unsupported NtSetInformationProcess class"
+            );
+            NtStatus::INVALID_INFO_CLASS
+        };
+
+        if status == NtStatus::SUCCESS {
+            litebox_util_log::debug!(
+                process_information_class:? = process_information_class,
+                process_information_length;
+                "Handled NtSetInformationProcess syscall"
+            );
+        }
+
+        status
+    }
+}
+
+fn read_fixed_information<T: FromBytes + IntoBytes>(
+    process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<u8>,
+    process_information_length: u32,
+) -> Result<T, NtStatus> {
+    let required_len =
+        u32::try_from(size_of::<T>()).expect("process information length fits in ULONG");
+    if process_information_length < required_len {
+        return Err(NtStatus::INFO_LENGTH_MISMATCH);
+    }
+
+    let input =
+        <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<T>::from_usize(
+            process_information.as_usize(),
+        );
+    input.read_at_offset(0).ok_or(NtStatus::ACCESS_VIOLATION)
 }
 
 fn write_fixed_information<T: FromBytes + IntoBytes>(
@@ -146,6 +236,7 @@ mod tests {
     extern crate std;
 
     type MutPtr<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
+    type ConstPtr<T> = <Platform as RawPointerProvider>::RawConstPointer<T>;
 
     fn init_platform() {
         crate::tests::init_platform();
@@ -159,6 +250,10 @@ mod tests {
         MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
     }
 
+    fn const_byte_ptr<T>(value: &T) -> ConstPtr<u8> {
+        ConstPtr::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
     fn class_value(class: ProcessInformationClass) -> u32 {
         class as u32
     }
@@ -167,6 +262,12 @@ mod tests {
     fn process_basic_information_matches_windows_x64_layout() {
         assert_eq!(size_of::<ProcessBasicInformation>(), 48);
         assert_eq!(align_of::<ProcessBasicInformation>(), 8);
+    }
+
+    #[test]
+    fn process_default_hard_error_mode_matches_windows_x64_layout() {
+        assert_eq!(size_of::<ProcessDefaultHardErrorMode>(), 4);
+        assert_eq!(align_of::<ProcessDefaultHardErrorMode>(), 4);
     }
 
     #[test]
@@ -269,6 +370,84 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(cookie, process_cookie);
+    }
+
+    #[test]
+    fn nt_query_and_set_information_process_default_hard_error_mode() {
+        init_platform();
+        let task = crate::tests::test_task_with_process(0, 0);
+        let new_mode = ProcessDefaultHardErrorMode {
+            default_hard_error_mode: 0x8000,
+        };
+        let mut queried_mode = ProcessDefaultHardErrorMode {
+            default_hard_error_mode: u32::MAX,
+        };
+        let mut return_length = 0;
+
+        assert_eq!(
+            task.handle_nt_set_information_process(
+                ProcessHandle::CURRENT,
+                class_value(ProcessInformationClass::DefaultHardErrorMode),
+                const_byte_ptr(&new_mode),
+                u32::try_from(size_of::<ProcessDefaultHardErrorMode>()).unwrap(),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.handle_nt_query_information_process(
+                ProcessHandle::CURRENT,
+                class_value(ProcessInformationClass::DefaultHardErrorMode),
+                mut_byte_ptr(&mut queried_mode),
+                u32::try_from(size_of::<ProcessDefaultHardErrorMode>()).unwrap(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            queried_mode.default_hard_error_mode,
+            new_mode.default_hard_error_mode
+        );
+        assert_eq!(
+            return_length,
+            u32::try_from(size_of::<ProcessDefaultHardErrorMode>()).unwrap()
+        );
+    }
+
+    #[test]
+    fn nt_set_information_process_rejects_invalid_arguments() {
+        init_platform();
+        let task = crate::tests::test_task_with_process(0, 0);
+        let mode = ProcessDefaultHardErrorMode {
+            default_hard_error_mode: 1,
+        };
+
+        assert_eq!(
+            task.handle_nt_set_information_process(
+                ProcessHandle::from_raw(0x1234),
+                class_value(ProcessInformationClass::DefaultHardErrorMode),
+                const_byte_ptr(&mode),
+                u32::try_from(size_of::<ProcessDefaultHardErrorMode>()).unwrap(),
+            ),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            task.handle_nt_set_information_process(
+                ProcessHandle::CURRENT,
+                class_value(ProcessInformationClass::DefaultHardErrorMode),
+                const_byte_ptr(&mode),
+                u32::try_from(size_of::<ProcessDefaultHardErrorMode>() - 1).unwrap(),
+            ),
+            NtStatus::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(
+            task.handle_nt_set_information_process(
+                ProcessHandle::CURRENT,
+                class_value(ProcessInformationClass::BasicInformation),
+                const_byte_ptr(&mode),
+                u32::try_from(size_of::<ProcessDefaultHardErrorMode>()).unwrap(),
+            ),
+            NtStatus::INVALID_INFO_CLASS
+        );
     }
 
     #[test]

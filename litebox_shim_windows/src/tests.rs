@@ -6,7 +6,7 @@ extern crate std;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
-use core::sync::atomic::AtomicI32;
+use core::sync::atomic::{AtomicI32, AtomicU32};
 use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
@@ -94,6 +94,7 @@ fn test_task_with_nls_files_and_process(
             virtual_allocations: WindowsVirtualAllocations::new(BTreeMap::new()),
             peb_address,
             cookie,
+            default_hard_error_mode: AtomicU32::new(0),
             exit_code: AtomicI32::new(0),
         }),
         entry_point: 0,

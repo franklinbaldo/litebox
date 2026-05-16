@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -333,6 +333,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
             ),
             peb_address: load_info.environment.peb,
             cookie: generate_process_cookie(self.0.platform),
+            default_hard_error_mode: AtomicU32::new(0),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
 
@@ -378,6 +379,7 @@ struct Process {
     virtual_allocations: WindowsVirtualAllocations,
     peb_address: usize,
     cookie: u32,
+    default_hard_error_mode: AtomicU32,
     exit_code: AtomicI32,
 }
 
@@ -736,6 +738,20 @@ impl<FS: NtShimFS> Task<FS> {
                     process_information,
                     process_information_length,
                     return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+            } => {
+                let status = self.handle_nt_set_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
                 );
                 (status, ContinueOperation::Resume)
             }
