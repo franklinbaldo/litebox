@@ -5,6 +5,7 @@ mod nt_sysno {
     include!(concat!(env!("OUT_DIR"), "/nt_sysno.rs"));
 }
 
+pub(crate) mod apphelp;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod hard_error;
@@ -33,6 +34,10 @@ use crate::{Handle, ProcessHandle, ThreadHandle};
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtClose {
         handle: Handle,
+    },
+    NtApphelpCacheControl {
+        service_class: u32,
+        service_data: Option<Platform::RawMutPointer<u8>>,
     },
     NtCreateEvent {
         event_handle: Platform::RawMutPointer<Handle>,
@@ -261,6 +266,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         match NtSysno::from_raw(pt_regs.orig_rax)? {
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
+            })),
+            NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
+                service_class,
+                service_data: *,
             })),
             NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
                 event_handle:*,
@@ -670,5 +679,33 @@ mod tests {
 
         assert!(process_handle.is_current());
         assert_eq!(base_address, 0x1234_5000);
+    }
+
+    #[test]
+    fn nt_apphelp_cache_control_decodes_arguments() {
+        crate::tests::init_platform();
+        let mut service_data = 0u8;
+        let pt_regs = litebox_common_linux::PtRegs {
+            r10: 2,
+            rdx: core::ptr::from_mut(&mut service_data) as usize,
+            orig_rax: 0x4c,
+            ..Default::default()
+        };
+
+        let Some(SyscallRequest::NtApphelpCacheControl {
+            service_class,
+            service_data: decoded_service_data,
+        }) = SyscallRequest::<Platform>::try_from_raw(&pt_regs)
+        else {
+            panic!("NtApphelpCacheControl did not decode");
+        };
+
+        assert_eq!(service_class, 2);
+        assert_eq!(
+            decoded_service_data
+                .expect("service data pointer")
+                .as_usize(),
+            core::ptr::from_mut(&mut service_data) as usize
+        );
     }
 }

@@ -44,7 +44,7 @@ pub use loader::{PeImageAccessError, WindowsLoadError};
 use crate::syscalls::event;
 use crate::syscalls::wait_completion_packet;
 use crate::syscalls::{
-    NtSysno, SyscallRequest, hard_error, mm, registry, section, sysinfo, thread, trace,
+    NtSysno, SyscallRequest, apphelp, hard_error, mm, registry, section, sysinfo, thread, trace,
 };
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
@@ -497,6 +497,13 @@ impl<FS: NtShimFS> Task<FS> {
             "Handling Windows"
         );
         let (result, op) = match req {
+            SyscallRequest::NtApphelpCacheControl {
+                service_class,
+                service_data,
+            } => {
+                let status = apphelp::handle_nt_apphelp_cache_control(service_class, service_data);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtCreateEvent {
                 event_handle,
                 desired_access,
