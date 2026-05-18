@@ -102,6 +102,7 @@ fn test_task_with_nls_files_and_process(
         }),
         entry_point: 0,
         stack_top: 0,
+        initial_context: None,
         teb_address: 0,
     }
 }

@@ -378,6 +378,7 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                     process: process.clone(),
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
+                    initial_context: load_info.initial_context,
                     teb_address: load_info.environment.teb,
                 },
                 _not_send: PhantomData,
@@ -423,6 +424,7 @@ struct Task<FS: NtShimFS> {
     process: Arc<Process>,
     entry_point: usize,
     stack_top: usize,
+    initial_context: Option<usize>,
     teb_address: usize,
 }
 
@@ -467,13 +469,12 @@ impl<FS: NtShimFS> Task<FS> {
             self.stack_top
         };
         ctx.eflags = 0x202;
-        // TODO: Build the initial CONTEXT
-        ctx.rcx = 0;
-        ctx.rdx = if self.process.ntdll_mapping.is_some() {
-            self.process.mapping.base_addr
-        } else {
-            0
-        };
+        ctx.rcx = self.initial_context.unwrap_or(0);
+        ctx.rdx = self
+            .process
+            .ntdll_mapping
+            .as_ref()
+            .map_or(0, |mapping| mapping.base_addr);
         ctx.r8 = 0;
         ctx.r9 = 0;
         litebox_util_log::debug!(

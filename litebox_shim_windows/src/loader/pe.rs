@@ -45,11 +45,26 @@ const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
 const WINDOWS_OS_MINOR_VERSION: u32 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
 const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
+const AMD64_CONTEXT_SIZE: usize = 0x4d0;
+const AMD64_CONTEXT_FLAGS: usize = 0x30;
+const AMD64_CONTEXT_SEG_CS: usize = 0x38;
+const AMD64_CONTEXT_SEG_DS: usize = 0x3a;
+const AMD64_CONTEXT_SEG_ES: usize = 0x3c;
+const AMD64_CONTEXT_SEG_FS: usize = 0x3e;
+const AMD64_CONTEXT_SEG_GS: usize = 0x40;
+const AMD64_CONTEXT_SEG_SS: usize = 0x42;
+const AMD64_CONTEXT_EFLAGS: usize = 0x44;
+const AMD64_CONTEXT_RSP: usize = 0x98;
+const AMD64_CONTEXT_RIP: usize = 0xf8;
+const CONTEXT_AMD64_CONTROL_INTEGER: u32 = 0x0010_0003;
+const USER_MODE_CODE_SELECTOR: u16 = 0x33;
+const USER_MODE_DATA_SELECTOR: u16 = 0x2b;
 
 /// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
+    pub(crate) initial_context: Option<usize>,
     pub(crate) environment: WindowsProcessEnvironment,
     pub(crate) application_mapping: MappingInfo,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
@@ -101,13 +116,24 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             .as_usize()
             .checked_add(INITIAL_STACK_SIZE)
             .ok_or(PeImageAccessError::AddressOverflow)?;
+        let initial_context_stack_top = initial_stack_top(stack_top);
+        let environment = self.create_process_environment(
+            &image.image,
+            image_base_address,
+            path,
+            ntdll
+                .as_ref()
+                .map(|_| (application_entry_point, initial_context_stack_top)),
+        )?;
+        let initial_context = environment.initial_context;
 
         Ok(PeLoadInfo {
             entry_point,
             stack_top,
+            initial_context,
             application_mapping: image.mapping,
             ntdll_mapping: ntdll.map(|image| image.mapping),
-            environment: self.create_process_environment(&image.image, image_base_address, path)?,
+            environment,
         })
     }
 
@@ -116,6 +142,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         image: &PeImageInfo,
         image_base_address: usize,
         image_path: &str,
+        initial_context: Option<(usize, usize)>,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let mut virtual_allocations = Vec::new();
         let mut create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
@@ -143,6 +170,14 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         let api_set_map = build_api_set_namespace()?;
         let api_set_map_ptr = create_pages(api_set_map.len())?;
         write_slice(api_set_map_ptr, &api_set_map).ok_or(PeImageAccessError::MemoryAccess)?;
+        let initial_context = initial_context
+            .map(|(entry_point, stack_top)| {
+                let context_ptr = create_pages(AMD64_CONTEXT_SIZE)?;
+                let context = initial_thread_context(entry_point, stack_top);
+                write_slice(context_ptr, &context).ok_or(PeImageAccessError::MemoryAccess)?;
+                Ok::<usize, PeImageAccessError>(context_ptr)
+            })
+            .transpose()?;
 
         let dos_image_path = dos_image_path(image_path);
         let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
@@ -243,6 +278,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             peb: peb_ptr,
             _process_parameters: process_parameters_ptr,
             teb: teb_ptr,
+            initial_context,
             virtual_allocations,
         })
     }
@@ -331,7 +367,47 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) peb: usize,
     pub(crate) _process_parameters: usize,
     pub(crate) teb: usize,
+    pub(crate) initial_context: Option<usize>,
     pub(crate) virtual_allocations: Vec<WindowsVirtualAllocation>,
+}
+
+fn initial_stack_top(stack_top: usize) -> usize {
+    if stack_top.is_multiple_of(16) {
+        stack_top - core::mem::size_of::<usize>()
+    } else {
+        stack_top
+    }
+}
+
+fn initial_thread_context(entry_point: usize, stack_top: usize) -> Vec<u8> {
+    let mut context = vec![0; AMD64_CONTEXT_SIZE];
+    write_context_u32(
+        &mut context,
+        AMD64_CONTEXT_FLAGS,
+        CONTEXT_AMD64_CONTROL_INTEGER,
+    );
+    write_context_u16(&mut context, AMD64_CONTEXT_SEG_CS, USER_MODE_CODE_SELECTOR);
+    write_context_u16(&mut context, AMD64_CONTEXT_SEG_DS, USER_MODE_DATA_SELECTOR);
+    write_context_u16(&mut context, AMD64_CONTEXT_SEG_ES, USER_MODE_DATA_SELECTOR);
+    write_context_u16(&mut context, AMD64_CONTEXT_SEG_FS, USER_MODE_DATA_SELECTOR);
+    write_context_u16(&mut context, AMD64_CONTEXT_SEG_GS, USER_MODE_DATA_SELECTOR);
+    write_context_u16(&mut context, AMD64_CONTEXT_SEG_SS, USER_MODE_DATA_SELECTOR);
+    write_context_u32(&mut context, AMD64_CONTEXT_EFLAGS, 0x202);
+    write_context_u64(&mut context, AMD64_CONTEXT_RSP, stack_top as u64);
+    write_context_u64(&mut context, AMD64_CONTEXT_RIP, entry_point as u64);
+    context
+}
+
+fn write_context_u16(context: &mut [u8], offset: usize, value: u16) {
+    context[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_context_u32(context: &mut [u8], offset: usize, value: u32) {
+    context[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_context_u64(context: &mut [u8], offset: usize, value: u64) {
+    context[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
 }
 
 pub(crate) struct LoadedImage {
