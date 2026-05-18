@@ -12,7 +12,9 @@ use litebox_common_windows::nt_status::NtStatus;
 use crate::loader::WindowsLoadError;
 use crate::loader::pe;
 use crate::syscalls::object::{ObjectAttributes, read_object_attributes, read_unicode_string};
-use crate::{Handle, NtShimFS, Platform, Task, insert_raw_handle, remove_raw_handle};
+use crate::{
+    Handle, NtShimFS, Platform, Task, WindowsSectionView, insert_raw_handle, remove_raw_handle,
+};
 use crate::{PAGE_SIZE, ProcessHandle};
 
 type GuestMutPointer<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
@@ -22,6 +24,7 @@ const VIEW_UNMAP: u32 = 2;
 const MEM_TOP_DOWN: u32 = 0x100000;
 const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x800000;
 const SUPPORTED_MAP_ALLOCATION_TYPES: u32 = MEM_TOP_DOWN | MEM_DIFFERENT_IMAGE_BASE_OK;
+const IMAGE_EXTENSION_SIZE: usize = PAGE_SIZE;
 
 pub(crate) struct SectionSubsystem;
 
@@ -95,9 +98,24 @@ impl<FS: NtShimFS> Task<FS> {
             Err(status) => return status,
         };
         let Some(fs_path) = known_dll_section_fs_path(&object_path) else {
+            litebox_util_log::debug!(
+                desired_access:% = format_args!("{desired_access:#x}"),
+                root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                object_path:% = object_path,
+                status:% = NtStatus::OBJECT_NAME_NOT_FOUND;
+                "Handled NtOpenSection syscall"
+            );
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
         let Ok(fd) = self.fs.open(&fs_path, OFlags::RDONLY, Mode::empty()) else {
+            litebox_util_log::debug!(
+                desired_access:% = format_args!("{desired_access:#x}"),
+                root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                object_path:% = object_path,
+                fs_path:% = fs_path,
+                status:% = NtStatus::OBJECT_NAME_NOT_FOUND;
+                "Handled NtOpenSection syscall"
+            );
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
         let _ = self.fs.close(&fd);
@@ -190,6 +208,17 @@ impl<FS: NtShimFS> Task<FS> {
             Err(error) => return map_section_load_error(&error),
         };
 
+        let mapped_size = match section_view_mapped_size(image.mapping.mapped_size) {
+            Some(mapped_size) => mapped_size,
+            None => {
+                let _ = remove_section_view_pages(
+                    &self.global.page_manager,
+                    image.mapping.base_addr,
+                    image.mapping.mapped_size,
+                );
+                return NtStatus::NO_MEMORY;
+            }
+        };
         if request
             .base_address
             .write_at_offset(0, image.mapping.base_addr)
@@ -202,15 +231,18 @@ impl<FS: NtShimFS> Task<FS> {
             let _ = remove_section_view_pages(
                 &self.global.page_manager,
                 image.mapping.base_addr,
-                image.mapping.image_size,
+                mapped_size,
             );
             return NtStatus::ACCESS_VIOLATION;
         }
 
-        self.process
-            .section_views
-            .lock()
-            .insert(image.mapping.base_addr, image.mapping.image_size);
+        self.process.section_views.lock().insert(
+            image.mapping.base_addr,
+            WindowsSectionView {
+                image_size: image.mapping.image_size,
+                mapped_size: image.mapping.mapped_size,
+            },
+        );
 
         litebox_util_log::debug!(
             section_handle:% = format_args!("{:#x}", request.section_handle.as_raw()),
@@ -237,17 +269,19 @@ impl<FS: NtShimFS> Task<FS> {
             return NtStatus::INVALID_HANDLE;
         }
 
-        let Some((view_base, view_size)) =
+        let Some((view_base, view)) =
             remove_section_view_for_address(&self.process.section_views, base_address)
         else {
             return NtStatus::NOT_MAPPED_VIEW;
         };
 
-        if remove_section_view_pages(&self.global.page_manager, view_base, view_size).is_err() {
-            self.process
-                .section_views
-                .lock()
-                .insert(view_base, view_size);
+        let Some(mapped_size) = section_view_mapped_size(view.mapped_size) else {
+            self.process.section_views.lock().insert(view_base, view);
+            return NtStatus::UNABLE_TO_FREE_VM;
+        };
+
+        if remove_section_view_pages(&self.global.page_manager, view_base, mapped_size).is_err() {
+            self.process.section_views.lock().insert(view_base, view);
             return NtStatus::UNABLE_TO_FREE_VM;
         }
 
@@ -255,7 +289,7 @@ impl<FS: NtShimFS> Task<FS> {
             process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
             base_address:% = format_args!("{base_address:#x}"),
             view_base:% = format_args!("{view_base:#x}"),
-            view_size = view_size;
+            view_size = view.image_size;
             "Handled NtUnmapViewOfSection syscall"
         );
 
@@ -263,16 +297,20 @@ impl<FS: NtShimFS> Task<FS> {
     }
 }
 
+fn section_view_mapped_size(mapped_size: usize) -> Option<usize> {
+    mapped_size.checked_add(IMAGE_EXTENSION_SIZE)
+}
+
 fn remove_section_view_for_address(
     section_views: &crate::WindowsSectionViews,
     base_address: usize,
-) -> Option<(usize, usize)> {
+) -> Option<(usize, WindowsSectionView)> {
     let mut views = section_views.lock();
-    let (&view_base, &view_size) = views.range(..=base_address).next_back()?;
-    let view_end = view_base.checked_add(view_size)?;
+    let (&view_base, &view) = views.range(..=base_address).next_back()?;
+    let view_end = view_base.checked_add(view.image_size)?;
     if base_address < view_end {
         views.remove(&view_base);
-        Some((view_base, view_size))
+        Some((view_base, view))
     } else {
         None
     }
@@ -590,10 +628,13 @@ mod tests {
         )
         .unwrap();
         let view_base = mapping.as_usize();
-        task.process
-            .section_views
-            .lock()
-            .insert(view_base, PAGE_SIZE);
+        task.process.section_views.lock().insert(
+            view_base,
+            WindowsSectionView {
+                image_size: PAGE_SIZE,
+                mapped_size: PAGE_SIZE,
+            },
+        );
 
         assert_eq!(
             task.handle_nt_unmap_view_of_section(ProcessHandle::CURRENT, view_base + 0x20),

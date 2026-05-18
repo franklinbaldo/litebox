@@ -13,8 +13,8 @@ use litebox::mm::linux::{
 use litebox::platform::RawPointerProvider;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _};
 use litebox_common_windows::loader::{
-    AccessMemory, Fault, MapMemory, MappingInfo, PeDataDirectory, PeExport, PeLoadError,
-    PeParseError, PeParsedFile, Protection, ReadAt,
+    AccessMemory, Fault, MapMemory, MappingInfo, PeDataDirectory, PeExport, PeImageInfo,
+    PeLoadError, PeParseError, PeParsedFile, Protection, ReadAt,
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
@@ -41,6 +41,10 @@ const API_SET_NAMESPACE_VERSION: u32 = 6;
 const API_SET_NAMESPACE_ENTRY_FLAGS: u32 = 1;
 const API_SET_NAMESPACE_HASH_FACTOR: u32 = 31;
 const MAX_API_SET_NAMESPACE_SIZE: usize = 16 * 1024 * 1024;
+const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
+const WINDOWS_OS_MINOR_VERSION: u32 = 0;
+const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
+const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
 
 /// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
@@ -103,12 +107,13 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             stack_top,
             application_mapping: image.mapping,
             ntdll_mapping: ntdll.map(|image| image.mapping),
-            environment: self.create_process_environment(image_base_address, path)?,
+            environment: self.create_process_environment(&image.image, image_base_address, path)?,
         })
     }
 
     fn create_process_environment(
         &self,
+        image: &PeImageInfo,
         image_base_address: usize,
         image_path: &str,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
@@ -212,6 +217,17 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         peb.image_base_address = image_base_address;
         peb.process_parameters = process_parameters_ptr;
         peb.api_set_map = api_set_map_ptr;
+        peb.number_of_processors = 1;
+        peb.heap_segment_reserve = image.size_of_heap_reserve as u64;
+        peb.heap_segment_commit = image.size_of_heap_commit as u64;
+        peb.active_process_affinity_mask = 1;
+        peb.os_major_version = WINDOWS_OS_MAJOR_VERSION;
+        peb.os_minor_version = WINDOWS_OS_MINOR_VERSION;
+        peb.os_build_number = WINDOWS_OS_BUILD_NUMBER;
+        peb.os_platform_id = WINDOWS_OS_PLATFORM_WIN32_NT;
+        peb.image_subsystem = u32::from(image.subsystem);
+        peb.image_subsystem_major_version = u32::from(image.major_subsystem_version);
+        peb.image_subsystem_minor_version = u32::from(image.minor_subsystem_version);
         write_value(peb_ptr, peb).ok_or(PeImageAccessError::MemoryAccess)?;
 
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
@@ -320,6 +336,7 @@ pub(crate) struct WindowsProcessEnvironment {
 
 pub(crate) struct LoadedImage {
     pub(crate) mapping: MappingInfo,
+    image: PeImageInfo,
     image_size: usize,
     data_directories: Vec<PeDataDirectory>,
     exports: Vec<PeExport>,
@@ -442,7 +459,9 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-debug-l1-1-2", "kernelbase.dll"),
     ("api-ms-win-core-delayload-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-delayload-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-downlevel-shlwapi-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-errorhandling-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-errorhandling-l1-1-2", "kernelbase.dll"),
     ("api-ms-win-core-errorhandling-l1-1-3", "kernelbase.dll"),
     ("api-ms-win-core-fibers-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-fibers-l1-1-2", "kernelbase.dll"),
@@ -516,9 +535,11 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-processthreads-l1-1-8", "kernel32.dll"),
     ("api-ms-win-core-processtopology-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-profile-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-pcw-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-psapi-ansi-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-psapi-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-realtime-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-registry-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-rtlsupport-l1-1-0", "ntdll.dll"),
     ("api-ms-win-core-rtlsupport-l1-1-1", "ntdll.dll"),
     ("api-ms-win-core-rtlsupport-l1-2-2", "ntdll.dll"),
@@ -538,6 +559,7 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-systemtopology-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-systemtopology-l1-1-1", "kernelbase.dll"),
     ("api-ms-win-core-threadpool-legacy-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-threadpool-l1-2-0", "kernelbase.dll"),
     (
         "api-ms-win-core-threadpool-private-l1-1-0",
         "kernelbase.dll",
@@ -566,16 +588,36 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-xstate-l2-1-0", "kernelbase.dll"),
     ("api-ms-win-core-xstate-l2-1-1", "kernelbase.dll"),
     ("api-ms-win-core-xstate-l2-1-2", "kernelbase.dll"),
+    ("api-ms-win-eventing-consumer-l1-1-0", "sechost.dll"),
+    ("api-ms-win-eventing-consumer-l1-1-1", "sechost.dll"),
+    ("api-ms-win-eventing-controller-l1-1-0", "sechost.dll"),
     ("api-ms-win-eventing-provider-l1-1-0", "advapi32.dll"),
+    ("api-ms-win-security-audit-l1-1-0", "sechost.dll"),
+    ("api-ms-win-security-audit-l1-1-1", "sechost.dll"),
     ("api-ms-win-security-appcontainer-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-security-base-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-security-base-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-security-base-private-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-security-lsalookup-l1-1-0", "sechost.dll"),
+    ("api-ms-win-security-sddl-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-core-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-core-l1-1-1", "sechost.dll"),
+    ("api-ms-win-service-core-l1-1-2", "sechost.dll"),
+    ("api-ms-win-service-management-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-management-l2-1-0", "sechost.dll"),
+    ("api-ms-win-service-private-l1-1-0", "sechost.dll"),
+    ("api-ms-win-service-private-l1-1-2", "sechost.dll"),
+    ("api-ms-win-service-private-l1-1-3", "sechost.dll"),
+    ("api-ms-win-service-winsvc-l1-1-0", "sechost.dll"),
     ("ext-ms-win-appcompat-apphelp-l1-1-2", "apphelp.dll"),
+    ("ext-ms-win-authz-context-l1-1-0", "authz.dll"),
+    ("ext-ms-win-core-winrt-remote-l1-1-0", "rpcrtremote.dll"),
     ("ext-ms-win-oobe-query-l1-1-0", "kernelbase.dll"),
     (
         "ext-ms-win-packagevirtualizationcontext-l1-1-0",
         "kernelbase.dll",
     ),
+    ("ext-ms-win-rpc-ssl-l1-1-0", "rpcrtremote.dll"),
 ];
 
 fn build_api_set_namespace() -> Result<Vec<u8>, PeImageAccessError> {
@@ -757,6 +799,7 @@ fn load_image_with_writable_sections<FS: NtShimFS>(
     let file = PeImageFile::open(fs, path)?;
     let mut parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
     let image_size = parsed.image.size_of_image;
+    let image = parsed.image;
     let data_directories = parsed.data_directories.clone();
     let exports = parsed.exports.clone();
     parsed
@@ -776,6 +819,7 @@ fn load_image_with_writable_sections<FS: NtShimFS>(
         .map_err(WindowsLoadError::Load)?;
     Ok(LoadedImage {
         mapping,
+        image,
         image_size,
         data_directories,
         exports,

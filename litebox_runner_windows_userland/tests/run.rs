@@ -13,13 +13,30 @@ unsafe extern "system" {
 #[test]
 fn loads_minimal_pe_without_imports() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("no_import");
+    if test_dir.exists() {
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
     std::fs::create_dir_all(&test_dir).unwrap();
     let pe_path = build_no_import_pe(&test_dir);
     println!(
         "Built rewritten no-import PE fixture at `{}`",
         pe_path.display()
     );
-    for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+    for dll_name in [
+        "ntdll.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "advapi32.dll",
+        "msvcrt.dll",
+        "rpcrt4.dll",
+        "sechost.dll",
+        "sspicli.dll",
+        "ws2_32.dll",
+        "iphlpapi.dll",
+        "bcryptprimitives.dll",
+        "authz.dll",
+        "rpcrtremote.dll",
+    ] {
         let dll_path = build_rewritten_system_dll(&test_dir, dll_name);
         println!(
             "Built rewritten {dll_name} fixture at `{}`",
@@ -101,7 +118,7 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             "-C",
             "link-arg=/ENTRY:mainCRTStartup",
             "-C",
-            "link-arg=/SUBSYSTEM:CONSOLE",
+            "link-arg=/SUBSYSTEM:NATIVE",
             "-C",
             "link-arg=/NODEFAULTLIB",
             "-o",

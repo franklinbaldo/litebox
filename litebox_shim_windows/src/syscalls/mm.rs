@@ -44,6 +44,8 @@ const MEM_TOP_DOWN: u32 = 0x100000;
 const SUPPORTED_ALLOCATION_TYPES: u32 = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN;
 
 const MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE: usize = 24;
+const SECTION_VIEW_IMAGE_FLAGS: u32 = 0x70;
+const IMAGE_EXTENSION_PRESENT_FLAG: u32 = 0x40;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
 const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
 const MEM_EXTENDED_PARAMETER_NUMA_NODE: u64 = 2;
@@ -56,11 +58,13 @@ const SUPPORTED_MEM_EXTENDED_PARAMETER_ATTRIBUTE_FLAGS: usize = MEM_EXTENDED_PAR
     | MEM_EXTENDED_PARAMETER_NONPAGED_LARGE
     | MEM_EXTENDED_PARAMETER_NONPAGED_HUGE
     | MEM_EXTENDED_PARAMETER_EC_CODE;
+const MEMORY_WORKING_SET_LIST_MIN_SIZE: usize = 16;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum MemoryInformationClass {
     Basic = 0,
+    WorkingSetList = 4,
     Image = 6,
     ImageExtension = 14,
 }
@@ -87,6 +91,15 @@ struct MemoryImageInformation {
     size_of_image: usize,
     image_flags: u32,
     _padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct MemoryImageExtensionInformation {
+    extension_type: u32,
+    flags: u32,
+    extension_image_base_rva: usize,
+    extension_size: usize,
 }
 
 #[repr(C)]
@@ -495,6 +508,13 @@ impl<FS: NtShimFS> Task<FS> {
         };
 
         match memory_information_class {
+            MemoryInformationClass::WorkingSetList => {
+                return handle_nt_query_virtual_memory_working_set_list(
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+            }
             MemoryInformationClass::Image => {
                 return self.handle_nt_query_virtual_memory_image_information(
                     process_handle,
@@ -584,7 +604,7 @@ impl<FS: NtShimFS> Task<FS> {
         let info = MemoryImageInformation {
             image_base: mapping.base_addr,
             size_of_image: mapping.image_size,
-            image_flags: 0,
+            image_flags: mapping.image_flags,
             _padding: 0,
         };
         let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
@@ -598,7 +618,8 @@ impl<FS: NtShimFS> Task<FS> {
             process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
             base:% = format_args!("{:#x}", base_address),
             image_base:% = format_args!("{:#x}", mapping.base_addr),
-            image_size = mapping.image_size;
+            image_size = mapping.image_size,
+            image_flags:% = format_args!("{:#x}", mapping.image_flags);
             "Handled NtQueryVirtualMemory MemoryImageInformation syscall"
         );
 
@@ -632,14 +653,33 @@ impl<FS: NtShimFS> Task<FS> {
             return NtStatus::INVALID_PARAMETER;
         };
 
-        let info = MemoryImageInformation {
-            image_base: mapping.base_addr,
-            size_of_image: mapping.image_size,
-            image_flags: 0,
-            _padding: 0,
+        let input = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<
+            [u8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE],
+        >::from_usize(memory_information.as_usize());
+        let Some(request) = input.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if request != [0; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE] {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let info = if mapping.image_flags & IMAGE_EXTENSION_PRESENT_FLAG != 0 {
+            MemoryImageExtensionInformation {
+                extension_type: 0,
+                flags: 0,
+                extension_image_base_rva: mapping.mapped_size,
+                extension_size: PAGE_SIZE,
+            }
+        } else {
+            MemoryImageExtensionInformation {
+                extension_type: 0,
+                flags: 0,
+                extension_image_base_rva: 0,
+                extension_size: 0,
+            }
         };
         let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
-            MemoryImageInformation,
+            MemoryImageExtensionInformation,
         >::from_usize(memory_information.as_usize());
         if output.write_at_offset(0, info).is_none() {
             return NtStatus::ACCESS_VIOLATION;
@@ -649,7 +689,8 @@ impl<FS: NtShimFS> Task<FS> {
             process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
             base:% = format_args!("{:#x}", base_address),
             image_base:% = format_args!("{:#x}", mapping.base_addr),
-            image_size = mapping.image_size;
+            image_size = mapping.image_size,
+            mapped_size = mapping.mapped_size;
             "Handled NtQueryVirtualMemory MemoryImageExtensionInformation syscall"
         );
 
@@ -657,10 +698,44 @@ impl<FS: NtShimFS> Task<FS> {
     }
 }
 
+fn handle_nt_query_virtual_memory_working_set_list(
+    memory_information: GuestMutPointer<u8>,
+    memory_information_length: usize,
+    return_length: Option<GuestMutPointer<usize>>,
+) -> NtStatus {
+    if memory_information_length < MEMORY_WORKING_SET_LIST_MIN_SIZE {
+        return NtStatus::INFO_LENGTH_MISMATCH;
+    }
+    if let Some(return_length) = return_length
+        && return_length
+            .write_at_offset(0, memory_information_length)
+            .is_none()
+    {
+        return NtStatus::ACCESS_VIOLATION;
+    }
+    for offset in 0..memory_information_length {
+        let Ok(offset) = isize::try_from(offset) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if memory_information.write_at_offset(offset, 0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+    }
+
+    litebox_util_log::debug!(
+        memory_information_length;
+        "Handled NtQueryVirtualMemory MemoryWorkingSetList syscall"
+    );
+
+    NtStatus::SUCCESS
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ImageMappingInformation {
     base_addr: usize,
     image_size: usize,
+    mapped_size: usize,
+    image_flags: u32,
 }
 
 fn image_mapping_for_address(
@@ -673,13 +748,15 @@ fn image_mapping_for_address(
         .into_iter()
         .flatten()
         .find(|mapping| {
-            mapping.image_size != 0
+            mapping.mapped_size != 0
                 && address >= mapping.base_addr
-                && address < mapping.base_addr.saturating_add(mapping.image_size)
+                && address < mapping.base_addr.saturating_add(mapping.mapped_size)
         })
         .map(|mapping| ImageMappingInformation {
             base_addr: mapping.base_addr,
             image_size: mapping.image_size,
+            mapped_size: mapping.mapped_size,
+            image_flags: mapping.image_flags,
         })
         .or_else(|| section_view_for_address(section_views, address))
 }
@@ -688,11 +765,16 @@ fn section_view_for_address(
     section_views: &crate::WindowsSectionViews,
     address: usize,
 ) -> Option<ImageMappingInformation> {
-    section_views.lock().iter().find_map(|(&base, &size)| {
-        if size != 0 && address >= base && address < base.saturating_add(size) {
+    section_views.lock().iter().find_map(|(&base, &view)| {
+        if view.mapped_size != 0
+            && address >= base
+            && address < base.saturating_add(view.mapped_size)
+        {
             Some(ImageMappingInformation {
                 base_addr: base,
-                image_size: size,
+                image_size: view.image_size,
+                mapped_size: view.mapped_size,
+                image_flags: SECTION_VIEW_IMAGE_FLAGS,
             })
         } else {
             None
@@ -1098,6 +1180,8 @@ mod tests {
     fn memory_image_information_matches_windows_x64_layout() {
         assert_eq!(size_of::<MemoryImageInformation>(), 24);
         assert_eq!(align_of::<MemoryImageInformation>(), 8);
+        assert_eq!(size_of::<MemoryImageExtensionInformation>(), 24);
+        assert_eq!(align_of::<MemoryImageExtensionInformation>(), 8);
     }
 
     #[test]
@@ -1109,18 +1193,16 @@ mod tests {
     }
 
     #[test]
-    fn nt_query_virtual_memory_image_extension_information_reports_section_view() {
+    fn nt_query_virtual_memory_image_extension_information_reports_dll_extension() {
         let task = crate::tests::test_task();
-        task.process
-            .section_views
-            .lock()
-            .insert(SECTION_VIEW_TEST_BASE, SECTION_VIEW_TEST_SIZE);
-        let mut information = MemoryImageInformation {
-            image_base: usize::MAX,
-            size_of_image: usize::MAX,
-            image_flags: u32::MAX,
-            _padding: u32::MAX,
-        };
+        task.process.section_views.lock().insert(
+            SECTION_VIEW_TEST_BASE,
+            crate::WindowsSectionView {
+                image_size: SECTION_VIEW_TEST_SIZE,
+                mapped_size: SECTION_VIEW_TEST_SIZE,
+            },
+        );
+        let mut information = [0u8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE];
         let mut return_length = 0usize;
 
         assert_eq!(
@@ -1135,9 +1217,16 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(return_length, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE);
-        assert_eq!(information.image_base, SECTION_VIEW_TEST_BASE);
-        assert_eq!(information.size_of_image, SECTION_VIEW_TEST_SIZE);
-        assert_eq!(information.image_flags, 0);
+        assert_eq!(
+            information.as_slice(),
+            MemoryImageExtensionInformation {
+                extension_type: 0,
+                flags: 0,
+                extension_image_base_rva: SECTION_VIEW_TEST_SIZE,
+                extension_size: PAGE_SIZE,
+            }
+            .as_bytes()
+        );
     }
 
     #[test]
@@ -1162,6 +1251,35 @@ mod tests {
         assert_eq!(
             information,
             [0xff; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE - 1]
+        );
+    }
+
+    #[test]
+    fn nt_query_virtual_memory_image_extension_information_rejects_nonzero_request() {
+        let task = crate::tests::test_task();
+        task.process.section_views.lock().insert(
+            SECTION_VIEW_TEST_BASE,
+            crate::WindowsSectionView {
+                image_size: SECTION_VIEW_TEST_SIZE,
+                mapped_size: SECTION_VIEW_TEST_SIZE,
+            },
+        );
+        let mut information = [0xffu8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE];
+
+        assert_eq!(
+            task.handle_nt_query_virtual_memory(
+                ProcessHandle::CURRENT,
+                SECTION_VIEW_TEST_BASE + PAGE_SIZE,
+                class_value(MemoryInformationClass::ImageExtension),
+                mut_byte_ptr(&mut information),
+                MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE,
+                None,
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            information,
+            [0xffu8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE]
         );
     }
 

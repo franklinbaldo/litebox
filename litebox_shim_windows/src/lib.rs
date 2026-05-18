@@ -158,9 +158,15 @@ type WindowsWaitCompletionPacketHandle =
     alloc::sync::Arc<litebox::fd::TypedFd<wait_completion_packet::WaitCompletionPacketSubsystem>>;
 type WindowsNlsSectionMappings =
     litebox::sync::Mutex<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
-type WindowsSectionViews = litebox::sync::Mutex<Platform, BTreeMap<usize, usize>>;
+type WindowsSectionViews = litebox::sync::Mutex<Platform, BTreeMap<usize, WindowsSectionView>>;
 pub(crate) type WindowsVirtualAllocations =
     litebox::sync::Mutex<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsSectionView {
+    pub(crate) image_size: usize,
+    pub(crate) mapped_size: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {

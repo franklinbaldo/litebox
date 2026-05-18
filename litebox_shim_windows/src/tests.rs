@@ -86,7 +86,9 @@ fn test_task_with_nls_files_and_process(
             mapping: MappingInfo {
                 base_addr: 0,
                 image_size: 0,
+                mapped_size: 0,
                 entry_point: 0,
+                image_flags: 0,
             },
             ntdll_mapping: None,
             handles: WindowsHandleStore::new(RawDescriptorStorage::new()),

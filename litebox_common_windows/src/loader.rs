@@ -60,6 +60,10 @@ pub struct PeImageInfo {
     pub file_alignment: usize,
     /// Windows subsystem value, such as `IMAGE_SUBSYSTEM_WINDOWS_CUI`.
     pub subsystem: u16,
+    /// Major subsystem version from the PE optional header.
+    pub major_subsystem_version: u16,
+    /// Minor subsystem version from the PE optional header.
+    pub minor_subsystem_version: u16,
     /// PE DLL characteristics flags.
     pub dll_characteristics: u16,
     /// Initial thread stack reservation size.
@@ -76,10 +80,16 @@ pub struct PeImageInfo {
 pub struct MappingInfo {
     /// The base address where the PE image is mapped.
     pub base_addr: usize,
-    /// The mapped image size.
+    /// The image size reported to Windows image-information queries.
     pub image_size: usize,
+    /// The mapped image size, including LiteBox-private trampoline pages.
+    ///
+    /// The loader also maps a trailing image-extension page at `base_addr + mapped_size`.
+    pub mapped_size: usize,
     /// The entry point, where execution begins.
     pub entry_point: usize,
+    /// Windows `MemoryImageInformation` flags for this image.
+    pub image_flags: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +110,35 @@ struct TrampolineHeader64 {
 }
 
 const TRAMPOLINE_MAGIC: [u8; 8] = *b"LITEBOX0";
+const IMAGE_FILE_DLL: u16 = 0x2000;
+const IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG: usize = 10;
+const MEMORY_IMAGE_EXTENSION_SIZE: usize = PAGE_SIZE;
+const MEMORY_IMAGE_EXTENSION_HEADER: [u32; 6] = [0x40, 0xc0, 0x140, 0x1c0, 0x240, 0x2a4];
+const MEMORY_IMAGE_EXTENSION_PADDING_RANGES: [(usize, usize); 6] = [
+    (0x18, 0x40),
+    (0x43, 0xc0),
+    (0xc3, 0x140),
+    (0x141, 0x1c0),
+    (0x1c1, 0x240),
+    (0x24d, 0x280),
+];
+const MEMORY_IMAGE_EXTENSION_JMP_RAX: [u8; 3] = [0x48, 0xff, 0xe0];
+const MEMORY_IMAGE_EXTENSION_RET: [u8; 1] = [0xc3];
+const MEMORY_IMAGE_EXTENSION_INVALID_CALL_TARGET: [u8; 13] = [
+    0x49, 0xbb, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x49, 0xff, 0xe3,
+];
+const MEMORY_IMAGE_EXTENSION_VALIDATE_VERSION_OFFSET: usize = 0x280;
+const MEMORY_IMAGE_EXTENSION_VALIDATE_VERSION: [u8; 23] = [
+    0x81, 0x39, 0x06, 0x00, 0x00, 0xc0, 0x74, 0x0a, 0x33, 0xd2, 0xb9, 0x0a, 0x00, 0x00, 0x00, 0xcd,
+    0x29, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3,
+];
+const MEMORY_IMAGE_EXTENSION_UNWIND_INFO_OFFSET: usize = 0x298;
+const MEMORY_IMAGE_EXTENSION_UNWIND_INFO: [u32; 2] = [0x19, 0x280];
+const MEMORY_IMAGE_EXTENSION_FUNCTION_TABLE_OFFSET: usize = 0x2a4;
+const MEMORY_IMAGE_EXTENSION_RUNTIME_FUNCTION: [u32; 3] = [0, 0x280, 0x298];
+const MEMORY_IMAGE_FLAGS_UNSIGNED_IMAGE: u32 = 0x08;
+const MEMORY_IMAGE_FLAGS_SIGNED_IMAGE: u32 = 0x20;
+const MEMORY_IMAGE_FLAGS_SYSTEM_DLL: u32 = 0x70;
 
 /// A PE data directory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,9 +279,12 @@ impl PeParsedFile {
             return Err(PeLoadError::InvalidImage);
         }
         let mapping_size = self.mapping_size::<M::Error>(image_size)?;
+        let reserved_size = mapping_size
+            .checked_add(MEMORY_IMAGE_EXTENSION_SIZE)
+            .ok_or(PeLoadError::InvalidImage)?;
 
         let base_addr = mapper
-            .reserve(preferred_base, mapping_size, PAGE_SIZE)
+            .reserve(preferred_base, reserved_size, PAGE_SIZE)
             .map_err(PeLoadError::Map)?;
         let image_end = base_addr
             .checked_add(image_size)
@@ -365,15 +407,131 @@ impl PeParsedFile {
             self.load_trampoline(mapper, mem, base_addr)?;
         }
 
+        self.load_memory_image_extension(mapper, mem, base_addr, mapping_size)?;
+
         let entry_point = base_addr
             .checked_add(self.image.entry_point_rva)
             .ok_or(PeLoadError::InvalidImage)?;
 
         Ok(MappingInfo {
             base_addr,
-            image_size: mapping_size,
+            image_size,
+            mapped_size: mapping_size,
             entry_point,
+            image_flags: self.memory_image_flags(),
         })
+    }
+
+    fn memory_image_flags(&self) -> u32 {
+        if self.image.characteristics & IMAGE_FILE_DLL != 0 {
+            MEMORY_IMAGE_FLAGS_SYSTEM_DLL
+        } else if self.has_load_config_directory() {
+            MEMORY_IMAGE_FLAGS_SIGNED_IMAGE
+        } else {
+            MEMORY_IMAGE_FLAGS_UNSIGNED_IMAGE
+        }
+    }
+
+    fn load_memory_image_extension<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        base_addr: usize,
+        mapping_size: usize,
+    ) -> Result<(), PeLoadError<M::Error>> {
+        let image_extension_start = base_addr
+            .checked_add(mapping_size)
+            .ok_or(PeLoadError::InvalidImage)?;
+        mapper
+            .map_zero(
+                image_extension_start,
+                MEMORY_IMAGE_EXTENSION_SIZE,
+                &Protection {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+            )
+            .map_err(PeLoadError::Map)?;
+
+        write_u32s(mem, image_extension_start, &MEMORY_IMAGE_EXTENSION_HEADER)?;
+        write_extension_padding(mem, image_extension_start)?;
+        write_slice(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_HEADER[0] as usize)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_JMP_RAX,
+        )?;
+        write_slice(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_HEADER[1] as usize)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_JMP_RAX,
+        )?;
+        write_slice(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_HEADER[2] as usize)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_RET,
+        )?;
+        write_slice(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_HEADER[3] as usize)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_RET,
+        )?;
+        write_slice(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_HEADER[4] as usize)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_INVALID_CALL_TARGET,
+        )?;
+        write_slice(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_VALIDATE_VERSION_OFFSET)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_VALIDATE_VERSION,
+        )?;
+        write_u32s(
+            mem,
+            image_extension_start
+                .checked_add(MEMORY_IMAGE_EXTENSION_UNWIND_INFO_OFFSET)
+                .ok_or(PeLoadError::InvalidImage)?,
+            &MEMORY_IMAGE_EXTENSION_UNWIND_INFO,
+        )?;
+
+        let runtime_function_address = image_extension_start
+            .checked_add(MEMORY_IMAGE_EXTENSION_FUNCTION_TABLE_OFFSET)
+            .ok_or(PeLoadError::InvalidImage)?;
+        write_u32s(
+            mem,
+            runtime_function_address,
+            &MEMORY_IMAGE_EXTENSION_RUNTIME_FUNCTION,
+        )?;
+
+        mapper
+            .protect(
+                image_extension_start,
+                MEMORY_IMAGE_EXTENSION_SIZE,
+                &Protection {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+            )
+            .map_err(PeLoadError::Map)
+    }
+
+    fn has_load_config_directory(&self) -> bool {
+        self.data_directories
+            .get(IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+            .is_some_and(|directory| directory.virtual_address != 0 && directory.size != 0)
     }
 
     /// Parse the LiteBox PE trampoline footer, if present.
@@ -575,6 +733,8 @@ fn parse_bytes<E>(data: &[u8]) -> Result<PeParsedFile, PeParseError<E>> {
         section_alignment: usize_from_u32(optional_header.section_alignment())?,
         file_alignment: usize_from_u32(optional_header.file_alignment())?,
         subsystem: optional_header.subsystem(),
+        major_subsystem_version: optional_header.major_subsystem_version(),
+        minor_subsystem_version: optional_header.minor_subsystem_version(),
         dll_characteristics: optional_header.dll_characteristics(),
         size_of_stack_reserve: usize_from_u64(optional_header.size_of_stack_reserve())?,
         size_of_stack_commit: usize_from_u64(optional_header.size_of_stack_commit())?,
@@ -622,6 +782,51 @@ fn usize_from_u64<E>(value: u64) -> Result<usize, PeParseError<E>> {
 
 fn page_align_down(address: usize) -> usize {
     address & !(PAGE_SIZE - 1)
+}
+
+fn write_slice<E>(
+    mem: &mut impl AccessMemory,
+    address: usize,
+    bytes: &[u8],
+) -> Result<(), PeLoadError<E>> {
+    mem.write(address, bytes)
+        .map_err(|_| PeLoadError::InvalidImage)
+}
+
+fn write_extension_padding<E>(
+    mem: &mut impl AccessMemory,
+    image_extension_start: usize,
+) -> Result<(), PeLoadError<E>> {
+    const NOPS: [u8; 128] = [0x90; 128];
+
+    for (start, end) in MEMORY_IMAGE_EXTENSION_PADDING_RANGES {
+        let mut address = image_extension_start
+            .checked_add(start)
+            .ok_or(PeLoadError::InvalidImage)?;
+        let mut remaining = end.checked_sub(start).ok_or(PeLoadError::InvalidImage)?;
+        while remaining != 0 {
+            let chunk_len = core::cmp::min(remaining, NOPS.len());
+            write_slice(mem, address, &NOPS[..chunk_len])?;
+            address = address
+                .checked_add(chunk_len)
+                .ok_or(PeLoadError::InvalidImage)?;
+            remaining -= chunk_len;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_u32s<E>(
+    mem: &mut impl AccessMemory,
+    address: usize,
+    values: &[u32],
+) -> Result<(), PeLoadError<E>> {
+    let mut bytes = Vec::with_capacity(values.len() * size_of::<u32>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    write_slice(mem, address, &bytes)
 }
 
 fn page_align_up(len: usize) -> Option<usize> {
