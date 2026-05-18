@@ -21,7 +21,7 @@ use thiserror::Error;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
 use crate::nt_types::{
-    KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
+    ClientId, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, ProcessEnvironmentBlock, RtlUserProcFlags,
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString,
 };
@@ -33,6 +33,8 @@ const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
 const KI_USER_INVERTED_FUNCTION_TABLE: &[u8] = b"KiUserInvertedFunctionTable";
+const INITIAL_PROCESS_ID: usize = 1;
+const INITIAL_THREAD_ID: usize = 1;
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 const PROCESS_ENVIRONMENT_ALLOCATION_PROTECT: u32 = 0x04;
 const API_SET_NAMESPACE_VERSION: u32 = 6;
@@ -214,7 +216,12 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
 
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
         teb.nt_tib.self_pointer = teb_ptr;
+        teb.client_id = ClientId {
+            unique_process: INITIAL_PROCESS_ID,
+            unique_thread: INITIAL_THREAD_ID,
+        };
         teb.process_environment_block = peb_ptr;
+        teb.real_client_id = teb.client_id;
         write_value(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
         Ok(WindowsProcessEnvironment {
             peb: peb_ptr,
@@ -403,18 +410,23 @@ struct ApiSetHashEntry {
 }
 
 const API_SET_MAPPINGS: &[(&str, &str)] = &[
+    ("api-ms-win-core-apiquery-l1-1-0", "ntdll.dll"),
     ("api-ms-win-core-apiquery-l1-1-2", "ntdll.dll"),
     ("api-ms-win-core-apiquery-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-appcompat-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-appcompat-l1-1-1", "kernelbase.dll"),
     ("api-ms-win-core-appinit-l1-1-0", "kernel32.dll"),
     ("api-ms-win-core-atoms-l1-1-0", "kernel32.dll"),
     ("api-ms-win-core-backgroundtask-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-calendar-l1-1-0", "kernel32.dll"),
+    ("api-ms-win-core-comm-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-comm-l1-1-2", "kernelbase.dll"),
     ("api-ms-win-core-commandlinetoargv-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-console-ansi-l2-1-0", "kernel32.dll"),
     ("api-ms-win-core-console-internal-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-console-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-console-l1-2-1", "kernelbase.dll"),
     ("api-ms-win-core-console-l1-2-2", "kernelbase.dll"),
     ("api-ms-win-core-console-l2-1-0", "kernelbase.dll"),
     ("api-ms-win-core-console-l2-2-0", "kernelbase.dll"),
@@ -422,28 +434,72 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
     ("api-ms-win-core-console-l3-2-0", "kernelbase.dll"),
     ("api-ms-win-core-crt-l1-1-0", "ntdll.dll"),
     ("api-ms-win-core-crt-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-datetime-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-datetime-l1-1-1", "kernelbase.dll"),
     ("api-ms-win-core-datetime-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-debug-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-debug-l1-1-1", "kernelbase.dll"),
     ("api-ms-win-core-debug-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-delayload-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-delayload-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-errorhandling-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-errorhandling-l1-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-fibers-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-fibers-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-file-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-2", "kernelbase.dll"),
+    ("api-ms-win-core-file-l1-2-3", "kernelbase.dll"),
     ("api-ms-win-core-file-l1-2-5", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-file-l2-1-3", "kernelbase.dll"),
     ("api-ms-win-core-file-l2-1-4", "kernelbase.dll"),
     ("api-ms-win-core-handle-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-obsolete-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-heap-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-heap-l2-1-0", "kernelbase.dll"),
     ("api-ms-win-core-heap-l1-2-0", "kernelbase.dll"),
     ("api-ms-win-core-interlocked-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-io-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-io-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-job-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-largeinteger-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-libraryloader-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l1-2-2", "kernelbase.dll"),
     ("api-ms-win-core-libraryloader-l1-2-3", "kernelbase.dll"),
+    ("api-ms-win-core-libraryloader-l2-1-0", "kernelbase.dll"),
     ("api-ms-win-core-localization-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-localization-l1-2-0", "kernelbase.dll"),
     ("api-ms-win-core-localization-l1-2-4", "kernelbase.dll"),
+    ("api-ms-win-core-localization-l2-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-localization-private-l1-1-0",
+        "kernelbase.dll",
+    ),
     ("api-ms-win-core-localregistry-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-memory-l1-1-2", "kernelbase.dll"),
     ("api-ms-win-core-memory-l1-1-9", "kernelbase.dll"),
     ("api-ms-win-core-misc-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-namedpipe-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-namedpipe-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-namedpipe-l1-2-2", "kernelbase.dll"),
+    ("api-ms-win-core-namespace-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-normalization-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-path-l1-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-processenvironment-l1-1-0",
+        "kernelbase.dll",
+    ),
     (
         "api-ms-win-core-processenvironment-l1-1-1",
         "kernelbase.dll",
@@ -452,19 +508,74 @@ const API_SET_MAPPINGS: &[(&str, &str)] = &[
         "api-ms-win-core-processenvironment-l1-2-0",
         "kernelbase.dll",
     ),
+    ("api-ms-win-core-processsnapshot-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-2", "kernelbase.dll"),
+    ("api-ms-win-core-processthreads-l1-1-3", "kernelbase.dll"),
     ("api-ms-win-core-processthreads-l1-1-8", "kernel32.dll"),
+    ("api-ms-win-core-processtopology-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-profile-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-psapi-ansi-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-psapi-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-realtime-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-rtlsupport-l1-1-0", "ntdll.dll"),
     ("api-ms-win-core-rtlsupport-l1-1-1", "ntdll.dll"),
     ("api-ms-win-core-rtlsupport-l1-2-2", "ntdll.dll"),
+    ("api-ms-win-core-sidebyside-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-string-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-string-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-synch-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-synch-l1-2-0", "kernelbase.dll"),
     ("api-ms-win-core-synch-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-sysinfo-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-0", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-1", "kernelbase.dll"),
+    ("api-ms-win-core-sysinfo-l1-2-3", "kernelbase.dll"),
     ("api-ms-win-core-sysinfo-l1-2-8", "kernelbase.dll"),
+    ("api-ms-win-core-systemtopology-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-systemtopology-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-threadpool-legacy-l1-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-threadpool-private-l1-1-0",
+        "kernelbase.dll",
+    ),
     ("api-ms-win-core-timezone-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-util-l1-1-0", "kernelbase.dll"),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-0",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-1",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-2",
+        "kernelbase.dll",
+    ),
+    (
+        "api-ms-win-core-windowserrorreporting-l1-1-3",
+        "kernelbase.dll",
+    ),
+    ("api-ms-win-core-wow64-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-wow64-l1-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-wow64-l1-1-3", "kernelbase.dll"),
+    ("api-ms-win-core-xstate-l2-1-0", "kernelbase.dll"),
+    ("api-ms-win-core-xstate-l2-1-1", "kernelbase.dll"),
+    ("api-ms-win-core-xstate-l2-1-2", "kernelbase.dll"),
+    ("api-ms-win-eventing-provider-l1-1-0", "advapi32.dll"),
+    ("api-ms-win-security-appcontainer-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-security-base-l1-1-0", "kernelbase.dll"),
+    ("api-ms-win-security-base-l1-2-0", "kernelbase.dll"),
+    ("ext-ms-win-appcompat-apphelp-l1-1-2", "apphelp.dll"),
+    ("ext-ms-win-oobe-query-l1-1-0", "kernelbase.dll"),
+    (
+        "ext-ms-win-packagevirtualizationcontext-l1-1-0",
+        "kernelbase.dll",
+    ),
 ];
 
 fn build_api_set_namespace() -> Result<Vec<u8>, PeImageAccessError> {
@@ -1075,6 +1186,25 @@ mod tests {
             .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
             .collect::<Vec<_>>();
         Some(String::from_utf16_lossy(&units))
+    }
+
+    #[test]
+    fn api_set_namespace_maps_apphelp_contract() {
+        let namespace = build_api_set_namespace().expect("LiteBox API_SET_NAMESPACE builds");
+        let api_set_map = ApiSetNamespace::parse(&namespace).expect("valid API_SET_NAMESPACE");
+
+        for index in 0..api_set_map.count {
+            let entry = api_set_map
+                .entry(&namespace, index)
+                .expect("namespace entry");
+            if entry.name(&namespace).as_deref() == Some("ext-ms-win-appcompat-apphelp-l1-1-2") {
+                let value = entry.value(&namespace, 0).expect("namespace value");
+                assert_eq!(value.value(&namespace).as_deref(), Some("apphelp.dll"));
+                return;
+            }
+        }
+
+        panic!("apphelp API-set contract is missing");
     }
 
     #[test]
