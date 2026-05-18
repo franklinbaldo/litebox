@@ -18,6 +18,9 @@ use litebox_common_windows::loader::{
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
 use crate::nt_types::{
@@ -45,18 +48,6 @@ const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
 const WINDOWS_OS_MINOR_VERSION: u32 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
 const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
-const AMD64_CONTEXT_SIZE: usize = 0x4d0;
-const AMD64_CONTEXT_FLAGS: usize = 0x30;
-const AMD64_CONTEXT_SEG_CS: usize = 0x38;
-const AMD64_CONTEXT_SEG_DS: usize = 0x3a;
-const AMD64_CONTEXT_SEG_ES: usize = 0x3c;
-const AMD64_CONTEXT_SEG_FS: usize = 0x3e;
-const AMD64_CONTEXT_SEG_GS: usize = 0x40;
-const AMD64_CONTEXT_SEG_SS: usize = 0x42;
-const AMD64_CONTEXT_EFLAGS: usize = 0x44;
-const AMD64_CONTEXT_RSP: usize = 0x98;
-const AMD64_CONTEXT_RIP: usize = 0xf8;
-const CONTEXT_AMD64_CONTROL_INTEGER: u32 = 0x0010_0003;
 const USER_MODE_CODE_SELECTOR: u16 = 0x33;
 const USER_MODE_DATA_SELECTOR: u16 = 0x2b;
 
@@ -172,9 +163,10 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         write_slice(api_set_map_ptr, &api_set_map).ok_or(PeImageAccessError::MemoryAccess)?;
         let initial_context = initial_context
             .map(|(entry_point, stack_top)| {
-                let context_ptr = create_pages(AMD64_CONTEXT_SIZE)?;
+                let context_ptr = create_pages(size_of::<CONTEXT>())?;
                 let context = initial_thread_context(entry_point, stack_top);
-                write_slice(context_ptr, &context).ok_or(PeImageAccessError::MemoryAccess)?;
+                let context_bytes = context_as_bytes(&context);
+                write_slice(context_ptr, context_bytes).ok_or(PeImageAccessError::MemoryAccess)?;
                 Ok::<usize, PeImageAccessError>(context_ptr)
             })
             .transpose()?;
@@ -379,35 +371,31 @@ fn initial_stack_top(stack_top: usize) -> usize {
     }
 }
 
-fn initial_thread_context(entry_point: usize, stack_top: usize) -> Vec<u8> {
-    let mut context = vec![0; AMD64_CONTEXT_SIZE];
-    write_context_u32(
-        &mut context,
-        AMD64_CONTEXT_FLAGS,
-        CONTEXT_AMD64_CONTROL_INTEGER,
-    );
-    write_context_u16(&mut context, AMD64_CONTEXT_SEG_CS, USER_MODE_CODE_SELECTOR);
-    write_context_u16(&mut context, AMD64_CONTEXT_SEG_DS, USER_MODE_DATA_SELECTOR);
-    write_context_u16(&mut context, AMD64_CONTEXT_SEG_ES, USER_MODE_DATA_SELECTOR);
-    write_context_u16(&mut context, AMD64_CONTEXT_SEG_FS, USER_MODE_DATA_SELECTOR);
-    write_context_u16(&mut context, AMD64_CONTEXT_SEG_GS, USER_MODE_DATA_SELECTOR);
-    write_context_u16(&mut context, AMD64_CONTEXT_SEG_SS, USER_MODE_DATA_SELECTOR);
-    write_context_u32(&mut context, AMD64_CONTEXT_EFLAGS, 0x202);
-    write_context_u64(&mut context, AMD64_CONTEXT_RSP, stack_top as u64);
-    write_context_u64(&mut context, AMD64_CONTEXT_RIP, entry_point as u64);
-    context
+fn initial_thread_context(entry_point: usize, stack_top: usize) -> CONTEXT {
+    CONTEXT {
+        ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+        SegCs: USER_MODE_CODE_SELECTOR,
+        SegDs: USER_MODE_DATA_SELECTOR,
+        SegEs: USER_MODE_DATA_SELECTOR,
+        SegFs: USER_MODE_DATA_SELECTOR,
+        SegGs: USER_MODE_DATA_SELECTOR,
+        SegSs: USER_MODE_DATA_SELECTOR,
+        EFlags: 0x202,
+        Rsp: stack_top as u64,
+        Rip: entry_point as u64,
+        ..CONTEXT::default()
+    }
 }
 
-fn write_context_u16(context: &mut [u8], offset: usize, value: u16) {
-    context[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_context_u32(context: &mut [u8], offset: usize, value: u32) {
-    context[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-}
-
-fn write_context_u64(context: &mut [u8], offset: usize, value: u64) {
-    context[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+fn context_as_bytes(context: &CONTEXT) -> &[u8] {
+    // SAFETY: `CONTEXT` is a `repr(C)` Windows ABI struct from `windows-sys`.
+    // The loader only copies its initialized bytes into guest memory.
+    unsafe {
+        core::slice::from_raw_parts(
+            core::ptr::from_ref(context).cast::<u8>(),
+            size_of::<CONTEXT>(),
+        )
+    }
 }
 
 pub(crate) struct LoadedImage {
