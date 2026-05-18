@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::vec::Vec;
 use core::mem::size_of;
 
 use int_enum::IntEnum;
@@ -197,7 +198,7 @@ impl<FS: NtShimFS> Task<FS> {
             {
                 return NtStatus::INVALID_PARAMETER;
             }
-            if update_permissions(
+            if commit_existing_range(
                 &self.global.page_manager,
                 aligned_base,
                 aligned_len,
@@ -1042,6 +1043,66 @@ fn update_permissions(
     result.map_err(|_| ())
 }
 
+fn commit_existing_range(
+    page_manager: &WindowsPageManager,
+    aligned_base: usize,
+    aligned_len: usize,
+    permissions: MemoryRegionPermissions,
+) -> Result<(), ()> {
+    let inaccessible_pages = inaccessible_pages(page_manager, aligned_base, aligned_len)?;
+    if inaccessible_pages.is_empty() {
+        return update_permissions(page_manager, aligned_base, aligned_len, permissions);
+    }
+
+    update_permissions(
+        page_manager,
+        aligned_base,
+        aligned_len,
+        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+    )?;
+    zero_pages(&inaccessible_pages)?;
+
+    if permissions == MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE {
+        Ok(())
+    } else {
+        update_permissions(page_manager, aligned_base, aligned_len, permissions)
+    }
+}
+
+fn inaccessible_pages(
+    page_manager: &WindowsPageManager,
+    aligned_base: usize,
+    aligned_len: usize,
+) -> Result<Vec<usize>, ()> {
+    let mut pages = Vec::new();
+    let end = aligned_base.checked_add(aligned_len).ok_or(())?;
+    let mut page = aligned_base;
+    while page < end {
+        let permissions = page_manager
+            .get_memory_permissions(
+                NonZeroAddress::new(page).ok_or(())?,
+                NonZeroPageSize::new(PAGE_SIZE).ok_or(())?,
+            )
+            .ok_or(())?;
+        if permissions.is_empty() {
+            pages.push(page);
+        }
+        page = page.checked_add(PAGE_SIZE).ok_or(())?;
+    }
+    Ok(pages)
+}
+
+fn zero_pages(pages: &[usize]) -> Result<(), ()> {
+    for page in pages {
+        let ptr = GuestMutPointer::<u8>::from_usize(*page);
+        for offset in 0..PAGE_SIZE {
+            ptr.write_at_offset(offset.try_into().map_err(|_| ())?, 0)
+                .ok_or(())?;
+        }
+    }
+    Ok(())
+}
+
 fn query_memory_basic_information(
     page_manager: &WindowsPageManager,
     virtual_allocations: &WindowsVirtualAllocations,
@@ -1809,6 +1870,56 @@ mod tests {
             ),
             NtStatus::SUCCESS
         );
+    }
+
+    #[test]
+    fn nt_allocate_virtual_memory_zeroes_recommitted_pages() {
+        let task = crate::tests::test_task();
+        let mut base = FREE_TEST_BASE + 0x1_0000;
+        let mut size = PAGE_SIZE;
+        assert_eq!(
+            task.handle_nt_allocate_virtual_memory(
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                0,
+                mut_ptr(&mut size),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let page = GuestMutPointer::<u8>::from_usize(base);
+        assert!(page.write_at_offset(0, 0xa5).is_some());
+
+        let mut free_base = base;
+        let mut free_size = PAGE_SIZE;
+        assert_eq!(
+            task.handle_nt_free_virtual_memory(
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut free_base),
+                mut_ptr(&mut free_size),
+                MEM_DECOMMIT,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut commit_base = base;
+        let mut commit_size = PAGE_SIZE;
+        assert_eq!(
+            task.handle_nt_allocate_virtual_memory(
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut commit_base),
+                0,
+                mut_ptr(&mut commit_size),
+                MEM_COMMIT,
+                PAGE_READWRITE,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(page.read_at_offset(0), Some(0));
+
+        release_mapping(&task, base);
     }
 
     #[test]
