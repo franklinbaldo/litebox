@@ -652,6 +652,49 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenProcessToken {
+                process_handle,
+                desired_access,
+                token_handle,
+            } => {
+                let status =
+                    self.handle_nt_open_process_token(process_handle, desired_access, token_handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInformationToken {
+                token_handle,
+                token_information_class,
+                token_information,
+                token_information_length,
+                return_length,
+            } => {
+                let status = self.handle_nt_query_information_token(
+                    token_handle,
+                    token_information_class,
+                    token_information,
+                    token_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQuerySecurityAttributesToken {
+                token_handle,
+                attributes,
+                number_of_attributes,
+                buffer,
+                length,
+                return_length,
+            } => {
+                let status = self.handle_nt_query_security_attributes_token(
+                    token_handle,
+                    attributes.is_some(),
+                    number_of_attributes,
+                    buffer,
+                    length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtSetInformationThread {
                 thread_handle,
                 thread_information_class,

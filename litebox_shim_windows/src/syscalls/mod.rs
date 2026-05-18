@@ -96,6 +96,26 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         open_as_self: u8,
         token_handle: Platform::RawMutPointer<Handle>,
     },
+    NtOpenProcessToken {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtQueryInformationToken {
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: Platform::RawMutPointer<u8>,
+        token_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQuerySecurityAttributesToken {
+        token_handle: Handle,
+        attributes: Option<Platform::RawConstPointer<u8>>,
+        number_of_attributes: u32,
+        buffer: Option<Platform::RawMutPointer<u8>>,
+        length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtOpenSection {
         section_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -328,6 +348,28 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 open_as_self,
                 token_handle:*,
             })),
+            NtSysno::NtOpenProcessToken => Some(sys_req!(NtOpenProcessToken {
+                process_handle:{ProcessHandle::from_raw},
+                desired_access,
+                token_handle:*,
+            })),
+            NtSysno::NtQueryInformationToken => Some(sys_req!(NtQueryInformationToken {
+                token_handle:{Handle::from_raw},
+                token_information_class,
+                token_information:*,
+                token_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySecurityAttributesToken => {
+                Some(sys_req!(NtQuerySecurityAttributesToken {
+                    token_handle:{Handle::from_raw},
+                    attributes:*,
+                    number_of_attributes,
+                    buffer:*,
+                    length,
+                    return_length:*,
+                }))
+            }
             NtSysno::NtOpenSection => Some(sys_req!(NtOpenSection {
                 section_handle:*,
                 desired_access,
