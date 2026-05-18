@@ -186,8 +186,7 @@ pub(crate) fn insert_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
         let typed = handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok();
         drop(handles);
         if let Some(typed) = typed {
-            let removed = litebox.descriptor_table_mut().remove(&typed);
-            debug_assert!(removed.is_some());
+            let _ = litebox.descriptor_table_mut().remove(&typed);
         }
         return Err(NtStatus::QUOTA_EXCEEDED);
     };
@@ -220,8 +219,7 @@ pub(crate) fn remove_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
         handles.fd_consume_raw_integer::<Subsystem>(raw_fd).ok()
     };
     if let Some(typed) = typed {
-        let removed = litebox.descriptor_table_mut().remove(&typed);
-        debug_assert!(removed.is_some());
+        let _ = litebox.descriptor_table_mut().remove(&typed);
     }
 }
 
@@ -620,6 +618,26 @@ impl<FS: NtShimFS> Task<FS> {
             }
             SyscallRequest::NtClose { handle } => {
                 let status = self.handle_nt_close(handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtDuplicateObject {
+                source_process_handle,
+                source_handle,
+                target_process_handle,
+                target_handle,
+                desired_access,
+                handle_attributes,
+                options,
+            } => {
+                let status = self.handle_nt_duplicate_object(DuplicateObjectRequest {
+                    source_process_handle,
+                    source_handle,
+                    target_process_handle,
+                    target_handle,
+                    desired_access,
+                    handle_attributes,
+                    options,
+                });
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtClearEvent { event_handle } => {
@@ -1039,6 +1057,60 @@ impl<FS: NtShimFS> Task<FS> {
         status
     }
 
+    fn handle_nt_duplicate_object(&self, request: DuplicateObjectRequest<Platform>) -> NtStatus {
+        if !ProcessHandle::from_raw(request.source_process_handle.as_raw()).is_current()
+            || !ProcessHandle::from_raw(request.target_process_handle.as_raw()).is_current()
+        {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let status = self
+            .run_on_raw_handle(
+                request.source_handle,
+                DuplicateRawHandleVisitor {
+                    task: self,
+                    target_handle: request.target_handle,
+                },
+            )
+            .unwrap_or_else(|status| status);
+        if status == NtStatus::SUCCESS {
+            litebox_util_log::debug!(
+                source_handle:% = format_args!("{:#x}", request.source_handle.as_raw()),
+                target_handle:% = format_args!("{:#x}", request.target_handle.as_usize()),
+                desired_access:% = format_args!("{:#x}", request.desired_access),
+                handle_attributes:% = format_args!("{:#x}", request.handle_attributes),
+                options:% = format_args!("{:#x}", request.options);
+                "Handled NtDuplicateObject syscall"
+            );
+        }
+        status
+    }
+
+    fn duplicate_raw_handle<Subsystem: litebox::fd::FdEnabledSubsystem>(
+        &self,
+        source_fd: &litebox::fd::TypedFd<Subsystem>,
+        target_handle: <Platform as RawPointerProvider>::RawMutPointer<Handle>,
+    ) -> NtStatus {
+        let Some(duplicate) = self
+            .global
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(source_fd)
+        else {
+            return NtStatus::INVALID_HANDLE;
+        };
+        let handle = match insert_raw_handle(&self.global.litebox, &self.process.handles, duplicate)
+        {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+        if target_handle.write_at_offset(0, handle).is_none() {
+            remove_raw_handle::<Subsystem>(&self.global.litebox, &self.process.handles, handle);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn run_on_raw_handle<R>(
         &self,
         handle: Handle,
@@ -1096,8 +1168,7 @@ impl<FS: NtShimFS> Task<FS> {
         let Some(typed) = typed else {
             return NtStatus::INVALID_HANDLE;
         };
-        let removed = self.global.litebox.descriptor_table_mut().remove(&typed);
-        debug_assert!(removed.is_some());
+        let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
         NtStatus::SUCCESS
     }
 
@@ -1149,6 +1220,21 @@ struct CloseRawHandleVisitor<'task, FS: NtShimFS> {
     task: &'task Task<FS>,
 }
 
+struct DuplicateObjectRequest<P: RawPointerProvider> {
+    source_process_handle: Handle,
+    source_handle: Handle,
+    target_process_handle: Handle,
+    target_handle: P::RawMutPointer<Handle>,
+    desired_access: u32,
+    handle_attributes: u32,
+    options: u32,
+}
+
+struct DuplicateRawHandleVisitor<'task, FS: NtShimFS> {
+    task: &'task Task<FS>,
+    target_handle: <Platform as RawPointerProvider>::RawMutPointer<Handle>,
+}
+
 impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for CloseRawHandleVisitor<'_, FS> {
     fn event(self, raw_fd: usize, _handle: WindowsEventHandle) -> NtStatus {
         self.task.close_raw_handle::<event::EventSubsystem>(raw_fd)
@@ -1186,6 +1272,137 @@ impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for CloseRawHandleVisitor<'_, FS> 
     ) -> NtStatus {
         self.task
             .close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(raw_fd)
+    }
+}
+
+impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for DuplicateRawHandleVisitor<'_, FS> {
+    fn event(self, _raw_fd: usize, handle: WindowsEventHandle) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<event::EventSubsystem>(handle.as_ref(), self.target_handle)
+    }
+
+    fn object_directory(self, _raw_fd: usize, handle: WindowsObjectDirectoryHandle) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<syscalls::object::ObjectDirectorySubsystem>(
+                handle.as_ref(),
+                self.target_handle,
+            )
+    }
+
+    fn symbolic_link(self, _raw_fd: usize, handle: WindowsSymbolicLinkHandle) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<syscalls::object::SymbolicLinkSubsystem>(
+                handle.as_ref(),
+                self.target_handle,
+            )
+    }
+
+    fn registry_key(self, _raw_fd: usize, handle: WindowsRegistryKeyHandle) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<registry::RegistryKeySubsystem>(
+                handle.as_ref(),
+                self.target_handle,
+            )
+    }
+
+    fn section(self, _raw_fd: usize, handle: WindowsSectionHandle) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<section::SectionSubsystem>(handle.as_ref(), self.target_handle)
+    }
+
+    fn token(self, _raw_fd: usize, handle: WindowsTokenHandle) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<syscalls::token::TokenSubsystem>(
+                handle.as_ref(),
+                self.target_handle,
+            )
+    }
+
+    fn wait_completion_packet(
+        self,
+        _raw_fd: usize,
+        handle: WindowsWaitCompletionPacketHandle,
+    ) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(
+                handle.as_ref(),
+                self.target_handle,
+            )
+    }
+}
+
+#[cfg(test)]
+mod duplicate_tests {
+    use super::*;
+
+    type MutPtr<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
+
+    fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<T> {
+        MutPtr::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+    }
+
+    fn create_event(task: &Task<DefaultFS>) -> Handle {
+        let mut handle = Handle::default();
+        assert_eq!(
+            event::handle_nt_create_event(
+                &task.global.litebox,
+                &task.process.handles,
+                mut_ptr(&mut handle),
+                0,
+                None,
+                0,
+                0,
+            ),
+            NtStatus::SUCCESS
+        );
+        handle
+    }
+
+    #[test]
+    fn nt_duplicate_object_creates_independent_handle_slot() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let source_handle = create_event(&task);
+        let mut target_handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_duplicate_object(DuplicateObjectRequest {
+                source_process_handle: Handle::from_raw(ProcessHandle::CURRENT.as_raw()),
+                source_handle,
+                target_process_handle: Handle::from_raw(ProcessHandle::CURRENT.as_raw()),
+                target_handle: mut_ptr(&mut target_handle),
+                desired_access: 0,
+                handle_attributes: 0,
+                options: 0,
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_ne!(target_handle, Handle::default());
+        assert_ne!(target_handle, source_handle);
+
+        assert_eq!(task.handle_nt_close(target_handle), NtStatus::SUCCESS);
+        assert_eq!(task.handle_nt_close(source_handle), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn nt_duplicate_object_rejects_unknown_source_handle() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let mut target_handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_duplicate_object(DuplicateObjectRequest {
+                source_process_handle: Handle::from_raw(ProcessHandle::CURRENT.as_raw()),
+                source_handle: Handle::from_raw_fd(0).unwrap(),
+                target_process_handle: Handle::from_raw(ProcessHandle::CURRENT.as_raw()),
+                target_handle: mut_ptr(&mut target_handle),
+                desired_access: 0,
+                handle_attributes: 0,
+                options: 0,
+            }),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(target_handle, Handle::default());
     }
 }
 
