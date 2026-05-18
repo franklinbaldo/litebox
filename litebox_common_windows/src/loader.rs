@@ -82,9 +82,7 @@ pub struct MappingInfo {
     pub base_addr: usize,
     /// The image size reported to Windows image-information queries.
     pub image_size: usize,
-    /// The mapped image size, including LiteBox-private trampoline pages.
-    ///
-    /// The loader also maps a trailing image-extension page at `base_addr + mapped_size`.
+    /// The mapped image size, including the image extension and LiteBox-private trampoline pages.
     pub mapped_size: usize,
     /// The entry point, where execution begins.
     pub entry_point: usize,
@@ -138,6 +136,7 @@ const MEMORY_IMAGE_EXTENSION_FUNCTION_TABLE_OFFSET: usize = 0x2a4;
 const MEMORY_IMAGE_EXTENSION_RUNTIME_FUNCTION: [u32; 3] = [0, 0x280, 0x298];
 const MEMORY_IMAGE_FLAGS_UNSIGNED_IMAGE: u32 = 0x08;
 const MEMORY_IMAGE_FLAGS_SIGNED_IMAGE: u32 = 0x20;
+const MEMORY_IMAGE_FLAGS_IMAGE_EXTENSION_PRESENT: u32 = 0x40;
 const MEMORY_IMAGE_FLAGS_SYSTEM_DLL: u32 = 0x70;
 
 /// A PE data directory entry.
@@ -279,12 +278,9 @@ impl PeParsedFile {
             return Err(PeLoadError::InvalidImage);
         }
         let mapping_size = self.mapping_size::<M::Error>(image_size)?;
-        let reserved_size = mapping_size
-            .checked_add(MEMORY_IMAGE_EXTENSION_SIZE)
-            .ok_or(PeLoadError::InvalidImage)?;
 
         let base_addr = mapper
-            .reserve(preferred_base, reserved_size, PAGE_SIZE)
+            .reserve(preferred_base, mapping_size, PAGE_SIZE)
             .map_err(PeLoadError::Map)?;
         let image_end = base_addr
             .checked_add(image_size)
@@ -403,11 +399,11 @@ impl PeParsedFile {
                 .map_err(PeLoadError::Map)?;
         }
 
+        self.load_memory_image_extension(mapper, mem, base_addr, image_size)?;
+
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, base_addr)?;
         }
-
-        self.load_memory_image_extension(mapper, mem, base_addr, mapping_size)?;
 
         let entry_point = base_addr
             .checked_add(self.image.entry_point_rva)
@@ -423,13 +419,17 @@ impl PeParsedFile {
     }
 
     fn memory_image_flags(&self) -> u32 {
-        if self.image.characteristics & IMAGE_FILE_DLL != 0 {
+        let mut flags = if self.image.characteristics & IMAGE_FILE_DLL != 0 {
             MEMORY_IMAGE_FLAGS_SYSTEM_DLL
         } else if self.has_load_config_directory() {
             MEMORY_IMAGE_FLAGS_SIGNED_IMAGE
         } else {
             MEMORY_IMAGE_FLAGS_UNSIGNED_IMAGE
+        };
+        if self.trampoline.is_some() {
+            flags |= MEMORY_IMAGE_FLAGS_IMAGE_EXTENSION_PRESENT;
         }
+        flags
     }
 
     fn load_memory_image_extension<M: MapMemory>(
@@ -437,10 +437,10 @@ impl PeParsedFile {
         mapper: &mut M,
         mem: &mut impl AccessMemory,
         base_addr: usize,
-        mapping_size: usize,
+        image_size: usize,
     ) -> Result<(), PeLoadError<M::Error>> {
         let image_extension_start = base_addr
-            .checked_add(mapping_size)
+            .checked_add(image_size)
             .ok_or(PeLoadError::InvalidImage)?;
         mapper
             .map_zero(
@@ -580,11 +580,14 @@ impl PeParsedFile {
             .map_err(|_| PeParseError::BadTrampoline)?;
         let image_size =
             page_align_up(self.image.size_of_image).ok_or(PeParseError::BadTrampoline)?;
+        let image_extension_end = image_size
+            .checked_add(MEMORY_IMAGE_EXTENSION_SIZE)
+            .ok_or(PeParseError::BadTrampoline)?;
 
         if trampoline_size == 0
             || !file_offset.is_multiple_of(PAGE_SIZE as u64)
             || !rva.is_multiple_of(PAGE_SIZE)
-            || rva < image_size
+            || rva < image_extension_end
             || file_offset
                 .checked_add(trampoline_size as u64)
                 .ok_or(PeParseError::BadTrampoline)?
@@ -603,15 +606,18 @@ impl PeParsedFile {
     }
 
     fn mapping_size<E>(&self, image_size: usize) -> Result<usize, PeLoadError<E>> {
+        let image_extension_end = image_size
+            .checked_add(MEMORY_IMAGE_EXTENSION_SIZE)
+            .ok_or(PeLoadError::InvalidImage)?;
         let Some(trampoline) = &self.trampoline else {
-            return Ok(image_size);
+            return Ok(image_extension_end);
         };
 
         trampoline
             .rva
             .checked_add(trampoline.size)
             .and_then(page_align_up)
-            .map(|trampoline_end| image_size.max(trampoline_end))
+            .map(|trampoline_end| image_extension_end.max(trampoline_end))
             .ok_or(PeLoadError::InvalidImage)
     }
 
@@ -1014,4 +1020,64 @@ fn parse_relocations(pe: &PeFile64<'_>) -> Result<Vec<Relocation>, object::read:
     }
 
     Ok(relocations)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed_file(characteristics: u16, has_trampoline: bool) -> PeParsedFile {
+        PeParsedFile {
+            image: PeImageInfo {
+                machine: 0,
+                characteristics,
+                image_base: 0,
+                entry_point_rva: 0,
+                entry_point: 0,
+                size_of_image: PAGE_SIZE,
+                size_of_headers: 0,
+                section_alignment: PAGE_SIZE,
+                file_alignment: 0,
+                subsystem: 0,
+                major_subsystem_version: 0,
+                minor_subsystem_version: 0,
+                dll_characteristics: 0,
+                size_of_stack_reserve: 0,
+                size_of_stack_commit: 0,
+                size_of_heap_reserve: 0,
+                size_of_heap_commit: 0,
+            },
+            sections: Vec::new(),
+            data_directories: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            relocations: Vec::new(),
+            trampoline: has_trampoline.then_some(PeTrampolineInfo {
+                rva: PAGE_SIZE * 2,
+                size: PAGE_SIZE,
+                file_offset: 0,
+                syscall_entry_point: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn image_flags_advertise_trampoline_image_extension() {
+        assert_eq!(
+            parsed_file(0, true).memory_image_flags(),
+            MEMORY_IMAGE_FLAGS_UNSIGNED_IMAGE | MEMORY_IMAGE_FLAGS_IMAGE_EXTENSION_PRESENT
+        );
+        assert_eq!(
+            parsed_file(IMAGE_FILE_DLL, true).memory_image_flags(),
+            MEMORY_IMAGE_FLAGS_SYSTEM_DLL
+        );
+    }
+
+    #[test]
+    fn image_flags_omit_extension_for_plain_executable() {
+        assert_eq!(
+            parsed_file(0, false).memory_image_flags(),
+            MEMORY_IMAGE_FLAGS_UNSIGNED_IMAGE
+        );
+    }
 }

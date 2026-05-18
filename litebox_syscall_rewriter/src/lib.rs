@@ -242,8 +242,12 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
         let pe = PeFile64::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
         let optional_header = pe.nt_headers().optional_header();
         let size_of_image = u64::from(optional_header.size_of_image());
+        let image_extension_rva =
+            checked_add_u64(size_of_image, 0xfff, "PE image extension base")? & !0xfff;
+        // Store the RVA after Windows' image-extension page; the loader maps
+        // the footer trampoline at this RVA directly.
         let trampoline_base_rva =
-            checked_add_u64(size_of_image, 0xfff, "PE trampoline base")? & !0xfff;
+            checked_add_u64(image_extension_rva, 0x1000, "PE trampoline base")?;
         let trampoline_base_addr = checked_add_u64(
             optional_header.image_base(),
             trampoline_base_rva,

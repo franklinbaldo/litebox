@@ -667,7 +667,7 @@ impl<FS: NtShimFS> Task<FS> {
             MemoryImageExtensionInformation {
                 extension_type: 0,
                 flags: 0,
-                extension_image_base_rva: mapping.mapped_size,
+                extension_image_base_rva: mapping.image_size,
                 extension_size: PAGE_SIZE,
             }
         } else {
