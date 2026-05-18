@@ -48,6 +48,11 @@ pub(crate) struct RegistryStore {
 const VALUES_DIR_NAME: &str = ".values";
 const DEFAULT_CODE_PAGE_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
+const DEFAULT_SESSION_MANAGER_KEY: &str =
+    "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager";
+const DEFAULT_SEGMENT_HEAP_KEY: &str =
+    "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\Segment Heap";
+const DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY: &str = "\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
 const DEFAULT_ACP_VALUE: &[u8] = &[b'1', 0, b'2', 0, b'5', 0, b'2', 0, 0, 0];
 const DEFAULT_OEMCP_VALUE: &[u8] = &[b'4', 0, b'3', 0, b'7', 0, 0, 0];
 const DEFAULT_MACCP_VALUE: &[u8] = &[b'1', 0, b'0', 0, b'0', 0, b'0', 0, b'0', 0, 0, 0];
@@ -74,6 +79,12 @@ impl RegistryStore {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
         let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
         in_mem.with_root_privileges(|fs| {
+            create_key_in_fs(fs, DEFAULT_SESSION_MANAGER_KEY)
+                .expect("default Session Manager registry key can be initialized");
+            create_key_in_fs(fs, DEFAULT_SEGMENT_HEAP_KEY)
+                .expect("default Segment Heap registry key can be initialized");
+            create_key_in_fs(fs, DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY)
+                .expect("default IFEO registry key can be initialized");
             write_value_in_fs(fs, DEFAULT_CODE_PAGE_KEY, "ACP", REG_SZ, DEFAULT_ACP_VALUE)
                 .expect("default ACP registry value can be initialized");
             write_value_in_fs(
@@ -208,8 +219,20 @@ impl<FS: NtShimFS> Task<FS> {
 
         match self.global.registry.key_exists(&path) {
             Ok(true) => {}
-            Ok(false) => return NtStatus::OBJECT_NAME_NOT_FOUND,
-            Err(status) => return status,
+            Ok(false) => {
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
+            Err(status) => {
+                litebox_util_log::debug!(
+                    desired_access:% = format_args!("{desired_access:#x}"),
+                    root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                    name:% = name,
+                    path:% = path,
+                    status:? = status;
+                    "NtOpenKey failed"
+                );
+                return status;
+            }
         }
 
         let key = RegistryKeyObject { path: path.clone() };
@@ -478,7 +501,7 @@ fn append_registry_components(path: &mut String, name: &str) -> Result<(), NtSta
         if component.is_empty()
             || component == "."
             || component == ".."
-            || component == VALUES_DIR_NAME
+            || component.eq_ignore_ascii_case(VALUES_DIR_NAME)
             || component.contains('/')
         {
             return Err(NtStatus::INVALID_PARAMETER);
@@ -486,7 +509,7 @@ fn append_registry_components(path: &mut String, name: &str) -> Result<(), NtSta
         if !path.ends_with('/') {
             path.push('/');
         }
-        path.push_str(component);
+        path.push_str(&component.to_ascii_lowercase());
     }
     Ok(())
 }
@@ -592,7 +615,7 @@ fn value_path(key_path: &str, value_name: &str) -> Result<String, NtStatus> {
     }
     path.push_str(VALUES_DIR_NAME);
     path.push('/');
-    path.push_str(value_name);
+    path.push_str(&value_name.to_ascii_lowercase());
     Ok(path)
 }
 
@@ -798,7 +821,9 @@ mod tests {
     #[test]
     fn nt_open_key_reports_missing_absolute_key() {
         let task = crate::tests::test_task();
-        let name: std::vec::Vec<u16> = "\\Registry\\Machine\\Software".encode_utf16().collect();
+        let name: std::vec::Vec<u16> = "\\Registry\\Machine\\Software\\Missing"
+            .encode_utf16()
+            .collect();
         let name = unicode_string(&name);
         let object_attributes = object_attributes(&name);
         let mut handle = Handle::default();
