@@ -505,7 +505,7 @@ impl<FS: NtShimFS> Task<FS> {
                 );
             }
             MemoryInformationClass::ImageExtension => {
-                return handle_nt_query_virtual_memory_image_extension_information(
+                return self.handle_nt_query_virtual_memory_image_extension_information(
                     process_handle,
                     base_address,
                     memory_information,
@@ -575,6 +575,7 @@ impl<FS: NtShimFS> Task<FS> {
         let Some(mapping) = image_mapping_for_address(
             &self.process.mapping,
             self.process.ntdll_mapping.as_ref(),
+            &self.process.section_views,
             base_address,
         ) else {
             return NtStatus::INVALID_PARAMETER;
@@ -603,13 +604,71 @@ impl<FS: NtShimFS> Task<FS> {
 
         NtStatus::SUCCESS
     }
+
+    fn handle_nt_query_virtual_memory_image_extension_information(
+        &self,
+        process_handle: ProcessHandle,
+        base_address: usize,
+        memory_information: GuestMutPointer<u8>,
+        memory_information_length: usize,
+        return_length: Option<GuestMutPointer<usize>>,
+    ) -> NtStatus {
+        let required_len = MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE;
+        if let Some(return_length) = return_length
+            && return_length.write_at_offset(0, required_len).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if memory_information_length < required_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        let Some(mapping) = image_mapping_for_address(
+            &self.process.mapping,
+            self.process.ntdll_mapping.as_ref(),
+            &self.process.section_views,
+            base_address,
+        ) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+
+        let info = MemoryImageInformation {
+            image_base: mapping.base_addr,
+            size_of_image: mapping.image_size,
+            image_flags: 0,
+            _padding: 0,
+        };
+        let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
+            MemoryImageInformation,
+        >::from_usize(memory_information.as_usize());
+        if output.write_at_offset(0, info).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
+            base:% = format_args!("{:#x}", base_address),
+            image_base:% = format_args!("{:#x}", mapping.base_addr),
+            image_size = mapping.image_size;
+            "Handled NtQueryVirtualMemory MemoryImageExtensionInformation syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
 }
 
-fn image_mapping_for_address<'a>(
-    application_mapping: &'a MappingInfo,
-    ntdll_mapping: Option<&'a MappingInfo>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageMappingInformation {
+    base_addr: usize,
+    image_size: usize,
+}
+
+fn image_mapping_for_address(
+    application_mapping: &MappingInfo,
+    ntdll_mapping: Option<&MappingInfo>,
+    section_views: &crate::WindowsSectionViews,
     address: usize,
-) -> Option<&'a MappingInfo> {
+) -> Option<ImageMappingInformation> {
     [Some(application_mapping), ntdll_mapping]
         .into_iter()
         .flatten()
@@ -618,43 +677,27 @@ fn image_mapping_for_address<'a>(
                 && address >= mapping.base_addr
                 && address < mapping.base_addr.saturating_add(mapping.image_size)
         })
+        .map(|mapping| ImageMappingInformation {
+            base_addr: mapping.base_addr,
+            image_size: mapping.image_size,
+        })
+        .or_else(|| section_view_for_address(section_views, address))
 }
 
-fn handle_nt_query_virtual_memory_image_extension_information(
-    process_handle: ProcessHandle,
-    base_address: usize,
-    memory_information: GuestMutPointer<u8>,
-    memory_information_length: usize,
-    return_length: Option<GuestMutPointer<usize>>,
-) -> NtStatus {
-    if let Some(return_length) = return_length
-        && return_length
-            .write_at_offset(0, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE)
-            .is_none()
-    {
-        return NtStatus::ACCESS_VIOLATION;
-    }
-    if memory_information_length < MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE {
-        return NtStatus::INFO_LENGTH_MISMATCH;
-    }
-    let output = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<
-        [u8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE],
-    >::from_usize(memory_information.as_usize());
-    if output
-        .write_at_offset(0, [0; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE])
-        .is_none()
-    {
-        return NtStatus::ACCESS_VIOLATION;
-    }
-
-    litebox_util_log::debug!(
-        process_handle:% = format_args!("{:#x}", process_handle.as_raw()),
-        base:% = format_args!("{:#x}", base_address),
-        required_len = MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE;
-        "Handled NtQueryVirtualMemory MemoryImageExtensionInformation syscall"
-    );
-
-    NtStatus::SUCCESS
+fn section_view_for_address(
+    section_views: &crate::WindowsSectionViews,
+    address: usize,
+) -> Option<ImageMappingInformation> {
+    section_views.lock().iter().find_map(|(&base, &size)| {
+        if size != 0 && address >= base && address < base.saturating_add(size) {
+            Some(ImageMappingInformation {
+                base_addr: base,
+                image_size: size,
+            })
+        } else {
+            None
+        }
+    })
 }
 
 fn page_aligned_region(base: usize, size: usize) -> Option<(usize, usize)> {
@@ -1000,7 +1043,8 @@ mod tests {
     const QUERY_TEST_BASE: usize = 0x1300_0000;
     const FREE_TEST_BASE: usize = 0x1400_0000;
     const COMMIT_TEST_BASE: usize = 0x1500_0000;
-    const IMAGE_EXTENSION_TEST_BASE: usize = 0x1600_0000;
+    const SECTION_VIEW_TEST_BASE: usize = 0x1700_0000;
+    const SECTION_VIEW_TEST_SIZE: usize = 0x3000;
     const OTHER_PROCESS_HANDLE: ProcessHandle = ProcessHandle::from_raw(0x1234);
 
     fn mut_ptr<T: FromBytes + IntoBytes>(value: &mut T) -> MutPtr<T> {
@@ -1065,48 +1109,35 @@ mod tests {
     }
 
     #[test]
-    fn nt_query_virtual_memory_image_extension_information_returns_zeroed_info() {
+    fn nt_query_virtual_memory_image_extension_information_reports_section_view() {
         let task = crate::tests::test_task();
-        let mut output_base = IMAGE_EXTENSION_TEST_BASE;
-        let mut output_size = PAGE_SIZE;
-        assert_eq!(
-            task.handle_nt_allocate_virtual_memory(
-                ProcessHandle::CURRENT,
-                mut_ptr(&mut output_base),
-                0,
-                mut_ptr(&mut output_size),
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let output = MutPtr::<u8>::from_usize(output_base);
-        output
-            .write_slice_at_offset(0, &[0xff; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE])
-            .unwrap();
+        task.process
+            .section_views
+            .lock()
+            .insert(SECTION_VIEW_TEST_BASE, SECTION_VIEW_TEST_SIZE);
+        let mut information = MemoryImageInformation {
+            image_base: usize::MAX,
+            size_of_image: usize::MAX,
+            image_flags: u32::MAX,
+            _padding: u32::MAX,
+        };
         let mut return_length = 0usize;
 
         assert_eq!(
             task.handle_nt_query_virtual_memory(
                 ProcessHandle::CURRENT,
-                QUERY_TEST_BASE,
+                SECTION_VIEW_TEST_BASE + PAGE_SIZE,
                 class_value(MemoryInformationClass::ImageExtension),
-                output,
+                mut_byte_ptr(&mut information),
                 MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE,
                 Some(mut_ptr(&mut return_length)),
             ),
             NtStatus::SUCCESS
         );
         assert_eq!(return_length, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE);
-        let information = core::array::from_fn(|index| {
-            output
-                .read_at_offset(index.try_into().unwrap())
-                .expect("test output byte is readable")
-        });
-        assert_eq!(information, [0; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE]);
-
-        release_mapping(&task, output_base);
+        assert_eq!(information.image_base, SECTION_VIEW_TEST_BASE);
+        assert_eq!(information.size_of_image, SECTION_VIEW_TEST_SIZE);
+        assert_eq!(information.image_flags, 0);
     }
 
     #[test]
