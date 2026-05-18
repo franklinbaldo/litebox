@@ -28,6 +28,7 @@ enum ProcessInformationClass {
     Wow64Information = 26,
     DebugFlags = 31,
     Cookie = 36,
+    ImageInformation = 53,
     SchedulerSharedData = 112,
 }
 
@@ -113,7 +114,8 @@ impl<FS: NtShimFS> Task<FS> {
                 return_length,
                 self.process.cookie,
             ),
-            ProcessInformationClass::SchedulerSharedData => {
+            ProcessInformationClass::ImageInformation
+            | ProcessInformationClass::SchedulerSharedData => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
                     "Unsupported NtQueryInformationProcess class"
@@ -160,7 +162,8 @@ impl<FS: NtShimFS> Task<FS> {
                     .store(mode.default_hard_error_mode, Ordering::Release);
                 NtStatus::SUCCESS
             }
-            ProcessInformationClass::SchedulerSharedData => NtStatus::SUCCESS,
+            ProcessInformationClass::ImageInformation
+            | ProcessInformationClass::SchedulerSharedData => NtStatus::SUCCESS,
             _ => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
