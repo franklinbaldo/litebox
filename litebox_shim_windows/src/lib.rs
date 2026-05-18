@@ -1153,6 +1153,10 @@ impl<FS: NtShimFS> Task<FS> {
             drop(handles);
             return Ok(visitor.wait_completion_packet(raw_fd, fd));
         }
+        if let Ok(fd) = handles.fd_from_raw_integer::<FS>(raw_fd) {
+            drop(handles);
+            return Ok(visitor.file::<FS>(raw_fd, fd));
+        }
         Err(NtStatus::INVALID_HANDLE)
     }
 
@@ -1213,6 +1217,8 @@ pub(crate) trait RawHandleVisitor<R> {
     fn token(self, raw_fd: usize, handle: WindowsTokenHandle) -> R;
 
     fn wait_completion_packet(self, raw_fd: usize, handle: WindowsWaitCompletionPacketHandle) -> R;
+
+    fn file<FS: NtShimFS>(self, raw_fd: usize, handle: Arc<litebox::fd::TypedFd<FS>>) -> R;
 }
 
 struct CloseRawHandleVisitor<'task, FS: NtShimFS> {
@@ -1272,6 +1278,14 @@ impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for CloseRawHandleVisitor<'_, FS> 
         self.task
             .close_raw_handle::<wait_completion_packet::WaitCompletionPacketSubsystem>(raw_fd)
     }
+
+    fn file<FileSystem: NtShimFS>(
+        self,
+        raw_fd: usize,
+        _handle: Arc<litebox::fd::TypedFd<FileSystem>>,
+    ) -> NtStatus {
+        self.task.close_raw_handle::<FileSystem>(raw_fd)
+    }
 }
 
 impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for DuplicateRawHandleVisitor<'_, FS> {
@@ -1328,11 +1342,21 @@ impl<FS: NtShimFS> RawHandleVisitor<NtStatus> for DuplicateRawHandleVisitor<'_, 
                 self.target_handle,
             )
     }
+
+    fn file<FileSystem: NtShimFS>(
+        self,
+        _raw_fd: usize,
+        handle: Arc<litebox::fd::TypedFd<FileSystem>>,
+    ) -> NtStatus {
+        self.task
+            .duplicate_raw_handle::<FileSystem>(handle.as_ref(), self.target_handle)
+    }
 }
 
 #[cfg(test)]
 mod duplicate_tests {
     use super::*;
+    use litebox::fs::{FileSystem as _, Mode, OFlags};
 
     type MutPtr<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
 
@@ -1355,6 +1379,11 @@ mod duplicate_tests {
             NtStatus::SUCCESS
         );
         handle
+    }
+
+    fn create_file(task: &Task<DefaultFS>) -> Handle {
+        let fd = task.fs.open("/", OFlags::RDONLY, Mode::empty()).unwrap();
+        insert_raw_handle(&task.global.litebox, &task.process.handles, fd).unwrap()
     }
 
     #[test]
@@ -1402,6 +1431,32 @@ mod duplicate_tests {
             NtStatus::INVALID_HANDLE
         );
         assert_eq!(target_handle, Handle::default());
+    }
+
+    #[test]
+    fn nt_duplicate_object_duplicates_file_handle() {
+        crate::tests::init_platform();
+        let task = crate::tests::test_task();
+        let source_handle = create_file(&task);
+        let mut target_handle = Handle::default();
+
+        assert_eq!(
+            task.handle_nt_duplicate_object(DuplicateObjectRequest {
+                source_process_handle: Handle::from_raw(ProcessHandle::CURRENT.as_raw()),
+                source_handle,
+                target_process_handle: Handle::from_raw(ProcessHandle::CURRENT.as_raw()),
+                target_handle: mut_ptr(&mut target_handle),
+                desired_access: 0,
+                handle_attributes: 0,
+                options: 0,
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_ne!(target_handle, Handle::default());
+        assert_ne!(target_handle, source_handle);
+
+        assert_eq!(task.handle_nt_close(target_handle), NtStatus::SUCCESS);
+        assert_eq!(task.handle_nt_close(source_handle), NtStatus::SUCCESS);
     }
 }
 

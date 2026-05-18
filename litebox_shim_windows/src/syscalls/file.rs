@@ -28,6 +28,14 @@ const LITEBOX_VOLUME_LABEL: &str = "LiteBox";
 const LITEBOX_FILE_SYSTEM_NAME: &str = "NTFS";
 const FILE_FS_VOLUME_INFORMATION_VOLUME_LABEL_OFFSET: usize = 18;
 const FILE_FS_ATTRIBUTE_INFORMATION_FILE_SYSTEM_NAME_OFFSET: usize = 12;
+const CONDRV_SERVER_DEVICE: &str = r"\Device\ConDrv\Server";
+const CONDRV_REFERENCE_OBJECT: &str = r"\Reference";
+const CONDRV_CONNECT_OBJECT: &str = r"\Connect";
+const CONDRV_INPUT_OBJECT: &str = r"\Input";
+const CONDRV_OUTPUT_OBJECT: &str = r"\Output";
+const DEV_NULL: &str = "/dev/null";
+const DEV_STDIN: &str = "/dev/stdin";
+const DEV_STDOUT: &str = "/dev/stdout";
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -142,6 +150,38 @@ impl<FS: NtShimFS> Task<FS> {
             Ok(path) => path,
             Err(status) => return write_io_status(io_status_block, status),
         };
+        if let Some((fs_path, flags)) = condrv_device_file(&path) {
+            let Ok(fd) = self.fs.open(fs_path, flags, Mode::empty()) else {
+                return write_io_status(io_status_block, NtStatus::OBJECT_NAME_NOT_FOUND);
+            };
+            let handle = match insert_raw_handle(&self.global.litebox, &self.process.handles, fd) {
+                Ok(handle) => handle,
+                Err(status) => return write_io_status(io_status_block, status),
+            };
+            if file_handle.write_at_offset(0, handle).is_none() {
+                remove_raw_handle::<FS>(&self.global.litebox, &self.process.handles, handle);
+                return write_io_status(io_status_block, NtStatus::ACCESS_VIOLATION);
+            }
+            let status =
+                write_io_status_with_information(io_status_block, NtStatus::SUCCESS, FILE_OPENED);
+            if status == NtStatus::ACCESS_VIOLATION {
+                remove_raw_handle::<FS>(&self.global.litebox, &self.process.handles, handle);
+                let _ = file_handle.write_at_offset(0, Handle::default());
+                return status;
+            }
+            litebox_util_log::debug!(
+                handle:% = format_args!("{:#x}", handle.as_raw()),
+                desired_access:% = format_args!("{desired_access:#x}"),
+                share_access:% = format_args!("{share_access:#x}"),
+                open_options:% = format_args!("{open_options:#x}"),
+                root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                path:% = path,
+                fs_path:% = fs_path,
+                status:% = status;
+                "Handled NtOpenFile syscall for ConDrv pseudo-device"
+            );
+            return status;
+        }
         let Some(fs_path) = nt_object_path_to_fs_path(&path) else {
             return write_io_status(io_status_block, NtStatus::OBJECT_NAME_NOT_FOUND);
         };
@@ -398,6 +438,22 @@ fn nt_object_path_to_fs_path(object_path: &str) -> Option<String> {
     Some(fs_path)
 }
 
+fn condrv_device_file(path: &str) -> Option<(&'static str, OFlags)> {
+    if path.eq_ignore_ascii_case(CONDRV_INPUT_OBJECT) {
+        return Some((DEV_STDIN, OFlags::RDONLY));
+    }
+    if path.eq_ignore_ascii_case(CONDRV_OUTPUT_OBJECT) {
+        return Some((DEV_STDOUT, OFlags::WRONLY));
+    }
+    if path.eq_ignore_ascii_case(CONDRV_SERVER_DEVICE)
+        || path.eq_ignore_ascii_case(CONDRV_REFERENCE_OBJECT)
+        || path.eq_ignore_ascii_case(CONDRV_CONNECT_OBJECT)
+    {
+        return Some((DEV_NULL, OFlags::RDWR));
+    }
+    None
+}
+
 fn strip_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
     value
         .get(..prefix.len())
@@ -439,8 +495,12 @@ mod tests {
     use super::*;
     use crate::loader::nt_types::UnicodeString;
     use core::mem::{align_of, size_of};
+    use litebox::fs::FileSystem as _;
     use litebox::platform::{RawConstPointer as _, RawPointerProvider};
     use zerocopy::{FromBytes, IntoBytes};
+
+    const NULL_RDEV: usize = 0x103;
+    const STDIO_RDEV: usize = 34_822;
 
     type MutPtr<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
     type ConstPtr<T> = <Platform as RawPointerProvider>::RawConstPointer<T>;
@@ -589,6 +649,40 @@ mod tests {
     }
 
     #[test]
+    fn nt_open_file_maps_condrv_output_to_stdio_device() {
+        let task = crate::tests::test_task();
+        let (file_handle, io_status, status) = open_nt_file(&task, CONDRV_OUTPUT_OBJECT);
+
+        assert_eq!(status, NtStatus::SUCCESS);
+        assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(io_status.information, FILE_OPENED);
+        let status = file_status(&task, file_handle);
+        assert_eq!(status.file_type, FileType::CharacterDevice);
+        assert_eq!(
+            status.node_info.rdev.map(|rdev| rdev.get()),
+            Some(STDIO_RDEV)
+        );
+        assert_eq!(task.handle_nt_close(file_handle), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn nt_open_file_maps_condrv_control_to_null_device() {
+        let task = crate::tests::test_task();
+        let (file_handle, io_status, status) = open_nt_file(&task, CONDRV_SERVER_DEVICE);
+
+        assert_eq!(status, NtStatus::SUCCESS);
+        assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(io_status.information, FILE_OPENED);
+        let status = file_status(&task, file_handle);
+        assert_eq!(status.file_type, FileType::CharacterDevice);
+        assert_eq!(
+            status.node_info.rdev.map(|rdev| rdev.get()),
+            Some(NULL_RDEV)
+        );
+        assert_eq!(task.handle_nt_close(file_handle), NtStatus::SUCCESS);
+    }
+
+    #[test]
     fn nt_query_attributes_file_reports_existing_system32_file() {
         let task =
             crate::tests::test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", b"dll")]);
@@ -722,5 +816,53 @@ mod tests {
 
     fn wide(value: &str) -> alloc::vec::Vec<u16> {
         value.encode_utf16().collect()
+    }
+
+    fn open_nt_file(
+        task: &Task<crate::DefaultFS>,
+        path: &str,
+    ) -> (Handle, IoStatusBlock, NtStatus) {
+        let mut file_handle = Handle::default();
+        let mut io_status = IoStatusBlock {
+            status: NtStatus::OBJECT_NAME_NOT_FOUND.as_raw(),
+            _padding: u32::MAX,
+            information: 0,
+        };
+        let path = wide(path);
+        let object_name = UnicodeString {
+            length: u16::try_from(path.len() * size_of::<u16>()).unwrap(),
+            maximum_length: u16::try_from(path.len() * size_of::<u16>()).unwrap(),
+            padding_0: [0; 4],
+            buffer: path.as_ptr() as usize,
+        };
+        let object_attributes = ObjectAttributes {
+            length: u32::try_from(size_of::<ObjectAttributes>()).unwrap(),
+            root_directory: Handle::default(),
+            object_name: core::ptr::from_ref(&object_name) as usize,
+            attributes: 0,
+            security_descriptor: 0,
+            security_quality_of_service: 0,
+        };
+
+        let status = task.handle_nt_open_file(
+            mut_ptr(&mut file_handle),
+            0x12019f,
+            Some(const_ptr(&object_attributes)),
+            mut_ptr(&mut io_status),
+            0x7,
+            0x20,
+        );
+        (file_handle, io_status, status)
+    }
+
+    fn file_status(task: &Task<crate::DefaultFS>, handle: Handle) -> litebox::fs::FileStatus {
+        let raw_fd = handle.raw_fd().unwrap();
+        let fd = task
+            .process
+            .handles
+            .read()
+            .fd_from_raw_integer::<crate::DefaultFS>(raw_fd)
+            .unwrap();
+        task.fs.fd_file_status(&fd).unwrap()
     }
 }
