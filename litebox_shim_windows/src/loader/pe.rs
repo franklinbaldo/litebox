@@ -19,7 +19,8 @@ use litebox_common_windows::loader::{
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+    CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_FLOATING_POINT_AMD64,
+    CONTEXT_INTEGER_AMD64,
 };
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
@@ -35,6 +36,7 @@ const INITIAL_STACK_SIZE: usize = 1024 * 1024;
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
+const NTDLL_THREAD_ENTRYPOINT: &[u8] = b"RtlUserThreadStart";
 const KI_USER_INVERTED_FUNCTION_TABLE: &[u8] = b"KiUserInvertedFunctionTable";
 const INITIAL_PROCESS_ID: usize = 1;
 const INITIAL_THREAD_ID: usize = 1;
@@ -48,8 +50,10 @@ const WINDOWS_OS_MAJOR_VERSION: u32 = 10;
 const WINDOWS_OS_MINOR_VERSION: u32 = 0;
 const WINDOWS_OS_BUILD_NUMBER: u16 = 19041;
 const WINDOWS_OS_PLATFORM_WIN32_NT: u32 = 2;
+const INITIAL_CONTEXT_EFLAGS: u32 = 0x200;
+const INITIAL_CONTEXT_MXCSR: u32 = 0x1f80;
 const USER_MODE_CODE_SELECTOR: u16 = 0x33;
-const USER_MODE_DATA_SELECTOR: u16 = 0x2b;
+const USER_MODE_STACK_SELECTOR: u16 = 0x2b;
 
 /// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
@@ -78,6 +82,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         let image_base_address = image.mapping.base_addr;
         let ntdll = load_ntdll(self.fs.clone(), self.page_manager, NTDLL_PATHS)?;
 
+        let initial_thread_entry_point;
         let entry_point = if let Some(ntdll) = &ntdll {
             if !ntdll.has_trampoline {
                 return Err(WindowsLoadError::UnrewrittenNtDll);
@@ -86,6 +91,11 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             let loader_entry_point = ntdll
                 .export_address(NTDLL_LOADER_ENTRYPOINT)?
                 .ok_or(WindowsLoadError::MissingNtDllLoaderEntrypoint)?;
+            initial_thread_entry_point = Some(
+                ntdll
+                    .export_address(NTDLL_THREAD_ENTRYPOINT)?
+                    .ok_or(WindowsLoadError::MissingNtDllThreadEntrypoint)?,
+            );
             litebox_util_log::debug!(
                 entry_point:% = format_args!("{loader_entry_point:#x}"),
                 application_entry_point:% = format_args!("{application_entry_point:#x}");
@@ -93,6 +103,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             );
             loader_entry_point
         } else {
+            initial_thread_entry_point = None;
             application_entry_point
         };
 
@@ -112,9 +123,13 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             &image.image,
             image_base_address,
             path,
-            ntdll
-                .as_ref()
-                .map(|_| (application_entry_point, initial_context_stack_top)),
+            initial_thread_entry_point.map(|thread_entry_point| {
+                (
+                    thread_entry_point,
+                    application_entry_point,
+                    initial_context_stack_top,
+                )
+            }),
         )?;
         let initial_context = environment.initial_context;
 
@@ -133,7 +148,7 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         image: &PeImageInfo,
         image_base_address: usize,
         image_path: &str,
-        initial_context: Option<(usize, usize)>,
+        initial_context: Option<(usize, usize, usize)>,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let mut virtual_allocations = Vec::new();
         let mut create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
@@ -162,9 +177,14 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         let api_set_map_ptr = create_pages(api_set_map.len())?;
         write_slice(api_set_map_ptr, &api_set_map).ok_or(PeImageAccessError::MemoryAccess)?;
         let initial_context = initial_context
-            .map(|(entry_point, stack_top)| {
+            .map(|(thread_entry_point, application_entry_point, stack_top)| {
                 let context_ptr = create_pages(size_of::<CONTEXT>())?;
-                let context = initial_thread_context(entry_point, stack_top);
+                let context = initial_thread_context(
+                    thread_entry_point,
+                    application_entry_point,
+                    stack_top,
+                    peb_ptr,
+                );
                 let context_bytes = context_as_bytes(&context);
                 write_slice(context_ptr, context_bytes).ok_or(PeImageAccessError::MemoryAccess)?;
                 Ok::<usize, PeImageAccessError>(context_ptr)
@@ -371,18 +391,25 @@ fn initial_stack_top(stack_top: usize) -> usize {
     }
 }
 
-fn initial_thread_context(entry_point: usize, stack_top: usize) -> CONTEXT {
+fn initial_thread_context(
+    thread_entry_point: usize,
+    application_entry_point: usize,
+    stack_top: usize,
+    peb: usize,
+) -> CONTEXT {
     CONTEXT {
-        ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+        ContextFlags: CONTEXT_CONTROL_AMD64
+            | CONTEXT_INTEGER_AMD64
+            | CONTEXT_FLOATING_POINT_AMD64
+            | CONTEXT_DEBUG_REGISTERS_AMD64,
+        MxCsr: INITIAL_CONTEXT_MXCSR,
         SegCs: USER_MODE_CODE_SELECTOR,
-        SegDs: USER_MODE_DATA_SELECTOR,
-        SegEs: USER_MODE_DATA_SELECTOR,
-        SegFs: USER_MODE_DATA_SELECTOR,
-        SegGs: USER_MODE_DATA_SELECTOR,
-        SegSs: USER_MODE_DATA_SELECTOR,
-        EFlags: 0x202,
+        SegSs: USER_MODE_STACK_SELECTOR,
+        EFlags: INITIAL_CONTEXT_EFLAGS,
+        Rcx: application_entry_point as u64,
+        Rdx: peb as u64,
         Rsp: stack_top as u64,
-        Rip: entry_point as u64,
+        Rip: thread_entry_point as u64,
         ..CONTEXT::default()
     }
 }
@@ -906,6 +933,9 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll does not export LdrInitializeThunk.
     #[error("guest ntdll.dll does not export LdrInitializeThunk")]
     MissingNtDllLoaderEntrypoint,
+    /// Guest ntdll.dll does not export RtlUserThreadStart.
+    #[error("guest ntdll.dll does not export RtlUserThreadStart")]
+    MissingNtDllThreadEntrypoint,
     /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
     #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
     UnrewrittenNtDll,

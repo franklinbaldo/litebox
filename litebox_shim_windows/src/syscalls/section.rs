@@ -337,6 +337,7 @@ fn map_section_load_error(error: &WindowsLoadError) -> NtStatus {
         WindowsLoadError::Load(_) => NtStatus::NO_MEMORY,
         WindowsLoadError::Parse(_)
         | WindowsLoadError::MissingNtDllLoaderEntrypoint
+        | WindowsLoadError::MissingNtDllThreadEntrypoint
         | WindowsLoadError::UnrewrittenNtDll => NtStatus::INVALID_FILE_FOR_SECTION,
     }
 }

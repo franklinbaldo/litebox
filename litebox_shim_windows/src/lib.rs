@@ -475,8 +475,6 @@ impl<FS: NtShimFS> Task<FS> {
             .ntdll_mapping
             .as_ref()
             .map_or(0, |mapping| mapping.base_addr);
-        ctx.r8 = 0;
-        ctx.r9 = 0;
         litebox_util_log::debug!(
             entry_point:% = format_args!("{:#x}", self.entry_point),
             stack_top:% = format_args!("{:#x}", self.stack_top);
