@@ -1725,12 +1725,33 @@ pub enum SocketcallType {
     Sendmmsg = 20,
 }
 
+/// `how` argument to the `shutdown(2)` syscall.
+///
+/// Discriminants match Linux's `SHUT_RD` (0), `SHUT_WR` (1), `SHUT_RDWR` (2) ABI.
 #[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, Clone, Copy, IntEnum)]
 pub enum ShutdownHow {
+    /// `SHUT_RD`: disallow further receives. Already-queued data may still be drained;
+    /// once empty, subsequent reads observe EOF and the peer's writes fail with `EPIPE`.
     Read = 0,
+    /// `SHUT_WR`: disallow further sends. Subsequent local writes fail with `EPIPE`;
+    /// the peer keeps reading anything still in flight.
     Write = 1,
+    /// `SHUT_RDWR`: union of `Read` and `Write`.
     Both = 2,
+}
+
+impl ShutdownHow {
+    /// Whether `self` shuts the read side down.
+    #[must_use]
+    pub fn affects_read(self) -> bool {
+        matches!(self, Self::Read | Self::Both)
+    }
+    /// Whether `self` shuts the write side down.
+    #[must_use]
+    pub fn affects_write(self) -> bool {
+        matches!(self, Self::Write | Self::Both)
+    }
 }
 
 /// Request to syscall handler
@@ -2353,7 +2374,6 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
                 newfd: Some(ctx.sys_req_arg(1)),
                 flags: Some(ctx.sys_req_arg(2)),
             },
-            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::socket => sys_req!(Socket {
                 domain,
                 type_and_flags,
@@ -2378,6 +2398,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::sendmsg => sys_req!(Sendmsg { sockfd, msg:*, flags }),
             Sysno::recvfrom => sys_req!(Recvfrom { sockfd, buf:*, len, flags, addr:*, addrlen:*, }),
             Sysno::recvmsg => sys_req!(Recvmsg { sockfd, msg:*, flags }),
+            Sysno::shutdown => sys_req!(Shutdown { sockfd, how }),
             Sysno::bind => sys_req!(Bind { sockfd, sockaddr:*, addrlen }),
             Sysno::listen => sys_req!(Listen { sockfd, backlog }),
             Sysno::setsockopt => sys_req!(Setsockopt {

@@ -661,7 +661,6 @@ impl<FS: ShimFS> Task<FS> {
                 newfd,
                 flags,
             } => syscall!(sys_dup(oldfd, newfd, flags)),
-            SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
@@ -702,6 +701,7 @@ impl<FS: ShimFS> Task<FS> {
                 addrlen,
             } => self.sys_recvfrom(sockfd, buf, len, flags, addr, addrlen),
             SyscallRequest::Recvmsg { sockfd, msg, flags } => self.sys_recvmsg(sockfd, msg, flags),
+            SyscallRequest::Shutdown { sockfd, how } => syscall!(sys_shutdown(sockfd, how)),
             SyscallRequest::Bind {
                 sockfd,
                 sockaddr,

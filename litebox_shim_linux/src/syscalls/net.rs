@@ -27,8 +27,9 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
-    SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno, signal::Signal,
+    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, ShutdownHow,
+    SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, errno::Errno,
+    signal::Signal,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -1798,23 +1799,28 @@ impl<FS: ShimFS> Task<FS> {
         )
     }
 
+    /// Handle syscall `shutdown`
     pub(crate) fn sys_shutdown(&self, sockfd: i32, how: i32) -> Result<(), Errno> {
         let Ok(sockfd) = u32::try_from(sockfd) else {
             return Err(Errno::EBADF);
         };
-        let how = litebox_common_linux::ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+        let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
         self.do_shutdown(sockfd, how)
     }
-    fn do_shutdown(
-        &self,
-        sockfd: u32,
-        how: litebox_common_linux::ShutdownHow,
-    ) -> Result<(), Errno> {
+    fn do_shutdown(&self, sockfd: u32, how: ShutdownHow) -> Result<(), Errno> {
         self.files.borrow().with_socket(
             &self.global,
             sockfd,
-            |fd| todo!(),
-            |file| file.shutdown(how),
+            |_fd| {
+                // Half-close on inet sockets needs a hook through the smoltcp-backed
+                // Network that does not exist yet.
+                log_unsupported!("shutdown on inet socket");
+                Err(Errno::EOPNOTSUPP)
+            },
+            |file| {
+                file.shutdown(how);
+                Ok(())
+            },
         )
     }
 }

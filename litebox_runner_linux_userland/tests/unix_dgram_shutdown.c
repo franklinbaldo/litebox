@@ -105,6 +105,9 @@ static void close_pair(int sv[2]) {
     close(sv[1]);
 }
 
+// SHUT_RD on a connected datagram socket: queued datagrams remain readable; once the queue
+// drains, a non-blocking recv returns EAGAIN (datagram quirk) while a blocking recv returns
+// EOF, and the peer's send fails with EPIPE.
 static void test_shutdown_read_keeps_queued_datagram(void) {
     int sv[2];
     const char *queued = "queued-before-read-shutdown";
@@ -177,6 +180,24 @@ static void test_shutdown_both_combines_read_and_write_rules(void) {
     close_pair(sv);
 }
 
+static void test_shutdown_invalid_how_returns_einval(void) {
+    int sv[2];
+
+    make_dgram_pair(sv);
+
+    errno = 0;
+    long ret = syscall(SYS_shutdown, sv[0], 99);
+    if (ret != -1) {
+        fprintf(stderr, "FAIL: shutdown(invalid how) expected failure, got %ld\n", ret);
+        exit(1);
+    }
+    if (errno != EINVAL) {
+        fail_errno("shutdown(invalid how)", EINVAL);
+    }
+
+    close_pair(sv);
+}
+
 int main(void) {
     printf("== unix datagram shutdown syscall tests ==\n");
 
@@ -184,6 +205,7 @@ int main(void) {
     test_shutdown_read_empty_blocking_recv_returns_eof();
     test_shutdown_write_keeps_receive_side_open();
     test_shutdown_both_combines_read_and_write_rules();
+    test_shutdown_invalid_how_returns_einval();
 
     printf("All unix datagram shutdown tests passed.\n");
     return 0;

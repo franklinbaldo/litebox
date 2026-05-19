@@ -4,7 +4,7 @@
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::{
-    sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -26,8 +26,8 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
-    errno::Errno,
+    IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
+    SocketOptionName, errno::Errno,
 };
 
 use crate::{
@@ -189,10 +189,17 @@ impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
 ///
 /// This is the state immediately after socket creation, before the socket
 /// has been connected, or put into listening mode.
+/// Bit 0 = read shutdown pending, bit 1 = write shutdown pending.
+const PENDING_READ_SHUTDOWN: u8 = 1 << 0;
+const PENDING_WRITE_SHUTDOWN: u8 = 1 << 1;
+
 struct UnixInitStream<FS: ShimFS> {
     /// Optional bound address for this socket
     addr: Option<UnixBoundSocketAddr<FS>>,
     pollee: Pollee<crate::Platform>,
+    /// Linux preserves `shutdown(2)` flags set before `connect(2)` and applies them
+    /// once the socket transitions to Connected. We record them here.
+    pending_shutdown: AtomicU8,
 }
 
 impl<FS: ShimFS> UnixInitStream<FS> {
@@ -200,7 +207,19 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         Self {
             addr: None,
             pollee: Pollee::new(),
+            pending_shutdown: AtomicU8::new(0),
         }
+    }
+
+    fn record_pending_shutdown(&self, how: ShutdownHow) {
+        let mut bits = 0;
+        if how.affects_read() {
+            bits |= PENDING_READ_SHUTDOWN;
+        }
+        if how.affects_write() {
+            bits |= PENDING_WRITE_SHUTDOWN;
+        }
+        self.pending_shutdown.fetch_or(bits, Ordering::Release);
     }
 
     /// Binds this socket to the given address.
@@ -241,12 +260,37 @@ impl<FS: ShimFS> UnixInitStream<FS> {
     }
 
     /// Converts this initial socket into a connected stream pair.
+    ///
+    /// Any half-close flags recorded by a pre-connect `shutdown(2)` are applied to the
+    /// returned *client* stream (the caller side); the server side starts fresh.
     fn into_connected(
         self,
         peer_addr: Arc<UnixBoundSocketAddr<FS>>,
     ) -> (UnixConnectedStream<FS>, UnixConnectedStream<FS>) {
-        let UnixInitStream { addr, pollee } = self;
-        UnixConnectedStream::new_pair(addr.map(Arc::new), Some(Arc::new(pollee)), Some(peer_addr))
+        let UnixInitStream {
+            addr,
+            pollee,
+            pending_shutdown,
+        } = self;
+        let (client, server) = UnixConnectedStream::new_pair(
+            addr.map(Arc::new),
+            Some(Arc::new(pollee)),
+            Some(peer_addr),
+        );
+        let pending = pending_shutdown.load(Ordering::Acquire);
+        let how = match (
+            pending & PENDING_READ_SHUTDOWN != 0,
+            pending & PENDING_WRITE_SHUTDOWN != 0,
+        ) {
+            (true, true) => Some(ShutdownHow::Both),
+            (true, false) => Some(ShutdownHow::Read),
+            (false, true) => Some(ShutdownHow::Write),
+            (false, false) => None,
+        };
+        if let Some(how) = how {
+            client.shutdown(how);
+        }
+        (client, server)
     }
 }
 
@@ -305,8 +349,8 @@ impl<FS: ShimFS> Backlog<FS> {
     fn try_accept(&self) -> Result<UnixConnectedStream<FS>, TryOpError<Errno>> {
         let mut sockets = self.sockets.lock();
         let Some(sockets) = &mut *sockets else {
-            // the server socket is shutdown
-            return Err(TryOpError::Other(Errno::ECONNREFUSED));
+            // Linux returns EINVAL from accept(2) on a listening socket that was shut down.
+            return Err(TryOpError::Other(Errno::EINVAL));
         };
 
         match sockets.pop_front() {
@@ -333,10 +377,14 @@ impl<FS: ShimFS> Backlog<FS> {
         events
     }
 
-    /// Shuts down this backlog, preventing new connections.
+    /// Shuts down this backlog, preventing new connections. Wakes any pending pollers
+    /// so they observe the new HUP state without having to retry.
     fn shutdown(&self) {
         let mut sockets = self.sockets.lock();
-        *sockets = None;
+        if sockets.is_some() {
+            *sockets = None;
+            self.pollee.notify_observers(Events::HUP);
+        }
     }
 }
 
@@ -532,6 +580,19 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             events |= Events::OUT;
         }
         events
+    }
+
+    fn shutdown(&self, how: ShutdownHow) {
+        let mut events = Events::empty();
+        if how.affects_read() {
+            self.recv_channel.shutdown();
+            events |= Events::IN | Events::RDHUP;
+        }
+        if how.affects_write() {
+            self.connected_send_channel.shutdown();
+            events |= Events::OUT | Events::HUP;
+        }
+        self.pollee.notify_observers(events);
     }
 }
 
@@ -820,6 +881,19 @@ impl<FS: ShimFS> UnixStream<FS> {
             UnixStreamState::Connected(conn) => conn.check_io_events(),
         })
     }
+
+    fn shutdown(&self, how: ShutdownHow) {
+        self.with_state_ref(|state| match state {
+            // Linux records pre-connect shutdown flags on the unix_sock and applies them
+            // post-connect; we mirror that by stashing the bits on UnixInitStream.
+            UnixStreamState::Init(init) => init.record_pending_shutdown(how),
+            // Linux sets SOCK_RCV_SHUTDOWN on a listening socket, after which a blocking
+            // accept returns EINVAL and poll reports POLLIN | POLLHUP. The existing backlog
+            // machinery uses `sockets = None` as that signal.
+            UnixStreamState::Listen(listen) => listen.backlog.shutdown(),
+            UnixStreamState::Connected(conn) => conn.shutdown(how),
+        });
+    }
 }
 
 /// A datagram message with source address information
@@ -1032,7 +1106,8 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        cx.with_timeout(timeout)
+        let res = cx
+            .with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
                 Events::IN,
@@ -1048,7 +1123,15 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                     recv_channel.try_read(buf, source_addr.as_deref_mut())
                 },
             )
-            .map_err(Errno::from)
+            .map_err(Errno::from);
+        // Linux datagram quirk: after shutdown(SHUT_RD) with an empty queue, a non-blocking
+        // recv returns EAGAIN (datagram boundaries mean we don't synthesize EOF when caller
+        // explicitly asked not to block). Blocking recv still returns 0 via the ESHUTDOWN ->
+        // EOF mapping at the UnixSocket layer.
+        match res {
+            Err(Errno::ESHUTDOWN) if is_nonblocking => Err(Errno::EAGAIN),
+            other => other,
+        }
     }
 
     // Sends data to the specified or connected peer.
@@ -1121,29 +1204,22 @@ impl<FS: ShimFS> UnixDatagram<FS> {
         events
     }
 
-    fn shutdown(&self, how: litebox_common_linux::ShutdownHow) -> Result<(), Errno> {
+    fn shutdown(&self, how: ShutdownHow) {
         let inner = self.inner.read();
-        match how {
-            litebox_common_linux::ShutdownHow::Read | litebox_common_linux::ShutdownHow::Both => {
-                // TODO: set the recv channel to None to prevent further reads?
-                if let Some(recv_channel) = &inner.recv_channel {
-                    recv_channel.shutdown();
-                    inner.pollee.notify_observers(Events::HUP);
-                }
-            }
-            _ => {}
+        let mut events = Events::empty();
+        if how.affects_read()
+            && let Some(recv_channel) = &inner.recv_channel
+        {
+            recv_channel.shutdown();
+            events |= Events::IN | Events::RDHUP;
         }
-        match how {
-            litebox_common_linux::ShutdownHow::Write | litebox_common_linux::ShutdownHow::Both => {
-                // TODO: set the send channel to None to prevent further writes?
-                if let Some((connected_send_channel, _)) = &inner.connected_send_channel {
-                    connected_send_channel.shutdown();
-                    inner.pollee.notify_observers(Events::ERR);
-                }
-            }
-            _ => {}
+        if how.affects_write()
+            && let Some((connected_send_channel, _)) = &inner.connected_send_channel
+        {
+            connected_send_channel.shutdown();
+            events |= Events::OUT | Events::HUP;
         }
-        Ok(())
+        inner.pollee.notify_observers(events);
     }
 }
 
@@ -1453,9 +1529,9 @@ impl<FS: ShimFS> UnixSocket<FS> {
         super::write_to_user(val, optval, len)
     }
 
-    pub(crate) fn shutdown(&self, how: litebox_common_linux::ShutdownHow) -> Result<(), Errno> {
+    pub(super) fn shutdown(&self, how: ShutdownHow) {
         match &self.inner {
-            UnixSocketInner::Stream(_stream) => todo!(),
+            UnixSocketInner::Stream(stream) => stream.shutdown(how),
             UnixSocketInner::Datagram(datagram) => datagram.shutdown(how),
         }
     }
