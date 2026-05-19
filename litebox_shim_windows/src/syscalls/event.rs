@@ -89,6 +89,7 @@ pub(crate) fn handle_nt_create_event(
     >,
     event_type: u32,
     initial_state: u8,
+    _loader_tls_initialized: bool,
 ) -> NtStatus {
     let Ok(event_type) = EventType::try_from(event_type) else {
         return NtStatus::INVALID_PARAMETER;
@@ -254,6 +255,7 @@ mod tests {
                 None,
                 EventType::Notification.into(),
                 u8::from(initial_state),
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -284,6 +286,7 @@ mod tests {
                 None,
                 EventType::Notification.into(),
                 1,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -319,6 +322,7 @@ mod tests {
                 Some(const_ptr(&object_attributes)),
                 EventType::Synchronization.into(),
                 0,
+                false,
             ),
             NtStatus::SUCCESS
         );
@@ -331,7 +335,16 @@ mod tests {
         let mut handle = Handle::from_raw(usize::MAX);
 
         assert_eq!(
-            handle_nt_create_event(&litebox, &handles, mut_ptr(&mut handle), 0, None, 2, 0),
+            handle_nt_create_event(
+                &litebox,
+                &handles,
+                mut_ptr(&mut handle),
+                0,
+                None,
+                2,
+                0,
+                false
+            ),
             NtStatus::INVALID_PARAMETER
         );
         assert_eq!(handle, Handle::from_raw(usize::MAX));

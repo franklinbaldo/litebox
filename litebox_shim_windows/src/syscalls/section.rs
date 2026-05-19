@@ -5,7 +5,8 @@ use alloc::string::String;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::{Mode, OFlags};
-use litebox::mm::linux::NonZeroPageSize;
+use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 
@@ -22,9 +23,18 @@ type GuestMutPointer<T> = <Platform as RawPointerProvider>::RawMutPointer<T>;
 const VIEW_SHARE: u32 = 1;
 const VIEW_UNMAP: u32 = 2;
 const MEM_TOP_DOWN: u32 = 0x100000;
+const MEM_PHYSICAL: u32 = 0x400000;
 const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x800000;
-const SUPPORTED_MAP_ALLOCATION_TYPES: u32 = MEM_TOP_DOWN | MEM_DIFFERENT_IMAGE_BASE_OK;
-const IMAGE_EXTENSION_SIZE: usize = PAGE_SIZE;
+const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
+    MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
+const KERNELBASE_PATH_SUFFIX: &str = "/kernelbase.dll";
+const WINDOWS_SHARED_SECTION_OBJECT: &str = r"\Windows\SharedSection";
+const WINDOWS_SHARED_SECTION_FS_PATH: &str = ":litebox-windows-shared-section:";
+const ANONYMOUS_SECTION_FS_PATH: &str = ":litebox-anonymous-section:";
+const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
+const KERNELBASE_UNICODE_CASE_TABLE_PTRS_OFFSET: usize = 0x0039_def0;
+const KERNELBASE_UNICODE_TABLE_OFFSET: usize = 0x24;
+const KERNELBASE_UNICODE_CASE_MAP_OFFSET: usize = 0x38a;
 
 pub(crate) struct SectionSubsystem;
 
@@ -37,6 +47,7 @@ impl FdEnabledSubsystemEntry for SectionObject {}
 pub(crate) struct SectionObject {
     object_path: String,
     fs_path: String,
+    mapped_size: usize,
 }
 
 pub(crate) struct MapViewOfSectionRequest {
@@ -97,7 +108,23 @@ impl<FS: NtShimFS> Task<FS> {
             Ok(path) => path,
             Err(status) => return status,
         };
-        let Some(fs_path) = known_dll_section_fs_path(&object_path) else {
+        let fs_path = if object_path.eq_ignore_ascii_case(WINDOWS_SHARED_SECTION_OBJECT) {
+            String::from(WINDOWS_SHARED_SECTION_FS_PATH)
+        } else if let Some(fs_path) = known_dll_section_fs_path(&object_path) {
+            let Ok(fd) = self.fs.open(&fs_path, OFlags::RDONLY, Mode::empty()) else {
+                litebox_util_log::debug!(
+                    desired_access:% = format_args!("{desired_access:#x}"),
+                    root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                    object_path:% = object_path,
+                    fs_path:% = fs_path,
+                    status:% = NtStatus::OBJECT_NAME_NOT_FOUND;
+                    "Handled NtOpenSection syscall"
+                );
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            };
+            let _ = self.fs.close(&fd);
+            fs_path
+        } else {
             litebox_util_log::debug!(
                 desired_access:% = format_args!("{desired_access:#x}"),
                 root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
@@ -107,22 +134,15 @@ impl<FS: NtShimFS> Task<FS> {
             );
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
-        let Ok(fd) = self.fs.open(&fs_path, OFlags::RDONLY, Mode::empty()) else {
-            litebox_util_log::debug!(
-                desired_access:% = format_args!("{desired_access:#x}"),
-                root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
-                object_path:% = object_path,
-                fs_path:% = fs_path,
-                status:% = NtStatus::OBJECT_NAME_NOT_FOUND;
-                "Handled NtOpenSection syscall"
-            );
-            return NtStatus::OBJECT_NAME_NOT_FOUND;
-        };
-        let _ = self.fs.close(&fd);
 
         let section = SectionObject {
             object_path: object_path.clone(),
             fs_path: fs_path.clone(),
+            mapped_size: if fs_path == WINDOWS_SHARED_SECTION_FS_PATH {
+                WINDOWS_SHARED_SECTION_SIZE
+            } else {
+                0
+            },
         };
         let log_object_path = String::from(section.object_path());
         let log_fs_path = String::from(section.fs_path());
@@ -150,6 +170,281 @@ impl<FS: NtShimFS> Task<FS> {
             object_path:% = log_object_path,
             fs_path:% = log_fs_path;
             "Handled NtOpenSection syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_nt_create_section(
+        &self,
+        section_handle: GuestMutPointer<Handle>,
+        desired_access: u32,
+        _object_attributes: Option<
+            <Platform as RawPointerProvider>::RawConstPointer<ObjectAttributes>,
+        >,
+        maximum_size: Option<<Platform as RawPointerProvider>::RawConstPointer<i64>>,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+    ) -> NtStatus {
+        if section_handle
+            .write_at_offset(0, Handle::default())
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if file_handle != Handle::default() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let size = if let Some(maximum_size) = maximum_size {
+            let Some(maximum_size) = maximum_size.read_at_offset(0) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            if maximum_size <= 0 {
+                return NtStatus::INVALID_PARAMETER;
+            }
+            usize::try_from(maximum_size).unwrap_or(usize::MAX)
+        } else {
+            PAGE_SIZE
+        };
+        let Some(mapped_size) = size.checked_next_multiple_of(PAGE_SIZE) else {
+            return NtStatus::NO_MEMORY;
+        };
+        if NonZeroPageSize::<PAGE_SIZE>::new(mapped_size).is_none() {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let section = SectionObject {
+            object_path: String::from("<anonymous>"),
+            fs_path: String::from(ANONYMOUS_SECTION_FS_PATH),
+            mapped_size,
+        };
+        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
+        let typed = descriptor_table.insert::<SectionSubsystem>(section);
+        drop(descriptor_table);
+        let handle = match insert_raw_handle(&self.global.litebox, &self.process.handles, typed) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+
+        if section_handle.write_at_offset(0, handle).is_none() {
+            remove_raw_handle::<SectionSubsystem>(
+                &self.global.litebox,
+                &self.process.handles,
+                handle,
+            );
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", handle.as_raw()),
+            desired_access:% = format_args!("{desired_access:#x}"),
+            size = mapped_size,
+            section_page_protection:% = format_args!("{section_page_protection:#x}"),
+            allocation_attributes:% = format_args!("{allocation_attributes:#x}");
+            "Handled NtCreateSection syscall as anonymous pagefile section"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_nt_connect_port(
+        &self,
+        port_handle: GuestMutPointer<Handle>,
+        port_name: <Platform as RawPointerProvider>::RawConstPointer<u8>,
+        security_qos: <Platform as RawPointerProvider>::RawConstPointer<u8>,
+        client_view: GuestMutPointer<u8>,
+        server_view: GuestMutPointer<u8>,
+        max_message_length: GuestMutPointer<u32>,
+        connection_information: GuestMutPointer<u8>,
+        connection_information_length: GuestMutPointer<u32>,
+    ) -> NtStatus {
+        if port_handle.write_at_offset(0, Handle::default()).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let port = SectionObject {
+            object_path: String::from("<csr-port>"),
+            fs_path: String::from(ANONYMOUS_SECTION_FS_PATH),
+            mapped_size: 0,
+        };
+        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
+        let typed = descriptor_table.insert::<SectionSubsystem>(port);
+        drop(descriptor_table);
+        let handle = match insert_raw_handle(&self.global.litebox, &self.process.handles, typed) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+
+        if port_handle.write_at_offset(0, handle).is_none() {
+            remove_raw_handle::<SectionSubsystem>(
+                &self.global.litebox,
+                &self.process.handles,
+                handle,
+            );
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if max_message_length.as_usize() != 0
+            && max_message_length.write_at_offset(0, 0x130).is_none()
+        {
+            remove_raw_handle::<SectionSubsystem>(
+                &self.global.litebox,
+                &self.process.handles,
+                handle,
+            );
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let mut client_view_base = 0;
+        let mut client_view_size = 0;
+        if client_view.as_usize() != 0 {
+            let client_view_usize =
+                <Platform as RawPointerProvider>::RawMutPointer::<usize>::from_usize(
+                    client_view.as_usize(),
+                );
+            let section_handle = client_view_usize
+                .read_at_offset(1)
+                .map(Handle::from_raw)
+                .unwrap_or_default();
+            client_view_size = client_view_usize.read_at_offset(3).unwrap_or(0);
+            if client_view_size == 0 {
+                client_view_size = crate::raw_handle_entry::<SectionSubsystem>(
+                    &self.global.litebox,
+                    &self.process.handles,
+                    section_handle,
+                )
+                .map(|section| section.with_entry(|section| section.mapped_size))
+                .unwrap_or(WINDOWS_SHARED_SECTION_SIZE);
+            }
+            let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(client_view_size) else {
+                remove_raw_handle::<SectionSubsystem>(
+                    &self.global.litebox,
+                    &self.process.handles,
+                    handle,
+                );
+                return NtStatus::INVALID_PARAMETER;
+            };
+            let mapping = match crate::syscalls::mm::create_pages(
+                &self.global.page_manager,
+                None,
+                length,
+                CreatePagesFlags::empty(),
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                |_| Ok(0),
+            ) {
+                Ok(mapping) => mapping,
+                Err(status) => {
+                    remove_raw_handle::<SectionSubsystem>(
+                        &self.global.litebox,
+                        &self.process.handles,
+                        handle,
+                    );
+                    return status;
+                }
+            };
+            client_view_base = mapping.as_usize();
+            if client_view_usize
+                .write_at_offset(3, client_view_size)
+                .is_none()
+                || client_view_usize
+                    .write_at_offset(4, client_view_base)
+                    .is_none()
+                || client_view_usize
+                    .write_at_offset(5, client_view_base)
+                    .is_none()
+            {
+                let _ = remove_section_view_pages(
+                    &self.global.page_manager,
+                    client_view_base,
+                    client_view_size,
+                );
+                remove_raw_handle::<SectionSubsystem>(
+                    &self.global.litebox,
+                    &self.process.handles,
+                    handle,
+                );
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            self.process.section_views.lock().insert(
+                client_view_base,
+                WindowsSectionView {
+                    image_size: client_view_size,
+                    mapped_size: client_view_size,
+                },
+            );
+        }
+
+        if server_view.as_usize() != 0 && client_view_base != 0 {
+            let server_view_usize =
+                <Platform as RawPointerProvider>::RawMutPointer::<usize>::from_usize(
+                    server_view.as_usize(),
+                );
+            if server_view_usize
+                .write_at_offset(1, client_view_size)
+                .is_none()
+                || server_view_usize
+                    .write_at_offset(2, client_view_base)
+                    .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", handle.as_raw()),
+            port_name:% = format_args!("{:#x}", port_name.as_usize()),
+            security_qos:% = format_args!("{:#x}", security_qos.as_usize()),
+            client_view:% = format_args!("{:#x}", client_view.as_usize()),
+            server_view:% = format_args!("{:#x}", server_view.as_usize()),
+            client_view_base:% = format_args!("{client_view_base:#x}"),
+            client_view_size = client_view_size,
+            max_message_length:% = format_args!("{:#x}", max_message_length.as_usize()),
+            connection_information:% = format_args!("{:#x}", connection_information.as_usize()),
+            connection_information_length:% = format_args!("{:#x}", connection_information_length.as_usize());
+            "Handled NtConnectPort syscall as local CSR port"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_nt_alpc_send_wait_receive_port(
+        &self,
+        port_handle: Handle,
+        flags: u32,
+        send_message: Option<<Platform as RawPointerProvider>::RawConstPointer<u8>>,
+        send_message_attributes: Option<<Platform as RawPointerProvider>::RawConstPointer<u8>>,
+        receive_message: Option<GuestMutPointer<u8>>,
+        buffer_length: Option<GuestMutPointer<u32>>,
+        receive_message_attributes: Option<GuestMutPointer<u8>>,
+        timeout: Option<<Platform as RawPointerProvider>::RawConstPointer<i64>>,
+    ) -> NtStatus {
+        if crate::raw_handle_entry::<SectionSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            port_handle,
+        )
+        .is_none()
+        {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        let buffer_length_value =
+            buffer_length.and_then(|buffer_length| buffer_length.read_at_offset(0));
+        let timeout_value = timeout.and_then(|timeout| timeout.read_at_offset(0));
+        litebox_util_log::debug!(
+            port_handle:% = format_args!("{:#x}", port_handle.as_raw()),
+            flags:% = format_args!("{flags:#x}"),
+            send_message:% = format_args!("{:#x}", send_message.map(|ptr| ptr.as_usize()).unwrap_or(0)),
+            send_message_attributes:% = format_args!("{:#x}", send_message_attributes.map(|ptr| ptr.as_usize()).unwrap_or(0)),
+            receive_message:% = format_args!("{:#x}", receive_message.map(|ptr| ptr.as_usize()).unwrap_or(0)),
+            buffer_length = buffer_length_value,
+            receive_message_attributes:% = format_args!("{:#x}", receive_message_attributes.map(|ptr| ptr.as_usize()).unwrap_or(0)),
+            timeout:? = timeout_value;
+            "Handled NtAlpcSendWaitReceivePort syscall as local CSR port exchange"
         );
 
         NtStatus::SUCCESS
@@ -196,17 +491,35 @@ impl<FS: NtShimFS> Task<FS> {
         ) else {
             return NtStatus::INVALID_HANDLE;
         };
-        let (object_path, fs_path) = section.with_entry(|section| {
+        let (object_path, fs_path, mapped_size) = section.with_entry(|section| {
             (
                 String::from(section.object_path()),
                 String::from(section.fs_path()),
+                section.mapped_size,
             )
         });
+
+        if fs_path == WINDOWS_SHARED_SECTION_FS_PATH || fs_path == ANONYMOUS_SECTION_FS_PATH {
+            return self.map_zero_section(request, object_path, mapped_size);
+        }
 
         let image = match pe::load_image(self.fs.clone(), &fs_path, &self.global.page_manager) {
             Ok(image) => image,
             Err(error) => return map_section_load_error(&error),
         };
+        if fs_path
+            .to_ascii_lowercase()
+            .ends_with(KERNELBASE_PATH_SUFFIX)
+        {
+            if !self.initialize_kernelbase_unicode_case_table(&image) {
+                let _ = remove_section_view_pages(
+                    &self.global.page_manager,
+                    image.mapping.base_addr,
+                    image.mapping.mapped_size,
+                );
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
 
         let mapped_size = match section_view_mapped_size(image.mapping.mapped_size) {
             Some(mapped_size) => mapped_size,
@@ -260,6 +573,117 @@ impl<FS: NtShimFS> Task<FS> {
         NtStatus::SUCCESS
     }
 
+    fn map_zero_section(
+        &self,
+        request: MapViewOfSectionRequest,
+        object_path: String,
+        mapped_size: usize,
+    ) -> NtStatus {
+        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
+            return NtStatus::NO_MEMORY;
+        };
+        let mapping = match crate::syscalls::mm::create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        ) {
+            Ok(mapping) => mapping,
+            Err(status) => return status,
+        };
+        let base = mapping.as_usize();
+        if request.base_address.write_at_offset(0, base).is_none()
+            || request.view_size.write_at_offset(0, mapped_size).is_none()
+        {
+            let _ = remove_section_view_pages(&self.global.page_manager, base, mapped_size);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        self.process.section_views.lock().insert(
+            base,
+            WindowsSectionView {
+                image_size: mapped_size,
+                mapped_size,
+            },
+        );
+
+        litebox_util_log::debug!(
+            section_handle:% = format_args!("{:#x}", request.section_handle.as_raw()),
+            process_handle:% = format_args!("{:#x}", request.process_handle.as_raw()),
+            base:% = format_args!("{base:#x}"),
+            view_size = mapped_size,
+            object_path:% = object_path;
+            "Handled NtMapViewOfSection syscall for zero-backed section"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    fn initialize_kernelbase_unicode_case_table(&self, image: &pe::LoadedImage) -> bool {
+        let unicode_case_table = self.process.unicode_case_table_data;
+        litebox_util_log::debug!(
+            unicode_case_table:% = format_args!("{unicode_case_table:#x}");
+            "Preparing guest KERNELBASE Unicode case-table cache"
+        );
+        if unicode_case_table == 0 {
+            return true;
+        }
+        let Some(table_ptrs_address) = image
+            .mapping
+            .base_addr
+            .checked_add(KERNELBASE_UNICODE_CASE_TABLE_PTRS_OFFSET)
+        else {
+            return false;
+        };
+        let table_ptrs_pointer =
+            <Platform as RawPointerProvider>::RawMutPointer::<usize>::from_usize(
+                table_ptrs_address,
+            );
+        let Some(unicode_table) = unicode_case_table.checked_add(KERNELBASE_UNICODE_TABLE_OFFSET)
+        else {
+            return false;
+        };
+        let Some(unicode_case_map) =
+            unicode_case_table.checked_add(KERNELBASE_UNICODE_CASE_MAP_OFFSET)
+        else {
+            return false;
+        };
+        let cache_page = table_ptrs_address & !(PAGE_SIZE - 1);
+        let cache_page_ptr =
+            <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(cache_page);
+        // SAFETY: KERNELBASE has just been mapped and guest execution is still inside
+        // the current NtMapViewOfSection syscall; this temporarily relaxes protection
+        // to seed loader-owned process initialization data.
+        if unsafe {
+            self.global
+                .page_manager
+                .make_pages_writable(cache_page_ptr, PAGE_SIZE)
+        }
+        .is_err()
+        {
+            return false;
+        }
+        if table_ptrs_pointer
+            .write_at_offset(0, unicode_table)
+            .is_none()
+            || table_ptrs_pointer
+                .write_at_offset(1, unicode_case_map)
+                .is_none()
+        {
+            return false;
+        }
+        litebox_util_log::debug!(
+            table_ptrs_address:% = format_args!("{table_ptrs_address:#x}"),
+            unicode_table:% = format_args!("{unicode_table:#x}"),
+            unicode_case_map:% = format_args!("{unicode_case_map:#x}"),
+            unicode_case_table:% = format_args!("{unicode_case_table:#x}");
+            "Initialized guest KERNELBASE Unicode case-table cache"
+        );
+        true
+    }
+
     pub(crate) fn handle_nt_unmap_view_of_section(
         &self,
         process_handle: ProcessHandle,
@@ -298,7 +722,7 @@ impl<FS: NtShimFS> Task<FS> {
 }
 
 fn section_view_mapped_size(mapped_size: usize) -> Option<usize> {
-    mapped_size.checked_add(IMAGE_EXTENSION_SIZE)
+    Some(mapped_size)
 }
 
 fn remove_section_view_for_address(

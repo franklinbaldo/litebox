@@ -6,7 +6,7 @@ extern crate std;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize};
 use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
@@ -28,6 +28,12 @@ pub(crate) fn init_platform() {
 
 pub(crate) fn test_task() -> Task<DefaultFS> {
     test_task_with_process(0, 1)
+}
+
+pub(crate) fn test_task_with_teb_address(teb_address: usize) -> Task<DefaultFS> {
+    let mut task = test_task();
+    task.teb_address = teb_address;
+    task
 }
 
 pub(crate) fn test_task_with_process(peb_address: usize, cookie: u32) -> Task<DefaultFS> {
@@ -96,8 +102,12 @@ fn test_task_with_nls_files_and_process(
             section_views: crate::WindowsSectionViews::new(BTreeMap::new()),
             virtual_allocations: WindowsVirtualAllocations::new(BTreeMap::new()),
             peb_address,
+            unicode_case_table_data: 0,
+            nls_files_data: 0,
             cookie,
             default_hard_error_mode: AtomicU32::new(0),
+            scheduler_shared_data: AtomicUsize::new(0),
+            loader_tls_initialized: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
         }),
         entry_point: 0,

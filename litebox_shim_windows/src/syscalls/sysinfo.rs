@@ -33,6 +33,7 @@ const SUPPORTED_FLUSH_PROCESSOR_FEATURES: u32 = 0x40;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum SystemInformationClass {
     Basic = 0,
+    Verifier = 50,
     NumaProcessorMap = 55,
     EmulationBasic = 62,
     LogicalProcessorAndGroup = 107,
@@ -86,6 +87,12 @@ struct SystemHypervisorSharedPageInformation {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct SystemProcessorFeaturesBitMapInformation {
     feature_bits: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct SystemVerifierInformation {
+    flags: u64,
 }
 
 #[repr(C)]
@@ -243,6 +250,12 @@ pub(crate) fn handle_nt_query_system_information(
             system_information_length,
             return_length,
             &system_processor_features_bitmap_information(),
+        ),
+        SystemInformationClass::Verifier => write_system_information(
+            system_information,
+            system_information_length,
+            return_length,
+            &SystemVerifierInformation { flags: 0 },
         ),
         _ => {
             litebox_util_log::debug!(

@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use int_enum::IntEnum;
 use litebox::fs::{FileType, Mode, OFlags};
-use litebox::platform::{RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -183,9 +183,28 @@ impl<FS: NtShimFS> Task<FS> {
             return status;
         }
         let Some(fs_path) = nt_object_path_to_fs_path(&path) else {
+            litebox_util_log::debug!(
+                desired_access:% = format_args!("{desired_access:#x}"),
+                share_access:% = format_args!("{share_access:#x}"),
+                open_options:% = format_args!("{open_options:#x}"),
+                root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                path:% = path,
+                status:% = NtStatus::OBJECT_NAME_NOT_FOUND;
+                "Handled NtOpenFile syscall"
+            );
             return write_io_status(io_status_block, NtStatus::OBJECT_NAME_NOT_FOUND);
         };
         let Ok(fd) = self.fs.open(&*fs_path, OFlags::RDONLY, Mode::empty()) else {
+            litebox_util_log::debug!(
+                desired_access:% = format_args!("{desired_access:#x}"),
+                share_access:% = format_args!("{share_access:#x}"),
+                open_options:% = format_args!("{open_options:#x}"),
+                root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                path:% = path,
+                fs_path:% = fs_path,
+                status:% = NtStatus::OBJECT_NAME_NOT_FOUND;
+                "Handled NtOpenFile syscall"
+            );
             return write_io_status(io_status_block, NtStatus::OBJECT_NAME_NOT_FOUND);
         };
         let handle = match insert_raw_handle(&self.global.litebox, &self.process.handles, fd) {
@@ -316,6 +335,38 @@ impl<FS: NtShimFS> Task<FS> {
             "Handled NtQueryVolumeInformationFile syscall"
         );
 
+        status
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_nt_device_io_control_file(
+        &self,
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: <Platform as RawPointerProvider>::RawMutPointer<u8>,
+        apc_context: <Platform as RawPointerProvider>::RawMutPointer<u8>,
+        io_status_block: <Platform as RawPointerProvider>::RawMutPointer<IoStatusBlock>,
+        io_control_code: u32,
+        input_buffer: <Platform as RawPointerProvider>::RawMutPointer<u8>,
+        input_buffer_length: u32,
+        output_buffer: <Platform as RawPointerProvider>::RawMutPointer<u8>,
+        output_buffer_length: u32,
+    ) -> NtStatus {
+        let status = write_io_status_with_information(io_status_block, NtStatus::SUCCESS, 0);
+        if status == NtStatus::SUCCESS {
+            litebox_util_log::debug!(
+                file_handle:% = format_args!("{:#x}", file_handle.as_raw()),
+                event:% = format_args!("{:#x}", event.as_raw()),
+                apc_routine:% = format_args!("{:#x}", apc_routine.as_usize()),
+                apc_context:% = format_args!("{:#x}", apc_context.as_usize()),
+                io_control_code:% = format_args!("{io_control_code:#x}"),
+                input_buffer:% = format_args!("{:#x}", input_buffer.as_usize()),
+                input_buffer_length = input_buffer_length,
+                output_buffer:% = format_args!("{:#x}", output_buffer.as_usize()),
+                output_buffer_length = output_buffer_length;
+                "Handled NtDeviceIoControlFile syscall as local device sink"
+            );
+        }
         status
     }
 }
@@ -496,7 +547,7 @@ mod tests {
     use crate::loader::nt_types::UnicodeString;
     use core::mem::{align_of, size_of};
     use litebox::fs::FileSystem as _;
-    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+    use litebox::platform::RawPointerProvider;
     use zerocopy::{FromBytes, IntoBytes};
 
     const NULL_RDEV: usize = 0x103;

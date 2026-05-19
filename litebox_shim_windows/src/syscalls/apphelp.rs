@@ -4,8 +4,6 @@ use litebox_platform_multiplex::Platform;
 
 type GuestMutPointer<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
-const STATUS_NOT_FOUND: NtStatus = NtStatus::from_raw(0xC000_0225);
-
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum ApphelpCacheServiceClass {
@@ -35,14 +33,14 @@ pub(crate) fn handle_nt_apphelp_cache_control(
             if service_data.is_none() {
                 NtStatus::INVALID_PARAMETER
             } else {
-                STATUS_NOT_FOUND
+                NtStatus::SUCCESS
             }
         }
         ApphelpCacheServiceClass::LookupCdb => {
             if service_data.is_none() {
                 NtStatus::INVALID_PARAMETER
             } else {
-                STATUS_NOT_FOUND
+                NtStatus::SUCCESS
             }
         }
         ApphelpCacheServiceClass::Remove | ApphelpCacheServiceClass::Update => {
@@ -87,14 +85,14 @@ mod tests {
                 service_value(ApphelpCacheServiceClass::Lookup),
                 Some(service_data_ptr()),
             ),
-            STATUS_NOT_FOUND
+            NtStatus::SUCCESS
         );
         assert_eq!(
             handle_nt_apphelp_cache_control(
                 service_value(ApphelpCacheServiceClass::LookupCdb),
                 Some(service_data_ptr()),
             ),
-            STATUS_NOT_FOUND
+            NtStatus::SUCCESS
         );
     }
 

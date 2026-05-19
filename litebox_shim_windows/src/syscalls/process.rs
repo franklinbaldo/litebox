@@ -5,12 +5,16 @@ use core::mem::size_of;
 use core::sync::atomic::Ordering;
 
 use int_enum::IntEnum;
+use litebox::mm::linux::{CreatePagesFlags, NonZeroPageSize};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
 use litebox_platform_multiplex::Platform;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::{NtShimFS, ProcessHandle, Task};
+use crate::nt_types::ThreadEnvironmentBlock;
+use crate::syscalls::mm::create_pages;
+use crate::{NtShimFS, PAGE_SIZE, ProcessHandle, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
@@ -18,6 +22,16 @@ const GUEST_PROCESS_ID: usize = 1;
 const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
+const PROCESS_TLS_REPLACE_INDEX: u32 = 0;
+const PROCESS_TLS_REPLACE_VECTOR: u32 = 1;
+const PROCESS_TLS_OPERATION_TYPE_OFFSET: usize = 4;
+const PROCESS_TLS_THREAD_DATA_COUNT_OFFSET: usize = 8;
+const PROCESS_TLS_INDEX_OFFSET: usize = 12;
+const PROCESS_TLS_THREAD_DATA_OFFSET: usize = 20;
+const THREAD_TLS_INFORMATION_SIZE: usize = 20;
+const THREAD_TLS_NEW_DATA_OFFSET: usize = 4;
+const THREAD_TLS_OLD_DATA_OFFSET: usize = 12;
+const TEB_TLS_SLOT_COUNT: usize = 64;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -27,7 +41,9 @@ enum ProcessInformationClass {
     DefaultHardErrorMode = 12,
     Wow64Information = 26,
     DebugFlags = 31,
+    TlsInformation = 35,
     Cookie = 36,
+    ConsoleHostProcess = 49,
     ImageInformation = 53,
     SchedulerSharedData = 112,
 }
@@ -114,7 +130,9 @@ impl<FS: NtShimFS> Task<FS> {
                 return_length,
                 self.process.cookie,
             ),
-            ProcessInformationClass::ImageInformation
+            ProcessInformationClass::ConsoleHostProcess
+            | ProcessInformationClass::TlsInformation
+            | ProcessInformationClass::ImageInformation
             | ProcessInformationClass::SchedulerSharedData => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
@@ -162,8 +180,25 @@ impl<FS: NtShimFS> Task<FS> {
                     .store(mode.default_hard_error_mode, Ordering::Release);
                 NtStatus::SUCCESS
             }
-            ProcessInformationClass::ImageInformation
-            | ProcessInformationClass::SchedulerSharedData => NtStatus::SUCCESS,
+            ProcessInformationClass::ConsoleHostProcess
+            | ProcessInformationClass::ImageInformation => NtStatus::SUCCESS,
+            ProcessInformationClass::SchedulerSharedData => self
+                .handle_process_scheduler_shared_data(
+                    process_information,
+                    process_information_length,
+                ),
+            ProcessInformationClass::TlsInformation => {
+                let status = self.handle_process_tls_information(
+                    process_information,
+                    process_information_length,
+                );
+                if status == NtStatus::SUCCESS {
+                    self.process
+                        .loader_tls_initialized
+                        .store(true, Ordering::Release);
+                }
+                status
+            }
             _ => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
@@ -183,6 +218,247 @@ impl<FS: NtShimFS> Task<FS> {
 
         status
     }
+
+    fn handle_process_scheduler_shared_data(
+        &self,
+        process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<
+            u8,
+        >,
+        process_information_length: u32,
+    ) -> NtStatus {
+        let Some(shared_data) = self.scheduler_shared_data() else {
+            return NtStatus::NO_MEMORY;
+        };
+        if write_process_information_usize(
+            process_information,
+            0,
+            process_information_length,
+            shared_data,
+        )
+        .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn scheduler_shared_data(&self) -> Option<usize> {
+        let existing = self.process.scheduler_shared_data.load(Ordering::Acquire);
+        if existing != 0 {
+            return Some(existing);
+        }
+
+        let length = NonZeroPageSize::new(PAGE_SIZE)?;
+        let shared_data = create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        )
+        .ok()?
+        .as_usize();
+
+        match self.process.scheduler_shared_data.compare_exchange(
+            0,
+            shared_data,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Some(shared_data),
+            Err(existing) => Some(existing),
+        }
+    }
+
+    fn handle_process_tls_information(
+        &self,
+        process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<
+            u8,
+        >,
+        process_information_length: u32,
+    ) -> NtStatus {
+        let Some(operation_type) = read_process_information_u32(
+            process_information,
+            PROCESS_TLS_OPERATION_TYPE_OFFSET,
+            process_information_length,
+        ) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(thread_data_count) = read_process_information_u32(
+            process_information,
+            PROCESS_TLS_THREAD_DATA_COUNT_OFFSET,
+            process_information_length,
+        ) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(tls_index) = read_process_information_u32(
+            process_information,
+            PROCESS_TLS_INDEX_OFFSET,
+            process_information_length,
+        ) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(required_len) = PROCESS_TLS_THREAD_DATA_OFFSET.checked_add(
+            usize::try_from(thread_data_count)
+                .ok()
+                .and_then(|count| count.checked_mul(THREAD_TLS_INFORMATION_SIZE))
+                .unwrap_or(usize::MAX),
+        ) else {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        };
+        if usize::try_from(process_information_length).unwrap_or(0) < required_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        match operation_type {
+            PROCESS_TLS_REPLACE_VECTOR => {
+                for thread_data_index in 0..thread_data_count as usize {
+                    let thread_data_offset = PROCESS_TLS_THREAD_DATA_OFFSET
+                        + thread_data_index * THREAD_TLS_INFORMATION_SIZE;
+                    let Some(new_tls_data) = read_process_information_usize(
+                        process_information,
+                        thread_data_offset + THREAD_TLS_NEW_DATA_OFFSET,
+                        process_information_length,
+                    ) else {
+                        return NtStatus::ACCESS_VIOLATION;
+                    };
+                    let old_tls_data = read_teb_usize(
+                        self.teb_address,
+                        core::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+                    );
+                    let Some(old_tls_data) = old_tls_data else {
+                        return NtStatus::ACCESS_VIOLATION;
+                    };
+                    if write_process_information_usize(
+                        process_information,
+                        thread_data_offset + THREAD_TLS_OLD_DATA_OFFSET,
+                        process_information_length,
+                        old_tls_data,
+                    )
+                    .is_none()
+                    {
+                        return NtStatus::ACCESS_VIOLATION;
+                    }
+                    if write_teb_usize(
+                        self.teb_address,
+                        core::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+                        new_tls_data,
+                    )
+                    .is_none()
+                    {
+                        return NtStatus::ACCESS_VIOLATION;
+                    }
+                }
+                NtStatus::SUCCESS
+            }
+            PROCESS_TLS_REPLACE_INDEX => {
+                let Ok(tls_index) = usize::try_from(tls_index) else {
+                    return NtStatus::INVALID_PARAMETER;
+                };
+                if tls_index >= TEB_TLS_SLOT_COUNT {
+                    return NtStatus::INVALID_PARAMETER;
+                }
+                let slot_offset = core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots)
+                    + tls_index * size_of::<usize>();
+                for thread_data_index in 0..thread_data_count as usize {
+                    let thread_data_offset = PROCESS_TLS_THREAD_DATA_OFFSET
+                        + thread_data_index * THREAD_TLS_INFORMATION_SIZE;
+                    let Some(new_tls_data) = read_process_information_usize(
+                        process_information,
+                        thread_data_offset + THREAD_TLS_NEW_DATA_OFFSET,
+                        process_information_length,
+                    ) else {
+                        return NtStatus::ACCESS_VIOLATION;
+                    };
+                    let Some(old_tls_data) = read_teb_usize(self.teb_address, slot_offset) else {
+                        return NtStatus::ACCESS_VIOLATION;
+                    };
+                    if write_process_information_usize(
+                        process_information,
+                        thread_data_offset + THREAD_TLS_OLD_DATA_OFFSET,
+                        process_information_length,
+                        old_tls_data,
+                    )
+                    .is_none()
+                    {
+                        return NtStatus::ACCESS_VIOLATION;
+                    }
+                    if write_teb_usize(self.teb_address, slot_offset, new_tls_data).is_none() {
+                        return NtStatus::ACCESS_VIOLATION;
+                    }
+                }
+                NtStatus::SUCCESS
+            }
+            _ => {
+                litebox_util_log::debug!(
+                    operation_type,
+                    thread_data_count,
+                    tls_index;
+                    "Unsupported ProcessTlsInformation operation"
+                );
+                NtStatus::INVALID_INFO_CLASS
+            }
+        }
+    }
+}
+
+fn read_process_information_u32(
+    process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<u8>,
+    offset: usize,
+    process_information_length: u32,
+) -> Option<u32> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<u32>())? {
+        return None;
+    }
+    <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<u32>::from_usize(
+        process_information.as_usize().checked_add(offset)?,
+    )
+    .read_at_offset(0)
+}
+
+fn read_process_information_usize(
+    process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<u8>,
+    offset: usize,
+    process_information_length: u32,
+) -> Option<usize> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<usize>())? {
+        return None;
+    }
+    <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<usize>::from_usize(
+        process_information.as_usize().checked_add(offset)?,
+    )
+    .read_at_offset(0)
+}
+
+fn write_process_information_usize(
+    process_information: <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<u8>,
+    offset: usize,
+    process_information_length: u32,
+    value: usize,
+) -> Option<()> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<usize>())? {
+        return None;
+    }
+    <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<usize>::from_usize(
+        process_information.as_usize().checked_add(offset)?,
+    )
+    .write_at_offset(0, value)
+}
+
+fn read_teb_usize(teb_address: usize, offset: usize) -> Option<usize> {
+    <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<usize>::from_usize(
+        teb_address.checked_add(offset)?,
+    )
+    .read_at_offset(0)
+}
+
+fn write_teb_usize(teb_address: usize, offset: usize, value: usize) -> Option<()> {
+    <Platform as litebox::platform::RawPointerProvider>::RawMutPointer::<usize>::from_usize(
+        teb_address.checked_add(offset)?,
+    )
+    .write_at_offset(0, value)
 }
 
 fn read_fixed_information<T: FromBytes + IntoBytes>(

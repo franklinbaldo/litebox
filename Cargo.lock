@@ -1770,7 +1770,6 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_util_log",
  "thiserror",
- "windows-sys 0.60.2",
  "zerocopy",
 ]
 

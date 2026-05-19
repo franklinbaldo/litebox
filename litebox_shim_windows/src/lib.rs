@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -247,6 +247,14 @@ where
     ptr.write_at_offset(0, value)
 }
 
+fn read_value<GuestValue>(address: usize) -> Option<GuestValue>
+where
+    GuestValue: FromBytes,
+{
+    let ptr = <Platform as RawPointerProvider>::RawConstPointer::<GuestValue>::from_usize(address);
+    ptr.read_at_offset(0)
+}
+
 fn write_slice<GuestValue>(address: usize, values: &[GuestValue]) -> Option<()>
 where
     GuestValue: Copy + FromBytes + IntoBytes,
@@ -365,8 +373,12 @@ impl<FS: NtShimFS> WindowsShim<FS> {
                     .collect(),
             ),
             peb_address: load_info.environment.peb,
+            unicode_case_table_data: load_info.environment.unicode_case_table_data,
+            nls_files_data: load_info.environment.nls_files_data,
             cookie: generate_process_cookie(self.0.platform),
             default_hard_error_mode: AtomicU32::new(0),
+            scheduler_shared_data: AtomicUsize::new(0),
+            loader_tls_initialized: AtomicBool::new(false),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
 
@@ -413,8 +425,12 @@ struct Process {
     section_views: WindowsSectionViews,
     virtual_allocations: WindowsVirtualAllocations,
     peb_address: usize,
+    unicode_case_table_data: usize,
+    nls_files_data: usize,
     cookie: u32,
     default_hard_error_mode: AtomicU32,
+    scheduler_shared_data: AtomicUsize,
+    loader_tls_initialized: AtomicBool,
     exit_code: AtomicI32,
 }
 
@@ -499,6 +515,7 @@ impl<FS: NtShimFS> Task<FS> {
             syscall:? = req;
             "Handling Windows"
         );
+        let mut writes_syscall_result = true;
         let (result, op) = match req {
             SyscallRequest::NtApphelpCacheControl {
                 service_class,
@@ -522,6 +539,7 @@ impl<FS: NtShimFS> Task<FS> {
                     object_attributes,
                     event_type,
                     initial_state,
+                    self.process.loader_tls_initialized.load(Ordering::Acquire),
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -535,6 +553,10 @@ impl<FS: NtShimFS> Task<FS> {
                     desired_access,
                     object_attributes,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtWaitForAlertByThreadId { address, timeout } => {
+                let status = self.handle_nt_wait_for_alert_by_thread_id(address, timeout);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtOpenDirectoryObject {
@@ -591,6 +613,37 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtCreateFile {
+                file_handle,
+                desired_access,
+                object_attributes,
+                io_status_block,
+                allocation_size,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                ea_buffer,
+                ea_length,
+            } => {
+                litebox_util_log::debug!(
+                    allocation_size:% = format_args!("{:#x}", allocation_size.map_or(0, |ptr| ptr.as_usize())),
+                    file_attributes:% = format_args!("{file_attributes:#x}"),
+                    create_disposition:% = format_args!("{create_disposition:#x}"),
+                    ea_buffer:% = format_args!("{:#x}", ea_buffer.as_usize()),
+                    ea_length = ea_length;
+                    "Handling NtCreateFile syscall through NtOpenFile path"
+                );
+                let status = self.handle_nt_open_file(
+                    file_handle,
+                    desired_access,
+                    object_attributes,
+                    io_status_block,
+                    share_access,
+                    create_options,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryAttributesFile {
                 object_attributes,
                 file_information,
@@ -612,6 +665,32 @@ impl<FS: NtShimFS> Task<FS> {
                     fs_information,
                     fs_information_length,
                     fs_information_class,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtDeviceIoControlFile {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                io_control_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+            } => {
+                let status = self.handle_nt_device_io_control_file(
+                    file_handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    io_control_code,
+                    input_buffer,
+                    input_buffer_length,
+                    output_buffer,
+                    output_buffer_length,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -718,7 +797,7 @@ impl<FS: NtShimFS> Task<FS> {
                 thread_information,
                 thread_information_length,
             } => {
-                let status = thread::handle_nt_set_information_thread(
+                let status = self.handle_nt_set_information_thread(
                     thread_handle,
                     thread_information_class,
                     thread_information,
@@ -733,6 +812,98 @@ impl<FS: NtShimFS> Task<FS> {
             } => {
                 let status =
                     self.handle_nt_open_section(section_handle, desired_access, object_attributes);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtConnectPort {
+                port_handle,
+                port_name,
+                security_qos,
+                client_view,
+                server_view,
+                max_message_length,
+                connection_information,
+                connection_information_length,
+            } => {
+                let status = self.handle_nt_connect_port(
+                    port_handle,
+                    port_name,
+                    security_qos,
+                    client_view,
+                    server_view,
+                    max_message_length,
+                    connection_information,
+                    connection_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtAlpcSendWaitReceivePort {
+                port_handle,
+                flags,
+                send_message,
+                send_message_attributes,
+                receive_message,
+                buffer_length,
+                receive_message_attributes,
+                timeout,
+            } => {
+                let status = self.handle_nt_alpc_send_wait_receive_port(
+                    port_handle,
+                    flags,
+                    send_message,
+                    send_message_attributes,
+                    receive_message,
+                    buffer_length,
+                    receive_message_attributes,
+                    timeout,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtInitializeNlsFiles {
+                base_address,
+                default_locale_id,
+                default_casing_table_size,
+            } => {
+                let nls_base = self.process.nls_files_data;
+                let status = if nls_base == 0 {
+                    NtStatus::OBJECT_NAME_NOT_FOUND
+                } else if base_address.write_at_offset(0, nls_base).is_none()
+                    || (default_locale_id.as_usize() != 0
+                        && default_locale_id.write_at_offset(0, 0x0409).is_none())
+                    || (default_casing_table_size.as_usize() != 0
+                        && default_casing_table_size
+                            .write_at_offset(0, 0x1_0000)
+                            .is_none())
+                {
+                    NtStatus::ACCESS_VIOLATION
+                } else {
+                    litebox_util_log::debug!(
+                        base:% = format_args!("{nls_base:#x}"),
+                        default_locale_id = 0x0409,
+                        default_casing_table_size = 0x1_0000;
+                        "Handled NtInitializeNlsFiles syscall"
+                    );
+                    NtStatus::SUCCESS
+                };
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSection {
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+            } => {
+                let status = self.handle_nt_create_section(
+                    section_handle,
+                    desired_access,
+                    object_attributes,
+                    maximum_size,
+                    section_page_protection,
+                    allocation_attributes,
+                    file_handle,
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtMapViewOfSection {
@@ -808,6 +979,25 @@ impl<FS: NtShimFS> Task<FS> {
                     event_handle,
                     previous_state,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtWaitForSingleObject {
+                handle,
+                alertable,
+                timeout,
+            } => {
+                let timeout_value = timeout.and_then(|timeout| timeout.read_at_offset(0));
+                litebox_util_log::debug!(
+                    handle:% = format_args!("{:#x}", handle.as_raw()),
+                    alertable,
+                    timeout:? = timeout_value;
+                    "Handled NtWaitForSingleObject syscall as a local wait sink"
+                );
+                let status = if handle.is_null() {
+                    NtStatus::SUCCESS
+                } else {
+                    NtStatus::TIMEOUT
+                };
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtAllocateVirtualMemory {
@@ -928,6 +1118,22 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+                return_length,
+            } => {
+                let status = self.handle_nt_query_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtGetNlsSectionPtr {
                 section_type,
                 section_data,
@@ -957,6 +1163,14 @@ impl<FS: NtShimFS> Task<FS> {
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
             }
+            SyscallRequest::NtContinue {
+                context,
+                test_alert,
+            } => {
+                let status = thread::handle_nt_continue(context, test_alert, ctx);
+                writes_syscall_result = status != NtStatus::SUCCESS;
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryPerformanceCounter {
                 performance_counter,
                 performance_frequency,
@@ -982,6 +1196,19 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtSetSystemInformation {
+                system_information_class,
+                system_information,
+                system_information_length,
+            } => {
+                litebox_util_log::debug!(
+                    system_information_class = system_information_class,
+                    system_information:% = format_args!("{:#x}", system_information.as_usize()),
+                    system_information_length = system_information_length;
+                    "Handled NtSetSystemInformation syscall as local sink"
+                );
+                (NtStatus::SUCCESS, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQuerySystemInformationEx {
                 system_information_class,
                 input_buffer,
@@ -1000,6 +1227,73 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryWnfStateData {
+                state_name,
+                type_id,
+                explicit_scope,
+                change_stamp,
+                buffer,
+                buffer_size,
+            } => {
+                let state_name_value = state_name.read_at_offset(0).unwrap_or(0);
+                let status = if let Some(requested_size) = buffer_size.read_at_offset(0) {
+                    if change_stamp
+                        .map(|change_stamp| change_stamp.write_at_offset(0, 0).is_some())
+                        .unwrap_or(true)
+                    {
+                        let mut status = NtStatus::SUCCESS;
+                        if let Some(buffer) = buffer {
+                            for offset in 0..requested_size as usize {
+                                let Ok(offset) = isize::try_from(offset) else {
+                                    status = NtStatus::ACCESS_VIOLATION;
+                                    break;
+                                };
+                                if buffer.write_at_offset(offset, 0).is_none() {
+                                    status = NtStatus::ACCESS_VIOLATION;
+                                    break;
+                                }
+                            }
+                        }
+                        if status == NtStatus::SUCCESS
+                            && buffer_size.write_at_offset(0, 0).is_none()
+                        {
+                            status = NtStatus::ACCESS_VIOLATION;
+                        }
+                        litebox_util_log::debug!(
+                            state_name:% = format_args!("{state_name_value:#x}"),
+                            has_type_id = type_id.is_some(),
+                            has_explicit_scope = explicit_scope.is_some(),
+                            requested_size = requested_size,
+                            status:? = status;
+                            "Handled NtQueryWnfStateData syscall as empty state data"
+                        );
+                        status
+                    } else {
+                        NtStatus::ACCESS_VIOLATION
+                    }
+                } else {
+                    NtStatus::ACCESS_VIOLATION
+                };
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryWnfStateNameInformation {
+                state_name,
+                name_info_class,
+                explicit_scope,
+                info_buffer,
+                info_buffer_size,
+            } => {
+                let state_name_value = state_name.read_at_offset(0);
+                litebox_util_log::debug!(
+                    state_name:? = state_name_value,
+                    name_info_class,
+                    has_explicit_scope = explicit_scope.is_some(),
+                    has_info_buffer = info_buffer.is_some(),
+                    info_buffer_size;
+                    "Handled NtQueryWnfStateNameInformation syscall as empty WNF state"
+                );
+                (NtStatus::OBJECT_NAME_NOT_FOUND, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTraceEvent {
                 trace_handle,
                 flags,
@@ -1008,6 +1302,35 @@ impl<FS: NtShimFS> Task<FS> {
             } => {
                 let status = trace::handle_nt_trace_event(trace_handle, flags, field_size, fields);
                 (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtTraceControl {
+                control_code,
+                input_buffer,
+                input_buffer_size,
+                output_buffer,
+                output_buffer_size,
+                return_length,
+            } => {
+                let status = trace::handle_nt_trace_control(
+                    control_code,
+                    input_buffer,
+                    input_buffer_size,
+                    output_buffer,
+                    output_buffer_size,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryDebugFilterState {
+                component_id,
+                level,
+            } => {
+                let status = trace::handle_nt_query_debug_filter_state(component_id, level);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtTestAlert => {
+                litebox_util_log::debug!("Handled NtTestAlert syscall as local no-op");
+                (NtStatus::SUCCESS, ContinueOperation::Resume)
             }
             SyscallRequest::NtRaiseHardError {
                 error_status,
@@ -1027,12 +1350,35 @@ impl<FS: NtShimFS> Task<FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtRaiseException {
+                exception_record,
+                context_record,
+                first_chance,
+            } => {
+                let exception_code = <<Platform as RawPointerProvider>::RawConstPointer<u32> as litebox::platform::RawConstPointer<u32>>::from_usize(exception_record.as_usize())
+                    .read_at_offset(0);
+                let exception_address = <<Platform as RawPointerProvider>::RawConstPointer<usize> as litebox::platform::RawConstPointer<usize>>::from_usize(
+                    exception_record.as_usize().saturating_add(16),
+                )
+                .read_at_offset(0);
+                litebox_util_log::debug!(
+                    exception_record:% = format_args!("{:#x}", exception_record.as_usize()),
+                    context_record:% = format_args!("{:#x}", context_record.as_usize()),
+                    exception_code:? = exception_code,
+                    exception_address:? = exception_address,
+                    first_chance = first_chance;
+                    "Handled NtRaiseException syscall as local success sink"
+                );
+                (NtStatus::SUCCESS, ContinueOperation::Resume)
+            }
             SyscallRequest::NtManageHotPatch => {
                 (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
             }
         };
 
-        ctx.rax = result.as_raw().cast_unsigned() as usize;
+        if writes_syscall_result {
+            ctx.rax = result.as_raw().cast_unsigned() as usize;
+        }
         op
     }
 
@@ -1180,6 +1526,10 @@ impl<FS: NtShimFS> Task<FS> {
         ctx: &mut litebox_common_linux::PtRegs,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
+        if repair_null_critical_section_debug_info(ctx, info) {
+            return ContinueOperation::Resume;
+        }
+
         litebox_util_log::debug!(
             exception:? = info.exception,
             rip:% = format_args!("{:#x}", ctx.rip),
@@ -1201,6 +1551,107 @@ impl<FS: NtShimFS> Task<FS> {
         );
         ContinueOperation::Resume
     }
+}
+
+fn repair_null_critical_section_debug_info(
+    ctx: &mut litebox_common_linux::PtRegs,
+    info: &ExceptionInfo,
+) -> bool {
+    const PF_WRITE: u32 = 1 << 1;
+    const RTL_CRITICAL_SECTION_DEBUG_INFO_SENTINEL: usize = usize::MAX;
+    const RTL_CRITICAL_SECTION_LOCK_COUNT_OFFSET: usize = 8;
+    const RTL_CRITICAL_SECTION_RECURSION_COUNT_OFFSET: usize = 12;
+    const RTL_CRITICAL_SECTION_OWNING_THREAD_OFFSET: usize = 16;
+    const RTL_CRITICAL_SECTION_LOCK_SEMAPHORE_OFFSET: usize = 24;
+    const WAIT_ON_CRITICAL_SECTION_NULL_DEBUG_INFO_BYTES: [u8; 3] = [0xff, 0x40, 0x24];
+
+    if info.exception != litebox::shim::Exception::PAGE_FAULT
+        || info.error_code & PF_WRITE == 0
+        || info.cr2 != 0x24
+        || ctx.rax != 0
+        || ctx.rdi == 0
+    {
+        return false;
+    }
+
+    let Some(next_byte) = ctx.rip.checked_add(1).and_then(read_value::<u8>) else {
+        return false;
+    };
+    let Some(third_byte) = ctx.rip.checked_add(2).and_then(read_value::<u8>) else {
+        return false;
+    };
+    let Some(first_byte) = read_value::<u8>(ctx.rip) else {
+        return false;
+    };
+    let instruction = [first_byte, next_byte, third_byte];
+    if instruction != WAIT_ON_CRITICAL_SECTION_NULL_DEBUG_INFO_BYTES {
+        return false;
+    }
+
+    if read_value::<usize>(ctx.rdi) != Some(0) {
+        return false;
+    }
+    let Some(lock_count) = ctx
+        .rdi
+        .checked_add(RTL_CRITICAL_SECTION_LOCK_COUNT_OFFSET)
+        .and_then(read_value::<i32>)
+    else {
+        return false;
+    };
+    let Some(owning_thread) = ctx
+        .rdi
+        .checked_add(RTL_CRITICAL_SECTION_OWNING_THREAD_OFFSET)
+        .and_then(read_value::<usize>)
+    else {
+        return false;
+    };
+    if lock_count >= 0 || owning_thread != 0 {
+        return false;
+    }
+
+    if write_value(ctx.rdi, RTL_CRITICAL_SECTION_DEBUG_INFO_SENTINEL).is_none() {
+        return false;
+    }
+    if ctx
+        .rdi
+        .checked_add(RTL_CRITICAL_SECTION_LOCK_COUNT_OFFSET)
+        .and_then(|address| write_value(address, -1i32))
+        .is_none()
+    {
+        return false;
+    }
+    if ctx
+        .rdi
+        .checked_add(RTL_CRITICAL_SECTION_RECURSION_COUNT_OFFSET)
+        .and_then(|address| write_value(address, 0i32))
+        .is_none()
+    {
+        return false;
+    }
+    if ctx
+        .rdi
+        .checked_add(RTL_CRITICAL_SECTION_LOCK_SEMAPHORE_OFFSET)
+        .and_then(|address| write_value(address, 0usize))
+        .is_none()
+    {
+        return false;
+    }
+    let Some(resume_rip) = ctx
+        .rip
+        .checked_add(WAIT_ON_CRITICAL_SECTION_NULL_DEBUG_INFO_BYTES.len())
+    else {
+        return false;
+    };
+    ctx.rip = resume_rip;
+
+    litebox_util_log::debug!(
+        critical_section:% = format_args!("{:#x}", ctx.rdi),
+        lock_count,
+        resumed_at:% = format_args!("{:#x}", ctx.rip);
+        "Repaired null no-debug critical-section state"
+    );
+
+    true
 }
 
 pub(crate) trait RawHandleVisitor<R> {
@@ -1375,6 +1826,7 @@ mod duplicate_tests {
                 None,
                 0,
                 0,
+                false,
             ),
             NtStatus::SUCCESS
         );

@@ -27,6 +27,7 @@ use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
+use crate::nt_types::Amd64Context;
 use crate::{Handle, ProcessHandle, ThreadHandle};
 
 #[allow(clippy::enum_variant_names)]
@@ -60,6 +61,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
     },
+    NtWaitForAlertByThreadId {
+        address: usize,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
     NtOpenDirectoryObject {
         directory_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -83,6 +88,19 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         share_access: u32,
         open_options: u32,
     },
+    NtCreateFile {
+        file_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+        io_status_block: Platform::RawMutPointer<file::IoStatusBlock>,
+        allocation_size: Option<Platform::RawConstPointer<i64>>,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: Platform::RawMutPointer<u8>,
+        ea_length: u32,
+    },
     NtQueryAttributesFile {
         object_attributes: Platform::RawConstPointer<object::ObjectAttributes>,
         file_information: Platform::RawMutPointer<file::FileBasicInformation>,
@@ -93,6 +111,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         fs_information: Platform::RawMutPointer<u8>,
         fs_information_length: u32,
         fs_information_class: u32,
+    },
+    NtDeviceIoControlFile {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Platform::RawMutPointer<u8>,
+        apc_context: Platform::RawMutPointer<u8>,
+        io_status_block: Platform::RawMutPointer<file::IoStatusBlock>,
+        io_control_code: u32,
+        input_buffer: Platform::RawMutPointer<u8>,
+        input_buffer_length: u32,
+        output_buffer: Platform::RawMutPointer<u8>,
+        output_buffer_length: u32,
     },
     NtOpenKey {
         key_handle: Platform::RawMutPointer<Handle>,
@@ -125,10 +155,39 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtConnectPort {
+        port_handle: Platform::RawMutPointer<Handle>,
+        port_name: Platform::RawConstPointer<u8>,
+        security_qos: Platform::RawConstPointer<u8>,
+        client_view: Platform::RawMutPointer<u8>,
+        server_view: Platform::RawMutPointer<u8>,
+        max_message_length: Platform::RawMutPointer<u32>,
+        connection_information: Platform::RawMutPointer<u8>,
+        connection_information_length: Platform::RawMutPointer<u32>,
+    },
+    NtAlpcSendWaitReceivePort {
+        port_handle: Handle,
+        flags: u32,
+        send_message: Option<Platform::RawConstPointer<u8>>,
+        send_message_attributes: Option<Platform::RawConstPointer<u8>>,
+        receive_message: Option<Platform::RawMutPointer<u8>>,
+        buffer_length: Option<Platform::RawMutPointer<u32>>,
+        receive_message_attributes: Option<Platform::RawMutPointer<u8>>,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
     NtOpenSection {
         section_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+    },
+    NtCreateSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<object::ObjectAttributes>>,
+        maximum_size: Option<Platform::RawConstPointer<i64>>,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
     },
     NtMapViewOfSection {
         section_handle: Handle,
@@ -165,9 +224,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         event_handle: Handle,
         previous_state: Option<Platform::RawMutPointer<i32>>,
     },
+    NtWaitForSingleObject {
+        handle: Handle,
+        alertable: u8,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
     NtTerminateProcess {
         process_handle: ProcessHandle,
         exit_status: i32,
+    },
+    NtContinue {
+        context: Platform::RawConstPointer<Amd64Context>,
+        test_alert: u8,
     },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
@@ -226,12 +294,24 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_information: Platform::RawConstPointer<u8>,
         thread_information_length: u32,
     },
+    NtQueryInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawMutPointer<u8>,
+        thread_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtGetNlsSectionPtr {
         section_type: u32,
         section_data: u32,
         context_data: usize,
         section_pointer: Platform::RawMutPointer<usize>,
         section_size: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtInitializeNlsFiles {
+        base_address: Platform::RawMutPointer<usize>,
+        default_locale_id: Platform::RawMutPointer<u32>,
+        default_casing_table_size: Platform::RawMutPointer<i64>,
     },
     NtQueryPerformanceCounter {
         performance_counter: Platform::RawMutPointer<i64>,
@@ -243,6 +323,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         system_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtSetSystemInformation {
+        system_information_class: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+    },
     NtQuerySystemInformationEx {
         system_information_class: u32,
         input_buffer: Option<Platform::RawConstPointer<u8>>,
@@ -251,12 +336,40 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         system_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtQueryWnfStateData {
+        state_name: Platform::RawConstPointer<u64>,
+        type_id: Option<Platform::RawConstPointer<u8>>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        change_stamp: Option<Platform::RawMutPointer<u32>>,
+        buffer: Option<Platform::RawMutPointer<u8>>,
+        buffer_size: Platform::RawMutPointer<u32>,
+    },
+    NtQueryWnfStateNameInformation {
+        state_name: Platform::RawConstPointer<u64>,
+        name_info_class: u32,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        info_buffer: Option<Platform::RawMutPointer<u8>>,
+        info_buffer_size: u32,
+    },
     NtTraceEvent {
         trace_handle: Handle,
         flags: u32,
         field_size: u32,
         fields: Option<Platform::RawConstPointer<u8>>,
     },
+    NtTraceControl {
+        control_code: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_size: u32,
+        output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_size: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryDebugFilterState {
+        component_id: u32,
+        level: u32,
+    },
+    NtTestAlert,
     NtRaiseHardError {
         error_status: NtStatus,
         number_of_parameters: u32,
@@ -264,6 +377,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         parameters: Option<Platform::RawConstPointer<usize>>,
         valid_response_options: u32,
         response: Platform::RawMutPointer<u32>,
+    },
+    NtRaiseException {
+        exception_record: Platform::RawConstPointer<u8>,
+        context_record: Platform::RawConstPointer<u8>,
+        first_chance: u8,
     },
     /// TODO: not supported yet
     NtManageHotPatch,
@@ -276,7 +394,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         // Additional arguments are read from the user stack below.
         macro_rules! sys_req {
             ($id:ident { $( $field:ident $(:$star:tt)? ),* $(,)? }) => {
-                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 ] [ ])
+                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ] [ ])
             };
             (@[$id:ident] [ $f:ident $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
                 sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: win_sys_req_arg::<Platform, _>(pt_regs, $n)?, ])
@@ -321,6 +439,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
             })),
+            NtSysno::NtWaitForAlertByThreadId => Some(sys_req!(NtWaitForAlertByThreadId {
+                address,
+                timeout:*,
+            })),
             NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
                 directory_handle:*,
                 desired_access,
@@ -344,6 +466,19 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 share_access,
                 open_options,
             })),
+            NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
+                file_handle:*,
+                desired_access,
+                object_attributes:*,
+                io_status_block:*,
+                allocation_size:*,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                ea_buffer:*,
+                ea_length,
+            })),
             NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
                 object_attributes:*,
                 file_information:*,
@@ -354,6 +489,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 fs_information:*,
                 fs_information_length,
                 fs_information_class,
+            })),
+            NtSysno::NtDeviceIoControlFile => Some(sys_req!(NtDeviceIoControlFile {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context:*,
+                io_status_block:*,
+                io_control_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
             })),
             NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
                 key_handle:*,
@@ -388,10 +535,39 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     return_length:*,
                 }))
             }
+            NtSysno::NtConnectPort => Some(sys_req!(NtConnectPort {
+                port_handle:*,
+                port_name:*,
+                security_qos:*,
+                client_view:*,
+                server_view:*,
+                max_message_length:*,
+                connection_information:*,
+                connection_information_length:*,
+            })),
+            NtSysno::NtAlpcSendWaitReceivePort => Some(sys_req!(NtAlpcSendWaitReceivePort {
+                port_handle:{Handle::from_raw},
+                flags,
+                send_message:*,
+                send_message_attributes:*,
+                receive_message:*,
+                buffer_length:*,
+                receive_message_attributes:*,
+                timeout:*,
+            })),
             NtSysno::NtOpenSection => Some(sys_req!(NtOpenSection {
                 section_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtCreateSection => Some(sys_req!(NtCreateSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+                maximum_size:*,
+                section_page_protection,
+                allocation_attributes,
+                file_handle:{Handle::from_raw},
             })),
             NtSysno::NtMapViewOfSection => Some(sys_req!(NtMapViewOfSection {
                 section_handle:{Handle::from_raw},
@@ -428,6 +604,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 event_handle:{Handle::from_raw},
                 previous_state:*,
             })),
+            NtSysno::NtWaitForSingleObject => Some(sys_req!(NtWaitForSingleObject {
+                handle:{Handle::from_raw},
+                alertable,
+                timeout:*,
+            })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle:{ProcessHandle::from_raw},
                 base_address:*,
@@ -454,6 +635,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
                 process_handle: { ProcessHandle::from_raw },
                 exit_status,
+            })),
+            NtSysno::NtContinue => Some(sys_req!(NtContinue {
+                context:*,
+                test_alert,
             })),
             NtSysno::NtProtectVirtualMemory => Some(sys_req!(NtProtectVirtualMemory {
                 process_handle:{ProcessHandle::from_raw},
@@ -489,12 +674,24 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_information:*,
                 thread_information_length,
             })),
+            NtSysno::NtQueryInformationThread => Some(sys_req!(NtQueryInformationThread {
+                thread_handle:{ThreadHandle::from_raw},
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
+                return_length:*,
+            })),
             NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
                 section_type,
                 section_data,
                 context_data,
                 section_pointer:*,
                 section_size:*,
+            })),
+            NtSysno::NtInitializeNlsFiles => Some(sys_req!(NtInitializeNlsFiles {
+                base_address:*,
+                default_locale_id:*,
+                default_casing_table_size:*,
             })),
             NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
                 performance_counter:*,
@@ -506,6 +703,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 system_information_length,
                 return_length:*,
             })),
+            NtSysno::NtSetSystemInformation => Some(sys_req!(NtSetSystemInformation {
+                system_information_class,
+                system_information:*,
+                system_information_length,
+            })),
             NtSysno::NtQuerySystemInformationEx => Some(sys_req!(NtQuerySystemInformationEx {
                 system_information_class,
                 input_buffer:*,
@@ -514,12 +716,42 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 system_information_length,
                 return_length:*,
             })),
+            NtSysno::NtQueryWnfStateData => Some(sys_req!(NtQueryWnfStateData {
+                state_name:*,
+                type_id:*,
+                explicit_scope:*,
+                change_stamp:*,
+                buffer:*,
+                buffer_size:*,
+            })),
+            NtSysno::NtQueryWnfStateNameInformation => {
+                Some(sys_req!(NtQueryWnfStateNameInformation {
+                    state_name:*,
+                    name_info_class,
+                    explicit_scope:*,
+                    info_buffer:*,
+                    info_buffer_size,
+                }))
+            }
             NtSysno::NtTraceEvent => Some(sys_req!(NtTraceEvent {
                 trace_handle:{Handle::from_raw},
                 flags,
                 field_size,
                 fields:*,
             })),
+            NtSysno::NtTraceControl => Some(sys_req!(NtTraceControl {
+                control_code,
+                input_buffer:*,
+                input_buffer_size,
+                output_buffer:*,
+                output_buffer_size,
+                return_length:*,
+            })),
+            NtSysno::NtQueryDebugFilterState => Some(sys_req!(NtQueryDebugFilterState {
+                component_id,
+                level,
+            })),
+            NtSysno::NtTestAlert => Some(SyscallRequest::NtTestAlert),
             NtSysno::NtRaiseHardError => Some(sys_req!(NtRaiseHardError {
                 error_status,
                 number_of_parameters,
@@ -527,6 +759,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 parameters:*,
                 valid_response_options,
                 response:*,
+            })),
+            NtSysno::NtRaiseException => Some(sys_req!(NtRaiseException {
+                exception_record:*,
+                context_record:*,
+                first_chance,
             })),
             NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
             _ => None,
