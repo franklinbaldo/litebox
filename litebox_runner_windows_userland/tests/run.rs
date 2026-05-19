@@ -43,7 +43,7 @@ fn loads_minimal_pe_without_imports() {
             dll_path.display()
         );
     }
-    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls"] {
+    for nls_name in ["c_1252.nls", "c_437.nls", "c_10000.nls", "locale.nls"] {
         let nls_path = copy_host_system32_file(&test_dir, nls_name);
         println!("Copied {nls_name} fixture at `{}`", nls_path.display());
     }
@@ -65,31 +65,10 @@ fn loads_minimal_pe_without_imports() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined_output = format!("{stdout}\n{stderr}");
-
-    // Once the Windows shim supports the required startup syscalls, this test
-    // should naturally pass through the success path below.
-    if output.status.success() {
-        return;
-    }
 
     assert!(
-        combined_output.contains("Loaded guest ntdll.dll"),
-        "runner did not load guest ntdll.dll; status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
-    assert!(
-        combined_output.contains("Starting Windows guest through ntdll!LdrInitializeThunk"),
-        "runner did not reach ntdll!LdrInitializeThunk; status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
-    assert!(
-        combined_output.contains("Unsupported Windows syscall"),
-        "runner did not fail at the expected unsupported syscall; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.success(),
+        "runner failed; status {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         stdout,
         stderr
@@ -118,7 +97,7 @@ fn build_no_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             "-C",
             "link-arg=/ENTRY:mainCRTStartup",
             "-C",
-            "link-arg=/SUBSYSTEM:NATIVE",
+            "link-arg=/SUBSYSTEM:CONSOLE",
             "-C",
             "link-arg=/NODEFAULTLIB",
             "-o",
