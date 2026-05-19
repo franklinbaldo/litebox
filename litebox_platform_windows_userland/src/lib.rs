@@ -140,16 +140,20 @@ unsafe extern "system" fn vectored_exception_handler(
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && unsafe { litebox_common_linux::rdfsbase() } == 0
         && WindowsUserland::get_thread_fs_base() != 0
+        && instruction_has_fs_segment_override(context.Rip.truncate())
     {
         set_context_to_interrupt_callback(tls, context);
     } else {
         // Push the exception record onto the host stack.
-        let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
+        let host_sp = tls.host_sp.get();
+        let exception_record_ptr = host_sp.cast::<EXCEPTION_RECORD>().wrapping_sub(1);
         assert!(exception_record_ptr.is_aligned());
         unsafe { exception_record_ptr.write(*exception_record) };
 
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
+        let rsp = (exception_record_ptr as usize & !15) - 16;
+        // SAFETY: `host_sp` points at the saved `ThreadContext` pointer prepared by
+        // `run_thread_arch`, and `rsp` is reserved space below the copied exception record.
+        unsafe { (rsp as *mut usize).write(host_sp.cast::<usize>().read()) };
 
         // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
         let _ = run_thread_arch as *const () as usize;
@@ -162,6 +166,19 @@ unsafe extern "system" fn vectored_exception_handler(
     }
 
     EXCEPTION_CONTINUE_EXECUTION
+}
+
+fn instruction_has_fs_segment_override(instruction_pointer: usize) -> bool {
+    const FS_SEGMENT_OVERRIDE_PREFIX: u8 = 0x64;
+
+    if instruction_pointer == 0 {
+        return false;
+    }
+
+    // SAFETY: `instruction_pointer` is the currently faulting instruction pointer from the
+    // Windows exception context. The CPU just fetched this instruction, so reading its first byte
+    // is valid for this exception dispatch.
+    unsafe { (instruction_pointer as *const u8).read() == FS_SEGMENT_OVERRIDE_PREFIX }
 }
 
 fn save_guest_context(
