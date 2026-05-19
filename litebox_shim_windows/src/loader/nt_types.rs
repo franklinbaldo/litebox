@@ -5,6 +5,101 @@
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+pub const AMD64_CONTEXT_CONTROL: u32 = 0x0010_0001;
+pub const AMD64_CONTEXT_INTEGER: u32 = 0x0010_0002;
+pub const AMD64_CONTEXT_FLOATING_POINT: u32 = 0x0010_0008;
+pub const AMD64_CONTEXT_DEBUG_REGISTERS: u32 = 0x0010_0010;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub struct Amd64Context {
+    pub p1_home: u64,
+    pub p2_home: u64,
+    pub p3_home: u64,
+    pub p4_home: u64,
+    pub p5_home: u64,
+    pub p6_home: u64,
+    pub context_flags: u32,
+    pub mx_csr: u32,
+    pub seg_cs: u16,
+    pub seg_ds: u16,
+    pub seg_es: u16,
+    pub seg_fs: u16,
+    pub seg_gs: u16,
+    pub seg_ss: u16,
+    pub e_flags: u32,
+    pub dr0: u64,
+    pub dr1: u64,
+    pub dr2: u64,
+    pub dr3: u64,
+    pub dr6: u64,
+    pub dr7: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rsp: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub extended_state: [u8; 0x3d0],
+}
+
+impl Default for Amd64Context {
+    fn default() -> Self {
+        Self {
+            p1_home: 0,
+            p2_home: 0,
+            p3_home: 0,
+            p4_home: 0,
+            p5_home: 0,
+            p6_home: 0,
+            context_flags: 0,
+            mx_csr: 0,
+            seg_cs: 0,
+            seg_ds: 0,
+            seg_es: 0,
+            seg_fs: 0,
+            seg_gs: 0,
+            seg_ss: 0,
+            e_flags: 0,
+            dr0: 0,
+            dr1: 0,
+            dr2: 0,
+            dr3: 0,
+            dr6: 0,
+            dr7: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0,
+            rbx: 0,
+            rsp: 0,
+            rbp: 0,
+            rsi: 0,
+            rdi: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0,
+            r12: 0,
+            r13: 0,
+            r14: 0,
+            r15: 0,
+            rip: 0,
+            extended_state: [0; 0x3d0],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct ProcessEnvironmentBlock {
@@ -540,6 +635,18 @@ pub struct ThreadEnvironmentBlock {
 
 const _: [(); 0x1878] = [(); core::mem::size_of::<ThreadEnvironmentBlock>()];
 const _: [(); 0x7d0] = [(); core::mem::size_of::<ProcessEnvironmentBlock>()];
+const _: [(); 0x4d0] = [(); core::mem::size_of::<Amd64Context>()];
+const _: [(); 0x30] = [(); core::mem::offset_of!(Amd64Context, context_flags)];
+const _: [(); 0x34] = [(); core::mem::offset_of!(Amd64Context, mx_csr)];
+const _: [(); 0x38] = [(); core::mem::offset_of!(Amd64Context, seg_cs)];
+const _: [(); 0x42] = [(); core::mem::offset_of!(Amd64Context, seg_ss)];
+const _: [(); 0x44] = [(); core::mem::offset_of!(Amd64Context, e_flags)];
+const _: [(); 0x78] = [(); core::mem::offset_of!(Amd64Context, rax)];
+const _: [(); 0x80] = [(); core::mem::offset_of!(Amd64Context, rcx)];
+const _: [(); 0x88] = [(); core::mem::offset_of!(Amd64Context, rdx)];
+const _: [(); 0x98] = [(); core::mem::offset_of!(Amd64Context, rsp)];
+const _: [(); 0xf8] = [(); core::mem::offset_of!(Amd64Context, rip)];
+const _: [(); 0x100] = [(); core::mem::offset_of!(Amd64Context, extended_state)];
 const _: [(); 0x38] = [(); core::mem::size_of::<NtTib>()];
 const _: [(); 0x18] = [(); core::mem::size_of::<CurDir>()];
 const _: [(); 0x18] = [(); core::mem::size_of::<RtlDriveLetterCurdir>()];

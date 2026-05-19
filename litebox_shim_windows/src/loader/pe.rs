@@ -18,21 +18,22 @@ use litebox_common_windows::loader::{
 };
 use litebox_platform_multiplex::Platform;
 use thiserror::Error;
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_FLOATING_POINT_AMD64,
-    CONTEXT_INTEGER_AMD64,
-};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
 use crate::nt_types::{
-    ClientId, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
-    MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, ProcessEnvironmentBlock, RtlUserProcFlags,
-    RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString,
+    AMD64_CONTEXT_CONTROL, AMD64_CONTEXT_DEBUG_REGISTERS, AMD64_CONTEXT_FLOATING_POINT,
+    AMD64_CONTEXT_INTEGER, Amd64Context, ClientId, KiUserInvertedFunctionTableEntry,
+    KiUserInvertedFunctionTableHeader, MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE,
+    ProcessEnvironmentBlock, RtlUserProcFlags, RtlUserProcessParameters, ThreadEnvironmentBlock,
+    UnicodeString,
 };
 use crate::{NtShimFS, WindowsPageManager, WindowsVirtualAllocation, write_slice, write_value};
 
 const PAGE_SIZE: usize = litebox_common_windows::loader::PAGE_SIZE;
 const INITIAL_STACK_SIZE: usize = 1024 * 1024;
+const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
+const WINDOWS_STATIC_SERVER_DATA_OFFSET: usize = 0x100;
+const INITIAL_NLS_FILES_PATH: &str = "/Windows/System32/locale.nls";
 const NTDLL_PATHS: &[&str] = &["/Windows/System32/ntdll.dll", "/windows/system32/ntdll.dll"];
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_LOADER_ENTRYPOINT: &[u8] = b"LdrInitializeThunk";
@@ -54,6 +55,7 @@ const INITIAL_CONTEXT_EFLAGS: u32 = 0x200;
 const INITIAL_CONTEXT_MXCSR: u32 = 0x1f80;
 const USER_MODE_CODE_SELECTOR: u16 = 0x33;
 const USER_MODE_STACK_SELECTOR: u16 = 0x2b;
+const UNICODE_CASE_TABLE_PATH: &str = "/Windows/System32/c_10000.nls";
 
 /// Struct to hold the information needed to start the program.
 pub(crate) struct PeLoadInfo {
@@ -123,6 +125,8 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
             &image.image,
             image_base_address,
             path,
+            stack_base.as_usize(),
+            stack_top,
             initial_thread_entry_point.map(|thread_entry_point| {
                 (
                     thread_entry_point,
@@ -148,6 +152,8 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         image: &PeImageInfo,
         image_base_address: usize,
         image_path: &str,
+        stack_base: usize,
+        stack_top: usize,
         initial_context: Option<(usize, usize, usize)>,
     ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
         let mut virtual_allocations = Vec::new();
@@ -178,15 +184,15 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         write_slice(api_set_map_ptr, &api_set_map).ok_or(PeImageAccessError::MemoryAccess)?;
         let initial_context = initial_context
             .map(|(thread_entry_point, application_entry_point, stack_top)| {
-                let context_ptr = create_pages(size_of::<CONTEXT>())?;
+                let context_ptr = create_pages(size_of::<Amd64Context>())?;
                 let context = initial_thread_context(
                     thread_entry_point,
                     application_entry_point,
                     stack_top,
                     peb_ptr,
                 );
-                let context_bytes = context_as_bytes(&context);
-                write_slice(context_ptr, context_bytes).ok_or(PeImageAccessError::MemoryAccess)?;
+                write_slice(context_ptr, context.as_bytes())
+                    .ok_or(PeImageAccessError::MemoryAccess)?;
                 Ok::<usize, PeImageAccessError>(context_ptr)
             })
             .transpose()?;
@@ -260,6 +266,36 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         write_value(process_parameters_ptr, process_parameters)
             .ok_or(PeImageAccessError::MemoryAccess)?;
 
+        let unicode_case_table_data = self
+            .load_initial_nls_section(&mut create_pages, UNICODE_CASE_TABLE_PATH)
+            .inspect_err(|error| {
+                litebox_util_log::debug!(
+                    path = UNICODE_CASE_TABLE_PATH,
+                    error:? = error;
+                    "Initial Unicode NLS case table is not available"
+                );
+            })
+            .ok();
+        let nls_files_data = self
+            .load_initial_nls_section(&mut create_pages, INITIAL_NLS_FILES_PATH)
+            .inspect_err(|error| {
+                litebox_util_log::debug!(
+                    path = INITIAL_NLS_FILES_PATH,
+                    error:? = error;
+                    "Initial NLS files table is not available"
+                );
+            })
+            .ok();
+        let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
+        let read_only_static_server_data = read_only_shared_memory_base
+            .checked_add(WINDOWS_STATIC_SERVER_DATA_OFFSET)
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        write_value(
+            read_only_shared_memory_base + core::mem::size_of::<usize>(),
+            read_only_static_server_data,
+        )
+        .ok_or(PeImageAccessError::MemoryAccess)?;
+
         let mut peb = ProcessEnvironmentBlock::new_zeroed();
         peb.image_base_address = image_base_address;
         peb.process_parameters = process_parameters_ptr;
@@ -275,24 +311,93 @@ impl<'a, FS: NtShimFS> PeLoader<'a, FS> {
         peb.image_subsystem = u32::from(image.subsystem);
         peb.image_subsystem_major_version = u32::from(image.major_subsystem_version);
         peb.image_subsystem_minor_version = u32::from(image.minor_subsystem_version);
+        peb.read_only_shared_memory_base = read_only_shared_memory_base;
+        peb.shared_data = read_only_shared_memory_base;
+        peb.read_only_static_server_data = read_only_shared_memory_base;
+        peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
+        peb.unicode_case_table_data = unicode_case_table_data.unwrap_or(0);
         write_value(peb_ptr, peb).ok_or(PeImageAccessError::MemoryAccess)?;
 
         let mut teb = ThreadEnvironmentBlock::new_zeroed();
+        teb.nt_tib.exception_list = usize::MAX;
+        teb.nt_tib.stack_base = stack_top;
+        teb.nt_tib.stack_limit = stack_base;
         teb.nt_tib.self_pointer = teb_ptr;
         teb.client_id = ClientId {
             unique_process: INITIAL_PROCESS_ID,
             unique_thread: INITIAL_THREAD_ID,
         };
+        teb.thread_local_storage_pointer = teb_ptr
+            .checked_add(core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots))
+            .ok_or(PeImageAccessError::AddressOverflow)?;
         teb.process_environment_block = peb_ptr;
         teb.real_client_id = teb.client_id;
+        teb.activation_context_stack_pointer = teb_ptr
+            .checked_add(core::mem::offset_of!(
+                ThreadEnvironmentBlock,
+                activation_stack
+            ))
+            .ok_or(PeImageAccessError::AddressOverflow)?;
+        teb.deallocation_stack = stack_base;
         write_value(teb_ptr, teb).ok_or(PeImageAccessError::MemoryAccess)?;
         Ok(WindowsProcessEnvironment {
             peb: peb_ptr,
             _process_parameters: process_parameters_ptr,
             teb: teb_ptr,
             initial_context,
+            unicode_case_table_data: unicode_case_table_data.unwrap_or(0),
+            nls_files_data: nls_files_data.unwrap_or(0),
             virtual_allocations,
         })
+    }
+
+    fn load_initial_nls_section(
+        &self,
+        create_pages: &mut impl FnMut(usize) -> Result<usize, PeImageAccessError>,
+        path: &str,
+    ) -> Result<usize, PeImageAccessError> {
+        let fd = self.fs.open(path, OFlags::RDONLY, Mode::empty())?;
+        let section_len = match self.fs.fd_file_status(&fd) {
+            Ok(status) => status.size,
+            Err(error) => {
+                let _ = self.fs.close(&fd);
+                return Err(error.into());
+            }
+        };
+        let alloc_len = section_len.next_multiple_of(PAGE_SIZE);
+        let address = create_pages(alloc_len)?;
+        let ptr = <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(address);
+
+        let mut offset = 0;
+        while offset < section_len {
+            let mut chunk = [0; PAGE_SIZE];
+            let remaining = section_len - offset;
+            let chunk_len = remaining.min(PAGE_SIZE);
+            let read = match self.fs.read(&fd, &mut chunk[..chunk_len], Some(offset)) {
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = self.fs.close(&fd);
+                    return Err(error.into());
+                }
+            };
+            if read == 0 {
+                let _ = self.fs.close(&fd);
+                return Err(PeImageAccessError::ShortRead);
+            }
+            ptr.copy_from_slice(offset, &chunk[..read])
+                .ok_or(PeImageAccessError::MemoryAccess)?;
+            offset += read;
+        }
+        let _ = self.fs.close(&fd);
+
+        litebox_util_log::debug!(
+            path = path,
+            address:% = format_args!("{address:#x}"),
+            section_len = section_len;
+            "Mapped initial NLS section"
+        );
+
+        Ok(address)
     }
 
     fn initialize_ki_user_inverted_function_table(
@@ -380,6 +485,8 @@ pub(crate) struct WindowsProcessEnvironment {
     pub(crate) _process_parameters: usize,
     pub(crate) teb: usize,
     pub(crate) initial_context: Option<usize>,
+    pub(crate) unicode_case_table_data: usize,
+    pub(crate) nls_files_data: usize,
     pub(crate) virtual_allocations: Vec<WindowsVirtualAllocation>,
 }
 
@@ -396,32 +503,21 @@ fn initial_thread_context(
     application_entry_point: usize,
     stack_top: usize,
     peb: usize,
-) -> CONTEXT {
-    CONTEXT {
-        ContextFlags: CONTEXT_CONTROL_AMD64
-            | CONTEXT_INTEGER_AMD64
-            | CONTEXT_FLOATING_POINT_AMD64
-            | CONTEXT_DEBUG_REGISTERS_AMD64,
-        MxCsr: INITIAL_CONTEXT_MXCSR,
-        SegCs: USER_MODE_CODE_SELECTOR,
-        SegSs: USER_MODE_STACK_SELECTOR,
-        EFlags: INITIAL_CONTEXT_EFLAGS,
-        Rcx: application_entry_point as u64,
-        Rdx: peb as u64,
-        Rsp: stack_top as u64,
-        Rip: thread_entry_point as u64,
-        ..CONTEXT::default()
-    }
-}
-
-fn context_as_bytes(context: &CONTEXT) -> &[u8] {
-    // SAFETY: `CONTEXT` is a `repr(C)` Windows ABI struct from `windows-sys`.
-    // The loader only copies its initialized bytes into guest memory.
-    unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::from_ref(context).cast::<u8>(),
-            size_of::<CONTEXT>(),
-        )
+) -> Amd64Context {
+    Amd64Context {
+        context_flags: AMD64_CONTEXT_CONTROL
+            | AMD64_CONTEXT_INTEGER
+            | AMD64_CONTEXT_FLOATING_POINT
+            | AMD64_CONTEXT_DEBUG_REGISTERS,
+        mx_csr: INITIAL_CONTEXT_MXCSR,
+        seg_cs: USER_MODE_CODE_SELECTOR,
+        seg_ss: USER_MODE_STACK_SELECTOR,
+        e_flags: INITIAL_CONTEXT_EFLAGS,
+        rcx: application_entry_point as u64,
+        rdx: peb as u64,
+        rsp: stack_top as u64,
+        rip: thread_entry_point as u64,
+        ..Amd64Context::default()
     }
 }
 
