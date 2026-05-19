@@ -58,7 +58,7 @@ pub fn run_ta_with_test_commands(
                     allocate_session_id().unwrap(),
                 )
                 .map_err(|e| {
-                    panic!("Failed to load TA: {:?}", e);
+                    panic!("Failed to load TA: {e:?}");
                 })
                 .unwrap();
             ta_info = Some(loaded);
@@ -87,7 +87,7 @@ pub fn run_ta_with_test_commands(
                 .unwrap()
                 .load_ta_context(params.as_slice(), None, func_id as u32, Some(cmd.cmd_id))
                 .map_err(|e| {
-                    panic!("Failed to load TA context: {:?}", e);
+                    panic!("Failed to load TA context: {e:?}");
                 });
             let mut ctx = litebox_common_linux::PtRegs::default();
             unsafe {
