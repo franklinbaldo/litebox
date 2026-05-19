@@ -253,6 +253,27 @@ static void test_listen_shutdown_signals_hup(void) {
     unlink(sa.sun_path);
 }
 
+// When the *peer* calls shutdown(SHUT_WR), the local recv side must drain any queued bytes
+// first, then observe EOF on a subsequent recv — same behavior as a local SHUT_RD, just
+// triggered from the other side. Locks in the channel-layer "peer shutdown" drain path.
+static void test_peer_shutdown_write_drains_then_returns_eof(void) {
+    int sv[2];
+    const char *queued = "bytes-before-peer-shut-wr";
+
+    make_stream_pair(sv);
+    set_recv_timeout(sv[0]);
+
+    if (send(sv[1], queued, strlen(queued), MSG_NOSIGNAL) < 0) {
+        die("peer send before peer SHUT_WR");
+    }
+    expect_sys_shutdown(sv[1], SHUT_WR, "peer shutdown(SHUT_WR)");
+
+    expect_recv_string(sv[0], queued, "recv queued bytes after peer SHUT_WR");
+    expect_recv_eof(sv[0], "blocking recv after peer SHUT_WR queue drained");
+
+    close_pair(sv);
+}
+
 static void test_shutdown_invalid_how_returns_einval(void) {
     int sv[2];
 
@@ -273,6 +294,7 @@ int main(void) {
     test_shutdown_unconnected_succeeds();
     test_init_shutdown_persists_to_connected();
     test_listen_shutdown_signals_hup();
+    test_peer_shutdown_write_drains_then_returns_eof();
     test_shutdown_invalid_how_returns_einval();
 
     printf("All unix stream shutdown tests passed.\n");

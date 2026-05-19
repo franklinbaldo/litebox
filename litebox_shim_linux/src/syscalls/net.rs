@@ -3097,7 +3097,8 @@ mod unix_tests {
             .do_recvfrom(sock1, &mut buf, ReceiveFlags::empty(), None)
             .unwrap_err();
         let elapsed = start.elapsed();
-        assert_eq!(err, Errno::ETIMEDOUT);
+        // Linux returns EAGAIN (not ETIMEDOUT) when SO_RCVTIMEO expires on a blocking recv.
+        assert_eq!(err, Errno::EAGAIN);
         // Allow a small tolerance (5ms) for timing imprecision
         let tolerance = Duration::from_millis(5);
         assert!(

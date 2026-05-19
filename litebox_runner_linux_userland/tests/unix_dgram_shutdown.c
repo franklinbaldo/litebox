@@ -41,6 +41,23 @@ static void expect_send_errno(int fd, int expected_errno, const char *op) {
     }
 }
 
+// Blocking recv (no MSG_DONTWAIT) that we expect to time out via SO_RCVTIMEO. Distinct from
+// expect_recv_errno because we want to observe that the kernel kept blocking until the
+// timer expired, not that it gave up immediately with the same errno.
+static void expect_blocking_recv_eagain(int fd, const char *op) {
+    char buf[32];
+
+    errno = 0;
+    ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n != -1) {
+        fprintf(stderr, "FAIL: %s expected timeout failure, got %zd\n", op, n);
+        exit(1);
+    }
+    if (errno != EAGAIN) {
+        fail_errno(op, EAGAIN);
+    }
+}
+
 static void expect_recv_errno(int fd, int expected_errno, const char *op) {
     char buf[32];
 
@@ -180,6 +197,28 @@ static void test_shutdown_both_combines_read_and_write_rules(void) {
     close_pair(sv);
 }
 
+// When the peer calls shutdown(SHUT_WR), Linux does NOT synthesize EOF on the local recv —
+// unlike a local SHUT_RD, the socket is still connected and could in principle receive
+// from another sender, so a blocking recv keeps blocking (we observe EAGAIN via RCVTIMEO).
+// Queued datagrams must still drain first.
+static void test_peer_shutdown_write_drains_then_blocks(void) {
+    int sv[2];
+    const char *queued = "dgram-before-peer-shut-wr";
+
+    make_dgram_pair(sv);
+    set_recv_timeout(sv[0]);
+
+    if (send(sv[1], queued, strlen(queued), MSG_NOSIGNAL) < 0) {
+        die("peer send before peer SHUT_WR");
+    }
+    expect_sys_shutdown(sv[1], SHUT_WR, "peer shutdown(SHUT_WR)");
+
+    expect_recv_string(sv[0], queued, "recv queued datagram after peer SHUT_WR");
+    expect_blocking_recv_eagain(sv[0], "blocking recv after peer SHUT_WR with empty queue");
+
+    close_pair(sv);
+}
+
 static void test_shutdown_invalid_how_returns_einval(void) {
     int sv[2];
 
@@ -205,6 +244,7 @@ int main(void) {
     test_shutdown_read_empty_blocking_recv_returns_eof();
     test_shutdown_write_keeps_receive_side_open();
     test_shutdown_both_combines_read_and_write_rules();
+    test_peer_shutdown_write_drains_then_blocks();
     test_shutdown_invalid_how_returns_einval();
 
     printf("All unix datagram shutdown tests passed.\n");

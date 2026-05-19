@@ -816,7 +816,8 @@ impl<FS: ShimFS> UnixStream<FS> {
         is_nonblocking: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        cx.with_timeout(timeout)
+        let res = cx
+            .with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
                 Events::IN,
@@ -841,7 +842,12 @@ impl<FS: ShimFS> UnixStream<FS> {
                     })
                 },
             )
-            .map_err(Errno::from)
+            .map_err(Errno::from);
+        // SO_RCVTIMEO expiry: Linux returns EAGAIN, not ETIMEDOUT.
+        match res {
+            Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
+            other => other,
+        }
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
@@ -948,6 +954,7 @@ impl ReadEnd<DatagramMessage> {
         buf: &mut [u8],
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, TryOpError<Errno>> {
+        let is_self_shutdown = self.is_shutdown();
         self.peek_and_consume_one(|msg| {
             let copy_len = buf.len().min(msg.data.len());
             buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
@@ -959,6 +966,12 @@ impl ReadEnd<DatagramMessage> {
         })
         .map_err(|e| match e {
             Errno::EAGAIN => TryOpError::TryAgain,
+            // ESHUTDOWN from the channel layer collapses two distinct conditions: our own
+            // SHUT_RD (caller wants EOF) and peer SHUT_WR (Linux keeps the socket
+            // receivable in principle, since other senders could still target it). For
+            // datagram, only the self case synthesizes EOF; peer-shutdown looks like
+            // "empty queue, try again".
+            Errno::ESHUTDOWN if !is_self_shutdown => TryOpError::TryAgain,
             other => TryOpError::Other(other),
         })
     }
@@ -1124,12 +1137,13 @@ impl<FS: ShimFS> UnixDatagram<FS> {
                 },
             )
             .map_err(Errno::from);
-        // Linux datagram quirk: after shutdown(SHUT_RD) with an empty queue, a non-blocking
-        // recv returns EAGAIN (datagram boundaries mean we don't synthesize EOF when caller
-        // explicitly asked not to block). Blocking recv still returns 0 via the ESHUTDOWN ->
-        // EOF mapping at the UnixSocket layer.
+        // - Non-blocking + self-shutdown(SHUT_RD) with empty queue: Linux returns EAGAIN
+        //   instead of EOF (datagram boundaries — no message synthesized for the absent peer).
+        // - SO_RCVTIMEO expiry on a blocking recv: Linux returns EAGAIN, not ETIMEDOUT
+        //   (the latter is reserved for connect-style timeouts).
         match res {
             Err(Errno::ESHUTDOWN) if is_nonblocking => Err(Errno::EAGAIN),
+            Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
             other => other,
         }
     }
