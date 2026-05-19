@@ -357,6 +357,8 @@ impl LinuxUserland {
             let end = usize::from_str_radix(range[1], 16).expect("invalid end address");
             reserved_pages.push(start..end);
         }
+
+        unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
         reserved_pages
     }
 
