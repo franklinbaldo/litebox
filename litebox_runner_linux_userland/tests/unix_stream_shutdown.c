@@ -3,7 +3,9 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -216,10 +218,43 @@ static void test_init_shutdown_persists_to_connected(void) {
     unlink(sa.sun_path);
 }
 
+// A fresh Init Unix-stream socket polls as OUT|HUP (HUP because it's not connected).
+// After shutdown(SHUT_RD) — even pre-connect — Linux additionally reports POLLIN because
+// a recv would return EOF immediately. SHUT_WR alone leaves the poll output unchanged.
+static void test_init_shutdown_read_makes_poll_in_ready(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket(AF_UNIX, SOCK_STREAM)");
+    }
+    struct pollfd pfd = { .fd = fd, .events = POLLIN | POLLOUT };
+    int r = poll(&pfd, 1, 0);
+    if (r != 1 || (pfd.revents & POLLIN)) {
+        fprintf(stderr,
+                "FAIL: fresh Init poll expected !POLLIN, got r=%d revents=0x%x\n",
+                r, pfd.revents);
+        exit(1);
+    }
+
+    expect_sys_shutdown(fd, SHUT_RD, "shutdown(SHUT_RD) on Init");
+    // POLLIN must be level-triggered: every subsequent poll on the same socket should keep
+    // reporting it until the state changes. Probe three iterations to lock that in.
+    for (int i = 0; i < 3; i++) {
+        pfd.revents = 0;
+        r = poll(&pfd, 1, 0);
+        if (r != 1 || !(pfd.revents & POLLIN) || !(pfd.revents & POLLHUP)) {
+            fprintf(stderr,
+                    "FAIL: Init+SHUT_RD poll #%d expected POLLIN|POLLHUP, got r=%d revents=0x%x\n",
+                    i, r, pfd.revents);
+            exit(1);
+        }
+    }
+    close(fd);
+}
+
 // Linux's `shutdown(SHUT_RDWR)` on a listening socket is observable two ways: a blocking
-// accept returns EINVAL (not tested here to avoid pthreads), and poll reports POLLIN|POLLHUP.
-// We use the poll signal to confirm the listen state changed.
-static void test_listen_shutdown_signals_hup(void) {
+// accept returns EINVAL (not tested here to avoid pthreads), and poll reports both POLLIN
+// and POLLHUP.
+static void test_listen_shutdown_signals_in_and_hup(void) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket(listen)");
@@ -242,10 +277,104 @@ static void test_listen_shutdown_signals_hup(void) {
                 r, errno);
         exit(1);
     }
-    if (!(pfd.revents & POLLHUP)) {
+    if (!(pfd.revents & POLLIN) || !(pfd.revents & POLLHUP)) {
         fprintf(stderr,
-                "FAIL: poll after listen-shutdown expected POLLHUP, got revents=0x%x\n",
+                "FAIL: poll after listen-shutdown expected POLLIN|POLLHUP, got revents=0x%x\n",
                 pfd.revents);
+        exit(1);
+    }
+
+    close(fd);
+    unlink(sa.sun_path);
+}
+
+// Non-blocking accept on a shut-down listen socket returns EAGAIN on Linux (not EINVAL —
+// the empty-queue fast path runs before the shutdown check kicks in).
+static void test_listen_shutdown_nonblocking_accept_returns_eagain(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket(listen)");
+    }
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "/tmp/lb_shut_nbacc_%d", getpid());
+    unlink(sa.sun_path);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        die("bind(listen)");
+    }
+    if (listen(fd, 4) != 0) {
+        die("listen()");
+    }
+    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) != 0) {
+        die("fcntl O_NONBLOCK");
+    }
+    expect_sys_shutdown(fd, SHUT_RDWR, "shutdown(listen, SHUT_RDWR)");
+
+    errno = 0;
+    int a = accept(fd, NULL, NULL);
+    if (a != -1) {
+        fprintf(stderr, "FAIL: nonblocking accept on shut-down listen expected -1, got %d\n", a);
+        exit(1);
+    }
+    if (errno != EAGAIN) {
+        fail_errno("nonblocking accept on shut-down listen", EAGAIN);
+    }
+
+    close(fd);
+    unlink(sa.sun_path);
+}
+
+// Blocking accept on a shut-down listen socket returns EINVAL. We start a thread that
+// enters blocking accept, then shut the listen socket down from the main thread and
+// observe the thread's return code.
+struct blocking_accept_ctx {
+    int fd;
+    int ret;
+    int err;
+};
+
+static void *blocking_accept_thread(void *arg) {
+    struct blocking_accept_ctx *ctx = arg;
+    errno = 0;
+    ctx->ret = accept(ctx->fd, NULL, NULL);
+    ctx->err = errno;
+    return NULL;
+}
+
+static void test_listen_shutdown_blocking_accept_returns_einval(void) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket(listen)");
+    }
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    snprintf(sa.sun_path, sizeof(sa.sun_path), "/tmp/lb_shut_blkacc_%d", getpid());
+    unlink(sa.sun_path);
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        die("bind(listen)");
+    }
+    if (listen(fd, 4) != 0) {
+        die("listen()");
+    }
+
+    struct blocking_accept_ctx ctx = { .fd = fd, .ret = 0, .err = 0 };
+    pthread_t t;
+    if (pthread_create(&t, NULL, blocking_accept_thread, &ctx) != 0) {
+        die("pthread_create");
+    }
+    // Give the thread a moment to enter blocking accept().
+    usleep(100 * 1000);
+
+    expect_sys_shutdown(fd, SHUT_RDWR, "shutdown(listen, SHUT_RDWR)");
+
+    pthread_join(t, NULL);
+    if (ctx.ret != -1) {
+        fprintf(stderr, "FAIL: blocking accept on shut-down listen expected -1, got %d\n",
+                ctx.ret);
+        exit(1);
+    }
+    if (ctx.err != EINVAL) {
+        fprintf(stderr,
+                "FAIL: blocking accept on shut-down listen expected errno=%d (EINVAL), got %d (%s)\n",
+                EINVAL, ctx.err, strerror(ctx.err));
         exit(1);
     }
 
@@ -293,7 +422,10 @@ int main(void) {
     test_shutdown_both_combines_read_and_write_rules();
     test_shutdown_unconnected_succeeds();
     test_init_shutdown_persists_to_connected();
-    test_listen_shutdown_signals_hup();
+    test_init_shutdown_read_makes_poll_in_ready();
+    test_listen_shutdown_signals_in_and_hup();
+    test_listen_shutdown_nonblocking_accept_returns_eagain();
+    test_listen_shutdown_blocking_accept_returns_einval();
     test_peer_shutdown_write_drains_then_returns_eof();
     test_shutdown_invalid_how_returns_einval();
 

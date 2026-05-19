@@ -1726,28 +1726,22 @@ pub enum SocketcallType {
 }
 
 /// `how` argument to the `shutdown(2)` syscall.
-///
-/// Discriminants match Linux's `SHUT_RD` (0), `SHUT_WR` (1), `SHUT_RDWR` (2) ABI.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, IntEnum)]
 pub enum ShutdownHow {
-    /// `SHUT_RD`: disallow further receives. Already-queued data may still be drained;
-    /// once empty, subsequent reads observe EOF and the peer's writes fail with `EPIPE`.
+    /// `SHUT_RD`.
     Read = 0,
-    /// `SHUT_WR`: disallow further sends. Subsequent local writes fail with `EPIPE`;
-    /// the peer keeps reading anything still in flight.
+    /// `SHUT_WR`.
     Write = 1,
-    /// `SHUT_RDWR`: union of `Read` and `Write`.
+    /// `SHUT_RDWR`.
     Both = 2,
 }
 
 impl ShutdownHow {
-    /// Whether `self` shuts the read side down.
     #[must_use]
     pub fn affects_read(self) -> bool {
         matches!(self, Self::Read | Self::Both)
     }
-    /// Whether `self` shuts the write side down.
     #[must_use]
     pub fn affects_write(self) -> bool {
         matches!(self, Self::Write | Self::Both)

@@ -21,10 +21,8 @@ macro_rules! common_functions_for_channel {
 
         /// Shut this channel down.
         ///
-        /// On the first transition only, wakes any observer on the peer's pollee so a
-        /// peer blocked in send/recv notices the new state immediately. `HUP` is in
-        /// `Events::ALWAYS_POLLED`, so the notification reaches every observer
-        /// regardless of the mask they registered with.
+        /// On the first transition, wakes the peer's pollee so a
+        /// peer blocked in send/recv unblocks immediately.
         pub(crate) fn shutdown(&self) {
             if self.endpoint.shutdown() {
                 if let Some(peer) = self.peer.upgrade() {

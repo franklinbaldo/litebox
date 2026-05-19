@@ -4,7 +4,7 @@
 //! Unix domain socket implementation for the Linux shim layer.
 
 use core::{
-    sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
     time::Duration,
 };
 
@@ -189,17 +189,14 @@ impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
 ///
 /// This is the state immediately after socket creation, before the socket
 /// has been connected, or put into listening mode.
-/// Bit 0 = read shutdown pending, bit 1 = write shutdown pending.
-const PENDING_READ_SHUTDOWN: u8 = 1 << 0;
-const PENDING_WRITE_SHUTDOWN: u8 = 1 << 1;
-
 struct UnixInitStream<FS: ShimFS> {
     /// Optional bound address for this socket
     addr: Option<UnixBoundSocketAddr<FS>>,
     pollee: Pollee<crate::Platform>,
-    /// Linux preserves `shutdown(2)` flags set before `connect(2)` and applies them
-    /// once the socket transitions to Connected. We record them here.
-    pending_shutdown: AtomicU8,
+    /// Whether the read side of this socket is pending shutdown
+    pending_read_shutdown: AtomicBool,
+    /// Whether the write side of this socket is pending shutdown
+    pending_write_shutdown: AtomicBool,
 }
 
 impl<FS: ShimFS> UnixInitStream<FS> {
@@ -207,19 +204,18 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         Self {
             addr: None,
             pollee: Pollee::new(),
-            pending_shutdown: AtomicU8::new(0),
+            pending_read_shutdown: AtomicBool::new(false),
+            pending_write_shutdown: AtomicBool::new(false),
         }
     }
 
-    fn record_pending_shutdown(&self, how: ShutdownHow) {
-        let mut bits = 0;
-        if how.affects_read() {
-            bits |= PENDING_READ_SHUTDOWN;
+    fn shutdown(&self, how: ShutdownHow) {
+        if how.affects_read() && !self.pending_read_shutdown.swap(true, Ordering::Release) {
+            self.pollee.notify_observers(Events::IN);
         }
         if how.affects_write() {
-            bits |= PENDING_WRITE_SHUTDOWN;
+            self.pending_write_shutdown.store(true, Ordering::Release);
         }
-        self.pending_shutdown.fetch_or(bits, Ordering::Release);
     }
 
     /// Binds this socket to the given address.
@@ -260,9 +256,6 @@ impl<FS: ShimFS> UnixInitStream<FS> {
     }
 
     /// Converts this initial socket into a connected stream pair.
-    ///
-    /// Any half-close flags recorded by a pre-connect `shutdown(2)` are applied to the
-    /// returned *client* stream (the caller side); the server side starts fresh.
     fn into_connected(
         self,
         peer_addr: Arc<UnixBoundSocketAddr<FS>>,
@@ -270,27 +263,16 @@ impl<FS: ShimFS> UnixInitStream<FS> {
         let UnixInitStream {
             addr,
             pollee,
-            pending_shutdown,
+            pending_read_shutdown,
+            pending_write_shutdown,
         } = self;
-        let (client, server) = UnixConnectedStream::new_pair(
+        UnixConnectedStream::new_pair(
             addr.map(Arc::new),
             Some(Arc::new(pollee)),
             Some(peer_addr),
-        );
-        let pending = pending_shutdown.load(Ordering::Acquire);
-        let how = match (
-            pending & PENDING_READ_SHUTDOWN != 0,
-            pending & PENDING_WRITE_SHUTDOWN != 0,
-        ) {
-            (true, true) => Some(ShutdownHow::Both),
-            (true, false) => Some(ShutdownHow::Read),
-            (false, true) => Some(ShutdownHow::Write),
-            (false, false) => None,
-        };
-        if let Some(how) = how {
-            client.shutdown(how);
-        }
-        (client, server)
+            pending_read_shutdown.load(Ordering::Acquire),
+            pending_write_shutdown.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -349,8 +331,7 @@ impl<FS: ShimFS> Backlog<FS> {
     fn try_accept(&self) -> Result<UnixConnectedStream<FS>, TryOpError<Errno>> {
         let mut sockets = self.sockets.lock();
         let Some(sockets) = &mut *sockets else {
-            // Linux returns EINVAL from accept(2) on a listening socket that was shut down.
-            return Err(TryOpError::Other(Errno::EINVAL));
+            return Err(TryOpError::Other(Errno::ESHUTDOWN));
         };
 
         match sockets.pop_front() {
@@ -365,7 +346,7 @@ impl<FS: ShimFS> Backlog<FS> {
     fn check_io_events(&self) -> Events {
         let sockets = self.sockets.lock();
         let Some(sockets) = &*sockets else {
-            return Events::HUP;
+            return Events::IN | Events::HUP;
         };
         let mut events = Events::empty();
         if !sockets.is_empty() {
@@ -377,8 +358,7 @@ impl<FS: ShimFS> Backlog<FS> {
         events
     }
 
-    /// Shuts down this backlog, preventing new connections. Wakes any pending pollers
-    /// so they observe the new HUP state without having to retry.
+    /// Shuts down this backlog, preventing new connections.
     fn shutdown(&self) {
         let mut sockets = self.sockets.lock();
         if sockets.is_some() {
@@ -485,10 +465,14 @@ struct UnixConnectedStream<FS: ShimFS> {
 const UNIX_BUF_SIZE: usize = 65536;
 impl<FS: ShimFS> UnixConnectedStream<FS> {
     /// Creates a pair of connected Unix stream sockets.
+    ///
+    /// `read_shutdown` and `write_shutdown` half-close the corresponding sides of the stream.
     fn new_pair(
         addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
         pollee: Option<Arc<Pollee<crate::Platform>>>,
         peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
+        read_shutdown: bool,
+        write_shutdown: bool,
     ) -> (Self, Self) {
         let (addr1, addr2) = AddrView::new_pair(addr, peer);
         let pollee1 = pollee.unwrap_or(Arc::new(Pollee::new()));
@@ -497,21 +481,25 @@ impl<FS: ShimFS> UnixConnectedStream<FS> {
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee2.clone(), pollee1.clone()).split();
         let (send_channel_peer, recv_channel_peer) =
             crate::channel::Channel::new(UNIX_BUF_SIZE, pollee1.clone(), pollee2.clone()).split();
-        (
-            // Cross-wire: each socket keeps the other side's send channel.
-            UnixConnectedStream {
-                addr: addr1,
-                recv_channel,
-                connected_send_channel: send_channel_peer,
-                pollee: pollee1,
-            },
-            UnixConnectedStream {
-                addr: addr2,
-                recv_channel: recv_channel_peer,
-                connected_send_channel: send_channel,
-                pollee: pollee2,
-            },
-        )
+        let first = UnixConnectedStream {
+            addr: addr1,
+            recv_channel,
+            connected_send_channel: send_channel_peer,
+            pollee: pollee1,
+        };
+        let second = UnixConnectedStream {
+            addr: addr2,
+            recv_channel: recv_channel_peer,
+            connected_send_channel: send_channel,
+            pollee: pollee2,
+        };
+        if read_shutdown {
+            first.recv_channel.shutdown();
+        }
+        if write_shutdown {
+            first.connected_send_channel.shutdown();
+        }
+        (first, second)
     }
 
     fn get_local_addr(&self) -> UnixSocketAddr {
@@ -746,24 +734,32 @@ impl<FS: ShimFS> UnixStream<FS> {
             let listen = state.listen().ok_or(Errno::EINVAL)?;
             Ok(listen.backlog.clone())
         })?;
-        cx.wait_on_events(
-            is_nonblocking,
-            Events::IN,
-            |observer, mask| {
-                backlog.pollee.register_observer(observer, mask);
-                Ok(())
-            },
-            || {
-                let accepted = backlog.try_accept()?;
-                if let Some(peer) = peer.as_deref_mut() {
-                    *peer = accepted.get_peer_addr();
-                }
-                Ok(UnixSocketInner::Stream(UnixStream::new(
-                    UnixStreamState::Connected(accepted),
-                )))
-            },
-        )
-        .map_err(Errno::from)
+        let res = cx
+            .wait_on_events(
+                is_nonblocking,
+                Events::IN,
+                |observer, mask| {
+                    backlog.pollee.register_observer(observer, mask);
+                    Ok(())
+                },
+                || {
+                    let accepted = backlog.try_accept()?;
+                    if let Some(peer) = peer.as_deref_mut() {
+                        *peer = accepted.get_peer_addr();
+                    }
+                    Ok(UnixSocketInner::Stream(UnixStream::new(
+                        UnixStreamState::Connected(accepted),
+                    )))
+                },
+            )
+            .map_err(Errno::from);
+        // accept on a shut-down listen: Linux returns EAGAIN for non-blocking, EINVAL
+        // for blocking. try_accept signals shutdown via ESHUTDOWN; translate here.
+        match res {
+            Err(Errno::ESHUTDOWN) if is_nonblocking => Err(Errno::EAGAIN),
+            Err(Errno::ESHUTDOWN) => Err(Errno::EINVAL),
+            other => other,
+        }
     }
 
     fn sendto(
@@ -882,7 +878,17 @@ impl<FS: ShimFS> UnixStream<FS> {
     }
     fn check_io_events(&self) -> Events {
         self.with_state_ref(|state| match state {
-            UnixStreamState::Init(_) => Events::OUT | Events::HUP,
+            UnixStreamState::Init(init) => {
+                // Fresh Init reports OUT|HUP (HUP because not connected). After a
+                // shutdown(SHUT_RD) on an Init socket, Linux additionally reports IN
+                // (a recv would return EOF immediately). SHUT_WR has no observable
+                // effect on Init's poll output.
+                let mut events = Events::OUT | Events::HUP;
+                if init.pending_read_shutdown.load(Ordering::Acquire) {
+                    events |= Events::IN;
+                }
+                events
+            }
             UnixStreamState::Listen(listen) => listen.backlog.check_io_events(),
             UnixStreamState::Connected(conn) => conn.check_io_events(),
         })
@@ -890,12 +896,7 @@ impl<FS: ShimFS> UnixStream<FS> {
 
     fn shutdown(&self, how: ShutdownHow) {
         self.with_state_ref(|state| match state {
-            // Linux records pre-connect shutdown flags on the unix_sock and applies them
-            // post-connect; we mirror that by stashing the bits on UnixInitStream.
-            UnixStreamState::Init(init) => init.record_pending_shutdown(how),
-            // Linux sets SOCK_RCV_SHUTDOWN on a listening socket, after which a blocking
-            // accept returns EINVAL and poll reports POLLIN | POLLHUP. The existing backlog
-            // machinery uses `sockets = None` as that signal.
+            UnixStreamState::Init(init) => init.shutdown(how),
             UnixStreamState::Listen(listen) => listen.backlog.shutdown(),
             UnixStreamState::Connected(conn) => conn.shutdown(how),
         });
@@ -1388,7 +1389,7 @@ impl<FS: ShimFS> UnixSocket<FS> {
     ) -> Option<(UnixSocket<FS>, UnixSocket<FS>)> {
         match ty {
             SockType::Stream => {
-                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None);
+                let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None, false, false);
                 Some((
                     UnixSocket::new_with_inner(
                         UnixSocketInner::Stream(UnixStream::new(UnixStreamState::Connected(conn1))),
