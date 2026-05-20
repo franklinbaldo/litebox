@@ -929,12 +929,31 @@ pub struct TimeVal {
     tv_usec: suseconds_t,
 }
 #[repr(C)]
-#[derive(Clone, FromBytes, IntoBytes)]
+#[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
     /// Timer interval
     interval: TimeVal,
     /// Current value
     value: TimeVal,
+}
+
+impl ItimerVal {
+    pub fn new(interval: TimeVal, value: TimeVal) -> Self {
+        Self { interval, value }
+    }
+
+    /// `it_value = duration`, `it_interval = 0` (single-shot timer).
+    pub fn single_shot(duration: Duration) -> Self {
+        Self::new(TimeVal::from(Duration::ZERO), TimeVal::from(duration))
+    }
+
+    pub fn it_interval(&self) -> TimeVal {
+        self.interval
+    }
+
+    pub fn it_value(&self) -> TimeVal {
+        self.value
+    }
 }
 
 impl TryFrom<TimeVal> for Duration {
@@ -2310,8 +2329,12 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
     },
     SetITimer {
         which: IntervalTimer,
-        new_value: Platform::RawConstPointer<ItimerVal>,
+        new_value: Option<Platform::RawConstPointer<ItimerVal>>,
         old_value: Option<Platform::RawMutPointer<ItimerVal>>,
+    },
+    GetITimer {
+        which: IntervalTimer,
+        curr_value: Platform::RawMutPointer<ItimerVal>,
     },
     Statx {
         dirfd: i32,
@@ -2785,6 +2808,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::umask => sys_req!(Umask { mask }),
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
+            Sysno::getitimer => sys_req!(GetITimer { which:?, curr_value:* }),
             Sysno::statx => sys_req!(Statx {
                 dirfd,
                 pathname:*,
