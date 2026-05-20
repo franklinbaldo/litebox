@@ -637,6 +637,23 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// `MFD_*` flags for `memfd_create(2)`.
+    ///
+    /// `MFD_NAME_MAX_LEN` (the documented 249-byte limit on `name`) is
+    /// enforced by the shim, not by these flags.
+    #[derive(Debug, Clone, Copy)]
+    pub struct MfdFlags: core::ffi::c_uint {
+        const MFD_CLOEXEC = 0x0001;
+        const MFD_ALLOW_SEALING = 0x0002;
+        const MFD_HUGETLB = 0x0004;
+        const MFD_NOEXEC_SEAL = 0x0008;
+        const MFD_EXEC = 0x0010;
+        /// Retain unknown bits so the shim can reject them with `EINVAL`.
+        const _ = !0;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -2343,6 +2360,11 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
         mask: StatxMask,
         statxbuf: Platform::RawMutPointer<Statx>,
     },
+    MemfdCreate {
+        /// `None` (NULL on the syscall side) → `EFAULT` per `memfd_create(2)`.
+        name: Option<Platform::RawConstPointer<i8>>,
+        flags: MfdFlags,
+    },
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
@@ -2809,6 +2831,7 @@ impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
             Sysno::alarm => sys_req!(Alarm { seconds }),
             Sysno::setitimer => sys_req!(SetITimer { which:?, new_value:*, old_value:* }),
             Sysno::getitimer => sys_req!(GetITimer { which:?, curr_value:* }),
+            Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             Sysno::statx => sys_req!(Statx {
                 dirfd,
                 pathname:*,
@@ -3139,6 +3162,7 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        MfdFlags,
         RngFlags,
         TimerFlags,
         StatxMask,

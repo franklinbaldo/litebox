@@ -924,6 +924,13 @@ impl<FS: ShimFS> Task<FS> {
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
             }
+            SyscallRequest::MemfdCreate { name, flags } => {
+                let name = match name {
+                    Some(p) => p.to_cstring().ok_or(Errno::EFAULT)?,
+                    None => return Err(Errno::EFAULT),
+                };
+                syscall!(sys_memfd_create(name, flags))
+            }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd.write_at_offset(0, read_fd).ok_or(Errno::EFAULT)?;

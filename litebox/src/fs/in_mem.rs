@@ -293,6 +293,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::FileSystem for FileSystem
         Ok(fd)
     }
 
+    fn open_anonymous(&self, mode: super::Mode) -> Result<FileFd<Platform>, OpenError> {
+        // Allocate a fresh inode but never insert it into the namespace map
+        // (`root.entries`) or any parent's children list. The descriptor
+        // table holds the only `Arc` reference, so the file is invisible to
+        // `readdir`, unreachable by `open`/`unlink`/`stat`, and is freed when
+        // the last fd is closed.
+        let file = Arc::new(sync::RwLock::new(FileX {
+            perms: Permissions {
+                mode,
+                userinfo: self.current_user,
+            },
+            data: Vec::new().into(),
+            unique_id: self.fresh_id(),
+        }));
+        let fd = self
+            .litebox
+            .descriptor_table_mut()
+            .insert(Descriptor::File {
+                file,
+                read_allowed: true,
+                write_allowed: true,
+                position: 0,
+                append_mode: false,
+            });
+        Ok(fd)
+    }
+
     fn close(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
         self.litebox.descriptor_table_mut().remove(fd);
         Ok(())

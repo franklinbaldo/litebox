@@ -18,7 +18,7 @@ use litebox::{
 };
 use litebox_common_linux::{
     AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat, InodeType,
-    IoReadVec, IoWriteVec, IoctlArg, TimeParam, errno::Errno, signal::Signal,
+    IoReadVec, IoWriteVec, IoctlArg, MfdFlags, TimeParam, errno::Errno, signal::Signal,
 };
 use litebox_common_linux::{Statx, StatxMask};
 use litebox_platform_multiplex::Platform;
@@ -270,6 +270,54 @@ impl<FS: ShimFS> Task<FS> {
     ) -> Result<u32, Errno> {
         let file = self.do_openat(dirfd, pathname, flags, mode)?;
         self.insert_raw_file_fd(file, flags)
+    }
+
+    /// Handle syscall `memfd_create`.
+    ///
+    /// Delegates to [`FileSystem::open_anonymous`], which creates a fresh
+    /// inode that is never inserted into the FS namespace: the resulting
+    /// `FileFd` is the only handle to its backing storage, matching the
+    /// "anonymous file" guarantee in `memfd_create(2)`.
+    ///
+    /// Scope: `MFD_CLOEXEC` is honored; `MFD_ALLOW_SEALING` is accepted but
+    /// silently ignored (LiteBox has no `F_ADD_SEALS` support yet); all other
+    /// flag bits return `EINVAL`. `name` longer than 249 bytes returns
+    /// `EINVAL` (Linux's `MFD_NAME_MAX_LEN - sizeof("memfd:")` limit). The
+    /// `name` contents are validated for length but not retained — Linux uses
+    /// them only for the `/proc/self/fd/N` link target, which LiteBox does
+    /// not expose.
+    pub(crate) fn sys_memfd_create(
+        &self,
+        name: impl path::Arg,
+        flags: MfdFlags,
+    ) -> Result<u32, Errno> {
+        // Linux: `MFD_NAME_MAX_LEN` (256) minus the kernel's "memfd:" prefix
+        // leaves 249 bytes available for the user-supplied portion.
+        const MFD_NAME_MAX_LEN: usize = 249;
+
+        let allowed = MfdFlags::MFD_CLOEXEC | MfdFlags::MFD_ALLOW_SEALING;
+        if flags.intersects(allowed.complement()) {
+            log_unsupported!("memfd_create: unsupported flags {flags:?}");
+            return Err(Errno::EINVAL);
+        }
+        let name_str = name.as_rust_str().map_err(Errno::from)?;
+        if name_str.len() > MFD_NAME_MAX_LEN {
+            return Err(Errno::EINVAL);
+        }
+
+        let file = self
+            .files
+            .borrow()
+            .fs
+            .open_anonymous(Mode::RUSR | Mode::WUSR)
+            .map_err(Errno::from)?;
+
+        let oflags = if flags.contains(MfdFlags::MFD_CLOEXEC) {
+            OFlags::CLOEXEC
+        } else {
+            OFlags::empty()
+        };
+        self.insert_raw_file_fd(file, oflags)
     }
 
     /// Handle syscall `ftruncate`

@@ -27,6 +27,8 @@ pub enum OpenError {
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]
     Io,
+    #[error("operation is not supported by this filesystem")]
+    Unsupported,
     #[error(transparent)]
     PathError(#[from] PathError),
 }

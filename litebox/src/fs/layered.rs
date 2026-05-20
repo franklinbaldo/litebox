@@ -208,6 +208,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
                 OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::Unsupported
                 | OpenError::TruncateError(_) => unreachable!(),
                 OpenError::PathError(path_error) => return Err(path_error)?,
             },
@@ -538,6 +539,7 @@ impl<
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
+                | OpenError::Unsupported
                 | OpenError::TruncateError(
                     TruncateError::IsDirectory
                     | TruncateError::NotForWriting
@@ -629,6 +631,21 @@ impl<
             }
         }
         Ok(fd)
+    }
+
+    fn open_anonymous(&self, mode: Mode) -> Result<FileFd<Platform, Upper, Lower>, OpenError> {
+        // Anonymous files are upper-only: they never enter the layered
+        // namespace (`root.entries`) and the lower (typically read-only) layer
+        // has no concept of one. `EntryX::Upper { … }` is the shape `close()`
+        // already treats as "no root entry to clean up", so the unused `path`
+        // field is harmless.
+        let upper_fd = self.upper.open_anonymous(mode)?;
+        Ok(self.litebox.descriptor_table_mut().insert(Descriptor {
+            path: String::new(),
+            flags: OFlags::RDWR,
+            entry: Arc::new(EntryX::Upper { fd: upper_fd }),
+            position: AtomicUsize::new(0),
+        }))
     }
 
     fn close(&self, fd: &FileFd<Platform, Upper, Lower>) -> Result<(), CloseError> {
@@ -1137,6 +1154,7 @@ impl<
                 }
                 OpenError::NoWritePerms
                 | OpenError::AlreadyExists
+                | OpenError::Unsupported
                 | OpenError::TruncateError(_) => {
                     unreachable!()
                 }

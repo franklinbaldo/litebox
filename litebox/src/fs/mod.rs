@@ -54,6 +54,20 @@ pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError>;
 
+    /// Open an anonymous file with no directory entry.
+    ///
+    /// The returned fd refers to a fresh, writable regular file whose
+    /// contents are only reachable via this descriptor — there is no path to
+    /// open it by, no entry visible in any parent directory's listing, and no
+    /// way for a second open call to obtain another fd to the same inode.
+    /// This matches `memfd_create(2)` semantics. The default body returns
+    /// `Unsupported`; only filesystems that can synthesize inodes without a
+    /// namespace entry implement it.
+    #[expect(unused_variables, reason = "default body returns Unsupported")]
+    fn open_anonymous(&self, mode: Mode) -> Result<TypedFd<Self>, OpenError> {
+        Err(OpenError::Unsupported)
+    }
+
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
