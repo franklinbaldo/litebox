@@ -32,6 +32,26 @@ pub(crate) fn init_platform() -> crate::Task {
     shim_builder.build().0.new_test_task()
 }
 
+#[must_use]
+pub(crate) fn init_platform_with_svn(ta_svn: u32) -> crate::Task {
+    INIT_FUNC.call_once(|| {
+        #[cfg(target_os = "linux")]
+        let platform = Platform::new(None);
+
+        #[cfg(not(target_os = "linux"))]
+        let platform = Platform::new();
+
+        #[cfg(target_os = "linux")]
+        platform.initialize_boot_specific_kdf_support();
+
+        set_platform(platform);
+    });
+
+    let shim_builder = crate::OpteeShimBuilder::new();
+    let _litebox = shim_builder.litebox();
+    shim_builder.build().0.new_test_task_with_svn(ta_svn)
+}
+
 #[test]
 fn test_sys_log() {
     let task = init_platform();
@@ -94,4 +114,37 @@ fn test_derive_ta_svn_key_stack() {
         key_buf, first,
         "different chain depth must produce a different Key[0]"
     );
+}
+
+#[test]
+fn test_derive_ta_svn_key_stack_allows_ta_svn_above_stack_size() {
+    const KEY_SIZE: usize = 32;
+    const STACK_SIZE: u32 = 2;
+    const TA_SVN: u32 = 3;
+
+    let task = init_platform_with_svn(TA_SVN);
+    let extra_data = [0xAAu8; 16];
+    let mut key_buf = [0u8; KEY_SIZE * (TA_SVN as usize + 1)];
+
+    let mut params = UteeParams::new();
+    params.set_type(0, TeeParamType::ValueInput).unwrap();
+    params
+        .set_values(0, KEY_SIZE as u64, u64::from(STACK_SIZE))
+        .unwrap();
+    params.set_type(1, TeeParamType::MemrefInput).unwrap();
+    params
+        .set_values(1, extra_data.as_ptr() as u64, extra_data.len() as u64)
+        .unwrap();
+    params.set_type(2, TeeParamType::MemrefOutput).unwrap();
+    params
+        .set_values(2, key_buf.as_mut_ptr() as u64, key_buf.len() as u64)
+        .unwrap();
+    params.set_type(3, TeeParamType::None).unwrap();
+
+    let cmd_id = PtaSystemCommandId::DeriveTaSvnKeyStack as u32;
+    task.handle_system_pta_command(cmd_id, &params).unwrap();
+
+    assert_ne!(&key_buf[..KEY_SIZE], &[0u8; KEY_SIZE]);
+    assert_ne!(&key_buf[KEY_SIZE..KEY_SIZE * 2], &[0u8; KEY_SIZE]);
+    assert_eq!(&key_buf[KEY_SIZE * 2..], &[0u8; KEY_SIZE * 2]);
 }

@@ -227,12 +227,7 @@ impl Task {
             return Err(TeeResult::BadParameters);
         }
 
-        // Validate TA version is within the key stack bounds
         let ta_svn = self.ta_svn;
-        if ta_svn >= svn_key_stack_size {
-            return Err(TeeResult::BadParameters);
-        }
-
         let required_stack_buffer_size = key_size
             .checked_mul(ta_svn as usize + 1)
             .ok_or(TeeResult::BadParameters)?;

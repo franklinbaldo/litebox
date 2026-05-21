@@ -1422,12 +1422,17 @@ mod test_utils {
     impl GlobalState {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task {
+            self.new_test_task_with_svn(0)
+        }
+
+        /// Make a new task with the provided TA SVN for testing.
+        pub(crate) fn new_test_task_with_svn(self: Arc<Self>, ta_svn: u32) -> Task {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
                 session_id: SessionIdPool::allocate().unwrap(),
                 ta_app_id: TeeUuid::default(),
-                ta_svn: 0,
+                ta_svn,
                 client_identity: TeeIdentity {
                     login: TeeLogin::User,
                     uuid: TeeUuid::default(),
