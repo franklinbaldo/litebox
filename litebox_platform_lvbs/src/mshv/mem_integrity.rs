@@ -104,13 +104,12 @@ pub fn validate_kernel_module_against_elf(
         // load original ELF section (no relocation and patch applied)
         let start =
             usize::try_from(target_shdr.sh_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
-        let end = start
-            .checked_add(
-                usize::try_from(target_shdr.sh_size).map_err(|_| KernelElfError::ElfParseFailed)?,
-            )
+        let size =
+            usize::try_from(target_shdr.sh_size).map_err(|_| KernelElfError::ElfParseFailed)?;
+        let range = bounded_range(start, size, original_elf_data.len())
             .ok_or(KernelElfError::ElfParseFailed)?;
-        let mut section_from_elf = vec![0u8; end - start];
-        section_from_elf.copy_from_slice(&original_elf_data[start..end]);
+        let mut section_from_elf = vec![0u8; range.len()];
+        section_from_elf.copy_from_slice(&original_elf_data[range]);
 
         let mut reloc_ranges = RangeSet::<usize>::new();
         identify_direct_relocations(
@@ -208,20 +207,11 @@ fn identify_direct_relocations(
             let r_offset =
                 usize::try_from(rela.r_offset).map_err(|_| KernelElfError::ElfParseFailed)?;
             if elf_params.symtab.get(r_sym).is_ok() {
-                let reloc_size: usize = match rela.r_type {
-                    R_X86_64_64 => 8,
-                    R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
-                    _ => {
-                        todo!("Unsupported relocation type {:?}", rela.r_type);
-                    }
-                };
-                let start = r_offset;
-                if let Some(end) = start
-                    .checked_add(reloc_size)
-                    .filter(|&end| end <= section_from_elf.len())
-                {
-                    reloc_ranges.insert(start..end);
-                }
+                let reloc_size = relocation_size(rela.r_type)?;
+                reloc_ranges.insert(
+                    bounded_range(r_offset, reloc_size, section_from_elf.len())
+                        .ok_or(KernelElfError::RelocationOutOfBounds)?,
+                );
             }
         }
     } else {
@@ -265,6 +255,11 @@ fn identify_indirect_relocations(
             .elf
             .section_data_as_relas(&shdr)
             .map_err(|_| KernelElfError::ElfParseFailed)?;
+        let is_altinstructions = elf_params
+            .shdr_strtab
+            .get(usize::try_from(shdr.sh_name).map_err(|_| KernelElfError::ElfParseFailed)?)
+            .map_err(|_| KernelElfError::ElfParseFailed)?
+            == ".rela.altinstructions";
         for rela in relas {
             let r_sym = usize::try_from(rela.r_sym).map_err(|_| KernelElfError::ElfParseFailed)?;
             let r_addend =
@@ -296,42 +291,37 @@ fn identify_indirect_relocations(
                 })
                 .is_ok_and(|belongs_to_target| belongs_to_target)
             {
-                let reloc_size: usize = match rela.r_type {
-                    R_X86_64_64 => 8,
-                    R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => 4,
-                    _ => {
-                        todo!("Unsupported relocation type {:?}", rela.r_type);
-                    }
-                };
+                let reloc_size = relocation_size(rela.r_type)?;
 
                 // indirect relocations rely on `r_addend` to specify the offsets to patch
-                let start = r_addend;
-                if let Some(end) = start
-                    .checked_add(reloc_size)
-                    .filter(|&end| end <= section_from_elf.len())
-                {
-                    reloc_ranges.insert(start..end);
+                let reloc_range = bounded_range(r_addend, reloc_size, section_from_elf.len())
+                    .ok_or(KernelElfError::RelocationOutOfBounds)?;
+                let start = reloc_range.start;
+                reloc_ranges.insert(reloc_range);
 
-                    // handle some exceptions which depend on sections
-                    let section_name = elf_params
-                        .shdr_strtab
-                        .get(
-                            usize::try_from(shdr.sh_name)
-                                .map_err(|_| KernelElfError::ElfParseFailed)?,
-                        )
-                        .map_err(|_| KernelElfError::ElfParseFailed)?;
-                    // `.rela.altinstructions` could patch `nop` which is one byte prior to the specified relocation.
-                    if section_name == ".rela.altinstructions"
-                        && start > 0
-                        && section_from_elf[start - 1] == 0x90
-                    {
-                        reloc_ranges.insert(start - 1..start);
-                    }
+                // `.rela.altinstructions` could patch `nop` which is one byte prior to the specified relocation.
+                if is_altinstructions && start > 0 && section_from_elf[start - 1] == 0x90 {
+                    reloc_ranges.insert(start - 1..start);
                 }
             }
         }
     }
     Ok(())
+}
+
+fn bounded_range(start: usize, size: usize, max_len: usize) -> Option<core::ops::Range<usize>> {
+    start
+        .checked_add(size)
+        .filter(|&end| end <= max_len)
+        .map(|end| start..end)
+}
+
+fn relocation_size(relocation_type: u32) -> Result<usize, KernelElfError> {
+    match relocation_type {
+        R_X86_64_64 => Ok(8),
+        R_X86_64_32 | R_X86_64_32S | R_X86_64_PLT32 | R_X86_64_PC32 => Ok(4),
+        _ => Err(KernelElfError::UnsupportedRelocation),
+    }
 }
 
 /// This function parses the `.modinfo` section of a kernel module ELF
@@ -732,6 +722,10 @@ pub enum KernelElfError {
     ElfParseFailed,
     #[error("required section not found")]
     SectionNotFound,
+    #[error("relocation points outside the target section")]
+    RelocationOutOfBounds,
+    #[error("unsupported relocation type")]
+    UnsupportedRelocation,
 }
 
 /// Errors for module signature verification.
