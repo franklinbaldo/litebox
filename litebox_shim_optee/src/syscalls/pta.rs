@@ -221,49 +221,50 @@ impl Task {
             || extra_data_size > TA_DERIVED_EXTRA_DATA_MAX_SIZE
             || svn_key_stack_size > SVN_KEY_STACK_MAX_SIZE
             || svn_key_stack_size == 0
+            || (extra_data_size > 0 && extra_data_addr == 0)
             || key_stack_addr == 0
         {
             return Err(TeeResult::BadParameters);
         }
 
         // Validate TA version is within the key stack bounds
-        let ta_version = self.ta_svn;
-        if ta_version >= svn_key_stack_size {
+        let ta_svn = self.ta_svn;
+        if ta_svn >= svn_key_stack_size {
             return Err(TeeResult::BadParameters);
         }
 
         let required_stack_buffer_size = key_size
-            .checked_mul(ta_version as usize + 1)
+            .checked_mul(ta_svn as usize + 1)
             .ok_or(TeeResult::BadParameters)?;
         if key_stack_buffer_size < required_stack_buffer_size {
             return Err(TeeResult::BadParameters);
         }
 
-        let extra_data_ptr = UserConstPtr::<u8>::from_usize(
-            usize::try_from(extra_data_addr).map_err(|_| TeeResult::BadParameters)?,
-        );
-        let extra_data = extra_data_ptr
-            .to_owned_slice(extra_data_size)
-            .ok_or(TeeResult::BadParameters)?;
+        let extra_data = if extra_data_size == 0 {
+            Vec::new().into_boxed_slice()
+        } else {
+            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.truncate());
+            extra_data_ptr
+                .to_owned_slice(extra_data_size)
+                .ok_or(TeeResult::BadParameters)?
+        };
 
-        let key_stack_ptr = UserMutPtr::<u8>::from_usize(
-            usize::try_from(key_stack_addr).map_err(|_| TeeResult::BadParameters)?,
-        );
+        // Unlike OP-TEE OS, `UserMutPtr` (and `UserConstPtr`) in LiteBox ensure this
+        // pointer can never be used to access normal-world memory. That is, we don't
+        // need extra security check for detecting key leakage here.
+        let key_stack_ptr = UserMutPtr::<u8>::from_usize(key_stack_addr.truncate());
 
+        // First stage: derive base key = KDF(huk, usage || ta_uuid || extra data)
         let uuid_bytes = self.ta_app_id.to_le_bytes();
         let mut stage_key = Zeroizing::new(vec![0u8; key_size]);
+        self.huk_subkey_derive(
+            HukSubkeyUsage::UniqueTa,
+            &[&uuid_bytes, &extra_data],
+            &mut stage_key,
+        )?;
 
         // Derive keys from max SVN down to 0
         for svn_idx in (0..svn_key_stack_size).rev() {
-            if svn_idx == svn_key_stack_size - 1 {
-                // First iteration: derive base key = KDF(huk, usage || ta_uuid || extra data)
-                self.huk_subkey_derive(
-                    HukSubkeyUsage::UniqueTa,
-                    &[&uuid_bytes, &extra_data],
-                    &mut stage_key,
-                )?;
-            }
-
             // Second stage KDF: HMAC(current_key, SVN_index)
             // Key_v2047 = KDF(KDF(HUK, UUID), 2047)
             // Key_v2046 = KDF(Key_v2047, 2046)
@@ -274,17 +275,18 @@ impl Task {
                 HmacSha256::new_from_slice(&stage_key).map_err(|_| TeeResult::BadParameters)?;
             hmac.update(&svn_idx.to_le_bytes());
 
-            let hmac_bytes = hmac.finalize().into_bytes();
+            let mut hmac_bytes = hmac.finalize().into_bytes();
             let derived_key = &hmac_bytes[..key_size];
 
             // Only copy keys for SVN values <= current TA version to userspace
-            if svn_idx <= ta_version {
+            if svn_idx <= ta_svn {
                 let offset = svn_idx as usize * key_size;
                 key_stack_ptr
                     .copy_from_slice(offset, derived_key)
                     .ok_or(TeeResult::AccessDenied)?;
             }
             stage_key.copy_from_slice(derived_key);
+            hmac_bytes.zeroize();
         }
 
         Ok(())
