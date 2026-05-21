@@ -4,8 +4,8 @@
 //! An implementation of [`HostInterface`] for LVBS
 
 use crate::{
-    arch::ioport::serial_print_string, host::per_cpu_variables::with_per_cpu_variables, Errno,
-    HostInterface,
+    Errno, HostInterface, arch::ioport::serial_print_string,
+    host::per_cpu_variables::with_per_cpu_variables,
 };
 use zeroize::Zeroizing;
 
