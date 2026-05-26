@@ -995,6 +995,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -1295,6 +1301,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "indexmap"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd070e393353796e801d209ad339e89596eb4c8d430d18ede6a1cced8fafbd99"
+dependencies = [
+ "autocfg",
+ "hashbrown 0.12.3",
+]
+
+[[package]]
 name = "insta"
 version = "1.43.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1459,7 +1475,7 @@ dependencies = [
  "bitflags 2.11.0",
  "buddy_system_allocator",
  "either",
- "hashbrown",
+ "hashbrown 0.15.5",
  "litebox_util_log",
  "rangemap",
  "ringbuf",
@@ -1567,7 +1583,7 @@ dependencies = [
  "const-oid",
  "digest",
  "elf",
- "hashbrown",
+ "hashbrown 0.15.5",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -1582,6 +1598,7 @@ dependencies = [
  "sha2",
  "spin 0.10.0",
  "thiserror",
+ "vstd",
  "x509-cert",
  "x86_64",
  "zerocopy",
@@ -1733,7 +1750,7 @@ dependencies = [
  "arrayvec",
  "ctr",
  "elf",
- "hashbrown",
+ "hashbrown 0.15.5",
  "hmac",
  "litebox",
  "litebox_common_linux",
@@ -3302,10 +3319,74 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "verus_builtin"
+version = "0.0.0-2026-05-17-0151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab9266bfb5cf45a080f425c560b0e0be2bf81194f0e80258990c49c1829d8b9"
+
+[[package]]
+name = "verus_builtin_macros"
+version = "0.0.0-2026-05-24-0157"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9b5028291963009f075fd4fbfa883d176ad108afbeef54e950bc74cef4e1f9e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+ "synstructure",
+ "verus_prettyplease",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_prettyplease"
+version = "0.0.0-2026-05-24-0157"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed6977d81af3e0f2454f24833f2e82f50a0650254190584399d5476587083e51"
+dependencies = [
+ "proc-macro2",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_state_machines_macros"
+version = "0.0.0-2026-05-24-0157"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23036d788cacd25c4279130ef422124912bc199f351ef5f695d81009622a5458"
+dependencies = [
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "verus_syn",
+]
+
+[[package]]
+name = "verus_syn"
+version = "0.0.0-2026-05-24-0157"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0adef4208f95cd6cd0f27404afd9ffbbe3e09677b619a52d3f505ca43fa8f0a2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "volatile"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
+
+[[package]]
+name = "vstd"
+version = "0.0.0-2026-05-24-0157"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eef08139d238dfe8c1081513849f76136280c5699af0f88ad18dd95b3f72cfe0"
+dependencies = [
+ "verus_builtin",
+ "verus_builtin_macros",
+ "verus_state_machines_macros",
+]
 
 [[package]]
 name = "walkdir"
