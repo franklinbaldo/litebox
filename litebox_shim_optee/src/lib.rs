@@ -10,8 +10,9 @@ extern crate alloc;
 
 use crate::loader::elf::ElfLoaderError;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{sync::Arc, vec};
-use core::cell::Cell;
+use alloc::{sync::Arc, vec, vec::Vec};
+use core::cell::{Cell, RefCell};
+use core::ops::Range;
 use ctr::Ctr128BE;
 use hashbrown::HashMap;
 use litebox::{
@@ -245,6 +246,7 @@ impl OpteeShim {
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
                 ta_entry_point: Cell::new(0),
+                ta_exec_regions: RefCell::new(Vec::new()),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
                 #[cfg(target_arch = "x86_64")]
@@ -850,14 +852,32 @@ impl Task {
         if addr == 0 { None } else { Some(addr) }
     }
 
+    /// Record an executable address region the shim mapped for the TA.
+    ///
+    /// Recorded during `sys_map_bin` so that the (untrusted) TA entry point reported
+    /// by `ldelf` can later be validated.
+    pub(crate) fn record_ta_exec_region(&self, region: Range<usize>) {
+        if !region.is_empty() {
+            self.ta_exec_regions.borrow_mut().push(region);
+        }
+    }
+
+    fn is_in_ta_exec_region(&self, addr: usize) -> bool {
+        self.ta_exec_regions
+            .borrow()
+            .iter()
+            .any(|region| region.contains(&addr))
+    }
+
     /// Set the entry point of the TA for the current task.
     ///
     /// Since the TA entry point is provided by `ldelf` which is untrusted, we checks whether
-    /// the given `addr` is within the user space.
+    /// the given `addr` is within an executable region that the shim itself mapped for the
+    /// TA (recorded during `sys_map_bin`).
     pub(crate) fn set_ta_entry_point(&self, addr: usize) {
-        let ptr = UserConstPtr::<u8>::from_usize(addr);
-        if ptr.read_at_offset(0).is_some() {
+        if self.is_in_ta_exec_region(addr) {
             self.ta_entry_point.set(addr);
+            self.ta_exec_regions.borrow_mut().clear();
         }
     }
 
@@ -1287,6 +1307,8 @@ struct Task {
     ta_handle_map: TaHandleMap,
     /// TA entry point
     ta_entry_point: Cell<usize>,
+    /// Executable address regions the shim mapped for the TA.
+    ta_exec_regions: RefCell<Vec<Range<usize>>>,
     /// TA stack base address
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
@@ -1435,11 +1457,48 @@ mod test_utils {
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
                 ta_entry_point: Cell::new(0),
+                ta_exec_regions: RefCell::new(Vec::new()),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ta_entry_point_tests {
+    use super::*;
+
+    /// A untrusted `ldelf` can report any address as the TA entry point.
+    /// The shim must reject an entry point that does not fall inside an
+    /// executable region it actually mapped for the TA; otherwise it would steer
+    /// privileged execution (and any relative trampoline placement) into an
+    /// attacker-chosen page rather than the real, signed TA image.
+    #[test]
+    fn rejects_entry_point_outside_ta_executable_image() {
+        let task = crate::syscalls::tests::init_platform();
+
+        // Map a readable+writable but NON-executable anonymous page, modelling a TA
+        // data page / stack that is not part of the TA's executable code image.
+        let addr = task
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .unwrap()
+            .as_usize();
+
+        // `ldelf` reports this readable address as the TA entry point.
+        task.set_ta_entry_point(addr);
+
+        // It must be rejected: only addresses within an executable region the shim
+        // recorded for the TA are acceptable.
+        assert_eq!(task.get_ta_entry_point(), 0);
     }
 }

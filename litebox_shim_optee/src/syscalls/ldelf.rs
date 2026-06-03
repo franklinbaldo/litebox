@@ -250,17 +250,21 @@ impl Task {
         } else if flags.contains(LdelfMapFlags::LDELF_MAP_FLAG_EXECUTABLE) {
             prot |= ProtFlags::PROT_EXEC;
         }
+        let region_start = align_down(padded_start, PAGE_SIZE);
+        let region_len = (num_bytes + padded_start - region_start).next_multiple_of(PAGE_SIZE);
+        let region_is_executable = prot.contains(ProtFlags::PROT_EXEC);
         if self
-            .sys_mprotect(
-                UserMutPtr::from_usize(align_down(padded_start, PAGE_SIZE)),
-                (num_bytes + padded_start - align_down(padded_start, PAGE_SIZE))
-                    .next_multiple_of(PAGE_SIZE),
-                prot,
-            )
+            .sys_mprotect(UserMutPtr::from_usize(region_start), region_len, prot)
             .is_err()
         {
             let _ = self.sys_munmap(addr, total_size).ok();
             return Err(TeeResult::AccessDenied);
+        }
+
+        // Record the executable region so the (untrusted) TA entry point reported by
+        // `ldelf` can be validated against the code the shim actually mapped.
+        if region_is_executable {
+            self.record_ta_exec_region(region_start..region_start.saturating_add(region_len));
         }
 
         // Unmap the padding regions to free physical memory.
