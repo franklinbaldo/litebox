@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -321,6 +321,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
+            default_hard_error_mode: AtomicU32::new(0),
+            cookie: syscalls::process::default_process_cookie(),
+            scheduler_shared_data: AtomicUsize::new(0),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
         Ok(LoadedProgram {
@@ -362,6 +365,9 @@ pub struct Process<Platform: ShimPlatform> {
     system_lcid: AtomicU32,
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
+    default_hard_error_mode: AtomicU32,
+    cookie: u32,
+    scheduler_shared_data: AtomicUsize,
     exit_code: AtomicI32,
 }
 
@@ -656,6 +662,36 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     system_information,
                     system_information_length,
                     return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+            } => {
+                let status = self.sys_nt_set_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
                 );
                 (status, ContinueOperation::Resume)
             }

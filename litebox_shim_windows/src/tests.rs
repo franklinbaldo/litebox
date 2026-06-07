@@ -6,7 +6,7 @@ extern crate std;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize};
 use litebox::LiteBox;
 use litebox::fd::RawDescriptorStorage;
 use litebox::fs::{FileSystem as _, Mode, OFlags};
@@ -128,6 +128,9 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             system_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
+            default_hard_error_mode: AtomicU32::new(0),
+            cookie: crate::syscalls::process::default_process_cookie(),
+            scheduler_shared_data: AtomicUsize::new(0),
             exit_code: AtomicI32::new(0),
         }),
         fs,
