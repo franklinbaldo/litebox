@@ -276,9 +276,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if allocation.type_ != MemoryType::MEM_PRIVATE.bits() {
             return NtStatus::INVALID_PARAMETER;
         }
-        if allocation_first_protect_if_fully_committed(&allocation, aligned_base, aligned_len)
-            .is_none()
-        {
+        if !matches!(
+            scan_allocation_pages(&allocation, aligned_base, aligned_len),
+            Some(PageRangeScan::FullyCommitted(_))
+        ) {
             return NtStatus::CONFLICTING_ADDRESSES;
         }
 
@@ -441,12 +442,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some((new_protect, new_permissions)) = parse_page_protection(new_protect) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
-        let Some(old_protect_value) = first_protect_if_fully_committed(
+        let old_protect_value = match scan_protect_range(
             &self.process.virtual_allocations,
             aligned_base,
             aligned_len,
-        ) else {
-            return NtStatus::NOT_COMMITTED;
+        ) {
+            Some(PageRangeScan::FullyCommitted(first_protect)) => first_protect,
+            Some(PageRangeScan::ContainsUncommitted) => {
+                if old_protect
+                    .write_at_offset(0, PageProtection::PAGE_NOACCESS.bits())
+                    .is_none()
+                {
+                    return NtStatus::ACCESS_VIOLATION;
+                }
+                return NtStatus::NOT_COMMITTED;
+            }
+            None => return NtStatus::NOT_COMMITTED,
         };
 
         if update_permissions(
@@ -637,37 +648,47 @@ fn find_virtual_allocation_containing<Platform: ShimPlatform>(
     find_virtual_allocation(virtual_allocations, base, 1)
 }
 
-/// Returns the first page protection only if the whole range is committed.
-fn first_protect_if_fully_committed<Platform: ShimPlatform>(
-    virtual_allocations: &WindowsVirtualAllocations<Platform>,
-    base: usize,
-    size: usize,
-) -> Option<PageProtection> {
-    let allocation = find_virtual_allocation(virtual_allocations, base, size)?;
-    allocation_first_protect_if_fully_committed(&allocation, base, size)
+enum PageRangeScan {
+    FullyCommitted(PageProtection),
+    ContainsUncommitted,
 }
 
-/// Walks committed page metadata to reject ranges with reserved or decommitted holes.
-fn allocation_first_protect_if_fully_committed(
+fn scan_allocation_pages(
     allocation: &WindowsVirtualAllocation,
     base: usize,
     size: usize,
-) -> Option<PageProtection> {
+) -> Option<PageRangeScan> {
     let end = base.checked_add(size)?;
+    let allocation_end = allocation.base.checked_add(allocation.size)?;
+    let scan_end = end.min(allocation_end);
     let mut first_protect = None;
     let mut cursor = base;
-    for (range, protect) in allocation.pages.overlapping(base..end) {
+    for (range, protect) in allocation.pages.overlapping(base..scan_end) {
         let range_start = range.start.max(base);
         if cursor < range_start {
-            return None;
+            return Some(PageRangeScan::ContainsUncommitted);
         }
         first_protect.get_or_insert(*protect);
-        cursor = cursor.max(range.end.min(end));
+        cursor = cursor.max(range.end.min(scan_end));
         if cursor == end {
             break;
         }
     }
-    (cursor == end).then_some(first_protect?)
+
+    if cursor == end {
+        Some(PageRangeScan::FullyCommitted(first_protect?))
+    } else {
+        Some(PageRangeScan::ContainsUncommitted)
+    }
+}
+
+fn scan_protect_range<Platform: ShimPlatform>(
+    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+    base: usize,
+    size: usize,
+) -> Option<PageRangeScan> {
+    let allocation = find_virtual_allocation_containing(virtual_allocations, base)?;
+    scan_allocation_pages(&allocation, base, size)
 }
 
 fn set_committed_pages_protect<Platform: ShimPlatform>(
@@ -1483,7 +1504,7 @@ mod tests {
                 ),
                 NtStatus::NOT_COMMITTED
             );
-            assert_eq!(old_protect, u32::MAX);
+            assert_eq!(old_protect, PageProtection::PAGE_NOACCESS.bits());
 
             for invalid_protect in [
                 PageProtection::PAGE_NOACCESS | PageProtection::PAGE_GUARD,
@@ -1560,7 +1581,7 @@ mod tests {
                 ),
                 NtStatus::NOT_COMMITTED
             );
-            assert_eq!(old_protect, u32::MAX);
+            assert_eq!(old_protect, PageProtection::PAGE_NOACCESS.bits());
             assert_eq!(
                 query_basic_information(&task, base).protect,
                 PageProtection::PAGE_READWRITE.bits()
@@ -2059,6 +2080,254 @@ mod tests {
                 assert_eq!(guest_old_protect, host_old_protect);
                 assert_eq!(guest_protect_base, guest_base);
                 assert_eq!(guest_protect_size, host_protect_size);
+
+                release_allocation(&task, guest_base);
+
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
+            });
+        }
+
+        #[test]
+        fn protect_virtual_memory_mixed_committed_protections_match_host_ntdll() {
+            run_with_test_platform_pointers(|| {
+                let mut host_base = core::ptr::null_mut::<c_void>();
+                let mut host_region_size = PAGE_SIZE * 2;
+                // SAFETY: The output pointers are valid local variables and the pseudo process
+                // handle targets the current process. The allocation is released before return.
+                let host_allocate_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        0,
+                        &raw mut host_region_size,
+                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ))
+                };
+                assert_eq!(host_allocate_status, NtStatus::SUCCESS);
+
+                let mut host_second_page_base = host_base.wrapping_byte_add(PAGE_SIZE);
+                let mut host_second_page_size = PAGE_SIZE;
+                let mut host_second_old_protect = 0u32;
+                // SAFETY: The host allocation above covers the requested second page; output
+                // pointers are valid locals and ntdll does not retain them.
+                let host_second_protect_status = unsafe {
+                    host_status(NtProtectVirtualMemory(
+                        current_process(),
+                        &raw mut host_second_page_base,
+                        &raw mut host_second_page_size,
+                        PageProtection::PAGE_READONLY.bits(),
+                        &raw mut host_second_old_protect,
+                    ))
+                };
+                assert_eq!(host_second_protect_status, NtStatus::SUCCESS);
+
+                let task = crate::tests::test_task();
+                let (guest_base, _) = allocate_committed_rw(&task, PAGE_SIZE * 2);
+                let mut guest_second_page_base = guest_base + PAGE_SIZE;
+                let mut guest_second_page_size = PAGE_SIZE;
+                let mut guest_second_old_protect = 0u32;
+                let guest_second_protect_status = task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_second_page_base),
+                    mut_ptr(&mut guest_second_page_size),
+                    PageProtection::PAGE_READONLY.bits(),
+                    mut_ptr(&mut guest_second_old_protect),
+                );
+                assert_eq!(guest_second_protect_status, host_second_protect_status);
+                assert_eq!(guest_second_old_protect, host_second_old_protect);
+                assert_eq!(
+                    guest_second_page_base - guest_base,
+                    host_second_page_base as usize - host_base as usize
+                );
+                assert_eq!(guest_second_page_size, host_second_page_size);
+
+                let mut host_mixed_base = host_base;
+                let mut host_mixed_size = PAGE_SIZE * 2;
+                let mut host_mixed_old_protect = 0u32;
+                // SAFETY: The host range is fully committed with mixed protections; output
+                // pointers are valid locals and ntdll does not retain them.
+                let host_mixed_protect_status = unsafe {
+                    host_status(NtProtectVirtualMemory(
+                        current_process(),
+                        &raw mut host_mixed_base,
+                        &raw mut host_mixed_size,
+                        PageProtection::PAGE_EXECUTE_READ.bits(),
+                        &raw mut host_mixed_old_protect,
+                    ))
+                };
+
+                let mut guest_mixed_base = guest_base;
+                let mut guest_mixed_size = PAGE_SIZE * 2;
+                let mut guest_mixed_old_protect = 0u32;
+                let guest_mixed_protect_status = task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_mixed_base),
+                    mut_ptr(&mut guest_mixed_size),
+                    PageProtection::PAGE_EXECUTE_READ.bits(),
+                    mut_ptr(&mut guest_mixed_old_protect),
+                );
+                assert_eq!(guest_mixed_protect_status, host_mixed_protect_status);
+                assert_eq!(guest_mixed_old_protect, host_mixed_old_protect);
+                assert_eq!(guest_mixed_base, guest_base);
+                assert_eq!(host_mixed_base, host_base);
+                assert_eq!(guest_mixed_size, host_mixed_size);
+
+                release_allocation(&task, guest_base);
+
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
+            });
+        }
+
+        #[test]
+        fn protect_virtual_memory_uncommitted_ranges_match_host_ntdll() {
+            run_with_test_platform_pointers(|| {
+                let mut host_base = core::ptr::null_mut::<c_void>();
+                let mut host_region_size = PAGE_SIZE * 2;
+                // SAFETY: The output pointers are valid locals and the current-process pseudo
+                // handle targets this process. The allocation is released before return.
+                let host_reserve_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        0,
+                        &raw mut host_region_size,
+                        AllocationType::MEM_RESERVE.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ))
+                };
+                assert_eq!(host_reserve_status, NtStatus::SUCCESS);
+
+                let task = crate::tests::test_task();
+                let mut guest_base = 0usize;
+                let mut guest_region_size = PAGE_SIZE * 2;
+                assert_eq!(
+                    task.sys_nt_allocate_virtual_memory(
+                        ProcessHandle::CURRENT,
+                        mut_ptr(&mut guest_base),
+                        0,
+                        mut_ptr(&mut guest_region_size),
+                        AllocationType::MEM_RESERVE.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ),
+                    host_reserve_status
+                );
+
+                let mut host_protect_base = host_base;
+                let mut host_protect_size = PAGE_SIZE;
+                let mut host_old_protect = u32::MAX;
+                // SAFETY: The host range is reserved but uncommitted; output pointers are valid
+                // locals and ntdll does not retain them.
+                let host_reserved_protect_status = unsafe {
+                    host_status(NtProtectVirtualMemory(
+                        current_process(),
+                        &raw mut host_protect_base,
+                        &raw mut host_protect_size,
+                        PageProtection::PAGE_READONLY.bits(),
+                        &raw mut host_old_protect,
+                    ))
+                };
+
+                let mut guest_protect_base = guest_base;
+                let mut guest_protect_size = PAGE_SIZE;
+                let mut guest_old_protect = u32::MAX;
+                let guest_reserved_protect_status = task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_protect_base),
+                    mut_ptr(&mut guest_protect_size),
+                    PageProtection::PAGE_READONLY.bits(),
+                    mut_ptr(&mut guest_old_protect),
+                );
+                assert_eq!(guest_reserved_protect_status, host_reserved_protect_status);
+                assert_eq!(
+                    guest_protect_base - guest_base,
+                    host_protect_base as usize - host_base as usize
+                );
+                assert_eq!(guest_protect_size, host_protect_size);
+                assert_eq!(guest_old_protect, host_old_protect);
+
+                let mut host_commit_base = host_base;
+                let mut host_commit_size = PAGE_SIZE;
+                // SAFETY: Commits the first page inside the live host reservation; output pointers
+                // are valid locals and the reservation is released before return.
+                let host_commit_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut host_commit_base,
+                        0,
+                        &raw mut host_commit_size,
+                        AllocationType::MEM_COMMIT.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ))
+                };
+                assert_eq!(host_commit_status, NtStatus::SUCCESS);
+
+                let mut guest_commit_base = guest_base;
+                let mut guest_commit_size = PAGE_SIZE;
+                assert_eq!(
+                    task.sys_nt_allocate_virtual_memory(
+                        ProcessHandle::CURRENT,
+                        mut_ptr(&mut guest_commit_base),
+                        0,
+                        mut_ptr(&mut guest_commit_size),
+                        AllocationType::MEM_COMMIT.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ),
+                    host_commit_status
+                );
+
+                let mut host_mixed_protect_base = host_base;
+                let mut host_mixed_protect_size = PAGE_SIZE * 2;
+                let mut host_mixed_old_protect = u32::MAX;
+                // SAFETY: The host range spans one committed page and one reserved page; output
+                // pointers are valid locals and ntdll does not retain them.
+                let host_mixed_protect_status = unsafe {
+                    host_status(NtProtectVirtualMemory(
+                        current_process(),
+                        &raw mut host_mixed_protect_base,
+                        &raw mut host_mixed_protect_size,
+                        PageProtection::PAGE_READONLY.bits(),
+                        &raw mut host_mixed_old_protect,
+                    ))
+                };
+
+                let mut guest_mixed_protect_base = guest_base;
+                let mut guest_mixed_protect_size = PAGE_SIZE * 2;
+                let mut guest_mixed_old_protect = u32::MAX;
+                let guest_mixed_protect_status = task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_mixed_protect_base),
+                    mut_ptr(&mut guest_mixed_protect_size),
+                    PageProtection::PAGE_READONLY.bits(),
+                    mut_ptr(&mut guest_mixed_old_protect),
+                );
+                assert_eq!(guest_mixed_protect_status, host_mixed_protect_status);
+                assert_eq!(
+                    guest_mixed_protect_base - guest_base,
+                    host_mixed_protect_base as usize - host_base as usize
+                );
+                assert_eq!(guest_mixed_protect_size, host_mixed_protect_size);
+                assert_eq!(guest_mixed_old_protect, host_mixed_old_protect);
 
                 release_allocation(&task, guest_base);
 
