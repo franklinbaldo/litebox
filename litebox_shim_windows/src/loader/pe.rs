@@ -142,10 +142,12 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
                 .ok_or(PeImageAccessError::MemoryAccess)?;
         }
 
+        let ntdll_mapping = ntdll.map(|ntdll| ntdll.image.mapping);
+
         Ok(PeLoadInfo {
             entry_point,
             stack_top,
-            ntdll_mapping: ntdll.map(|ntdll| ntdll.image.mapping),
+            ntdll_mapping,
             environment,
         })
     }
@@ -200,6 +202,8 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
             let aligned_length = size.next_multiple_of(PAGE_SIZE);
             let length =
                 NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
+            // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
+            // selection to the page manager, so this cannot replace an existing mapping.
             let ptr = unsafe {
                 self.page_manager.create_writable_pages(
                     None,
@@ -208,8 +212,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
                     |_| Ok(0),
                 )
             }?;
-            let base = ptr.as_usize();
-            Ok(base)
+            Ok(ptr.as_usize())
         };
         let teb_ptr = create_pages(core::mem::size_of::<ThreadEnvironmentBlock>())?;
         let peb_ptr = create_pages(core::mem::size_of::<ProcessEnvironmentBlock>())?;
