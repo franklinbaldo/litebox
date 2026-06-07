@@ -88,7 +88,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct MemoryType: u32 {
+    pub(crate) struct MemoryType: u32 {
         const MEM_PRIVATE = 0x20000;
         const MEM_MAPPED = 0x40000;
         const MEM_IMAGE = 0x1000000;
@@ -476,6 +476,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
+
+        litebox_util_log::debug!(
+            process_handle:? = process_handle,
+            base:% = format_args!("{:#x}", base),
+            size = size,
+            aligned_base:% = format_args!("{:#x}", aligned_base),
+            aligned_len = aligned_len,
+            new_protect:% = format_args!("{:#x}", new_protect),
+            old_protect:% = format_args!("{:#x}", old_protect_value);
+            "Handled NtProtectVirtualMemory syscall"
+        );
 
         NtStatus::SUCCESS
     }
@@ -1061,7 +1072,7 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
     let mut mappings = page_manager.mappings();
     mappings.sort_by_key(|(range, _)| range.start);
     if let Some(allocation) = find_virtual_allocation_containing(virtual_allocations, query_base) {
-        return query_private_allocation_basic_information(allocation, query_base);
+        return query_allocation_basic_information(allocation, query_base);
     }
 
     if let Some((range, flags)) = mappings
@@ -1102,7 +1113,7 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
     })
 }
 
-fn query_private_allocation_basic_information(
+fn query_allocation_basic_information(
     allocation: WindowsVirtualAllocation,
     query_base: usize,
 ) -> Option<MemoryBasicInformation> {

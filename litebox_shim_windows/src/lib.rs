@@ -310,10 +310,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
-            // TODO: Track loader-created images, stack, PEB/TEB, and process parameters once VM
-            // metadata can distinguish queryable loader-owned mappings from guest-releasable
-            // allocations.
-            virtual_allocations: WindowsVirtualAllocations::<Platform>::new(BTreeMap::new()),
+            // TODO: Register stack, PEB/TEB, and process parameters once VM metadata can
+            // distinguish those loader-owned mappings from guest-releasable allocations.
+            virtual_allocations: load_info.virtual_allocations,
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
