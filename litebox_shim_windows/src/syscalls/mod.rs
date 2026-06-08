@@ -121,6 +121,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         io_status_information: usize,
         already_signaled: Option<Platform::RawMutPointer<u8>>,
     },
+    NtCancelWaitCompletionPacket {
+        wait_completion_packet_handle: Handle,
+        remove_signaled_packet: u8,
+    },
     NtCreateTimer2 {
         timer_handle: Platform::RawMutPointer<Handle>,
         timer_id: Option<Platform::RawConstPointer<u32>>,
@@ -391,6 +395,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     already_signaled:*,
                 }))
             }
+            NtSysno::NtCancelWaitCompletionPacket => Some(sys_req!(NtCancelWaitCompletionPacket {
+                wait_completion_packet_handle: { Handle::from_raw },
+                remove_signaled_packet,
+            })),
             NtSysno::NtCreateTimer2 => Some(sys_req!(NtCreateTimer2 {
                 timer_handle:*,
                 timer_id:*,

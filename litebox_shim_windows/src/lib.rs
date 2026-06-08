@@ -39,8 +39,9 @@ use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::wait_completion_packet::{
-    WaitCompletionPacketAssociateParameters, WaitCompletionPacketCreateParameters,
-    WaitCompletionPacketHandleObject, WaitCompletionPacketSubsystem,
+    WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
+    WaitCompletionPacketCreateParameters, WaitCompletionPacketHandleObject,
+    WaitCompletionPacketSubsystem,
 };
 use crate::syscalls::worker_factory::{
     WorkerFactoryCreateParameters, WorkerFactoryHandleObject,
@@ -502,6 +503,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         io_status,
                         io_status_information,
                         already_signaled,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCancelWaitCompletionPacket {
+                wait_completion_packet_handle,
+                remove_signaled_packet,
+            } => {
+                let status = self.sys_nt_cancel_wait_completion_packet(
+                    WaitCompletionPacketCancelParameters {
+                        wait_completion_packet_handle,
+                        remove_signaled_packet,
                     },
                 );
                 (status, ContinueOperation::Resume)

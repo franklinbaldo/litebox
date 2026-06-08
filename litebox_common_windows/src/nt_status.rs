@@ -87,6 +87,7 @@ impl NtStatus {
                 "STATUS_WAIT_3: Caller specified WaitAny and one of the dispatcher objects was set"
             }
             0x00000102 => "STATUS_TIMEOUT: The given timeout interval expired",
+            0x00000103 => "STATUS_PENDING: The operation is pending",
             0x00010001 => "DBG_EXCEPTION_HANDLED: Exception handled by debugger",
             0x00010002 => "DBG_CONTINUE: Continue from exception",
             0x40000000 => "STATUS_OBJECT_NAME_EXISTS: The object name already exists",
@@ -189,6 +190,7 @@ impl NtStatus {
             0xC0000109 => "STATUS_MESSAGE_NOT_FOUND: Message not found",
             0xC000010A => "STATUS_PROCESS_IS_TERMINATING: Process is terminating",
             0xC000010D => "STATUS_CANNOT_IMPERSONATE: Cannot impersonate",
+            0xC0000120 => "STATUS_CANCELLED: The operation was cancelled",
             0xC0000121 => "STATUS_CANNOT_DELETE: Cannot delete",
             0xC0000128 => "STATUS_FILE_CLOSED: File closed",
             0xC0000142 => "STATUS_DLL_INIT_FAILED: DLL initialization failed",
@@ -224,6 +226,9 @@ impl NtStatus {
 
     /// STATUS_TIMEOUT
     pub const TIMEOUT: Self = Self::from_raw(0x00000102);
+
+    /// STATUS_PENDING
+    pub const PENDING: Self = Self::from_raw(0x00000103);
 
     /// DBG_EXCEPTION_HANDLED
     pub const EXCEPTION_HANDLED: Self = Self::from_raw(0x00010001);
@@ -497,6 +502,9 @@ impl NtStatus {
 
     /// STATUS_INVALID_PARAMETER_4
     pub const INVALID_PARAMETER_4: Self = Self::from_raw(0xC00000F2);
+
+    /// STATUS_CANCELLED
+    pub const CANCELLED: Self = Self::from_raw(0xC0000120);
 
     /// STATUS_STACK_OVERFLOW
     pub const STACK_OVERFLOW: Self = Self::from_raw(0xC00000FD);

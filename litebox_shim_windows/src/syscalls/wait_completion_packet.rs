@@ -99,7 +99,7 @@ struct WaitCompletionPacketAssociation {
     _apc_context: usize,
     _io_status: i32,
     _io_status_information: usize,
-    _already_signaled: bool,
+    already_signaled: bool,
 }
 
 pub(crate) struct WaitCompletionPacketCreateParameters<Platform: RawPointerProvider> {
@@ -117,6 +117,11 @@ pub(crate) struct WaitCompletionPacketAssociateParameters<Platform: RawPointerPr
     pub(crate) io_status: i32,
     pub(crate) io_status_information: usize,
     pub(crate) already_signaled: Option<MutPtr<Platform, u8>>,
+}
+
+pub(crate) struct WaitCompletionPacketCancelParameters {
+    pub(crate) wait_completion_packet_handle: Handle,
+    pub(crate) remove_signaled_packet: u8,
 }
 
 fn validate_wait_completion_packet_object_attributes<Platform: RawPointerProvider>(
@@ -155,6 +160,29 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .descriptor_table()
             .entry_handle(&typed)
             .ok_or(NtStatus::OBJECT_TYPE_MISMATCH)
+    }
+
+    fn wait_completion_packet_entry_for_cancel(
+        &self,
+        handle: Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, WaitCompletionPacketSubsystem<Platform>>, NtStatus>
+    {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return Err(NtStatus::INVALID_HANDLE);
+        };
+        let typed = {
+            let handles = self.process.handles.read();
+            match handles.fd_from_raw_integer::<WaitCompletionPacketSubsystem<Platform>>(raw_fd) {
+                Ok(typed) => typed,
+                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
+                Err(ErrRawIntFd::InvalidSubsystem) => return Err(NtStatus::OBJECT_TYPE_MISMATCH),
+            }
+        };
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(NtStatus::INVALID_HANDLE)
     }
 
     fn validate_io_completion_for_wait_completion_packet(
@@ -318,12 +346,44 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _apc_context: params.apc_context,
             _io_status: params.io_status,
             _io_status_information: params.io_status_information,
-            _already_signaled: already_signaled,
+            already_signaled,
         });
 
         if let Some(already_signaled_ptr) = params.already_signaled {
             let _ = already_signaled_ptr.write_at_offset(0, u8::from(already_signaled));
         }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_cancel_wait_completion_packet(
+        &self,
+        params: WaitCompletionPacketCancelParameters,
+    ) -> NtStatus {
+        let entry = match self
+            .wait_completion_packet_entry_for_cancel(params.wait_completion_packet_handle)
+        {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let packet = match entry.with_entry(|entry| {
+            entry
+                .granted_access
+                .require(WaitCompletionPacketAccess::SET_STATE)
+                .map(|()| Arc::clone(&entry.packet))
+        }) {
+            Ok(packet) => packet,
+            Err(status) => return status,
+        };
+
+        let mut association = packet.association.lock();
+        let Some(current_association) = *association else {
+            return NtStatus::CANCELLED;
+        };
+        if current_association.already_signaled && params.remove_signaled_packet == 0 {
+            return NtStatus::PENDING;
+        }
+
+        *association = None;
         NtStatus::SUCCESS
     }
 }
@@ -419,6 +479,17 @@ mod tests {
             io_status: NtStatus::SUCCESS.as_raw(),
             io_status_information: 0x3333,
             already_signaled,
+        })
+    }
+
+    fn cancel_wait_completion_packet(
+        task: &Task<TestPlatform, crate::tests::TestFS>,
+        packet: Handle,
+        remove_signaled_packet: bool,
+    ) -> NtStatus {
+        task.sys_nt_cancel_wait_completion_packet(WaitCompletionPacketCancelParameters {
+            wait_completion_packet_handle: packet,
+            remove_signaled_packet: u8::from(remove_signaled_packet),
         })
     }
 
@@ -792,6 +863,477 @@ mod tests {
             NtStatus::INVALID_PARAMETER_3
         );
         assert_eq!(already_signaled, 0xaa);
+    }
+
+    #[test]
+    fn cancel_clears_unsignaled_association_and_allows_reuse() {
+        let task = test_task();
+        let mut packet = Handle::default();
+        let mut io_completion = Handle::default();
+        let mut event = Handle::default();
+        let mut already_signaled = 0xaa;
+
+        assert_eq!(
+            create_wait_completion_packet(&task, &mut packet, None),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_io_completion(&task, &mut io_completion, IO_COMPLETION_ALL_ACCESS),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_event(&task, &mut event, EVENT_ALL_ACCESS, false),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                packet,
+                io_completion,
+                event,
+                Some(mut_ptr(&mut already_signaled)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            cancel_wait_completion_packet(&task, packet, false),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            cancel_wait_completion_packet(&task, packet, false),
+            NtStatus::CANCELLED
+        );
+
+        already_signaled = 0xaa;
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                packet,
+                io_completion,
+                event,
+                Some(mut_ptr(&mut already_signaled)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(already_signaled, 0);
+    }
+
+    #[test]
+    fn cancel_signaled_packet_obeys_remove_signaled_packet() {
+        let task = test_task();
+        let mut packet = Handle::default();
+        let mut io_completion = Handle::default();
+        let mut event = Handle::default();
+        let mut already_signaled = 0xaa;
+
+        assert_eq!(
+            create_wait_completion_packet(&task, &mut packet, None),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_io_completion(&task, &mut io_completion, IO_COMPLETION_ALL_ACCESS),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_event(&task, &mut event, EVENT_ALL_ACCESS, true),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                packet,
+                io_completion,
+                event,
+                Some(mut_ptr(&mut already_signaled)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(already_signaled, 1);
+
+        assert_eq!(
+            cancel_wait_completion_packet(&task, packet, false),
+            NtStatus::PENDING
+        );
+        already_signaled = 0xaa;
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                packet,
+                io_completion,
+                event,
+                Some(mut_ptr(&mut already_signaled)),
+            ),
+            NtStatus::INVALID_PARAMETER_1
+        );
+        assert_eq!(already_signaled, 0xaa);
+
+        assert_eq!(
+            cancel_wait_completion_packet(&task, packet, true),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            cancel_wait_completion_packet(&task, packet, true),
+            NtStatus::CANCELLED
+        );
+    }
+
+    #[test]
+    fn cancel_distinguishes_handle_errors_and_requires_set_state() {
+        let task = test_task();
+        let mut event = Handle::default();
+        let mut packet_without_set_state = Handle::default();
+
+        assert_eq!(
+            create_event(&task, &mut event, EVENT_ALL_ACCESS, false),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_wait_completion_packet_with_access(&task, &mut packet_without_set_state, 0),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(
+            cancel_wait_completion_packet(&task, Handle::default(), false),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            cancel_wait_completion_packet(&task, Handle::from_raw(0x1234), true),
+            NtStatus::INVALID_HANDLE
+        );
+        assert_eq!(
+            cancel_wait_completion_packet(&task, event, false),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+        assert_eq!(
+            cancel_wait_completion_packet(&task, packet_without_set_state, false),
+            NtStatus::ACCESS_DENIED
+        );
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn host_cancel_wait_completion_packet_status_fidelity() {
+        use core::ffi::c_void;
+
+        unsafe extern "system" {
+            fn NtCreateWaitCompletionPacket(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+            ) -> i32;
+            fn NtCancelWaitCompletionPacket(handle: *mut c_void, remove_signaled_packet: u8)
+            -> i32;
+            fn NtAssociateWaitCompletionPacket(
+                packet: *mut c_void,
+                io_completion: *mut c_void,
+                target: *mut c_void,
+                key_context: *mut c_void,
+                apc_context: *mut c_void,
+                io_status: i32,
+                io_status_information: usize,
+                already_signaled: *mut u8,
+            ) -> i32;
+            fn NtCreateIoCompletion(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const ObjectAttributes,
+                number_of_concurrent_threads: u32,
+            ) -> i32;
+            fn NtCreateEvent(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const c_void,
+                event_type: u32,
+                initial_state: u8,
+            ) -> i32;
+            fn NtClose(handle: *mut c_void) -> i32;
+        }
+
+        unsafe fn close_host(handle: *mut c_void) {
+            if !handle.is_null() {
+                // SAFETY: The caller passes a live host handle returned by an NtCreate* call.
+                assert_eq!(unsafe { NtClose(handle) }, NtStatus::SUCCESS.as_raw());
+            }
+        }
+
+        let task = test_task();
+
+        // SAFETY: The null handle is an input-only value and no memory is dereferenced.
+        let host_null = unsafe { NtCancelWaitCompletionPacket(core::ptr::null_mut(), 0) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, Handle::default(), false).as_raw(),
+            host_null
+        );
+
+        let mut host_event = core::ptr::null_mut();
+        // SAFETY: The output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateEvent(
+                    &raw mut host_event,
+                    EVENT_ALL_ACCESS,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        let mut shim_event = Handle::default();
+        assert_eq!(
+            create_event(&task, &mut shim_event, EVENT_ALL_ACCESS, false),
+            NtStatus::SUCCESS
+        );
+        // SAFETY: The host event handle is valid for the duration of this call.
+        let host_wrong_type = unsafe { NtCancelWaitCompletionPacket(host_event, 0) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, shim_event, false).as_raw(),
+            host_wrong_type
+        );
+        // SAFETY: The event handle was returned by NtCreateEvent in this test.
+        unsafe { close_host(host_event) };
+
+        let mut host_packet = core::ptr::null_mut();
+        // SAFETY: The output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateWaitCompletionPacket(
+                    &raw mut host_packet,
+                    WAIT_COMPLETION_PACKET_ALL_ACCESS,
+                    core::ptr::null(),
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        let mut shim_packet = Handle::default();
+        assert_eq!(
+            create_wait_completion_packet(&task, &mut shim_packet, None),
+            NtStatus::SUCCESS
+        );
+        // SAFETY: The host packet handle is valid for the duration of this call.
+        let host_unassociated = unsafe { NtCancelWaitCompletionPacket(host_packet, 0) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, shim_packet, false).as_raw(),
+            host_unassociated
+        );
+        // SAFETY: The packet handle was returned by NtCreateWaitCompletionPacket in this test.
+        unsafe { close_host(host_packet) };
+
+        let mut host_packet_no_set = core::ptr::null_mut();
+        // SAFETY: The output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateWaitCompletionPacket(&raw mut host_packet_no_set, 0, core::ptr::null())
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        let mut shim_packet_no_set = Handle::default();
+        assert_eq!(
+            create_wait_completion_packet_with_access(&task, &mut shim_packet_no_set, 0),
+            NtStatus::SUCCESS
+        );
+        // SAFETY: The host packet handle is valid for the duration of this call.
+        let host_no_set = unsafe { NtCancelWaitCompletionPacket(host_packet_no_set, 0) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, shim_packet_no_set, false).as_raw(),
+            host_no_set
+        );
+        // SAFETY: The packet handle was returned by NtCreateWaitCompletionPacket in this test.
+        unsafe { close_host(host_packet_no_set) };
+
+        let mut host_iocp = core::ptr::null_mut();
+        let mut host_assoc_packet = core::ptr::null_mut();
+        let mut host_target = core::ptr::null_mut();
+        // SAFETY: Output pointers are valid and successful handles are closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateIoCompletion(
+                    &raw mut host_iocp,
+                    IO_COMPLETION_ALL_ACCESS,
+                    core::ptr::null(),
+                    0,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        // SAFETY: Output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateWaitCompletionPacket(
+                    &raw mut host_assoc_packet,
+                    WAIT_COMPLETION_PACKET_ALL_ACCESS,
+                    core::ptr::null(),
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        // SAFETY: Output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateEvent(
+                    &raw mut host_target,
+                    EVENT_ALL_ACCESS,
+                    core::ptr::null(),
+                    0,
+                    0,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        let mut host_already_signaled = 0xaa;
+        // SAFETY: All handles are valid and the output byte points to local storage.
+        assert_eq!(
+            unsafe {
+                NtAssociateWaitCompletionPacket(
+                    host_assoc_packet,
+                    host_iocp,
+                    host_target,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                    &raw mut host_already_signaled,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        let mut shim_iocp = Handle::default();
+        let mut shim_assoc_packet = Handle::default();
+        let mut shim_target = Handle::default();
+        let mut shim_already_signaled = 0xaa;
+        assert_eq!(
+            create_io_completion(&task, &mut shim_iocp, IO_COMPLETION_ALL_ACCESS),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_wait_completion_packet(&task, &mut shim_assoc_packet, None),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_event(&task, &mut shim_target, EVENT_ALL_ACCESS, false),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                shim_assoc_packet,
+                shim_iocp,
+                shim_target,
+                Some(mut_ptr(&mut shim_already_signaled)),
+            ),
+            NtStatus::SUCCESS
+        );
+        // SAFETY: The host packet handle is valid for the duration of this call.
+        let host_cancel_unsignaled = unsafe { NtCancelWaitCompletionPacket(host_assoc_packet, 0) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, shim_assoc_packet, false).as_raw(),
+            host_cancel_unsignaled
+        );
+        // SAFETY: Handles were returned by NtCreate* calls in this test.
+        unsafe {
+            close_host(host_target);
+            close_host(host_assoc_packet);
+            close_host(host_iocp);
+        }
+
+        let mut host_iocp = core::ptr::null_mut();
+        let mut host_signaled_packet = core::ptr::null_mut();
+        let mut host_signaled_event = core::ptr::null_mut();
+        // SAFETY: Output pointers are valid and successful handles are closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateIoCompletion(
+                    &raw mut host_iocp,
+                    IO_COMPLETION_ALL_ACCESS,
+                    core::ptr::null(),
+                    0,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        // SAFETY: Output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateWaitCompletionPacket(
+                    &raw mut host_signaled_packet,
+                    WAIT_COMPLETION_PACKET_ALL_ACCESS,
+                    core::ptr::null(),
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        // SAFETY: Output pointer is valid and the returned handle is closed below.
+        assert_eq!(
+            unsafe {
+                NtCreateEvent(
+                    &raw mut host_signaled_event,
+                    EVENT_ALL_ACCESS,
+                    core::ptr::null(),
+                    0,
+                    1,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        host_already_signaled = 0xaa;
+        // SAFETY: All handles are valid and the output byte points to local storage.
+        assert_eq!(
+            unsafe {
+                NtAssociateWaitCompletionPacket(
+                    host_signaled_packet,
+                    host_iocp,
+                    host_signaled_event,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    0,
+                    0,
+                    &raw mut host_already_signaled,
+                )
+            },
+            NtStatus::SUCCESS.as_raw()
+        );
+        let mut shim_signaled_packet = Handle::default();
+        let mut shim_signaled_event = Handle::default();
+        shim_already_signaled = 0xaa;
+        assert_eq!(
+            create_wait_completion_packet(&task, &mut shim_signaled_packet, None),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_event(&task, &mut shim_signaled_event, EVENT_ALL_ACCESS, true),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                shim_signaled_packet,
+                shim_iocp,
+                shim_signaled_event,
+                Some(mut_ptr(&mut shim_already_signaled)),
+            ),
+            NtStatus::SUCCESS
+        );
+        // SAFETY: The host packet handle is valid for the duration of these calls.
+        let host_cancel_signaled_pending =
+            unsafe { NtCancelWaitCompletionPacket(host_signaled_packet, 0) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, shim_signaled_packet, false).as_raw(),
+            host_cancel_signaled_pending
+        );
+        // SAFETY: The host packet handle is valid for the duration of this call.
+        let host_cancel_signaled_remove =
+            unsafe { NtCancelWaitCompletionPacket(host_signaled_packet, 1) };
+        assert_eq!(
+            cancel_wait_completion_packet(&task, shim_signaled_packet, true).as_raw(),
+            host_cancel_signaled_remove
+        );
+        // SAFETY: Handles were returned by NtCreate* calls in this test.
+        unsafe {
+            close_host(host_signaled_event);
+            close_host(host_signaled_packet);
+            close_host(host_iocp);
+        }
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
