@@ -3,6 +3,7 @@
 
 pub(crate) mod event;
 pub(crate) mod file;
+pub(crate) mod iocp;
 pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod process;
@@ -95,6 +96,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         event_type: u32,
         initial_state: u8,
+    },
+    NtCreateIoCompletion {
+        io_completion_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        number_of_concurrent_threads: u32,
     },
     NtOpenEvent {
         event_handle: Platform::RawMutPointer<Handle>,
@@ -302,6 +309,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 event_type,
                 initial_state,
+            })),
+            NtSysno::NtCreateIoCompletion => Some(sys_req!(NtCreateIoCompletion {
+                io_completion_handle:*,
+                desired_access,
+                object_attributes:*,
+                number_of_concurrent_threads,
             })),
             NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
                 event_handle:*,
