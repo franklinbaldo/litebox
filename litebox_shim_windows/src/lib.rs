@@ -37,6 +37,9 @@ use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::worker_factory::{
+    WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
+};
 
 mod loader;
 mod nt_types;
@@ -473,6 +476,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtCreateWorkerFactory {
+                worker_factory_handle,
+                desired_access,
+                object_attributes,
+                completion_port_handle,
+                worker_process_handle,
+                start_routine,
+                start_parameter,
+                max_thread_count,
+                stack_reserve,
+                stack_commit,
+            } => {
+                let status = self.sys_nt_create_worker_factory(WorkerFactoryCreateParameters {
+                    worker_factory_handle,
+                    desired_access,
+                    object_attributes,
+                    completion_port_handle,
+                    worker_process_handle,
+                    start_routine,
+                    start_parameter,
+                    max_thread_count,
+                    stack_reserve,
+                    stack_commit,
+                });
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenEvent {
                 event_handle,
                 desired_access,
@@ -898,6 +927,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, WorkerFactorySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |worker_factory| visitor.worker_factory(worker_factory),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         NtStatus::INVALID_HANDLE
     }
 
@@ -921,6 +958,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn event(&self, event: EventHandleObject<Platform>);
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
+
+    fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -944,6 +983,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
         Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
+        Task::<Platform, FS>::close_worker_factory(worker_factory);
     }
 }
 

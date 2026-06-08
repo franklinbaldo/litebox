@@ -9,6 +9,7 @@ pub(crate) mod nls;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
+pub(crate) mod worker_factory;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
@@ -82,6 +83,11 @@ impl ProcessHandle {
     pub(crate) fn is_current(self) -> bool {
         self == Self::CURRENT
     }
+
+    #[must_use]
+    pub(crate) const fn as_handle(self) -> Handle {
+        self.0
+    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -102,6 +108,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
+    },
+    NtCreateWorkerFactory {
+        worker_factory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        completion_port_handle: Handle,
+        worker_process_handle: ProcessHandle,
+        start_routine: usize,
+        start_parameter: usize,
+        max_thread_count: u32,
+        stack_reserve: usize,
+        stack_commit: usize,
     },
     NtOpenEvent {
         event_handle: Platform::RawMutPointer<Handle>,
@@ -315,6 +333,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
                 number_of_concurrent_threads,
+            })),
+            NtSysno::NtCreateWorkerFactory => Some(sys_req!(NtCreateWorkerFactory {
+                worker_factory_handle:*,
+                desired_access,
+                object_attributes:*,
+                completion_port_handle:{Handle::from_raw},
+                worker_process_handle:{ProcessHandle::from_raw},
+                start_routine,
+                start_parameter,
+                max_thread_count,
+                stack_reserve,
+                stack_commit,
             })),
             NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
                 event_handle:*,

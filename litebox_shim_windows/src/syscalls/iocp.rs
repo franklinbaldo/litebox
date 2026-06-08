@@ -68,7 +68,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for IoCompletionSubsystem
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for IoCompletionHandleObject<Platform> {}
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
-    _port: Arc<IoCompletionObject<Platform>>,
+    port: Arc<IoCompletionObject<Platform>>,
     _granted_access: IoCompletionAccess,
 }
 
@@ -83,6 +83,12 @@ impl<Platform: crate::ShimPlatform> IoCompletionObject<Platform> {
             _number_of_concurrent_threads: number_of_concurrent_threads,
             _not_send_without_platform: PhantomData,
         }
+    }
+}
+
+impl<Platform: crate::ShimPlatform> IoCompletionHandleObject<Platform> {
+    pub(crate) fn port(&self) -> Arc<IoCompletionObject<Platform>> {
+        self.port.clone()
     }
 }
 
@@ -110,7 +116,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .litebox
             .descriptor_table_mut()
             .insert::<IoCompletionSubsystem<Platform>>(IoCompletionHandleObject {
-                _port: port,
+                port,
                 _granted_access: granted_access,
             });
         insert_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
