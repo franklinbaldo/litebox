@@ -34,6 +34,7 @@ use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 use crate::syscalls::SyscallRequest;
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
+use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 
 mod loader;
@@ -724,6 +725,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     region_size,
                     allocation_type,
                     protect,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtAllocateVirtualMemoryEx {
+                process_handle,
+                base_address,
+                region_size,
+                allocation_type,
+                protect,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = self.sys_nt_allocate_virtual_memory_ex(
+                    process_handle,
+                    base_address,
+                    region_size,
+                    allocation_type,
+                    protect,
+                    mm::MemoryExtendedParameters {
+                        parameters: extended_parameters,
+                        count: extended_parameter_count,
+                    },
                 );
                 (status, ContinueOperation::Resume)
             }

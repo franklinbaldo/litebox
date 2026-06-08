@@ -226,6 +226,15 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         allocation_type: u32,
         protect: u32,
     },
+    NtAllocateVirtualMemoryEx {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        allocation_type: u32,
+        protect: u32,
+        extended_parameters: Option<Platform::RawConstPointer<mm::MemoryExtendedParameter>>,
+        extended_parameter_count: u32,
+    },
     NtFreeVirtualMemory {
         process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
@@ -417,6 +426,15 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 region_size:*,
                 allocation_type,
                 protect,
+            })),
+            NtSysno::NtAllocateVirtualMemoryEx => Some(sys_req!(NtAllocateVirtualMemoryEx {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                allocation_type,
+                protect,
+                extended_parameters:*,
+                extended_parameter_count,
             })),
             NtSysno::NtFreeVirtualMemory => Some(sys_req!(NtFreeVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },

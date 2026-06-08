@@ -10,12 +10,13 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::ProcessHandle;
 use crate::{
-    MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsPageManager, WindowsVirtualAllocation,
-    WindowsVirtualAllocations,
+    ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsPageManager,
+    WindowsVirtualAllocation, WindowsVirtualAllocations,
 };
 
 const ALLOCATION_GRANULARITY: usize = 0x1_0000;
 const ALLOCATION_SEARCH_ATTEMPTS: usize = 8;
+const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +102,14 @@ enum MemoryInformationClass {
     Basic = 0,
 }
 
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum MemoryExtendedParameterType {
+    AddressRequirements = 1,
+    NumaNode = 2,
+    AttributeFlags = 5,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
 struct MemoryBasicInformation {
@@ -116,7 +125,123 @@ struct MemoryBasicInformation {
     _padding1: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct MemoryExtendedParameter {
+    type_: u64,
+    value: usize,
+}
+
+pub(crate) struct MemoryExtendedParameters<Platform: ShimPlatform> {
+    pub(crate) parameters: Option<ConstPtr<Platform, MemoryExtendedParameter>>,
+    pub(crate) count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct MemoryAddressRequirements {
+    lowest_starting_address: usize,
+    highest_ending_address: usize,
+    alignment: usize,
+}
+
+fn validate_memory_extended_parameters<Platform: ShimPlatform>(
+    extended_parameters: MemoryExtendedParameters<Platform>,
+) -> Result<(), NtStatus> {
+    if extended_parameters.count == 0 {
+        return Ok(());
+    }
+
+    let Some(parameters) = extended_parameters.parameters else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+
+    let mut present = 0u32;
+    for index in 0..extended_parameters.count {
+        let parameter = parameters
+            .read_at_offset(index.try_into().map_err(|_| NtStatus::INVALID_PARAMETER)?)
+            .ok_or(NtStatus::ACCESS_VIOLATION)?;
+        validate_memory_extended_parameter::<Platform>(parameter, &mut present)?;
+    }
+
+    Ok(())
+}
+
+fn validate_memory_extended_parameter<Platform: ShimPlatform>(
+    parameter: MemoryExtendedParameter,
+    present: &mut u32,
+) -> Result<(), NtStatus> {
+    if parameter.type_ & !MEM_EXTENDED_PARAMETER_TYPE_MASK != 0 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+
+    let parameter_type_raw = parameter.type_ & MEM_EXTENDED_PARAMETER_TYPE_MASK;
+    let parameter_type = MemoryExtendedParameterType::try_from(parameter_type_raw)
+        .map_err(|_| NtStatus::INVALID_PARAMETER)?;
+    let parameter_bit = u32::try_from(parameter_type_raw)
+        .ok()
+        .and_then(|parameter_type| 1u32.checked_shl(parameter_type))
+        .ok_or(NtStatus::INVALID_PARAMETER)?;
+    if *present & parameter_bit != 0 {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    *present |= parameter_bit;
+
+    match parameter_type {
+        MemoryExtendedParameterType::AddressRequirements => {
+            let address_requirements =
+                ConstPtr::<Platform, MemoryAddressRequirements>::from_usize(parameter.value)
+                    .read_at_offset(0)
+                    .ok_or(NtStatus::ACCESS_VIOLATION)?;
+            if address_requirements.lowest_starting_address != 0
+                || address_requirements.highest_ending_address != 0
+                || !matches!(address_requirements.alignment, 0 | ALLOCATION_GRANULARITY)
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            Ok(())
+        }
+        MemoryExtendedParameterType::NumaNode => Ok(()),
+        MemoryExtendedParameterType::AttributeFlags => {
+            if parameter.value == 0 {
+                Ok(())
+            } else {
+                Err(NtStatus::INVALID_PARAMETER)
+            }
+        }
+    }
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_allocate_virtual_memory_ex(
+        &self,
+        process_handle: ProcessHandle,
+        base_address: MutPtr<Platform, usize>,
+        region_size: MutPtr<Platform, usize>,
+        allocation_type: u32,
+        protect: u32,
+        extended_parameters: MemoryExtendedParameters<Platform>,
+    ) -> NtStatus {
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        if let Err(status) = validate_memory_extended_parameters::<Platform>(extended_parameters) {
+            return status;
+        }
+
+        // TODO: Apply supported extended parameters (especially MEM_ADDRESS_REQUIREMENTS) to the
+        // allocation search once PageManager can honor caller-specified placement constraints.
+        self.sys_nt_allocate_virtual_memory(
+            process_handle,
+            base_address,
+            0,
+            region_size,
+            allocation_type,
+            protect,
+        )
+    }
+
     pub(crate) fn sys_nt_allocate_virtual_memory(
         &self,
         process_handle: ProcessHandle,
@@ -129,7 +254,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !process_handle.is_current() {
             return NtStatus::INVALID_HANDLE;
         }
-
         let Some(base) = base_address.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
@@ -1207,6 +1331,17 @@ mod tests {
         (base, region_size)
     }
 
+    fn const_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
+        ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value) as usize)
+    }
+
+    fn memory_extended_parameters(
+        parameters: Option<ConstPtr<TestPlatform, MemoryExtendedParameter>>,
+        count: u32,
+    ) -> MemoryExtendedParameters<TestPlatform> {
+        MemoryExtendedParameters { parameters, count }
+    }
+
     fn release_allocation(task: &TestTask, base: usize) {
         let mut release_base = base;
         let mut release_size = 0usize;
@@ -1333,6 +1468,154 @@ mod tests {
                     PageProtection::PAGE_READWRITE.bits(),
                 ),
                 NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn allocate_virtual_memory_ex_accepts_noop_extended_parameters() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut base = 0usize;
+            let mut region_size = PAGE_SIZE;
+            let address_requirements = MemoryAddressRequirements {
+                lowest_starting_address: 0,
+                highest_ending_address: 0,
+                alignment: ALLOCATION_GRANULARITY,
+            };
+            let extended_parameters = [
+                MemoryExtendedParameter {
+                    type_: MemoryExtendedParameterType::AddressRequirements as u64,
+                    value: core::ptr::from_ref(&address_requirements) as usize,
+                },
+                MemoryExtendedParameter {
+                    type_: MemoryExtendedParameterType::NumaNode as u64,
+                    value: 0,
+                },
+                MemoryExtendedParameter {
+                    type_: MemoryExtendedParameterType::AttributeFlags as u64,
+                    value: 0,
+                },
+            ];
+
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(
+                        Some(const_ptr(&extended_parameters[0])),
+                        u32::try_from(extended_parameters.len()).unwrap(),
+                    ),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_ne!(base, 0);
+            assert_eq!(region_size, PAGE_SIZE);
+
+            release_allocation(&task, base);
+        });
+    }
+
+    #[test]
+    fn allocate_virtual_memory_ex_rejects_unsupported_extended_parameters() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut base = 0usize;
+            let mut region_size = PAGE_SIZE;
+            let address_requirements = MemoryAddressRequirements {
+                lowest_starting_address: 0,
+                highest_ending_address: 0x7fff_ffff,
+                alignment: 0,
+            };
+            let address_parameter = MemoryExtendedParameter {
+                type_: MemoryExtendedParameterType::AddressRequirements as u64,
+                value: core::ptr::from_ref(&address_requirements) as usize,
+            };
+            let invalid_type_parameter = MemoryExtendedParameter { type_: 0, value: 0 };
+            let duplicate_parameters = [
+                MemoryExtendedParameter {
+                    type_: MemoryExtendedParameterType::NumaNode as u64,
+                    value: 0,
+                },
+                MemoryExtendedParameter {
+                    type_: MemoryExtendedParameterType::NumaNode as u64,
+                    value: 0,
+                },
+            ];
+
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(None, 1),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(Some(const_ptr(&address_parameter)), 1),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(Some(const_ptr(&invalid_type_parameter)), 1),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(
+                        Some(const_ptr(&duplicate_parameters[0])),
+                        u32::try_from(duplicate_parameters.len()).unwrap(),
+                    ),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn allocate_virtual_memory_ex_rejects_invalid_parameter_pointer() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut base = 0usize;
+            let mut region_size = PAGE_SIZE;
+
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(
+                        Some(ConstPtr::<TestPlatform, MemoryExtendedParameter>::from_usize(1)),
+                        1,
+                    ),
+                ),
+                NtStatus::ACCESS_VIOLATION
             );
         });
     }
@@ -1748,6 +2031,16 @@ mod tests {
                 protect: u32,
             ) -> i32;
 
+            fn NtAllocateVirtualMemoryEx(
+                process_handle: *mut c_void,
+                base_address: *mut *mut c_void,
+                region_size: *mut usize,
+                allocation_type: u32,
+                protect: u32,
+                extended_parameters: *const MemoryExtendedParameter,
+                extended_parameter_count: u32,
+            ) -> i32;
+
             fn NtProtectVirtualMemory(
                 process_handle: *mut c_void,
                 base_address: *mut *mut c_void,
@@ -1861,6 +2154,137 @@ mod tests {
                 };
                 assert_eq!(guest_free_status, host_free_status);
                 assert_eq!(guest_release_size, host_release_size);
+            });
+        }
+
+        #[test]
+        fn allocate_virtual_memory_ex_without_parameters_matches_host_ntdll() {
+            run_with_test_platform_pointers(|| {
+                let mut host_base = core::ptr::null_mut::<c_void>();
+                let mut host_region_size = PAGE_SIZE * 2;
+                // SAFETY: The output pointers are valid locals and the allocation is released
+                // before this test returns.
+                let host_allocate_status = unsafe {
+                    host_status(NtAllocateVirtualMemoryEx(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_region_size,
+                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                        core::ptr::null(),
+                        0,
+                    ))
+                };
+                assert_eq!(host_allocate_status, NtStatus::SUCCESS);
+
+                let task = crate::tests::test_task();
+                let mut guest_base = 0usize;
+                let mut guest_region_size = PAGE_SIZE * 2;
+                let guest_allocate_status = task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_base),
+                    mut_ptr(&mut guest_region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(None, 0),
+                );
+                assert_eq!(guest_allocate_status, host_allocate_status);
+                assert_eq!(guest_region_size, host_region_size);
+                assert_eq!(
+                    query_basic_information(&task, guest_base).protect,
+                    PageProtection::PAGE_READWRITE.bits()
+                );
+
+                release_allocation(&task, guest_base);
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
+            });
+        }
+
+        #[test]
+        fn allocate_virtual_memory_ex_parameter_status_matches_host_ntdll() {
+            run_with_test_platform_pointers(|| {
+                let task = crate::tests::test_task();
+                let mut host_base = core::ptr::null_mut::<c_void>();
+                let mut host_region_size = PAGE_SIZE;
+                // SAFETY: This probes host validation with a null parameter array and valid local
+                // base/size outputs. It does not allocate on failure.
+                let host_null_params_status = unsafe {
+                    host_status(NtAllocateVirtualMemoryEx(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_region_size,
+                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                        core::ptr::null(),
+                        1,
+                    ))
+                };
+                let mut guest_base = 0usize;
+                let mut guest_region_size = PAGE_SIZE;
+                let guest_null_params_status = task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_base),
+                    mut_ptr(&mut guest_region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(None, 1),
+                );
+                assert_eq!(guest_null_params_status, host_null_params_status);
+
+                let attribute_parameter = MemoryExtendedParameter {
+                    type_: MemoryExtendedParameterType::AttributeFlags as u64,
+                    value: 0,
+                };
+                host_base = core::ptr::null_mut();
+                host_region_size = PAGE_SIZE;
+                // SAFETY: The parameter pointer and output pointers are valid locals. Any host
+                // allocation is released before return.
+                let host_attribute_status = unsafe {
+                    host_status(NtAllocateVirtualMemoryEx(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_region_size,
+                        (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                        &raw const attribute_parameter,
+                        1,
+                    ))
+                };
+                assert_eq!(host_attribute_status, NtStatus::SUCCESS);
+                guest_base = 0;
+                guest_region_size = PAGE_SIZE;
+                let guest_attribute_status = task.sys_nt_allocate_virtual_memory_ex(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_base),
+                    mut_ptr(&mut guest_region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                    memory_extended_parameters(Some(const_ptr(&attribute_parameter)), 1),
+                );
+                assert_eq!(guest_attribute_status, host_attribute_status);
+
+                release_allocation(&task, guest_base);
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
             });
         }
 
