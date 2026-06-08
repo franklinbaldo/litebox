@@ -288,6 +288,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         destination: Platform::RawMutPointer<u64>,
         conversion_error: Option<Platform::RawMutPointer<u64>>,
     },
+    NtTraceControl {
+        function_code: u32,
+        input_buffer: Platform::RawConstPointer<u8>,
+        input_buffer_length: u32,
+        output_buffer: Platform::RawMutPointer<u8>,
+        output_buffer_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
@@ -556,6 +564,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     conversion_error:*,
                 }),
             ),
+            NtSysno::NtTraceControl => Some(sys_req!(NtTraceControl {
+                function_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
+                return_length:*,
+            })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
                 base_address:*,
@@ -728,6 +744,7 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{TestPlatform, mut_ptr};
 
     #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {
@@ -753,5 +770,60 @@ mod tests {
 
         assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
         assert_eq!(Handle::from_raw_fd(usize::MAX), None);
+    }
+
+    #[test]
+    fn nt_trace_control_decodes_stack_arguments() {
+        let mut stack = [0usize; 8];
+        let output_length = 0x1234u32;
+        let mut return_length = 0u32;
+        stack[5] = usize::try_from(output_length).unwrap();
+        stack[6] = mut_ptr::<u32>(&mut return_length).as_usize();
+
+        let regs = litebox_common_linux::PtRegs {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbp: 0,
+            rbx: 0,
+            r11: 0,
+            r10: 12,
+            r9: 0x5000,
+            r8: 0,
+            rax: 0,
+            rcx: 0,
+            rdx: 0x4000,
+            rsi: 0,
+            rdi: 0,
+            orig_rax: NtSysno::NtTraceControl.as_raw() as usize,
+            rip: 0,
+            cs: 0,
+            eflags: 0,
+            rsp: core::ptr::from_ref(&stack[0]) as usize,
+            ss: 0,
+        };
+
+        let Some(SyscallRequest::NtTraceControl {
+            function_code,
+            input_buffer,
+            input_buffer_length,
+            output_buffer,
+            output_buffer_length,
+            return_length: decoded_return_length,
+        }) = SyscallRequest::<TestPlatform>::try_from_raw(&regs)
+        else {
+            panic!("NtTraceControl should decode");
+        };
+
+        assert_eq!(function_code, 12);
+        assert_eq!(input_buffer.as_usize(), 0x4000);
+        assert_eq!(input_buffer_length, 0);
+        assert_eq!(output_buffer.as_usize(), 0x5000);
+        assert_eq!(output_buffer_length, output_length);
+        assert_eq!(
+            decoded_return_length.map(|ptr| ptr.as_usize()),
+            Some(stack[6])
+        );
     }
 }

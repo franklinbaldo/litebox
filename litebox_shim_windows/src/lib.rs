@@ -858,6 +858,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtTraceControl {
+                function_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_trace_control(
+                    function_code,
+                    input_buffer,
+                    input_buffer_length,
+                    output_buffer,
+                    output_buffer_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtAllocateVirtualMemory {
                 process_handle,
                 base_address,

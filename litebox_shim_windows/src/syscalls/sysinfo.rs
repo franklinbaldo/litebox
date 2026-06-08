@@ -27,6 +27,12 @@ const LOGICAL_PROCESSOR_RELATION_PROCESSOR_CORE: u32 = 0;
 const LOGICAL_PROCESSOR_RELATION_NUMA_NODE: u32 = 1;
 const LOGICAL_PROCESSOR_RELATION_PROCESSOR_PACKAGE: u32 = 3;
 const LOGICAL_PROCESSOR_RELATION_GROUP: u32 = 4;
+const ETW_ACTIVITY_ID_CREATE: u32 = 12;
+const ETW_ENUM_TRACE_GUID_LIST: u32 = 21;
+const ETW_REGISTER_SECURITY_PROVIDER: u32 = 24;
+const ETW_ACTIVITY_ID_LENGTH: u32 = 16;
+#[cfg(test)]
+const ETW_ACTIVITY_ID_LENGTH_USIZE: usize = 16;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -504,6 +510,70 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Wine reports auxiliary counter conversion as unsupported after validating the source.
         NtStatus::NOT_SUPPORTED
     }
+
+    pub(crate) fn sys_nt_trace_control(
+        &self,
+        function_code: u32,
+        _input_buffer: ConstPtr<Platform, u8>,
+        _input_buffer_length: u32,
+        output_buffer: MutPtr<Platform, u8>,
+        output_buffer_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        match function_code {
+            ETW_ACTIVITY_ID_CREATE => self.sys_nt_trace_control_activity_id_create(
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            ),
+            ETW_ENUM_TRACE_GUID_LIST => NtStatus::BUFFER_TOO_SMALL,
+            ETW_REGISTER_SECURITY_PROVIDER => NtStatus::ACCESS_DENIED,
+            _ => NtStatus::INVALID_PARAMETER,
+        }
+    }
+
+    fn sys_nt_trace_control_activity_id_create(
+        &self,
+        output_buffer: MutPtr<Platform, u8>,
+        output_buffer_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        let Some(return_length) = return_length else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if output_buffer.as_usize() == 0
+            || output_buffer_length < ETW_ACTIVITY_ID_LENGTH
+            || return_length.as_usize() == 0
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        if return_length.write_at_offset(0, 0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if output_buffer
+            .write_slice_at_offset(0, &self.new_trace_activity_id())
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn new_trace_activity_id(&self) -> [u8; 16] {
+        let elapsed = self
+            .global
+            .platform
+            .now()
+            .duration_since(&self.global.qpc_boot_instant);
+        let ticks = duration_as_qpc_ticks(elapsed);
+        let mut activity_id = [0u8; 16];
+        activity_id[..8].copy_from_slice(&ticks.to_ne_bytes());
+        activity_id[8..12].copy_from_slice(&self.process.cookie.to_ne_bytes());
+        activity_id[12..].copy_from_slice(&self.teb_address.to_ne_bytes()[..4]);
+        activity_id
+    }
 }
 
 fn system_basic_information<Platform: ShimPlatform>() -> SystemBasicInformation {
@@ -667,6 +737,15 @@ mod tests {
             destination: *mut u64,
             conversion_error: *mut u64,
         ) -> i32;
+
+        fn NtTraceControl(
+            function_code: u32,
+            input_buffer: *const core::ffi::c_void,
+            input_buffer_length: u32,
+            output_buffer: *mut core::ffi::c_void,
+            output_buffer_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
     }
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
@@ -748,6 +827,22 @@ mod tests {
             input_buffer_length,
             system_information,
             system_information_length,
+            return_length,
+        )
+    }
+
+    fn sys_nt_trace_control(
+        function_code: u32,
+        output_buffer: MutPtr<TestPlatform, u8>,
+        output_buffer_length: u32,
+        return_length: Option<MutPtr<TestPlatform, u32>>,
+    ) -> NtStatus {
+        crate::tests::test_task().sys_nt_trace_control(
+            function_code,
+            null_const_ptr(),
+            0,
+            output_buffer,
+            output_buffer_length,
             return_length,
         )
     }
@@ -1295,6 +1390,98 @@ mod tests {
         });
     }
 
+    #[test]
+    fn nt_trace_control_creates_activity_id() {
+        run_with_test_platform_pointers(|| {
+            let mut output = [0u8; ETW_ACTIVITY_ID_LENGTH_USIZE];
+            let mut return_length = u32::MAX;
+
+            assert_eq!(
+                sys_nt_trace_control(
+                    ETW_ACTIVITY_ID_CREATE,
+                    mut_byte_ptr(&mut output),
+                    ETW_ACTIVITY_ID_LENGTH,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_ne!(output, [0; ETW_ACTIVITY_ID_LENGTH_USIZE]);
+            assert_eq!(return_length, 0);
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_validates_activity_id_arguments() {
+        run_with_test_platform_pointers(|| {
+            let mut output = [0u8; ETW_ACTIVITY_ID_LENGTH_USIZE];
+            let mut return_length = u32::MAX;
+
+            assert_eq!(
+                sys_nt_trace_control(
+                    ETW_ACTIVITY_ID_CREATE,
+                    mut_byte_ptr(&mut output),
+                    ETW_ACTIVITY_ID_LENGTH,
+                    None,
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                sys_nt_trace_control(
+                    ETW_ACTIVITY_ID_CREATE,
+                    null_mut_ptr(),
+                    ETW_ACTIVITY_ID_LENGTH,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                sys_nt_trace_control(
+                    ETW_ACTIVITY_ID_CREATE,
+                    mut_byte_ptr(&mut output),
+                    ETW_ACTIVITY_ID_LENGTH - 1,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_reports_unsupported_etw_operations() {
+        run_with_test_platform_pointers(|| {
+            let mut output = [0u8; ETW_ACTIVITY_ID_LENGTH_USIZE];
+            let mut return_length = 0u32;
+
+            assert_eq!(
+                sys_nt_trace_control(
+                    ETW_ENUM_TRACE_GUID_LIST,
+                    mut_byte_ptr(&mut output),
+                    0,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::BUFFER_TOO_SMALL
+            );
+            assert_eq!(
+                sys_nt_trace_control(
+                    ETW_REGISTER_SECURITY_PROVIDER,
+                    mut_byte_ptr(&mut output),
+                    0,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::ACCESS_DENIED
+            );
+            assert_eq!(
+                sys_nt_trace_control(
+                    0,
+                    mut_byte_ptr(&mut output),
+                    0,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn nt_query_performance_counter_status_matches_host_ntdll() {
@@ -1428,6 +1615,98 @@ mod tests {
                     Some(mut_ptr(&mut conversion_error)),
                 );
             assert_eq!(guest_valid_source_status, host_valid_source_status);
+        });
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_trace_control_shallow_statuses_match_host_ntdll() {
+        run_with_test_platform_pointers(|| {
+            let mut host_output = [0u8; ETW_ACTIVITY_ID_LENGTH_USIZE];
+            let mut host_return_length = u32::MAX;
+            let mut guest_output = [0u8; ETW_ACTIVITY_ID_LENGTH_USIZE];
+            let mut guest_return_length = u32::MAX;
+
+            // SAFETY: The output and return-length pointers are valid locals and ntdll does not
+            // retain them.
+            let host_activity_status = unsafe {
+                host_status(NtTraceControl(
+                    ETW_ACTIVITY_ID_CREATE,
+                    core::ptr::null(),
+                    0,
+                    host_output.as_mut_ptr().cast(),
+                    ETW_ACTIVITY_ID_LENGTH,
+                    &raw mut host_return_length,
+                ))
+            };
+            let guest_activity_status = sys_nt_trace_control(
+                ETW_ACTIVITY_ID_CREATE,
+                mut_byte_ptr(&mut guest_output),
+                ETW_ACTIVITY_ID_LENGTH,
+                Some(mut_ptr(&mut guest_return_length)),
+            );
+            assert_eq!(guest_activity_status, host_activity_status);
+            assert_eq!(guest_return_length, host_return_length);
+
+            // SAFETY: Null buffers are intentionally used to compare host validation statuses; no
+            // memory is dereferenced by this test outside ntdll.
+            let host_no_return_length_status = unsafe {
+                host_status(NtTraceControl(
+                    ETW_ACTIVITY_ID_CREATE,
+                    core::ptr::null(),
+                    0,
+                    host_output.as_mut_ptr().cast(),
+                    ETW_ACTIVITY_ID_LENGTH,
+                    core::ptr::null_mut(),
+                ))
+            };
+            let guest_no_return_length_status = sys_nt_trace_control(
+                ETW_ACTIVITY_ID_CREATE,
+                mut_byte_ptr(&mut guest_output),
+                ETW_ACTIVITY_ID_LENGTH,
+                None,
+            );
+            assert_eq!(guest_no_return_length_status, host_no_return_length_status);
+
+            // SAFETY: All pointers are null or valid locals and are used only for this immediate
+            // status comparison.
+            let host_enum_status = unsafe {
+                host_status(NtTraceControl(
+                    ETW_ENUM_TRACE_GUID_LIST,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &raw mut host_return_length,
+                ))
+            };
+            let guest_enum_status = sys_nt_trace_control(
+                ETW_ENUM_TRACE_GUID_LIST,
+                null_mut_ptr(),
+                0,
+                Some(mut_ptr(&mut guest_return_length)),
+            );
+            assert_eq!(guest_enum_status, host_enum_status);
+
+            // SAFETY: All pointers are null or valid locals and are used only for this immediate
+            // status comparison.
+            let host_security_status = unsafe {
+                host_status(NtTraceControl(
+                    ETW_REGISTER_SECURITY_PROVIDER,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                    &raw mut host_return_length,
+                ))
+            };
+            let guest_security_status = sys_nt_trace_control(
+                ETW_REGISTER_SECURITY_PROVIDER,
+                null_mut_ptr(),
+                0,
+                Some(mut_ptr(&mut guest_return_length)),
+            );
+            assert_eq!(guest_security_status, host_security_status);
         });
     }
 }
