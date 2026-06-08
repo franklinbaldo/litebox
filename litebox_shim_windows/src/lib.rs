@@ -38,6 +38,10 @@ use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
+use crate::syscalls::wait_completion_packet::{
+    WaitCompletionPacketAssociateParameters, WaitCompletionPacketCreateParameters,
+    WaitCompletionPacketHandleObject, WaitCompletionPacketSubsystem,
+};
 use crate::syscalls::worker_factory::{
     WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
 };
@@ -477,6 +481,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtAssociateWaitCompletionPacket {
+                wait_completion_packet_handle,
+                io_completion_handle,
+                target_object_handle,
+                key_context,
+                apc_context,
+                io_status,
+                io_status_information,
+                already_signaled,
+            } => {
+                let status = self.sys_nt_associate_wait_completion_packet(
+                    WaitCompletionPacketAssociateParameters {
+                        wait_completion_packet_handle,
+                        io_completion_handle,
+                        target_object_handle,
+                        key_context,
+                        apc_context,
+                        io_status,
+                        io_status_information,
+                        already_signaled,
+                    },
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtCreateTimer2 {
                 timer_handle,
                 timer_id,
@@ -491,6 +519,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     attributes,
                     desired_access,
                 });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateWaitCompletionPacket {
+                wait_completion_packet_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_create_wait_completion_packet(
+                    WaitCompletionPacketCreateParameters {
+                        wait_completion_packet_handle,
+                        desired_access,
+                        object_attributes,
+                    },
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateWorkerFactory {
@@ -952,6 +994,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, WaitCompletionPacketSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |wait_completion_packet| visitor.wait_completion_packet(wait_completion_packet),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, WorkerFactorySubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -986,6 +1036,11 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
 
+    fn wait_completion_packet(
+        &self,
+        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
+    );
+
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
 }
 
@@ -1014,6 +1069,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {
         Task::<Platform, FS>::close_timer(timer);
+    }
+
+    fn wait_completion_packet(
+        &self,
+        wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
+    ) {
+        Task::<Platform, FS>::close_wait_completion_packet(wait_completion_packet);
     }
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {

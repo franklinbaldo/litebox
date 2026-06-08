@@ -57,6 +57,14 @@ impl IoCompletionAccess {
         ));
         access
     }
+
+    pub(crate) fn require(self, required: Self) -> Result<(), NtStatus> {
+        if self.contains(required) {
+            Ok(())
+        } else {
+            Err(NtStatus::ACCESS_DENIED)
+        }
+    }
 }
 
 pub(crate) struct IoCompletionSubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -69,7 +77,7 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for IoCompletionHand
 
 pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
     port: Arc<IoCompletionObject<Platform>>,
-    _granted_access: IoCompletionAccess,
+    granted_access: IoCompletionAccess,
 }
 
 pub(crate) struct IoCompletionObject<Platform: crate::ShimPlatform> {
@@ -89,6 +97,10 @@ impl<Platform: crate::ShimPlatform> IoCompletionObject<Platform> {
 impl<Platform: crate::ShimPlatform> IoCompletionHandleObject<Platform> {
     pub(crate) fn port(&self) -> Arc<IoCompletionObject<Platform>> {
         self.port.clone()
+    }
+
+    pub(crate) fn require_access(&self, required: IoCompletionAccess) -> Result<(), NtStatus> {
+        self.granted_access.require(required)
     }
 }
 
@@ -117,7 +129,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .descriptor_table_mut()
             .insert::<IoCompletionSubsystem<Platform>>(IoCompletionHandleObject {
                 port,
-                _granted_access: granted_access,
+                granted_access,
             });
         insert_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
             &self.global.litebox,

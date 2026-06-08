@@ -10,6 +10,7 @@ pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
 pub(crate) mod timer;
+pub(crate) mod wait_completion_packet;
 pub(crate) mod worker_factory;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
@@ -110,12 +111,27 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
     },
+    NtAssociateWaitCompletionPacket {
+        wait_completion_packet_handle: Handle,
+        io_completion_handle: Handle,
+        target_object_handle: Handle,
+        key_context: usize,
+        apc_context: usize,
+        io_status: i32,
+        io_status_information: usize,
+        already_signaled: Option<Platform::RawMutPointer<u8>>,
+    },
     NtCreateTimer2 {
         timer_handle: Platform::RawMutPointer<Handle>,
         timer_id: Option<Platform::RawConstPointer<u32>>,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         attributes: u32,
         desired_access: u32,
+    },
+    NtCreateWaitCompletionPacket {
+        wait_completion_packet_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
     NtCreateWorkerFactory {
         worker_factory_handle: Platform::RawMutPointer<Handle>,
@@ -342,12 +358,29 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 number_of_concurrent_threads,
             })),
+            NtSysno::NtAssociateWaitCompletionPacket => {
+                Some(sys_req!(NtAssociateWaitCompletionPacket {
+                    wait_completion_packet_handle:{Handle::from_raw},
+                    io_completion_handle:{Handle::from_raw},
+                    target_object_handle:{Handle::from_raw},
+                    key_context,
+                    apc_context,
+                    io_status,
+                    io_status_information,
+                    already_signaled:*,
+                }))
+            }
             NtSysno::NtCreateTimer2 => Some(sys_req!(NtCreateTimer2 {
                 timer_handle:*,
                 timer_id:*,
                 object_attributes:*,
                 attributes,
                 desired_access,
+            })),
+            NtSysno::NtCreateWaitCompletionPacket => Some(sys_req!(NtCreateWaitCompletionPacket {
+                wait_completion_packet_handle:*,
+                desired_access,
+                object_attributes:*,
             })),
             NtSysno::NtCreateWorkerFactory => Some(sys_req!(NtCreateWorkerFactory {
                 worker_factory_handle:*,
