@@ -9,6 +9,7 @@ pub(crate) mod nls;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod sysinfo;
+pub(crate) mod timer;
 pub(crate) mod worker_factory;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
@@ -108,6 +109,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
+    },
+    NtCreateTimer2 {
+        timer_handle: Platform::RawMutPointer<Handle>,
+        timer_id: Option<Platform::RawConstPointer<u32>>,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        attributes: u32,
+        desired_access: u32,
     },
     NtCreateWorkerFactory {
         worker_factory_handle: Platform::RawMutPointer<Handle>,
@@ -333,6 +341,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
                 number_of_concurrent_threads,
+            })),
+            NtSysno::NtCreateTimer2 => Some(sys_req!(NtCreateTimer2 {
+                timer_handle:*,
+                timer_id:*,
+                object_attributes:*,
+                attributes,
+                desired_access,
             })),
             NtSysno::NtCreateWorkerFactory => Some(sys_req!(NtCreateWorkerFactory {
                 worker_factory_handle:*,

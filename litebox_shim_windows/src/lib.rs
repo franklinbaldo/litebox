@@ -37,6 +37,7 @@ use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::worker_factory::{
     WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
 };
@@ -474,6 +475,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     object_attributes,
                     number_of_concurrent_threads,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateTimer2 {
+                timer_handle,
+                timer_id,
+                object_attributes,
+                attributes,
+                desired_access,
+            } => {
+                let status = self.sys_nt_create_timer2(TimerCreateParameters {
+                    timer_handle,
+                    timer_id,
+                    object_attributes,
+                    attributes,
+                    desired_access,
+                });
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtCreateWorkerFactory {
@@ -927,6 +944,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, TimerSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |timer| visitor.timer(timer),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, WorkerFactorySubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -959,6 +984,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
+    fn timer(&self, timer: TimerHandleObject<Platform>);
+
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
 }
 
@@ -983,6 +1010,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
         Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn timer(&self, timer: TimerHandleObject<Platform>) {
+        Task::<Platform, FS>::close_timer(timer);
     }
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {

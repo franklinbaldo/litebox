@@ -175,6 +175,9 @@ impl NtStatus {
             0xC00000BB => "STATUS_NOT_SUPPORTED: The request is not supported",
             0xC00000E6 => "STATUS_GENERIC_NOT_MAPPED: Generic not mapped",
             0xC00000EF => "STATUS_INVALID_PARAMETER_1: Invalid parameter 1",
+            0xC00000F0 => "STATUS_INVALID_PARAMETER_2: Invalid parameter 2",
+            0xC00000F1 => "STATUS_INVALID_PARAMETER_3: Invalid parameter 3",
+            0xC00000F2 => "STATUS_INVALID_PARAMETER_4: Invalid parameter 4",
             0xC00000FD => "STATUS_STACK_OVERFLOW: Stack overflow",
             0xC0000102 => "STATUS_FILE_CORRUPT_ERROR: File corrupt error",
             0xC0000103 => "STATUS_NOT_A_DIRECTORY: Not a directory",
@@ -485,6 +488,15 @@ impl NtStatus {
 
     /// STATUS_INVALID_PARAMETER_1
     pub const INVALID_PARAMETER_1: Self = Self::from_raw(0xC00000EF);
+
+    /// STATUS_INVALID_PARAMETER_2
+    pub const INVALID_PARAMETER_2: Self = Self::from_raw(0xC00000F0);
+
+    /// STATUS_INVALID_PARAMETER_3
+    pub const INVALID_PARAMETER_3: Self = Self::from_raw(0xC00000F1);
+
+    /// STATUS_INVALID_PARAMETER_4
+    pub const INVALID_PARAMETER_4: Self = Self::from_raw(0xC00000F2);
 
     /// STATUS_STACK_OVERFLOW
     pub const STACK_OVERFLOW: Self = Self::from_raw(0xC00000FD);
