@@ -44,7 +44,7 @@ use crate::syscalls::wait_completion_packet::{
 };
 use crate::syscalls::worker_factory::{
     WorkerFactoryCreateParameters, WorkerFactoryHandleObject,
-    WorkerFactorySetInformationParameters, WorkerFactorySubsystem,
+    WorkerFactorySetInformationParameters, WorkerFactoryShutdownParameters, WorkerFactorySubsystem,
 };
 
 mod loader;
@@ -578,6 +578,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtShutdownWorkerFactory {
+                worker_factory_handle,
+                pending_worker_count,
+            } => {
+                let status = self.sys_nt_shutdown_worker_factory(WorkerFactoryShutdownParameters {
+                    handle: worker_factory_handle,
+                    pending_worker_count,
+                });
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenEvent {
                 event_handle,
                 desired_access,
@@ -949,6 +959,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.process.exit_code.store(exit_status, Ordering::Relaxed);
                     (NtStatus::SUCCESS, ContinueOperation::Terminate)
                 }
+            }
+            SyscallRequest::NtSetWnfProcessNotificationEvent { notification_event } => {
+                let _ = notification_event.as_raw();
+                (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
             }
             SyscallRequest::NtManageHotPatch => {
                 (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)

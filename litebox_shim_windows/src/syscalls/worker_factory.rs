@@ -6,7 +6,7 @@
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use litebox::fd::{ErrRawIntFd, FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
@@ -119,6 +119,7 @@ pub(crate) struct WorkerFactoryObject<Platform: crate::ShimPlatform> {
     _start_parameter: usize,
     thread_minimum: AtomicU32,
     thread_maximum: AtomicU32,
+    shutdown: AtomicBool,
     _stack_reserve: usize,
     _stack_commit: usize,
 }
@@ -141,6 +142,11 @@ pub(crate) struct WorkerFactorySetInformationParameters<Platform: RawPointerProv
     pub(crate) information_class: u32,
     pub(crate) information: ConstPtr<Platform, u8>,
     pub(crate) information_length: u32,
+}
+
+pub(crate) struct WorkerFactoryShutdownParameters<Platform: RawPointerProvider> {
+    pub(crate) handle: Handle,
+    pub(crate) pending_worker_count: MutPtr<Platform, i32>,
 }
 
 fn validate_worker_factory_object_attributes<Platform: RawPointerProvider>(
@@ -284,6 +290,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _start_parameter: params.start_parameter,
             thread_minimum: AtomicU32::new(0),
             thread_maximum: AtomicU32::new(params.max_thread_count),
+            shutdown: AtomicBool::new(false),
             _stack_reserve: params.stack_reserve,
             _stack_commit: params.stack_commit,
         });
@@ -353,6 +360,37 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             })
             .map_or_else(|status| status, |()| NtStatus::SUCCESS)
     }
+
+    pub(crate) fn sys_nt_shutdown_worker_factory(
+        &self,
+        params: WorkerFactoryShutdownParameters<Platform>,
+    ) -> NtStatus {
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(params.pending_worker_count)
+        {
+            return status;
+        }
+        let entry = match self.worker_factory_entry(params.handle) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let status = entry
+            .with_entry(|entry| {
+                entry
+                    .granted_access
+                    .require(WorkerFactoryAccess::SHUTDOWN)?;
+                entry.factory.shutdown.store(true, Ordering::Relaxed);
+                Ok(())
+            })
+            .map_or_else(|status| status, |()| NtStatus::SUCCESS);
+        if status != NtStatus::SUCCESS {
+            return status;
+        }
+        params
+            .pending_worker_count
+            .write_at_offset(0, 0)
+            .map_or(NtStatus::ACCESS_VIOLATION, |()| NtStatus::SUCCESS)
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +410,7 @@ mod tests {
     const IO_COMPLETION_ALL_ACCESS: u32 = 0x001f_0003;
     const WORKER_FACTORY_ALL_ACCESS: u32 = 0x001f_003f;
     const WORKER_FACTORY_QUERY_INFORMATION: u32 = 0x0008;
+    const WORKER_FACTORY_SHUTDOWN: u32 = 0x0020;
     const START_ROUTINE: usize = 0x1234_5678;
 
     fn object_attributes_size() -> u32 {
@@ -460,6 +499,17 @@ mod tests {
             information_class: worker_factory_information_class,
             information: worker_factory_information,
             information_length: worker_factory_information_length,
+        })
+    }
+
+    fn shutdown_worker_factory(
+        task: &Task<TestPlatform, TestFS>,
+        worker_factory_handle: Handle,
+        pending_worker_count: MutPtr<TestPlatform, i32>,
+    ) -> NtStatus {
+        task.sys_nt_shutdown_worker_factory(WorkerFactoryShutdownParameters {
+            handle: worker_factory_handle,
+            pending_worker_count,
         })
     }
 
@@ -746,6 +796,105 @@ mod tests {
 
         assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(event), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn shutdown_sets_pending_worker_count_to_zero() {
+        let task = test_task();
+        let io_completion = create_io_completion_handle(&task);
+        let mut worker_factory = Handle::default();
+        assert_eq!(
+            create_worker_factory(
+                &task,
+                &mut worker_factory,
+                None,
+                io_completion,
+                ProcessHandle::CURRENT,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut pending_worker_count = 7;
+        assert_eq!(
+            shutdown_worker_factory(&task, worker_factory, mut_ptr(&mut pending_worker_count)),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(pending_worker_count, 0);
+
+        assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn shutdown_validates_pending_worker_count_before_handle() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+
+            assert_eq!(
+                shutdown_worker_factory(&task, Handle::default(), null_mut_ptr()),
+                NtStatus::ACCESS_VIOLATION
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_rejects_wrong_object_type_and_missing_access() {
+        let task = test_task();
+        let io_completion = create_io_completion_handle(&task);
+        let mut pending_worker_count = 1;
+        let mut event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            shutdown_worker_factory(&task, event, mut_ptr(&mut pending_worker_count)),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+        assert_eq!(pending_worker_count, 1);
+
+        let mut worker_factory = Handle::default();
+        assert_eq!(
+            create_worker_factory_with_access(
+                &task,
+                &mut worker_factory,
+                WORKER_FACTORY_QUERY_INFORMATION,
+                None,
+                io_completion,
+                ProcessHandle::CURRENT,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            shutdown_worker_factory(&task, worker_factory, mut_ptr(&mut pending_worker_count)),
+            NtStatus::ACCESS_DENIED
+        );
+        assert_eq!(pending_worker_count, 1);
+
+        assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(event), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+
+        let io_completion = create_io_completion_handle(&task);
+        let mut worker_factory = Handle::default();
+        assert_eq!(
+            create_worker_factory_with_access(
+                &task,
+                &mut worker_factory,
+                WORKER_FACTORY_SHUTDOWN,
+                None,
+                io_completion,
+                ProcessHandle::CURRENT,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            shutdown_worker_factory(&task, worker_factory, mut_ptr(&mut pending_worker_count)),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
     }
 

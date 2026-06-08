@@ -151,6 +151,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         worker_factory_information: Platform::RawConstPointer<u8>,
         worker_factory_information_length: u32,
     },
+    NtShutdownWorkerFactory {
+        worker_factory_handle: Handle,
+        pending_worker_count: Platform::RawMutPointer<i32>,
+    },
+    NtSetWnfProcessNotificationEvent {
+        notification_event: Handle,
+    },
     NtOpenEvent {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -408,6 +415,15 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     worker_factory_information_length,
                 }
             )),
+            NtSysno::NtShutdownWorkerFactory => Some(sys_req!(NtShutdownWorkerFactory {
+                worker_factory_handle:{Handle::from_raw},
+                pending_worker_count:*,
+            })),
+            NtSysno::NtSetWnfProcessNotificationEvent => {
+                Some(sys_req!(NtSetWnfProcessNotificationEvent {
+                    notification_event: { Handle::from_raw },
+                }))
+            }
             NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
                 event_handle:*,
                 desired_access,

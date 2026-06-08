@@ -13,7 +13,21 @@ fn loads_minimal_pe_without_imports() {
         "Built rewritten no-import PE fixture at `{}`",
         pe_path.display()
     );
-    for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
+    for dll_name in [
+        "ntdll.dll",
+        "kernel32.dll",
+        "kernelbase.dll",
+        "advapi32.dll",
+        "msvcrt.dll",
+        "rpcrt4.dll",
+        "sechost.dll",
+        "sspicli.dll",
+        "ws2_32.dll",
+        "iphlpapi.dll",
+        "bcryptprimitives.dll",
+        "authz.dll",
+        "rpcrtremote.dll",
+    ] {
         let dll_path = build_rewritten_system_dll(&test_dir, dll_name);
         println!(
             "Built rewritten {dll_name} fixture at `{}`",
