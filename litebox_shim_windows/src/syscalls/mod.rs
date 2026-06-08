@@ -145,6 +145,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         stack_reserve: usize,
         stack_commit: usize,
     },
+    NtSetInformationWorkerFactory {
+        worker_factory_handle: Handle,
+        worker_factory_information_class: u32,
+        worker_factory_information: Platform::RawConstPointer<u8>,
+        worker_factory_information_length: u32,
+    },
     NtOpenEvent {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -394,6 +400,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 stack_reserve,
                 stack_commit,
             })),
+            NtSysno::NtSetInformationWorkerFactory => Some(sys_req!(
+                NtSetInformationWorkerFactory {
+                    worker_factory_handle:{Handle::from_raw},
+                    worker_factory_information_class,
+                    worker_factory_information:*,
+                    worker_factory_information_length,
+                }
+            )),
             NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
                 event_handle:*,
                 desired_access,

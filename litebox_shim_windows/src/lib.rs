@@ -43,7 +43,8 @@ use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketHandleObject, WaitCompletionPacketSubsystem,
 };
 use crate::syscalls::worker_factory::{
-    WorkerFactoryCreateParameters, WorkerFactoryHandleObject, WorkerFactorySubsystem,
+    WorkerFactoryCreateParameters, WorkerFactoryHandleObject,
+    WorkerFactorySetInformationParameters, WorkerFactorySubsystem,
 };
 
 mod loader;
@@ -559,6 +560,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     stack_reserve,
                     stack_commit,
                 });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationWorkerFactory {
+                worker_factory_handle,
+                worker_factory_information_class,
+                worker_factory_information,
+                worker_factory_information_length,
+            } => {
+                let status = self.sys_nt_set_information_worker_factory(
+                    WorkerFactorySetInformationParameters {
+                        handle: worker_factory_handle,
+                        information_class: worker_factory_information_class,
+                        information: worker_factory_information,
+                        information_length: worker_factory_information_length,
+                    },
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtOpenEvent {

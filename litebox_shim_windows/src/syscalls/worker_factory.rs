@@ -5,9 +5,11 @@
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
+use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use litebox::fd::{ErrRawIntFd, FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
@@ -68,6 +70,31 @@ impl WorkerFactoryAccess {
         ));
         access
     }
+
+    fn require(self, required: Self) -> Result<(), NtStatus> {
+        if self.contains(required) {
+            Ok(())
+        } else {
+            Err(NtStatus::ACCESS_DENIED)
+        }
+    }
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerFactoryInformationClass {
+    ThreadMinimum = 4,
+    ThreadMaximum = 5,
+}
+
+impl WorkerFactoryInformationClass {
+    fn from_raw(raw: u32) -> Result<Self, NtStatus> {
+        match raw {
+            4 => Ok(Self::ThreadMinimum),
+            5 => Ok(Self::ThreadMaximum),
+            _ => Err(NtStatus::INVALID_INFO_CLASS),
+        }
+    }
 }
 
 pub(crate) struct WorkerFactorySubsystem<Platform>(PhantomData<fn(Platform)>);
@@ -82,15 +109,16 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry
 }
 
 pub(crate) struct WorkerFactoryHandleObject<Platform: crate::ShimPlatform> {
-    _factory: Arc<WorkerFactoryObject<Platform>>,
-    _granted_access: WorkerFactoryAccess,
+    factory: Arc<WorkerFactoryObject<Platform>>,
+    granted_access: WorkerFactoryAccess,
 }
 
 pub(crate) struct WorkerFactoryObject<Platform: crate::ShimPlatform> {
     _completion_port: Arc<IoCompletionObject<Platform>>,
     _start_routine: usize,
     _start_parameter: usize,
-    _max_thread_count: u32,
+    thread_minimum: AtomicU32,
+    thread_maximum: AtomicU32,
     _stack_reserve: usize,
     _stack_commit: usize,
 }
@@ -108,6 +136,13 @@ pub(crate) struct WorkerFactoryCreateParameters<Platform: RawPointerProvider> {
     pub(crate) stack_commit: usize,
 }
 
+pub(crate) struct WorkerFactorySetInformationParameters<Platform: RawPointerProvider> {
+    pub(crate) handle: Handle,
+    pub(crate) information_class: u32,
+    pub(crate) information: ConstPtr<Platform, u8>,
+    pub(crate) information_length: u32,
+}
+
 fn validate_worker_factory_object_attributes<Platform: RawPointerProvider>(
     object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
 ) -> Result<(), NtStatus> {
@@ -122,6 +157,31 @@ fn validate_worker_factory_object_attributes<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn worker_factory_entry(
+        &self,
+        handle: Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, WorkerFactorySubsystem<Platform>>, NtStatus>
+    {
+        let Some(raw_fd) = handle.raw_fd() else {
+            return Err(NtStatus::INVALID_HANDLE);
+        };
+        let typed = {
+            let handles = self.process.handles.read();
+            match handles.fd_from_raw_integer::<WorkerFactorySubsystem<Platform>>(raw_fd) {
+                Ok(typed) => typed,
+                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::INVALID_HANDLE),
+                Err(ErrRawIntFd::InvalidSubsystem) => {
+                    return Err(NtStatus::OBJECT_TYPE_MISMATCH);
+                }
+            }
+        };
+        self.global
+            .litebox
+            .descriptor_table()
+            .entry_handle(&typed)
+            .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
     fn io_completion_port(
         &self,
         handle: Handle,
@@ -172,8 +232,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .litebox
             .descriptor_table_mut()
             .insert::<WorkerFactorySubsystem<Platform>>(WorkerFactoryHandleObject {
-                _factory: factory,
-                _granted_access: granted_access,
+                factory,
+                granted_access,
             });
         insert_raw_handle::<Platform, WorkerFactorySubsystem<Platform>>(
             &self.global.litebox,
@@ -222,7 +282,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _completion_port: completion_port,
             _start_routine: params.start_routine,
             _start_parameter: params.start_parameter,
-            _max_thread_count: params.max_thread_count,
+            thread_minimum: AtomicU32::new(0),
+            thread_maximum: AtomicU32::new(params.max_thread_count),
             _stack_reserve: params.stack_reserve,
             _stack_commit: params.stack_commit,
         });
@@ -239,6 +300,58 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_set_information_worker_factory(
+        &self,
+        params: WorkerFactorySetInformationParameters<Platform>,
+    ) -> NtStatus {
+        let Ok(information_class) =
+            WorkerFactoryInformationClass::from_raw(params.information_class)
+        else {
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if params.information_length as usize != size_of::<u32>() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        let Some(value_bytes) = params.information.to_owned_slice(size_of::<u32>()) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let value = u32::from_le_bytes(
+            value_bytes
+                .as_ref()
+                .try_into()
+                .expect("ULONG input is four bytes"),
+        );
+
+        let entry = match self.worker_factory_entry(params.handle) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        entry
+            .with_entry(|entry| {
+                entry
+                    .granted_access
+                    .require(WorkerFactoryAccess::SET_INFORMATION)?;
+                match information_class {
+                    WorkerFactoryInformationClass::ThreadMinimum => {
+                        let maximum = entry.factory.thread_maximum.load(Ordering::Relaxed);
+                        if value > maximum {
+                            return Err(NtStatus::INVALID_PARAMETER);
+                        }
+                        entry.factory.thread_minimum.store(value, Ordering::Relaxed);
+                    }
+                    WorkerFactoryInformationClass::ThreadMaximum => {
+                        let minimum = entry.factory.thread_minimum.load(Ordering::Relaxed);
+                        if value < minimum {
+                            return Err(NtStatus::INVALID_PARAMETER);
+                        }
+                        entry.factory.thread_maximum.store(value, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            })
+            .map_or_else(|status| status, |()| NtStatus::SUCCESS)
     }
 }
 
@@ -258,10 +371,15 @@ mod tests {
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
     const IO_COMPLETION_ALL_ACCESS: u32 = 0x001f_0003;
     const WORKER_FACTORY_ALL_ACCESS: u32 = 0x001f_003f;
+    const WORKER_FACTORY_QUERY_INFORMATION: u32 = 0x0008;
     const START_ROUTINE: usize = 0x1234_5678;
 
     fn object_attributes_size() -> u32 {
         u32::try_from(size_of::<ObjectAttributes>()).expect("OBJECT_ATTRIBUTES fits in ULONG")
+    }
+
+    fn u32_information_length() -> u32 {
+        u32::try_from(size_of::<u32>()).expect("ULONG size fits in ULONG")
     }
 
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
@@ -290,9 +408,27 @@ mod tests {
         completion_port_handle: Handle,
         worker_process_handle: ProcessHandle,
     ) -> NtStatus {
+        create_worker_factory_with_access(
+            task,
+            worker_factory_handle,
+            WORKER_FACTORY_ALL_ACCESS,
+            object_attributes,
+            completion_port_handle,
+            worker_process_handle,
+        )
+    }
+
+    fn create_worker_factory_with_access(
+        task: &Task<TestPlatform, TestFS>,
+        worker_factory_handle: &mut Handle,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,
+        completion_port_handle: Handle,
+        worker_process_handle: ProcessHandle,
+    ) -> NtStatus {
         task.sys_nt_create_worker_factory(WorkerFactoryCreateParameters {
             worker_factory_handle: mut_ptr(worker_factory_handle),
-            desired_access: WORKER_FACTORY_ALL_ACCESS,
+            desired_access,
             object_attributes,
             completion_port_handle,
             worker_process_handle,
@@ -301,6 +437,29 @@ mod tests {
             max_thread_count: 1,
             stack_reserve: 0,
             stack_commit: 0,
+        })
+    }
+
+    fn information_class_value(class: WorkerFactoryInformationClass) -> u32 {
+        class as u32
+    }
+
+    fn information_ptr(value: &u32) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
+    fn set_worker_factory_information(
+        task: &Task<TestPlatform, TestFS>,
+        worker_factory_handle: Handle,
+        worker_factory_information_class: u32,
+        worker_factory_information: ConstPtr<TestPlatform, u8>,
+        worker_factory_information_length: u32,
+    ) -> NtStatus {
+        task.sys_nt_set_information_worker_factory(WorkerFactorySetInformationParameters {
+            handle: worker_factory_handle,
+            information_class: worker_factory_information_class,
+            information: worker_factory_information,
+            information_length: worker_factory_information_length,
         })
     }
 
@@ -452,6 +611,141 @@ mod tests {
             NtStatus::OBJECT_NAME_INVALID
         );
         assert_eq!(worker_factory, Handle::from_raw(usize::MAX));
+        assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn set_information_updates_thread_limits() {
+        let task = test_task();
+        let io_completion = create_io_completion_handle(&task);
+        let mut worker_factory = Handle::default();
+        assert_eq!(
+            create_worker_factory(
+                &task,
+                &mut worker_factory,
+                None,
+                io_completion,
+                ProcessHandle::CURRENT,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let maximum = 2;
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                worker_factory,
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                information_ptr(&maximum),
+                u32_information_length(),
+            ),
+            NtStatus::SUCCESS
+        );
+        let minimum = 1;
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                worker_factory,
+                information_class_value(WorkerFactoryInformationClass::ThreadMinimum),
+                information_ptr(&minimum),
+                u32_information_length(),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn set_information_validates_length_before_pointer() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let io_completion = create_io_completion_handle(&task);
+            let mut worker_factory = Handle::default();
+            assert_eq!(
+                create_worker_factory(
+                    &task,
+                    &mut worker_factory,
+                    None,
+                    io_completion,
+                    ProcessHandle::CURRENT,
+                ),
+                NtStatus::SUCCESS
+            );
+
+            assert_eq!(
+                set_worker_factory_information(
+                    &task,
+                    worker_factory,
+                    information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                    crate::tests::null_const_ptr(),
+                    0,
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+            assert_eq!(
+                set_worker_factory_information(
+                    &task,
+                    worker_factory,
+                    information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                    crate::tests::null_const_ptr(),
+                    u32_information_length(),
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn set_information_rejects_wrong_object_type_and_missing_access() {
+        let task = test_task();
+        let io_completion = create_io_completion_handle(&task);
+        let value = 1;
+        let mut event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(mut_ptr(&mut event), EVENT_ALL_ACCESS, None, 0, 0),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                event,
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                information_ptr(&value),
+                u32_information_length(),
+            ),
+            NtStatus::OBJECT_TYPE_MISMATCH
+        );
+
+        let mut worker_factory = Handle::default();
+        assert_eq!(
+            create_worker_factory_with_access(
+                &task,
+                &mut worker_factory,
+                WORKER_FACTORY_QUERY_INFORMATION,
+                None,
+                io_completion,
+                ProcessHandle::CURRENT,
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                worker_factory,
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                information_ptr(&value),
+                u32_information_length(),
+            ),
+            NtStatus::ACCESS_DENIED
+        );
+
+        assert_eq!(task.sys_nt_close(worker_factory), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(event), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(io_completion), NtStatus::SUCCESS);
     }
 
@@ -657,6 +951,124 @@ mod tests {
         unsafe {
             assert_eq!(NtClose(host_event), NtStatus::SUCCESS.as_raw());
             assert_eq!(NtClose(host_io_completion), NtStatus::SUCCESS.as_raw());
+        }
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "native NtSetInformationWorkerFactory probes crash on this host before returning NTSTATUS"]
+    fn host_set_worker_factory_status_fidelity() {
+        use core::ffi::c_void;
+
+        unsafe extern "system" {
+            fn NtCreateEvent(
+                handle: *mut *mut c_void,
+                access: u32,
+                attributes: *const c_void,
+                event_type: u32,
+                initial_state: u8,
+            ) -> i32;
+            fn NtSetInformationWorkerFactory(
+                handle: *mut c_void,
+                worker_factory_information_class: u32,
+                worker_factory_information: *const c_void,
+                worker_factory_information_length: u32,
+            ) -> i32;
+            fn NtClose(handle: *mut c_void) -> i32;
+        }
+
+        let task = test_task();
+        let value = 1;
+
+        for (handle, class, info, length) in [
+            (
+                core::ptr::null_mut(),
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                (&raw const value).cast(),
+                u32_information_length(),
+            ),
+            (
+                core::ptr::null_mut(),
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                core::ptr::null(),
+                u32_information_length(),
+            ),
+            (
+                core::ptr::null_mut(),
+                16,
+                (&raw const value).cast(),
+                u32_information_length(),
+            ),
+            (
+                core::ptr::null_mut(),
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                (&raw const value).cast(),
+                0,
+            ),
+        ] {
+            // SAFETY: These probes intentionally use an invalid handle; any non-null input pointer
+            // points to a live local and no native worker factory can be started.
+            let host_status = unsafe { NtSetInformationWorkerFactory(handle, class, info, length) };
+            assert_eq!(
+                set_worker_factory_information(
+                    &task,
+                    Handle::default(),
+                    class,
+                    if info.is_null() {
+                        crate::tests::null_const_ptr()
+                    } else {
+                        information_ptr(&value)
+                    },
+                    length,
+                )
+                .as_raw(),
+                host_status
+            );
+        }
+
+        let mut host_event = core::ptr::null_mut();
+        // SAFETY: The output pointer is valid, attributes are null, and the handle is closed below.
+        let status = unsafe {
+            NtCreateEvent(
+                &raw mut host_event,
+                EVENT_ALL_ACCESS,
+                core::ptr::null(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(status, NtStatus::SUCCESS.as_raw());
+        let mut shim_event = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_event(mut_ptr(&mut shim_event), EVENT_ALL_ACCESS, None, 0, 0),
+            NtStatus::SUCCESS
+        );
+
+        // SAFETY: The event handle is valid but intentionally has the wrong object type.
+        let host_wrong_type = unsafe {
+            NtSetInformationWorkerFactory(
+                host_event,
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                (&raw const value).cast(),
+                u32_information_length(),
+            )
+        };
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                shim_event,
+                information_class_value(WorkerFactoryInformationClass::ThreadMaximum),
+                information_ptr(&value),
+                u32_information_length(),
+            )
+            .as_raw(),
+            host_wrong_type
+        );
+
+        assert_eq!(task.sys_nt_close(shim_event), NtStatus::SUCCESS);
+        // SAFETY: The host event handle was created successfully above and has not yet been closed.
+        unsafe {
+            assert_eq!(NtClose(host_event), NtStatus::SUCCESS.as_raw());
         }
     }
 }
