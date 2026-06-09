@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -351,6 +351,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             default_hard_error_mode: AtomicU32::new(0),
             cookie: syscalls::process::default_process_cookie(),
             scheduler_shared_data: AtomicUsize::new(0),
+            thread_hidden_from_debugger: AtomicBool::new(false),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
         Ok(LoadedProgram {
@@ -397,6 +398,7 @@ pub struct Process<Platform: ShimPlatform> {
     default_hard_error_mode: AtomicU32,
     cookie: u32,
     scheduler_shared_data: AtomicUsize,
+    thread_hidden_from_debugger: AtomicBool,
     exit_code: AtomicI32,
 }
 
@@ -962,6 +964,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQuerySymbolicLinkObject {
                 link_handle,
                 link_target,
@@ -1000,6 +1018,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process_information_class,
                     process_information,
                     process_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+            } => {
+                let status = self.sys_nt_set_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
                 );
                 (status, ContinueOperation::Resume)
             }

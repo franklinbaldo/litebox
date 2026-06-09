@@ -345,7 +345,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
-    fn scheduler_shared_data(&self) -> Option<usize> {
+    pub(crate) fn scheduler_shared_data(&self) -> Option<usize> {
         let existing = self.process.scheduler_shared_data.load(Ordering::Acquire);
         if existing != 0 {
             return Some(existing);
