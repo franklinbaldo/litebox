@@ -12,7 +12,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::PAGE_SIZE;
-use crate::nt_types::UnicodeString;
+use crate::nt_types::{ThreadEnvironmentBlock, UnicodeString};
 use crate::syscalls::ProcessHandle;
 use crate::syscalls::mm::create_pages;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
@@ -24,6 +24,16 @@ const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
+const PROCESS_TLS_REPLACE_INDEX: u32 = 0;
+const PROCESS_TLS_REPLACE_VECTOR: u32 = 1;
+const PROCESS_TLS_OPERATION_TYPE_OFFSET: usize = 4;
+const PROCESS_TLS_THREAD_DATA_COUNT_OFFSET: usize = 8;
+const PROCESS_TLS_INDEX_OFFSET: usize = 12;
+const PROCESS_TLS_THREAD_DATA_OFFSET: usize = 20;
+const THREAD_TLS_INFORMATION_SIZE: usize = 20;
+const THREAD_TLS_NEW_DATA_OFFSET: usize = 4;
+const THREAD_TLS_OLD_DATA_OFFSET: usize = 12;
+const TEB_TLS_SLOT_COUNT: usize = 64;
 const MAXIMUM_HARDERROR_PARAMETERS: u32 = 5;
 const HARDERROR_OPTION_SHUTDOWN_SYSTEM: u32 = 6;
 const HARDERROR_OPTION_CANCEL_TRY_CONTINUE: u32 = 8;
@@ -38,6 +48,7 @@ enum ProcessInformationClass {
     DefaultHardErrorMode = 12,
     Wow64Information = 26,
     DebugFlags = 31,
+    TlsInformation = 35,
     Cookie = 36,
     ConsoleHostProcess = 49,
     ImageInformation = 53,
@@ -125,6 +136,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 &self.process.cookie,
             ),
             ProcessInformationClass::ConsoleHostProcess
+            | ProcessInformationClass::TlsInformation
             | ProcessInformationClass::ImageInformation
             | ProcessInformationClass::SchedulerSharedData => {
                 litebox_util_log::debug!(
@@ -193,6 +205,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ProcessInformationClass::ImageInformation => NtStatus::INFO_LENGTH_MISMATCH,
             ProcessInformationClass::SchedulerSharedData => {
                 self.write_scheduler_shared_data(process_information, process_information_length)
+            }
+            ProcessInformationClass::TlsInformation => {
+                self.write_process_tls_information(process_information, process_information_length)
             }
             _ => {
                 litebox_util_log::debug!(
@@ -345,6 +360,166 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    fn write_process_tls_information(
+        &self,
+        process_information: ConstPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        let Some(operation_type) = read_process_information_u32::<Platform>(
+            process_information,
+            PROCESS_TLS_OPERATION_TYPE_OFFSET,
+            process_information_length,
+        ) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(thread_data_count) = read_process_information_u32::<Platform>(
+            process_information,
+            PROCESS_TLS_THREAD_DATA_COUNT_OFFSET,
+            process_information_length,
+        ) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(tls_index) = read_process_information_u32::<Platform>(
+            process_information,
+            PROCESS_TLS_INDEX_OFFSET,
+            process_information_length,
+        ) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+
+        let Some(required_len) = PROCESS_TLS_THREAD_DATA_OFFSET.checked_add(
+            usize::try_from(thread_data_count)
+                .ok()
+                .and_then(|count| count.checked_mul(THREAD_TLS_INFORMATION_SIZE))
+                .unwrap_or(usize::MAX),
+        ) else {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        };
+        if usize::try_from(process_information_length).unwrap_or(0) < required_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        match operation_type {
+            PROCESS_TLS_REPLACE_VECTOR => self.replace_tls_vector(
+                process_information,
+                process_information_length,
+                thread_data_count,
+            ),
+            PROCESS_TLS_REPLACE_INDEX => self.replace_tls_index(
+                process_information,
+                process_information_length,
+                thread_data_count,
+                tls_index,
+            ),
+            _ => {
+                litebox_util_log::debug!(
+                    operation_type,
+                    thread_data_count,
+                    tls_index;
+                    "Unsupported ProcessTlsInformation operation"
+                );
+                NtStatus::INVALID_INFO_CLASS
+            }
+        }
+    }
+
+    fn replace_tls_vector(
+        &self,
+        process_information: ConstPtr<Platform, u8>,
+        process_information_length: u32,
+        thread_data_count: u32,
+    ) -> NtStatus {
+        for thread_data_offset in tls_thread_data_offsets(thread_data_count) {
+            let Some(new_tls_data) = read_process_information_usize::<Platform>(
+                process_information,
+                thread_data_offset + THREAD_TLS_NEW_DATA_OFFSET,
+                process_information_length,
+            ) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            let Some(old_tls_data) = self.read_teb_usize(core::mem::offset_of!(
+                ThreadEnvironmentBlock,
+                thread_local_storage_pointer
+            )) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+
+            if write_process_information_usize::<Platform>(
+                process_information,
+                thread_data_offset + THREAD_TLS_OLD_DATA_OFFSET,
+                process_information_length,
+                old_tls_data,
+            )
+            .is_none()
+                || self
+                    .write_teb_usize(
+                        core::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+                        new_tls_data,
+                    )
+                    .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn replace_tls_index(
+        &self,
+        process_information: ConstPtr<Platform, u8>,
+        process_information_length: u32,
+        thread_data_count: u32,
+        tls_index: u32,
+    ) -> NtStatus {
+        let Ok(tls_index) = usize::try_from(tls_index) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if tls_index >= TEB_TLS_SLOT_COUNT {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let slot_offset = core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots)
+            .checked_add(tls_index * size_of::<usize>())
+            .expect("TEB TLS slot offset fits usize");
+
+        for thread_data_offset in tls_thread_data_offsets(thread_data_count) {
+            let Some(new_tls_data) = read_process_information_usize::<Platform>(
+                process_information,
+                thread_data_offset + THREAD_TLS_NEW_DATA_OFFSET,
+                process_information_length,
+            ) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            let Some(old_tls_data) = self.read_teb_usize(slot_offset) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+
+            if write_process_information_usize::<Platform>(
+                process_information,
+                thread_data_offset + THREAD_TLS_OLD_DATA_OFFSET,
+                process_information_length,
+                old_tls_data,
+            )
+            .is_none()
+                || self.write_teb_usize(slot_offset, new_tls_data).is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn read_teb_usize(&self, offset: usize) -> Option<usize> {
+        let address = self.teb_address.checked_add(offset)?;
+        ConstPtr::<Platform, usize>::from_usize(address).read_at_offset(0)
+    }
+
+    fn write_teb_usize(&self, offset: usize, value: usize) -> Option<()> {
+        let address = self.teb_address.checked_add(offset)?;
+        MutPtr::<Platform, usize>::from_usize(address).write_at_offset(0, value)
+    }
+
     pub(crate) fn scheduler_shared_data(&self) -> Option<usize> {
         let existing = self.process.scheduler_shared_data.load(Ordering::Acquire);
         if existing != 0 {
@@ -430,6 +605,48 @@ fn process_information_len<T>() -> u32 {
     u32::try_from(size_of::<T>()).expect("process information fits in ULONG")
 }
 
+fn tls_thread_data_offsets(thread_data_count: u32) -> impl Iterator<Item = usize> {
+    (0..thread_data_count as usize)
+        .map(|index| PROCESS_TLS_THREAD_DATA_OFFSET + index * THREAD_TLS_INFORMATION_SIZE)
+}
+
+fn read_process_information_u32<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+    offset: usize,
+    process_information_length: u32,
+) -> Option<u32> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<u32>())? {
+        return None;
+    }
+    ConstPtr::<Platform, u32>::from_usize(process_information.as_usize().checked_add(offset)?)
+        .read_at_offset(0)
+}
+
+fn read_process_information_usize<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+    offset: usize,
+    process_information_length: u32,
+) -> Option<usize> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<usize>())? {
+        return None;
+    }
+    ConstPtr::<Platform, usize>::from_usize(process_information.as_usize().checked_add(offset)?)
+        .read_at_offset(0)
+}
+
+fn write_process_information_usize<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+    offset: usize,
+    process_information_length: u32,
+    value: usize,
+) -> Option<()> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<usize>())? {
+        return None;
+    }
+    MutPtr::<Platform, usize>::from_usize(process_information.as_usize().checked_add(offset)?)
+        .write_at_offset(0, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +690,26 @@ mod tests {
 
     fn const_byte_mut_ptr<T>(value: &mut T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+    }
+
+    fn zeroed_teb() -> ThreadEnvironmentBlock {
+        // SAFETY: The TEB model is a plain guest-memory layout made of integer fields and arrays;
+        // all-zero bytes are a valid test value for this snapshot type.
+        unsafe { core::mem::zeroed() }
+    }
+
+    fn write_u32(buffer: &mut [u8], offset: usize, value: u32) {
+        buffer[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn write_usize(buffer: &mut [u8], offset: usize, value: usize) {
+        buffer[offset..offset + size_of::<usize>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn read_usize(buffer: &[u8], offset: usize) -> usize {
+        let mut bytes = [0u8; size_of::<usize>()];
+        bytes.copy_from_slice(&buffer[offset..offset + size_of::<usize>()]);
+        usize::from_ne_bytes(bytes)
     }
 
     fn sys_nt_query_information_process(
@@ -602,6 +839,101 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_ne!(scheduler_shared_data, 0);
+        });
+    }
+
+    #[test]
+    fn nt_set_information_process_replaces_tls_vector() {
+        run_with_test_platform_pointers(|| {
+            let mut teb = zeroed_teb();
+            teb.thread_local_storage_pointer = 0x1111_2222_3333_4444;
+
+            let mut task = crate::tests::test_task();
+            task.teb_address = core::ptr::from_mut(&mut teb) as usize;
+
+            let mut process_tls_information =
+                [0u8; PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_INFORMATION_SIZE];
+            write_u32(
+                &mut process_tls_information,
+                PROCESS_TLS_OPERATION_TYPE_OFFSET,
+                PROCESS_TLS_REPLACE_VECTOR,
+            );
+            write_u32(
+                &mut process_tls_information,
+                PROCESS_TLS_THREAD_DATA_COUNT_OFFSET,
+                1,
+            );
+            write_usize(
+                &mut process_tls_information,
+                PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_NEW_DATA_OFFSET,
+                0x5555_6666_7777_8888,
+            );
+
+            assert_eq!(
+                sys_nt_set_information_process(
+                    &task,
+                    class_value(ProcessInformationClass::TlsInformation),
+                    const_byte_mut_ptr(&mut process_tls_information),
+                    u32::try_from(process_tls_information.len()).unwrap(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(teb.thread_local_storage_pointer, 0x5555_6666_7777_8888);
+            assert_eq!(
+                read_usize(
+                    &process_tls_information,
+                    PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_OLD_DATA_OFFSET,
+                ),
+                0x1111_2222_3333_4444,
+            );
+        });
+    }
+
+    #[test]
+    fn nt_set_information_process_replaces_tls_index() {
+        run_with_test_platform_pointers(|| {
+            let mut teb = zeroed_teb();
+            teb.tls_slots[7] = 0x1111_2222_3333_4444;
+
+            let mut task = crate::tests::test_task();
+            task.teb_address = core::ptr::from_mut(&mut teb) as usize;
+
+            let mut process_tls_information =
+                [0u8; PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_INFORMATION_SIZE];
+            write_u32(
+                &mut process_tls_information,
+                PROCESS_TLS_OPERATION_TYPE_OFFSET,
+                PROCESS_TLS_REPLACE_INDEX,
+            );
+            write_u32(
+                &mut process_tls_information,
+                PROCESS_TLS_THREAD_DATA_COUNT_OFFSET,
+                1,
+            );
+            write_u32(&mut process_tls_information, PROCESS_TLS_INDEX_OFFSET, 7);
+            write_usize(
+                &mut process_tls_information,
+                PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_NEW_DATA_OFFSET,
+                0x5555_6666_7777_8888,
+            );
+
+            assert_eq!(
+                sys_nt_set_information_process(
+                    &task,
+                    class_value(ProcessInformationClass::TlsInformation),
+                    const_byte_mut_ptr(&mut process_tls_information),
+                    u32::try_from(process_tls_information.len()).unwrap(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(teb.tls_slots[7], 0x5555_6666_7777_8888);
+            assert_eq!(
+                read_usize(
+                    &process_tls_information,
+                    PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_OLD_DATA_OFFSET,
+                ),
+                0x1111_2222_3333_4444,
+            );
         });
     }
 
