@@ -16,6 +16,8 @@ use crate::{
 
 const ALLOCATION_GRANULARITY: usize = 0x1_0000;
 const ALLOCATION_SEARCH_ATTEMPTS: usize = 8;
+const MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE: usize = 24;
+const MEMORY_WORKING_SET_LIST_MIN_SIZE: usize = 16;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
 
 bitflags::bitflags! {
@@ -100,6 +102,27 @@ bitflags::bitflags! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum MemoryInformationClass {
     Basic = 0,
+    WorkingSetList = 4,
+    Image = 6,
+    ImageExtension = 14,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct MemoryImageInformation {
+    image_base: usize,
+    size_of_image: usize,
+    image_flags: u32,
+    _padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct MemoryImageExtensionInformation {
+    extension_type: u32,
+    flags: u32,
+    extension_image_base_rva: usize,
+    extension_size: usize,
 }
 
 #[repr(u64)]
@@ -638,11 +661,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if !process_handle.is_current() {
             return NtStatus::INVALID_HANDLE;
         }
-        let Ok(MemoryInformationClass::Basic) =
+        let Ok(memory_information_class) =
             MemoryInformationClass::try_from(memory_information_class)
         else {
             return NtStatus::INVALID_INFO_CLASS;
         };
+
+        match memory_information_class {
+            MemoryInformationClass::Basic => {}
+            MemoryInformationClass::WorkingSetList => {
+                return Self::write_memory_working_set_list(
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+            }
+            MemoryInformationClass::Image => {
+                return self.write_memory_image_information(
+                    process_handle,
+                    base_address,
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+            }
+            MemoryInformationClass::ImageExtension => {
+                return self.write_memory_image_extension_information(
+                    process_handle,
+                    base_address,
+                    memory_information,
+                    memory_information_length,
+                    return_length,
+                );
+            }
+        }
 
         let required_len = size_of::<MemoryBasicInformation>();
         if let Some(return_length) = return_length
@@ -666,6 +718,139 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if output.write_at_offset(0, info).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
+
+        NtStatus::SUCCESS
+    }
+
+    fn write_memory_image_information(
+        &self,
+        process_handle: ProcessHandle,
+        base_address: usize,
+        memory_information: MutPtr<Platform, u8>,
+        memory_information_length: usize,
+        return_length: Option<MutPtr<Platform, usize>>,
+    ) -> NtStatus {
+        let required_len = size_of::<MemoryImageInformation>();
+        if let Some(return_length) = return_length
+            && return_length.write_at_offset(0, required_len).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if memory_information_length < required_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        let Some(allocation) =
+            find_image_allocation_containing(&self.process.virtual_allocations, base_address)
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+
+        let info = MemoryImageInformation {
+            image_base: allocation.base,
+            size_of_image: allocation.size,
+            image_flags: 0,
+            _padding: 0,
+        };
+        let output =
+            MutPtr::<Platform, MemoryImageInformation>::from_usize(memory_information.as_usize());
+        if output.write_at_offset(0, info).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:? = process_handle,
+            base:% = format_args!("{base_address:#x}"),
+            image_base:% = format_args!("{:#x}", allocation.base),
+            image_size = allocation.size;
+            "Handled NtQueryVirtualMemory MemoryImageInformation syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    fn write_memory_image_extension_information(
+        &self,
+        process_handle: ProcessHandle,
+        base_address: usize,
+        memory_information: MutPtr<Platform, u8>,
+        memory_information_length: usize,
+        return_length: Option<MutPtr<Platform, usize>>,
+    ) -> NtStatus {
+        let required_len = MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE;
+        if let Some(return_length) = return_length
+            && return_length.write_at_offset(0, required_len).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if memory_information_length < required_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        let Some(allocation) =
+            find_image_allocation_containing(&self.process.virtual_allocations, base_address)
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+
+        let input = ConstPtr::<Platform, [u8; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE]>::from_usize(
+            memory_information.as_usize(),
+        );
+        let Some(request) = input.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if request != [0; MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE] {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let info = MemoryImageExtensionInformation::default();
+        let output = MutPtr::<Platform, MemoryImageExtensionInformation>::from_usize(
+            memory_information.as_usize(),
+        );
+        if output.write_at_offset(0, info).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            process_handle:? = process_handle,
+            base:% = format_args!("{base_address:#x}"),
+            image_base:% = format_args!("{:#x}", allocation.base),
+            image_size = allocation.size;
+            "Handled NtQueryVirtualMemory MemoryImageExtensionInformation syscall"
+        );
+
+        NtStatus::SUCCESS
+    }
+
+    fn write_memory_working_set_list(
+        memory_information: MutPtr<Platform, u8>,
+        memory_information_length: usize,
+        return_length: Option<MutPtr<Platform, usize>>,
+    ) -> NtStatus {
+        if memory_information_length < MEMORY_WORKING_SET_LIST_MIN_SIZE {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if let Some(return_length) = return_length
+            && return_length
+                .write_at_offset(0, memory_information_length)
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        for offset in 0..memory_information_length {
+            let Ok(offset) = isize::try_from(offset) else {
+                return NtStatus::INVALID_PARAMETER;
+            };
+            if memory_information.write_at_offset(offset, 0).is_none() {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+        }
+
+        litebox_util_log::debug!(
+            memory_information_length;
+            "Handled NtQueryVirtualMemory MemoryWorkingSetList syscall"
+        );
 
         NtStatus::SUCCESS
     }
@@ -763,6 +948,14 @@ fn find_private_virtual_allocation<Platform: ShimPlatform>(
 ) -> Option<WindowsVirtualAllocation> {
     find_virtual_allocation(virtual_allocations, base, size)
         .filter(|allocation| allocation.type_ == MemoryType::MEM_PRIVATE.bits())
+}
+
+fn find_image_allocation_containing<Platform: ShimPlatform>(
+    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+    base: usize,
+) -> Option<WindowsVirtualAllocation> {
+    find_virtual_allocation(virtual_allocations, base, 1)
+        .filter(|allocation| allocation.type_ == MemoryType::MEM_IMAGE.bits())
 }
 
 fn find_virtual_allocation_containing<Platform: ShimPlatform>(
@@ -1372,6 +1565,125 @@ mod tests {
         );
         assert_eq!(return_length, size_of::<MemoryBasicInformation>());
         info
+    }
+
+    fn register_test_image_allocation(task: &TestTask, base: usize, size: usize) {
+        let mut pages = RangeMap::new();
+        pages.insert(base..base + size, PageProtection::PAGE_EXECUTE_READ);
+        task.process.virtual_allocations.write().insert(
+            base,
+            WindowsVirtualAllocation {
+                base,
+                size,
+                allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
+                type_: MemoryType::MEM_IMAGE.bits(),
+                pages,
+            },
+        );
+    }
+
+    #[test]
+    fn query_virtual_memory_reports_image_information() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let image_base = 0x1800_0000usize;
+            let image_size = 0x20_000usize;
+            register_test_image_allocation(&task, image_base, image_size);
+
+            let mut info = MemoryImageInformation::default();
+            let mut return_length = 0usize;
+            assert_eq!(
+                task.sys_nt_query_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    image_base + PAGE_SIZE,
+                    MemoryInformationClass::Image as u32,
+                    mut_byte_ptr(&mut info),
+                    size_of::<MemoryImageInformation>(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(return_length, size_of::<MemoryImageInformation>());
+            assert_eq!(info.image_base, image_base);
+            assert_eq!(info.size_of_image, image_size);
+            assert_eq!(info.image_flags, 0);
+        });
+    }
+
+    #[test]
+    fn query_virtual_memory_reports_absent_image_extension_information() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let image_base = 0x1800_0000usize;
+            register_test_image_allocation(&task, image_base, 0x20_000);
+
+            let mut info = MemoryImageExtensionInformation::default();
+            let mut return_length = 0usize;
+            assert_eq!(
+                task.sys_nt_query_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    image_base,
+                    MemoryInformationClass::ImageExtension as u32,
+                    mut_byte_ptr(&mut info),
+                    MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(return_length, MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE);
+            assert_eq!(info.extension_type, 0);
+            assert_eq!(info.flags, 0);
+            assert_eq!(info.extension_image_base_rva, 0);
+            assert_eq!(info.extension_size, 0);
+
+            info.flags = 1;
+            assert_eq!(
+                task.sys_nt_query_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    image_base,
+                    MemoryInformationClass::ImageExtension as u32,
+                    mut_byte_ptr(&mut info),
+                    MEMORY_IMAGE_EXTENSION_INFORMATION_SIZE,
+                    None,
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn query_virtual_memory_zeroes_working_set_list() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut info = [0xccu8; 80];
+            let mut return_length = 0usize;
+
+            assert_eq!(
+                task.sys_nt_query_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    0,
+                    MemoryInformationClass::WorkingSetList as u32,
+                    mut_byte_ptr(&mut info),
+                    info.len(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(return_length, info.len());
+            assert_eq!(info, [0u8; 80]);
+
+            assert_eq!(
+                task.sys_nt_query_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    0,
+                    MemoryInformationClass::WorkingSetList as u32,
+                    mut_byte_ptr(&mut info),
+                    MEMORY_WORKING_SET_LIST_MIN_SIZE - 1,
+                    None,
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+        });
     }
 
     #[test]
