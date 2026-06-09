@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod directory_object;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod iocp;
@@ -98,6 +99,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtClose {
         handle: Handle,
     },
+    NtCreateDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtCreateDirectoryObjectEx {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        shadow_directory_handle: Handle,
+        flags: u32,
+    },
     NtCreateEvent {
         event_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -110,6 +123,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
+    },
+    NtCreateSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        link_target: Platform::RawConstPointer<nt_types::UnicodeString>,
     },
     NtAssociateWaitCompletionPacket {
         wait_completion_packet_handle: Handle,
@@ -162,8 +181,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtSetWnfProcessNotificationEvent {
         notification_event: Handle,
     },
+    NtOpenDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
     NtOpenEvent {
         event_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtOpenSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
@@ -187,6 +216,15 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         event_information_class: u32,
         event_information: Platform::RawMutPointer<event::EventBasicInformation>,
         event_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryDirectoryObject {
+        directory_handle: Handle,
+        buffer: Platform::RawMutPointer<u8>,
+        length: u32,
+        return_single_entry: u8,
+        restart_scan: u8,
+        context: Platform::RawMutPointer<u32>,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtSetEventBoostPriority {
@@ -280,6 +318,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtQuerySymbolicLinkObject {
+        link_handle: Handle,
+        link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
     NtSetInformationProcess {
         process_handle: ProcessHandle,
         process_information_class: u32,
@@ -370,6 +413,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
             })),
+            NtSysno::NtCreateDirectoryObject => Some(sys_req!(NtCreateDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtCreateDirectoryObjectEx => Some(sys_req!(NtCreateDirectoryObjectEx {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+                shadow_directory_handle:{Handle::from_raw},
+                flags,
+            })),
             NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
                 event_handle:*,
                 desired_access,
@@ -382,6 +437,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
                 number_of_concurrent_threads,
+            })),
+            NtSysno::NtCreateSymbolicLinkObject => Some(sys_req!(NtCreateSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+                link_target:*,
             })),
             NtSysno::NtAssociateWaitCompletionPacket => {
                 Some(sys_req!(NtAssociateWaitCompletionPacket {
@@ -440,8 +501,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     notification_event: { Handle::from_raw },
                 }))
             }
+            NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
             NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
                 event_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtOpenSymbolicLinkObject => Some(sys_req!(NtOpenSymbolicLinkObject {
+                link_handle:*,
                 desired_access,
                 object_attributes:*,
             })),
@@ -465,6 +536,15 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 event_information_class,
                 event_information:*,
                 event_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQueryDirectoryObject => Some(sys_req!(NtQueryDirectoryObject {
+                directory_handle:{Handle::from_raw},
+                buffer:*,
+                length,
+                return_single_entry,
+                restart_scan,
+                context:*,
                 return_length:*,
             })),
             NtSysno::NtSetEventBoostPriority => Some(sys_req!(NtSetEventBoostPriority {
@@ -556,6 +636,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_information_class,
                 process_information:*,
                 process_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
+                link_handle:{Handle::from_raw},
+                link_target:*,
                 return_length:*,
             })),
             NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {

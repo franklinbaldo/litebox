@@ -32,6 +32,11 @@ use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
 
 use crate::syscalls::SyscallRequest;
+use crate::syscalls::directory_object::{
+    DirectoryObject, DirectoryObjectHandleObject, DirectoryObjectSubsystem,
+    QueryDirectoryObjectParameters, SymbolicLinkHandleObject, SymbolicLinkObject,
+    SymbolicLinkSubsystem,
+};
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
@@ -91,6 +96,10 @@ pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
 pub(crate) type WindowsEventNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
+pub(crate) type WindowsDirectoryNamespace<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Arc<DirectoryObject<Platform>>>>;
+pub(crate) type WindowsSymbolicLinkNamespace<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Arc<SymbolicLinkObject<Platform>>>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -326,6 +335,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
+            directory_namespace: WindowsDirectoryNamespace::<Platform>::new(
+                syscalls::directory_object::initial_directory_namespace(),
+            ),
+            symbolic_link_namespace: WindowsSymbolicLinkNamespace::<Platform>::new(
+                syscalls::directory_object::initial_symbolic_link_namespace(),
+            ),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             // TODO: Register stack, PEB/TEB, and process parameters once VM metadata can
             // distinguish those loader-owned mappings from guest-releasable allocations.
@@ -372,6 +387,8 @@ pub struct Process<Platform: ShimPlatform> {
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
     event_namespace: WindowsEventNamespace<Platform>,
+    directory_namespace: WindowsDirectoryNamespace<Platform>,
+    symbolic_link_namespace: WindowsSymbolicLinkNamespace<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
@@ -453,6 +470,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let status = self.sys_nt_close(handle);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtCreateDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_create_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateDirectoryObjectEx {
+                directory_handle,
+                desired_access,
+                object_attributes,
+                shadow_directory_handle,
+                flags,
+            } => {
+                let status = self.sys_nt_create_directory_object_ex(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                    shadow_directory_handle,
+                    flags,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtCreateEvent {
                 event_handle,
                 desired_access,
@@ -480,6 +525,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     desired_access,
                     object_attributes,
                     number_of_concurrent_threads,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+                link_target,
+            } => {
+                let status = self.sys_nt_create_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                    link_target,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -601,6 +660,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 });
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenDirectoryObject {
+                directory_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_open_directory_object(
+                    directory_handle,
+                    desired_access,
+                    object_attributes,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenEvent {
                 event_handle,
                 desired_access,
@@ -608,6 +679,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => {
                 let status =
                     self.sys_nt_open_event(event_handle, desired_access, object_attributes);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenSymbolicLinkObject {
+                link_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status = self.sys_nt_open_symbolic_link_object(
+                    link_handle,
+                    desired_access,
+                    object_attributes,
+                );
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtSetEvent {
@@ -649,6 +732,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     event_information_length,
                     return_length,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryDirectoryObject {
+                directory_handle,
+                buffer,
+                length,
+                return_single_entry,
+                restart_scan,
+                context,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_directory_object(QueryDirectoryObjectParameters {
+                    directory_handle,
+                    buffer,
+                    length,
+                    return_single_entry,
+                    restart_scan,
+                    context,
+                    return_length,
+                });
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtSetEventBoostPriority { event_handle } => {
@@ -841,6 +944,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process_information_length,
                     return_length,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQuerySymbolicLinkObject {
+                link_handle,
+                link_target,
+                return_length,
+            } => {
+                let status =
+                    self.sys_nt_query_symbolic_link_object(link_handle, link_target, return_length);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtSetInformationProcess {
@@ -1040,6 +1152,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, DirectoryObjectSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |directory| visitor.directory_object(directory),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, SymbolicLinkSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |link| visitor.symbolic_link(link),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, IoCompletionSubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -1094,6 +1222,10 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn event(&self, event: EventHandleObject<Platform>);
 
+    fn directory_object(&self, directory: DirectoryObjectHandleObject<Platform>);
+
+    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
+
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
@@ -1123,6 +1255,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn event(&self, event: EventHandleObject<Platform>) {
         Task::<Platform, FS>::close_event(event);
+    }
+
+    fn directory_object(&self, directory: DirectoryObjectHandleObject<Platform>) {
+        Task::<Platform, FS>::close_directory_object(directory);
+    }
+
+    fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>) {
+        Task::<Platform, FS>::close_symbolic_link(link);
     }
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
