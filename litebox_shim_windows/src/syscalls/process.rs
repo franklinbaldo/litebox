@@ -12,9 +12,10 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::PAGE_SIZE;
+use crate::nt_types::UnicodeString;
 use crate::syscalls::ProcessHandle;
 use crate::syscalls::mm::create_pages;
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
@@ -23,6 +24,11 @@ const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
+const MAXIMUM_HARDERROR_PARAMETERS: u32 = 5;
+const HARDERROR_OPTION_SHUTDOWN_SYSTEM: u32 = 6;
+const HARDERROR_OPTION_CANCEL_TRY_CONTINUE: u32 = 8;
+const HARDERROR_RESPONSE_RETURN_TO_CALLER: u32 = 0;
+const HARDERROR_RESPONSE_NOT_HANDLED: u32 = 1;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -208,6 +214,92 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         status
     }
 
+    pub(crate) fn sys_nt_raise_hard_error(
+        error_status: NtStatus,
+        number_of_parameters: u32,
+        unicode_string_parameter_mask: u32,
+        parameters: Option<ConstPtr<Platform, usize>>,
+        valid_response_options: u32,
+        response: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        if number_of_parameters > MAXIMUM_HARDERROR_PARAMETERS
+            || parameters.is_some() != (number_of_parameters != 0)
+        {
+            return NtStatus::INVALID_PARAMETER_2;
+        }
+        if valid_response_options > HARDERROR_OPTION_CANCEL_TRY_CONTINUE {
+            return NtStatus::INVALID_PARAMETER_4;
+        }
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, u32>(response) {
+            return status;
+        }
+        if let Some(parameters) = parameters
+            && let Err(status) = Self::probe_hard_error_parameters(
+                parameters,
+                number_of_parameters,
+                unicode_string_parameter_mask,
+            )
+        {
+            return status;
+        }
+
+        litebox_util_log::debug!(
+            error_status:? = error_status,
+            number_of_parameters,
+            unicode_string_parameter_mask:% = format_args!("{unicode_string_parameter_mask:#x}"),
+            valid_response_options;
+            "Handled NtRaiseHardError as a local hard-error sink"
+        );
+
+        let response_value = if valid_response_options == HARDERROR_OPTION_SHUTDOWN_SYSTEM {
+            HARDERROR_RESPONSE_NOT_HANDLED
+        } else {
+            HARDERROR_RESPONSE_RETURN_TO_CALLER
+        };
+        if response.write_at_offset(0, response_value).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if valid_response_options == HARDERROR_OPTION_SHUTDOWN_SYSTEM {
+            return NtStatus::PRIVILEGE_NOT_HELD;
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn probe_hard_error_parameters(
+        parameters: ConstPtr<Platform, usize>,
+        number_of_parameters: u32,
+        unicode_string_parameter_mask: u32,
+    ) -> Result<(), NtStatus> {
+        for index in 0..number_of_parameters {
+            let index_offset =
+                isize::try_from(index).expect("hard-error parameter index fits isize");
+            let parameter = parameters
+                .read_at_offset(index_offset)
+                .ok_or(NtStatus::ACCESS_VIOLATION)?;
+            if unicode_string_parameter_mask & (1u32 << index) == 0 {
+                continue;
+            }
+
+            let string = ConstPtr::<Platform, UnicodeString>::from_usize(parameter)
+                .read_at_offset(0)
+                .ok_or(NtStatus::ACCESS_VIOLATION)?;
+            if string.maximum_length == 0 {
+                continue;
+            }
+
+            let buffer = ConstPtr::<Platform, u8>::from_usize(string.buffer);
+            let last_byte_offset = isize::try_from(string.maximum_length - 1)
+                .expect("UNICODE_STRING maximum length fits isize");
+            if buffer.read_at_offset(0).is_none()
+                || buffer.read_at_offset(last_byte_offset).is_none()
+            {
+                return Err(NtStatus::ACCESS_VIOLATION);
+            }
+        }
+        Ok(())
+    }
+
     fn write_process_information<T: Immutable + IntoBytes>(
         process_information: MutPtr<Platform, u8>,
         process_information_length: u32,
@@ -341,7 +433,7 @@ fn process_information_len<T>() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr};
+    use crate::tests::{const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
     use litebox::platform::ThreadProvider;
 
     type TestPlatform = crate::tests::TestPlatform;
@@ -354,6 +446,15 @@ mod tests {
             process_information: *mut core::ffi::c_void,
             process_information_length: u32,
             return_length: *mut u32,
+        ) -> i32;
+
+        fn NtRaiseHardError(
+            error_status: i32,
+            number_of_parameters: u32,
+            unicode_string_parameter_mask: u32,
+            parameters: *const usize,
+            valid_response_options: u32,
+            response: *mut u32,
         ) -> i32;
     }
 
@@ -401,6 +502,22 @@ mod tests {
             process_information_class,
             process_information,
             process_information_length,
+        )
+    }
+
+    fn sys_nt_raise_hard_error(
+        number_of_parameters: u32,
+        parameters: Option<ConstPtr<TestPlatform, usize>>,
+        valid_response_options: u32,
+        response: MutPtr<TestPlatform, u32>,
+    ) -> NtStatus {
+        Task::<TestPlatform, crate::tests::TestFS>::sys_nt_raise_hard_error(
+            NtStatus::SUCCESS,
+            number_of_parameters,
+            0,
+            parameters,
+            valid_response_options,
+            response,
         )
     }
 
@@ -648,6 +765,114 @@ mod tests {
         });
     }
 
+    #[test]
+    fn nt_raise_hard_error_returns_to_caller_without_hard_error_port() {
+        run_with_test_platform_pointers(|| {
+            let mut response = u32::MAX;
+
+            assert_eq!(
+                sys_nt_raise_hard_error(0, None, 1, mut_ptr(&mut response),),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(response, HARDERROR_RESPONSE_RETURN_TO_CALLER);
+        });
+    }
+
+    #[test]
+    fn nt_raise_hard_error_validates_shallow_arguments() {
+        run_with_test_platform_pointers(|| {
+            let parameters = [0usize; 1];
+            let mut response = 0xcccc_cccc;
+
+            assert_eq!(
+                sys_nt_raise_hard_error(
+                    MAXIMUM_HARDERROR_PARAMETERS + 1,
+                    None,
+                    1,
+                    mut_ptr(&mut response),
+                ),
+                NtStatus::INVALID_PARAMETER_2
+            );
+            assert_eq!(response, 0xcccc_cccc);
+
+            assert_eq!(
+                sys_nt_raise_hard_error(1, None, 1, mut_ptr(&mut response)),
+                NtStatus::INVALID_PARAMETER_2
+            );
+
+            assert_eq!(
+                sys_nt_raise_hard_error(
+                    0,
+                    Some(const_ptr(&parameters[0])),
+                    1,
+                    mut_ptr(&mut response),
+                ),
+                NtStatus::INVALID_PARAMETER_2
+            );
+
+            assert_eq!(
+                sys_nt_raise_hard_error(
+                    0,
+                    None,
+                    HARDERROR_OPTION_CANCEL_TRY_CONTINUE + 1,
+                    mut_ptr(&mut response),
+                ),
+                NtStatus::INVALID_PARAMETER_4
+            );
+
+            assert_eq!(
+                sys_nt_raise_hard_error(0, None, 1, null_mut_ptr()),
+                NtStatus::ACCESS_VIOLATION
+            );
+        });
+    }
+
+    #[test]
+    fn nt_raise_hard_error_probes_unicode_string_parameters() {
+        run_with_test_platform_pointers(|| {
+            let text = [b'O', 0, b'K', 0];
+            let string = UnicodeString {
+                length: 4,
+                maximum_length: 4,
+                padding_0: [0; 4],
+                buffer: text.as_ptr() as usize,
+            };
+            let parameters = [core::ptr::from_ref(&string) as usize];
+            let mut response = u32::MAX;
+
+            assert_eq!(
+                Task::<TestPlatform, crate::tests::TestFS>::sys_nt_raise_hard_error(
+                    NtStatus::SUCCESS,
+                    1,
+                    1,
+                    Some(const_ptr(&parameters[0])),
+                    1,
+                    mut_ptr(&mut response),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(response, HARDERROR_RESPONSE_RETURN_TO_CALLER);
+
+            let bad_string = UnicodeString {
+                buffer: 0,
+                ..string
+            };
+            let bad_parameters = [core::ptr::from_ref(&bad_string) as usize];
+
+            assert_eq!(
+                Task::<TestPlatform, crate::tests::TestFS>::sys_nt_raise_hard_error(
+                    NtStatus::SUCCESS,
+                    1,
+                    1,
+                    Some(const_ptr(&bad_parameters[0])),
+                    1,
+                    mut_ptr(&mut response),
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+        });
+    }
+
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn nt_query_information_process_status_matches_host_ntdll() {
@@ -702,6 +927,113 @@ mod tests {
             );
             assert_eq!(guest_short_status, host_short_status);
             assert_eq!(guest_short_return_length, host_short_return_length);
+        });
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_raise_hard_error_shallow_statuses_match_host_ntdll() {
+        run_with_test_platform_pointers(|| {
+            let parameters = [0usize; 1];
+            let mut host_response = 0xcccc_cccc;
+            let mut guest_response = 0xcccc_cccc;
+
+            // SAFETY: This uses STATUS_SUCCESS and no parameters, which host probes show returns
+            // through the no-port path without displaying a hard-error UI; response is a local.
+            let host_nt_status = unsafe {
+                host_status(NtRaiseHardError(
+                    NtStatus::SUCCESS.as_raw(),
+                    0,
+                    0,
+                    core::ptr::null(),
+                    1,
+                    &raw mut host_response,
+                ))
+            };
+            let guest_status = sys_nt_raise_hard_error(0, None, 1, mut_ptr(&mut guest_response));
+            assert_eq!(guest_status, host_nt_status);
+            assert_eq!(guest_response, host_response);
+
+            host_response = 0xcccc_cccc;
+            guest_response = 0xcccc_cccc;
+            // SAFETY: Invalid response option is rejected before any hard-error port interaction.
+            let host_nt_status = unsafe {
+                host_status(NtRaiseHardError(
+                    NtStatus::SUCCESS.as_raw(),
+                    0,
+                    0,
+                    core::ptr::null(),
+                    HARDERROR_OPTION_CANCEL_TRY_CONTINUE + 1,
+                    &raw mut host_response,
+                ))
+            };
+            let guest_status = sys_nt_raise_hard_error(
+                0,
+                None,
+                HARDERROR_OPTION_CANCEL_TRY_CONTINUE + 1,
+                mut_ptr(&mut guest_response),
+            );
+            assert_eq!(guest_status, host_nt_status);
+            assert_eq!(guest_response, host_response);
+
+            host_response = 0xcccc_cccc;
+            guest_response = 0xcccc_cccc;
+            // SAFETY: Excess parameter count is rejected before dereferencing pointers.
+            let host_nt_status = unsafe {
+                host_status(NtRaiseHardError(
+                    NtStatus::SUCCESS.as_raw(),
+                    MAXIMUM_HARDERROR_PARAMETERS + 1,
+                    0,
+                    core::ptr::null(),
+                    1,
+                    &raw mut host_response,
+                ))
+            };
+            let guest_status = sys_nt_raise_hard_error(
+                MAXIMUM_HARDERROR_PARAMETERS + 1,
+                None,
+                1,
+                mut_ptr(&mut guest_response),
+            );
+            assert_eq!(guest_status, host_nt_status);
+            assert_eq!(guest_response, host_response);
+
+            host_response = 0xcccc_cccc;
+            guest_response = 0xcccc_cccc;
+            // SAFETY: A non-null parameter array with zero parameters is rejected before the
+            // parameter array is dereferenced.
+            let host_nt_status = unsafe {
+                host_status(NtRaiseHardError(
+                    NtStatus::SUCCESS.as_raw(),
+                    0,
+                    0,
+                    parameters.as_ptr(),
+                    1,
+                    &raw mut host_response,
+                ))
+            };
+            let guest_status = sys_nt_raise_hard_error(
+                0,
+                Some(const_ptr(&parameters[0])),
+                1,
+                mut_ptr(&mut guest_response),
+            );
+            assert_eq!(guest_status, host_nt_status);
+            assert_eq!(guest_response, host_response);
+
+            // SAFETY: Null response is rejected by ntdll probing; no hard-error UI is involved.
+            let host_nt_status = unsafe {
+                host_status(NtRaiseHardError(
+                    NtStatus::SUCCESS.as_raw(),
+                    0,
+                    0,
+                    core::ptr::null(),
+                    1,
+                    core::ptr::null_mut(),
+                ))
+            };
+            let guest_status = sys_nt_raise_hard_error(0, None, 1, null_mut_ptr());
+            assert_eq!(guest_status, host_nt_status);
         });
     }
 }

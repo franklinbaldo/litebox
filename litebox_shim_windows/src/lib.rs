@@ -955,6 +955,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.sys_nt_query_symbolic_link_object(link_handle, link_target, return_length);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtRaiseHardError {
+                error_status,
+                number_of_parameters,
+                unicode_string_parameter_mask,
+                parameters,
+                valid_response_options,
+                response,
+            } => {
+                let status = Self::sys_nt_raise_hard_error(
+                    error_status,
+                    number_of_parameters,
+                    unicode_string_parameter_mask,
+                    parameters,
+                    valid_response_options,
+                    response,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtSetInformationProcess {
                 process_handle,
                 process_information_class,

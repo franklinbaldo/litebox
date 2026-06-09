@@ -318,6 +318,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtRaiseHardError {
+        error_status: NtStatus,
+        number_of_parameters: u32,
+        unicode_string_parameter_mask: u32,
+        parameters: Option<Platform::RawConstPointer<usize>>,
+        valid_response_options: u32,
+        response: Platform::RawMutPointer<u32>,
+    },
     NtQuerySymbolicLinkObject {
         link_handle: Handle,
         link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
@@ -643,6 +651,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_information:*,
                 process_information_length,
                 return_length:*,
+            })),
+            NtSysno::NtRaiseHardError => Some(sys_req!(NtRaiseHardError {
+                error_status,
+                number_of_parameters,
+                unicode_string_parameter_mask,
+                parameters:*,
+                valid_response_options,
+                response:*,
             })),
             NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
                 link_handle:{Handle::from_raw},
