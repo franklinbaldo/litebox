@@ -15,6 +15,7 @@ use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
 use crate::syscalls::Handle;
 use crate::syscalls::event::{EventAccess, EventSubsystem};
 use crate::syscalls::iocp::{IoCompletionAccess, IoCompletionSubsystem};
+use crate::syscalls::timer::{TimerAccess, TimerSubsystem};
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
     remove_raw_handle,
@@ -207,31 +208,72 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         entry.with_entry(|entry| entry.require_access(IoCompletionAccess::MODIFY_STATE))
     }
 
-    fn target_event_signaled_for_wait_completion_packet(
+    fn target_object_signaled_for_wait_completion_packet(
         &self,
         handle: Handle,
     ) -> Result<bool, NtStatus> {
         let Some(raw_fd) = handle.raw_fd() else {
             return Err(NtStatus::ACCESS_DENIED);
         };
+        if let Some(signaled) = self.event_signaled_for_wait_completion_packet(raw_fd)? {
+            return Ok(signaled);
+        }
+        if let Some(signaled) = self.timer_signaled_for_wait_completion_packet(raw_fd)? {
+            return Ok(signaled);
+        }
+        Err(NtStatus::INVALID_PARAMETER_3)
+    }
+
+    fn event_signaled_for_wait_completion_packet(
+        &self,
+        raw_fd: usize,
+    ) -> Result<Option<bool>, NtStatus> {
         let typed = {
             let handles = self.process.handles.read();
             match handles.fd_from_raw_integer::<EventSubsystem<Platform>>(raw_fd) {
                 Ok(typed) => typed,
                 Err(ErrRawIntFd::NotFound) => return Err(NtStatus::ACCESS_DENIED),
-                Err(ErrRawIntFd::InvalidSubsystem) => return Err(NtStatus::INVALID_PARAMETER_3),
+                Err(ErrRawIntFd::InvalidSubsystem) => return Ok(None),
             }
         };
         let Some(entry) = self.global.litebox.descriptor_table().entry_handle(&typed) else {
             return Err(NtStatus::ACCESS_DENIED);
         };
-        entry.with_entry(|entry| {
-            entry
-                .require_access(EventAccess::from_bits_retain(
-                    AccessMask::SYNCHRONIZE.bits(),
-                ))
-                .map(|()| entry.is_signaled())
-        })
+        entry
+            .with_entry(|entry| {
+                entry
+                    .require_access(EventAccess::from_bits_retain(
+                        AccessMask::SYNCHRONIZE.bits(),
+                    ))
+                    .map(|()| entry.is_signaled())
+            })
+            .map(Some)
+    }
+
+    fn timer_signaled_for_wait_completion_packet(
+        &self,
+        raw_fd: usize,
+    ) -> Result<Option<bool>, NtStatus> {
+        let typed = {
+            let handles = self.process.handles.read();
+            match handles.fd_from_raw_integer::<TimerSubsystem<Platform>>(raw_fd) {
+                Ok(typed) => typed,
+                Err(ErrRawIntFd::NotFound) => return Err(NtStatus::ACCESS_DENIED),
+                Err(ErrRawIntFd::InvalidSubsystem) => return Ok(None),
+            }
+        };
+        let Some(entry) = self.global.litebox.descriptor_table().entry_handle(&typed) else {
+            return Err(NtStatus::ACCESS_DENIED);
+        };
+        entry
+            .with_entry(|entry| {
+                entry
+                    .require_access(TimerAccess::from_bits_retain(
+                        AccessMask::SYNCHRONIZE.bits(),
+                    ))
+                    .map(|()| false)
+            })
+            .map(Some)
     }
 
     fn insert_wait_completion_packet_handle(
@@ -331,7 +373,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER_1;
         }
         let already_signaled = match self
-            .target_event_signaled_for_wait_completion_packet(params.target_object_handle)
+            .target_object_signaled_for_wait_completion_packet(params.target_object_handle)
         {
             Ok(already_signaled) => already_signaled,
             Err(status) => return status,
@@ -461,6 +503,20 @@ mod tests {
             0,
             u8::from(initial_state),
         )
+    }
+
+    fn create_timer(
+        task: &Task<TestPlatform, crate::tests::TestFS>,
+        handle: &mut Handle,
+        desired_access: u32,
+    ) -> NtStatus {
+        task.sys_nt_create_timer2(crate::syscalls::timer::TimerCreateParameters {
+            timer_handle: mut_ptr(handle),
+            timer_id: None,
+            object_attributes: None,
+            attributes: 0,
+            desired_access,
+        })
     }
 
     fn associate_wait_completion_packet(
@@ -656,6 +712,40 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(already_signaled, 1);
+    }
+
+    #[test]
+    fn associate_accepts_timer_target_as_unsignaled() {
+        let task = test_task();
+        let mut packet = Handle::default();
+        let mut io_completion = Handle::default();
+        let mut timer = Handle::default();
+        let mut already_signaled = 0xaa;
+
+        assert_eq!(
+            create_wait_completion_packet(&task, &mut packet, None),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_io_completion(&task, &mut io_completion, IO_COMPLETION_ALL_ACCESS),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            create_timer(&task, &mut timer, SYNCHRONIZE),
+            NtStatus::SUCCESS
+        );
+
+        assert_eq!(
+            associate_wait_completion_packet(
+                &task,
+                packet,
+                io_completion,
+                timer,
+                Some(mut_ptr(&mut already_signaled)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(already_signaled, 0);
     }
 
     #[test]

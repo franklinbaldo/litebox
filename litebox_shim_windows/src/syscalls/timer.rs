@@ -90,7 +90,17 @@ impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for TimerHandleObjec
 
 pub(crate) struct TimerHandleObject<Platform: crate::ShimPlatform> {
     _timer: Arc<TimerObject<Platform>>,
-    _granted_access: TimerAccess,
+    granted_access: TimerAccess,
+}
+
+impl<Platform: crate::ShimPlatform> TimerHandleObject<Platform> {
+    pub(crate) fn require_access(&self, required: TimerAccess) -> Result<(), NtStatus> {
+        if self.granted_access.contains(required) {
+            Ok(())
+        } else {
+            Err(NtStatus::ACCESS_DENIED)
+        }
+    }
 }
 
 pub(crate) struct TimerObject<Platform: crate::ShimPlatform> {
@@ -146,7 +156,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .descriptor_table_mut()
             .insert::<TimerSubsystem<Platform>>(TimerHandleObject {
                 _timer: timer,
-                _granted_access: granted_access,
+                granted_access,
             });
         insert_raw_handle::<Platform, TimerSubsystem<Platform>>(
             &self.global.litebox,
