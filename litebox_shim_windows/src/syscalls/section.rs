@@ -783,15 +783,14 @@ fn required_map_access(protection: PageProtection) -> Result<SectionAccess, NtSt
     let required = if matches!(
         base,
         value if value == PageProtection::PAGE_READWRITE.bits()
-            || value == PageProtection::PAGE_WRITECOPY.bits()
             || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
-            || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
     ) {
         SectionAccess::MAP_WRITE
     } else if matches!(
         base,
         value if value == PageProtection::PAGE_EXECUTE.bits()
             || value == PageProtection::PAGE_EXECUTE_READ.bits()
+            || value == PageProtection::PAGE_EXECUTE_WRITECOPY.bits()
     ) {
         SectionAccess::MAP_EXECUTE
     } else if base == PageProtection::PAGE_NOACCESS.bits() {
@@ -1018,6 +1017,39 @@ mod tests {
         assert_eq!(
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::NOT_MAPPED_VIEW
+        );
+    }
+
+    #[test]
+    fn nt_map_view_of_section_allows_execute_writecopy_without_map_write() {
+        let task = crate::tests::test_task();
+        let handle = create_pagefile_section(
+            &task,
+            (SectionAccess::QUERY | SectionAccess::MAP_READ | SectionAccess::MAP_EXECUTE).bits(),
+            0x2000,
+        );
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_EXECUTE_WRITECOPY.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(view_size, 0x2000);
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
         );
     }
 
