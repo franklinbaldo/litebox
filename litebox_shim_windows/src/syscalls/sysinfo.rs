@@ -28,10 +28,14 @@ const LOGICAL_PROCESSOR_RELATION_PROCESSOR_CORE: u32 = 0;
 const LOGICAL_PROCESSOR_RELATION_NUMA_NODE: u32 = 1;
 const LOGICAL_PROCESSOR_RELATION_PROCESSOR_PACKAGE: u32 = 3;
 const LOGICAL_PROCESSOR_RELATION_GROUP: u32 = 4;
-const ETW_ACTIVITY_ID_CREATE: u32 = 12;
-const ETW_ENUM_TRACE_GUID_LIST: u32 = 21;
-const ETW_REGISTER_SECURITY_PROVIDER: u32 = 24;
 const ETW_ACTIVITY_ID_LENGTH: u32 = 16;
+const ETW_UM_REGISTRATION_INFORMATION_LENGTH: u32 = 160;
+const ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE: usize = 160;
+const ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH: usize = 0x70;
+const ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET: usize = 24;
+const ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET: usize = 0x2c;
+const ETW_PROVIDER_TRAITS_INPUT_LENGTH: u32 = 24;
+const ETW_PROVIDER_TRAITS_OUTPUT_LENGTH: u32 = 120;
 #[cfg(test)]
 const ETW_ACTIVITY_ID_LENGTH_USIZE: usize = 16;
 
@@ -47,6 +51,17 @@ enum SystemInformationClass {
     HypervisorSharedPage = 197,
     FeatureConfigurationSection = 211,
     ProcessorFeaturesBitMap = 250,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum EtwTraceControlCode {
+    ActivityIdCreate = 12,
+    RegisterGuids = 15,
+    EnumTraceGuidList = 21,
+    RegisterSecurityProvider = 24,
+    AddNotificationEvent = 27,
+    SetProviderTraits = 30,
 }
 
 #[repr(C)]
@@ -515,21 +530,65 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_nt_trace_control(
         &self,
         function_code: u32,
-        _input_buffer: ConstPtr<Platform, u8>,
-        _input_buffer_length: u32,
+        input_buffer: ConstPtr<Platform, u8>,
+        input_buffer_length: u32,
         output_buffer: MutPtr<Platform, u8>,
         output_buffer_length: u32,
         return_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
+        let input_u32 = if input_buffer_length as usize >= size_of::<u32>() {
+            input_buffer.to_owned_slice(size_of::<u32>()).map(|bytes| {
+                u32::from_le_bytes(
+                    bytes
+                        .as_ref()
+                        .try_into()
+                        .expect("ULONG input is four bytes"),
+                )
+            })
+        } else {
+            None
+        };
+        litebox_util_log::debug!(
+            function_code,
+            input_buffer:% = format_args!("{:#x}", input_buffer.as_usize()),
+            input_buffer_length,
+            input_u32:? = input_u32,
+            output_buffer_length,
+            has_return_length = return_length.is_some();
+            "NtTraceControl parameters"
+        );
+        let Ok(function_code) = EtwTraceControlCode::try_from(function_code) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
         match function_code {
-            ETW_ACTIVITY_ID_CREATE => self.sys_nt_trace_control_activity_id_create(
+            EtwTraceControlCode::ActivityIdCreate => self.sys_nt_trace_control_activity_id_create(
                 output_buffer,
                 output_buffer_length,
                 return_length,
             ),
-            ETW_ENUM_TRACE_GUID_LIST => NtStatus::BUFFER_TOO_SMALL,
-            ETW_REGISTER_SECURITY_PROVIDER => NtStatus::ACCESS_DENIED,
-            _ => NtStatus::INVALID_PARAMETER,
+            EtwTraceControlCode::RegisterGuids => self.sys_nt_trace_control_register_guids(
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            ),
+            EtwTraceControlCode::EnumTraceGuidList => NtStatus::BUFFER_TOO_SMALL,
+            EtwTraceControlCode::RegisterSecurityProvider => NtStatus::ACCESS_DENIED,
+            EtwTraceControlCode::AddNotificationEvent => self
+                .sys_nt_trace_control_add_notification_event(
+                    input_buffer,
+                    input_buffer_length,
+                    return_length,
+                ),
+            EtwTraceControlCode::SetProviderTraits => self
+                .sys_nt_trace_control_set_provider_traits(
+                    input_buffer,
+                    input_buffer_length,
+                    output_buffer,
+                    output_buffer_length,
+                    return_length,
+                ),
         }
     }
 
@@ -608,6 +667,107 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         activity_id[8..12].copy_from_slice(&self.process.cookie.to_ne_bytes());
         activity_id[12..].copy_from_slice(&self.teb_address.to_ne_bytes()[..4]);
         activity_id
+    }
+
+    fn sys_nt_trace_control_add_notification_event(
+        &self,
+        input_buffer: ConstPtr<Platform, u8>,
+        input_buffer_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if input_buffer.as_usize() == 0 || input_buffer_length as usize != size_of::<u32>() {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let Some(reg_handle_bytes) = input_buffer.to_owned_slice(size_of::<u32>()) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let reg_handle = u32::from_le_bytes(
+            reg_handle_bytes
+                .as_ref()
+                .try_into()
+                .expect("HANDLE input is four bytes"),
+        );
+        if reg_handle == 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if let Some(return_length) = return_length
+            && return_length.write_at_offset(0, 0).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    fn sys_nt_trace_control_register_guids(
+        &self,
+        input_buffer: ConstPtr<Platform, u8>,
+        input_buffer_length: u32,
+        output_buffer: MutPtr<Platform, u8>,
+        output_buffer_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if input_buffer.as_usize() == 0
+            || output_buffer.as_usize() == 0
+            || input_buffer_length < ETW_UM_REGISTRATION_INFORMATION_LENGTH
+            || output_buffer_length < ETW_UM_REGISTRATION_INFORMATION_LENGTH
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let Some(registration) =
+            input_buffer.to_owned_slice(ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE)
+        else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let mut reply = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+        reply[..ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH]
+            .copy_from_slice(&registration.as_ref()[..ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH]);
+        reply[ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET
+            ..ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET + size_of::<u64>()]
+            .copy_from_slice(&u64::from(self.process.cookie).to_le_bytes());
+        reply[ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET
+            ..ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET + size_of::<u32>()]
+            .copy_from_slice(&ETW_UM_REGISTRATION_INFORMATION_LENGTH.to_le_bytes());
+        if output_buffer.write_slice_at_offset(0, &reply).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if let Some(return_length) = return_length
+            && return_length
+                .write_at_offset(0, ETW_UM_REGISTRATION_INFORMATION_LENGTH)
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    fn sys_nt_trace_control_set_provider_traits(
+        &self,
+        input_buffer: ConstPtr<Platform, u8>,
+        input_buffer_length: u32,
+        output_buffer: MutPtr<Platform, u8>,
+        output_buffer_length: u32,
+        _return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if input_buffer.as_usize() == 0
+            || output_buffer.as_usize() == 0
+            || input_buffer_length != ETW_PROVIDER_TRAITS_INPUT_LENGTH
+            || output_buffer_length < ETW_PROVIDER_TRAITS_OUTPUT_LENGTH
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let Some(reg_handle_bytes) = input_buffer.to_owned_slice(size_of::<u32>()) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let reg_handle = u32::from_le_bytes(
+            reg_handle_bytes
+                .as_ref()
+                .try_into()
+                .expect("HANDLE input is four bytes"),
+        );
+        if reg_handle != self.process.cookie {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        NtStatus::FILE_CORRUPT_ERROR
     }
 }
 
@@ -881,10 +1041,28 @@ mod tests {
         output_buffer_length: u32,
         return_length: Option<MutPtr<TestPlatform, u32>>,
     ) -> NtStatus {
-        crate::tests::test_task().sys_nt_trace_control(
+        sys_nt_trace_control_with_input(
             function_code,
             null_const_ptr(),
             0,
+            output_buffer,
+            output_buffer_length,
+            return_length,
+        )
+    }
+
+    fn sys_nt_trace_control_with_input(
+        function_code: u32,
+        input_buffer: ConstPtr<TestPlatform, u8>,
+        input_buffer_length: u32,
+        output_buffer: MutPtr<TestPlatform, u8>,
+        output_buffer_length: u32,
+        return_length: Option<MutPtr<TestPlatform, u32>>,
+    ) -> NtStatus {
+        crate::tests::test_task().sys_nt_trace_control(
+            function_code,
+            input_buffer,
+            input_buffer_length,
             output_buffer,
             output_buffer_length,
             return_length,
@@ -1442,7 +1620,7 @@ mod tests {
 
             assert_eq!(
                 sys_nt_trace_control(
-                    ETW_ACTIVITY_ID_CREATE,
+                    EtwTraceControlCode::ActivityIdCreate as u32,
                     mut_byte_ptr(&mut output),
                     ETW_ACTIVITY_ID_LENGTH,
                     Some(mut_ptr(&mut return_length)),
@@ -1462,7 +1640,7 @@ mod tests {
 
             assert_eq!(
                 sys_nt_trace_control(
-                    ETW_ACTIVITY_ID_CREATE,
+                    EtwTraceControlCode::ActivityIdCreate as u32,
                     mut_byte_ptr(&mut output),
                     ETW_ACTIVITY_ID_LENGTH,
                     None,
@@ -1471,7 +1649,7 @@ mod tests {
             );
             assert_eq!(
                 sys_nt_trace_control(
-                    ETW_ACTIVITY_ID_CREATE,
+                    EtwTraceControlCode::ActivityIdCreate as u32,
                     null_mut_ptr(),
                     ETW_ACTIVITY_ID_LENGTH,
                     Some(mut_ptr(&mut return_length)),
@@ -1480,7 +1658,7 @@ mod tests {
             );
             assert_eq!(
                 sys_nt_trace_control(
-                    ETW_ACTIVITY_ID_CREATE,
+                    EtwTraceControlCode::ActivityIdCreate as u32,
                     mut_byte_ptr(&mut output),
                     ETW_ACTIVITY_ID_LENGTH - 1,
                     Some(mut_ptr(&mut return_length)),
@@ -1498,7 +1676,7 @@ mod tests {
 
             assert_eq!(
                 sys_nt_trace_control(
-                    ETW_ENUM_TRACE_GUID_LIST,
+                    EtwTraceControlCode::EnumTraceGuidList as u32,
                     mut_byte_ptr(&mut output),
                     0,
                     Some(mut_ptr(&mut return_length)),
@@ -1507,7 +1685,7 @@ mod tests {
             );
             assert_eq!(
                 sys_nt_trace_control(
-                    ETW_REGISTER_SECURITY_PROVIDER,
+                    EtwTraceControlCode::RegisterSecurityProvider as u32,
                     mut_byte_ptr(&mut output),
                     0,
                     Some(mut_ptr(&mut return_length)),
@@ -1518,6 +1696,169 @@ mod tests {
                 sys_nt_trace_control(
                     0,
                     mut_byte_ptr(&mut output),
+                    0,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_add_notification_event_accepts_registration_handle() {
+        run_with_test_platform_pointers(|| {
+            let reg_handle = 40u32;
+            let mut return_length = u32::MAX;
+
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::AddNotificationEvent as u32,
+                    const_byte_ptr(&reg_handle),
+                    size_of::<u32>() as u32,
+                    null_mut_ptr(),
+                    0,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(return_length, 0);
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_register_guids_returns_registration_reply() {
+        run_with_test_platform_pointers(|| {
+            let mut input = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+            let mut output = [0xcc; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+            let mut return_length = u32::MAX;
+            input[0] = 0x5a;
+            input[ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH..].fill(0x5a);
+
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::RegisterGuids as u32,
+                    const_byte_ptr(&input),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH,
+                    mut_byte_ptr(&mut output),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(output[0], 0x5a);
+            assert_eq!(
+                u32::from_le_bytes(
+                    output[ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET
+                        ..ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET + size_of::<u32>()]
+                        .try_into()
+                        .unwrap()
+                ),
+                ETW_UM_REGISTRATION_INFORMATION_LENGTH
+            );
+            assert_ne!(
+                &output[ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET
+                    ..ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET + size_of::<u64>()],
+                &[0; size_of::<u64>()]
+            );
+            assert_eq!(
+                &output[ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH..],
+                &[0; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE
+                    - ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH]
+            );
+            assert_eq!(return_length, ETW_UM_REGISTRATION_INFORMATION_LENGTH);
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_register_guids_validates_buffers() {
+        run_with_test_platform_pointers(|| {
+            let input = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+            let mut output = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+            let mut return_length = 0u32;
+
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::RegisterGuids as u32,
+                    const_byte_ptr(&input),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH - 1,
+                    mut_byte_ptr(&mut output),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::RegisterGuids as u32,
+                    const_byte_ptr(&input),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH,
+                    mut_byte_ptr(&mut output),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH - 1,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_set_provider_traits_returns_host_failure_for_local_etw() {
+        run_with_test_platform_pointers(|| {
+            let mut input = [0u8; ETW_PROVIDER_TRAITS_INPUT_LENGTH as usize];
+            input[..size_of::<u32>()]
+                .copy_from_slice(&crate::syscalls::process::default_process_cookie().to_le_bytes());
+            let mut output = [0xcc; ETW_PROVIDER_TRAITS_OUTPUT_LENGTH as usize];
+            let mut return_length = u32::MAX;
+
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::SetProviderTraits as u32,
+                    const_byte_ptr(&input),
+                    ETW_PROVIDER_TRAITS_INPUT_LENGTH,
+                    mut_byte_ptr(&mut output),
+                    ETW_PROVIDER_TRAITS_OUTPUT_LENGTH,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::FILE_CORRUPT_ERROR
+            );
+            assert_eq!(output, [0xcc; ETW_PROVIDER_TRAITS_OUTPUT_LENGTH as usize]);
+            assert_eq!(return_length, u32::MAX);
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_set_provider_traits_rejects_unknown_registration_handle() {
+        run_with_test_platform_pointers(|| {
+            let input = [0u8; ETW_PROVIDER_TRAITS_INPUT_LENGTH as usize];
+            let mut output = [0u8; ETW_PROVIDER_TRAITS_OUTPUT_LENGTH as usize];
+            let mut return_length = 0u32;
+
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::SetProviderTraits as u32,
+                    const_byte_ptr(&input),
+                    ETW_PROVIDER_TRAITS_INPUT_LENGTH,
+                    mut_byte_ptr(&mut output),
+                    ETW_PROVIDER_TRAITS_OUTPUT_LENGTH,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
+    }
+
+    #[test]
+    fn nt_trace_control_add_notification_event_rejects_null_registration_handle() {
+        run_with_test_platform_pointers(|| {
+            let reg_handle = 0u32;
+            let mut return_length = 0u32;
+
+            assert_eq!(
+                sys_nt_trace_control_with_input(
+                    EtwTraceControlCode::AddNotificationEvent as u32,
+                    const_byte_ptr(&reg_handle),
+                    size_of::<u32>() as u32,
+                    null_mut_ptr(),
                     0,
                     Some(mut_ptr(&mut return_length)),
                 ),
@@ -1675,7 +2016,7 @@ mod tests {
             // retain them.
             let host_activity_status = unsafe {
                 host_status(NtTraceControl(
-                    ETW_ACTIVITY_ID_CREATE,
+                    EtwTraceControlCode::ActivityIdCreate as u32,
                     core::ptr::null(),
                     0,
                     host_output.as_mut_ptr().cast(),
@@ -1684,7 +2025,7 @@ mod tests {
                 ))
             };
             let guest_activity_status = sys_nt_trace_control(
-                ETW_ACTIVITY_ID_CREATE,
+                EtwTraceControlCode::ActivityIdCreate as u32,
                 mut_byte_ptr(&mut guest_output),
                 ETW_ACTIVITY_ID_LENGTH,
                 Some(mut_ptr(&mut guest_return_length)),
@@ -1696,7 +2037,7 @@ mod tests {
             // memory is dereferenced by this test outside ntdll.
             let host_no_return_length_status = unsafe {
                 host_status(NtTraceControl(
-                    ETW_ACTIVITY_ID_CREATE,
+                    EtwTraceControlCode::ActivityIdCreate as u32,
                     core::ptr::null(),
                     0,
                     host_output.as_mut_ptr().cast(),
@@ -1705,7 +2046,7 @@ mod tests {
                 ))
             };
             let guest_no_return_length_status = sys_nt_trace_control(
-                ETW_ACTIVITY_ID_CREATE,
+                EtwTraceControlCode::ActivityIdCreate as u32,
                 mut_byte_ptr(&mut guest_output),
                 ETW_ACTIVITY_ID_LENGTH,
                 None,
@@ -1716,7 +2057,7 @@ mod tests {
             // status comparison.
             let host_enum_status = unsafe {
                 host_status(NtTraceControl(
-                    ETW_ENUM_TRACE_GUID_LIST,
+                    EtwTraceControlCode::EnumTraceGuidList as u32,
                     core::ptr::null(),
                     0,
                     core::ptr::null_mut(),
@@ -1725,7 +2066,7 @@ mod tests {
                 ))
             };
             let guest_enum_status = sys_nt_trace_control(
-                ETW_ENUM_TRACE_GUID_LIST,
+                EtwTraceControlCode::EnumTraceGuidList as u32,
                 null_mut_ptr(),
                 0,
                 Some(mut_ptr(&mut guest_return_length)),
@@ -1736,7 +2077,7 @@ mod tests {
             // status comparison.
             let host_security_status = unsafe {
                 host_status(NtTraceControl(
-                    ETW_REGISTER_SECURITY_PROVIDER,
+                    EtwTraceControlCode::RegisterSecurityProvider as u32,
                     core::ptr::null(),
                     0,
                     core::ptr::null_mut(),
@@ -1745,7 +2086,7 @@ mod tests {
                 ))
             };
             let guest_security_status = sys_nt_trace_control(
-                ETW_REGISTER_SECURITY_PROVIDER,
+                EtwTraceControlCode::RegisterSecurityProvider as u32,
                 null_mut_ptr(),
                 0,
                 Some(mut_ptr(&mut guest_return_length)),
