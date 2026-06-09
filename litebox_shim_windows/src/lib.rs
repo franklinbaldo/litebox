@@ -43,6 +43,7 @@ use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
+use crate::syscalls::token::{TokenHandleObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
     WaitCompletionPacketCreateParameters, WaitCompletionPacketHandleObject,
@@ -980,6 +981,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQueryInformationToken {
+                token_handle,
+                token_information_class,
+                token_information,
+                token_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_token(
+                    token_handle,
+                    token_information_class,
+                    token_information,
+                    token_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQuerySecurityAttributesToken {
+                token_handle,
+                attributes,
+                number_of_attributes,
+                buffer,
+                length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_security_attributes_token(
+                    token_handle,
+                    attributes,
+                    number_of_attributes,
+                    buffer,
+                    length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQuerySymbolicLinkObject {
                 link_handle,
                 link_target,
@@ -1032,6 +1067,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     thread_information_class,
                     thread_information,
                     thread_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenThreadToken {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                token_handle,
+            } => {
+                let status = Self::sys_nt_open_thread_token(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenThreadTokenEx {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle,
+            } => {
+                let status = Self::sys_nt_open_thread_token_ex(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    handle_attributes,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenProcessToken {
+                process_handle,
+                desired_access,
+                token_handle,
+            } => {
+                let status =
+                    self.sys_nt_open_process_token(process_handle, desired_access, token_handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenProcessTokenEx {
+                process_handle,
+                desired_access,
+                handle_attributes,
+                token_handle,
+            } => {
+                let status = self.sys_nt_open_process_token_ex(
+                    process_handle,
+                    desired_access,
+                    handle_attributes,
+                    token_handle,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1275,6 +1363,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, TokenSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |token| visitor.token(token),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         NtStatus::INVALID_HANDLE
     }
 
@@ -1311,6 +1407,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     );
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
+
+    fn token(&self, token: TokenHandleObject);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -1357,6 +1455,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
         Task::<Platform, FS>::close_worker_factory(worker_factory);
+    }
+
+    fn token(&self, token: TokenHandleObject) {
+        Task::<Platform, FS>::close_token(token);
     }
 }
 

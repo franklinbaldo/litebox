@@ -12,6 +12,7 @@ pub(crate) mod registry;
 pub(crate) mod sysinfo;
 pub(crate) mod thread;
 pub(crate) mod timer;
+pub(crate) mod token;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod worker_factory;
 
@@ -220,6 +221,30 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
+    NtOpenThreadToken {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u8,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenThreadTokenEx {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u8,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessToken {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessTokenEx {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
     NtSetEvent {
         event_handle: Handle,
         previous_state: Option<Platform::RawMutPointer<i32>>,
@@ -354,6 +379,21 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_information_class: u32,
         thread_information: Platform::RawMutPointer<u8>,
         thread_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryInformationToken {
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: Platform::RawMutPointer<u8>,
+        token_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQuerySecurityAttributesToken {
+        token_handle: Handle,
+        attributes: Option<Platform::RawConstPointer<u8>>,
+        number_of_attributes: u32,
+        buffer: Option<Platform::RawMutPointer<u8>>,
+        length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtRaiseHardError {
@@ -574,6 +614,30 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
             })),
+            NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
+                thread_handle:{ThreadHandle::from_raw},
+                desired_access,
+                open_as_self,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenThreadTokenEx => Some(sys_req!(NtOpenThreadTokenEx {
+                thread_handle:{ThreadHandle::from_raw},
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessToken => Some(sys_req!(NtOpenProcessToken {
+                process_handle:{ProcessHandle::from_raw},
+                desired_access,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessTokenEx => Some(sys_req!(NtOpenProcessTokenEx {
+                process_handle:{ProcessHandle::from_raw},
+                desired_access,
+                handle_attributes,
+                token_handle:*,
+            })),
             NtSysno::NtSetEvent => Some(sys_req!(NtSetEvent {
                 event_handle:{Handle::from_raw},
                 previous_state:*,
@@ -710,6 +774,23 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_information_length,
                 return_length:*,
             })),
+            NtSysno::NtQueryInformationToken => Some(sys_req!(NtQueryInformationToken {
+                token_handle: { Handle::from_raw },
+                token_information_class,
+                token_information:*,
+                token_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySecurityAttributesToken => {
+                Some(sys_req!(NtQuerySecurityAttributesToken {
+                    token_handle:{Handle::from_raw},
+                    attributes:*,
+                    number_of_attributes,
+                    buffer:*,
+                    length,
+                    return_length:*,
+                }))
+            }
             NtSysno::NtRaiseHardError => Some(sys_req!(NtRaiseHardError {
                 error_status,
                 number_of_parameters,
