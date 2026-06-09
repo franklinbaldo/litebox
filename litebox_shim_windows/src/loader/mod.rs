@@ -3,4 +3,5 @@
 
 mod pe;
 
-pub(super) use pe::{PeLoader, WindowsLoadError};
+pub(crate) use pe::load_image_section;
+pub(crate) use pe::{PeLoader, WindowsLoadError};

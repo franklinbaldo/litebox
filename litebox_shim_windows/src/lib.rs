@@ -42,6 +42,9 @@ use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::mm;
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::section::{
+    MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
+};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::token::{TokenHandleObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
@@ -101,6 +104,15 @@ pub(crate) type WindowsDirectoryNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Arc<DirectoryObject<Platform>>>>;
 pub(crate) type WindowsSymbolicLinkNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Arc<SymbolicLinkObject<Platform>>>>;
+pub(crate) type WindowsSectionNamespace<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<String, Weak<SectionObject>>>;
+pub(crate) type WindowsSectionViews<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsSectionView {
+    pub(crate) size: usize,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsVirtualAllocation {
@@ -342,6 +354,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             symbolic_link_namespace: WindowsSymbolicLinkNamespace::<Platform>::new(
                 syscalls::directory_object::initial_symbolic_link_namespace(),
             ),
+            section_namespace: WindowsSectionNamespace::<Platform>::new(BTreeMap::new()),
+            section_views: WindowsSectionViews::<Platform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<Platform>::new(BTreeMap::new()),
             // TODO: Register stack, PEB/TEB, and process parameters once VM metadata can
             // distinguish those loader-owned mappings from guest-releasable allocations.
@@ -391,6 +405,8 @@ pub struct Process<Platform: ShimPlatform> {
     event_namespace: WindowsEventNamespace<Platform>,
     directory_namespace: WindowsDirectoryNamespace<Platform>,
     symbolic_link_namespace: WindowsSymbolicLinkNamespace<Platform>,
+    section_namespace: WindowsSectionNamespace<Platform>,
+    section_views: WindowsSectionViews<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
     system_lcid: AtomicU32,
@@ -528,6 +544,50 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     desired_access,
                     object_attributes,
                     number_of_concurrent_threads,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSection {
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+            } => {
+                let status = self.sys_nt_create_section(
+                    section_handle,
+                    desired_access,
+                    object_attributes,
+                    maximum_size,
+                    section_page_protection,
+                    allocation_attributes,
+                    file_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtCreateSectionEx {
+                section_handle,
+                desired_access,
+                object_attributes,
+                maximum_size,
+                section_page_protection,
+                allocation_attributes,
+                file_handle,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = self.sys_nt_create_section_ex(
+                    section_handle,
+                    desired_access,
+                    object_attributes,
+                    maximum_size,
+                    section_page_protection,
+                    allocation_attributes,
+                    file_handle,
+                    extended_parameters,
+                    extended_parameter_count,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -694,6 +754,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     desired_access,
                     object_attributes,
                 );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenSection {
+                section_handle,
+                desired_access,
+                object_attributes,
+            } => {
+                let status =
+                    self.sys_nt_open_section(section_handle, desired_access, object_attributes);
                 (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtSetEvent {
@@ -997,6 +1066,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtQuerySection {
+                section_handle,
+                section_information_class,
+                section_information,
+                section_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_section(
+                    section_handle,
+                    section_information_class,
+                    section_information,
+                    section_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQuerySecurityAttributesToken {
                 token_handle,
                 attributes,
@@ -1252,6 +1337,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtMapViewOfSection {
+                section_handle,
+                process_handle,
+                base_address,
+                zero_bits,
+                commit_size,
+                section_offset,
+                view_size,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+            } => {
+                let status = self.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                    section_handle,
+                    process_handle,
+                    base_address,
+                    zero_bits,
+                    commit_size,
+                    section_offset,
+                    view_size,
+                    inherit_disposition,
+                    allocation_type,
+                    page_protection,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtMapViewOfSectionEx {
+                section_handle,
+                process_handle,
+                base_address,
+                section_offset,
+                view_size,
+                allocation_type,
+                page_protection,
+                extended_parameters,
+                extended_parameter_count,
+            } => {
+                let status = self.sys_nt_map_view_of_section_ex(
+                    MapViewOfSectionParameters {
+                        section_handle,
+                        process_handle,
+                        base_address,
+                        zero_bits: 0,
+                        commit_size: 0,
+                        section_offset,
+                        view_size,
+                        inherit_disposition: 2,
+                        allocation_type,
+                        page_protection,
+                    },
+                    extended_parameters,
+                    extended_parameter_count,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUnmapViewOfSection {
+                process_handle,
+                base_address,
+            } => {
+                let status = self.sys_nt_unmap_view_of_section(process_handle, base_address);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUnmapViewOfSectionEx {
+                process_handle,
+                base_address,
+                flags,
+            } => {
+                let status =
+                    self.sys_nt_unmap_view_of_section_ex(process_handle, base_address, flags);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,
@@ -1363,6 +1519,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, SectionSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |section| visitor.section(section),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, TokenSubsystem>(
             &self.global.litebox,
             &self.process.handles,
@@ -1407,6 +1571,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     );
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
+
+    fn section(&self, section: SectionHandleObject);
 
     fn token(&self, token: TokenHandleObject);
 }
@@ -1455,6 +1621,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
         Task::<Platform, FS>::close_worker_factory(worker_factory);
+    }
+
+    fn section(&self, section: SectionHandleObject) {
+        Task::<Platform, FS>::close_section(section);
     }
 
     fn token(&self, token: TokenHandleObject) {

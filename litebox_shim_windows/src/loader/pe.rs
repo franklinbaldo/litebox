@@ -856,6 +856,19 @@ fn load_image<Platform: crate::ShimPlatform, FS: ShimFS>(
     load_image_with_writable_sections(fs, path, platform, page_manager, &[])
 }
 
+pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
+    platform: &'static Platform,
+    fs: Arc<FS>,
+    path: &str,
+    page_manager: &crate::WindowsPageManager<Platform>,
+    virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
+) -> Result<MappingInfo, WindowsLoadError> {
+    let image = load_image(platform, fs, path, page_manager)?;
+    let mapping = image.mapping;
+    register_image_virtual_allocation(virtual_allocations, mapping, image.pages);
+    Ok(mapping)
+}
+
 fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
     fs: Arc<FS>,
     path: &str,

@@ -295,7 +295,7 @@ pub(crate) fn initial_directory_namespace<Platform: crate::ShimPlatform>()
         .collect()
 }
 
-fn directory_key(path: &str) -> String {
+pub(crate) fn directory_key(path: &str) -> String {
     path.to_ascii_lowercase()
 }
 
@@ -576,7 +576,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .cloned()
     }
 
-    fn directory_parent_exists(&self, path: &str) -> bool {
+    pub(crate) fn resolve_object_name_path(
+        &self,
+        object_attributes: &ObjectAttributes,
+        name: &str,
+    ) -> Result<String, NtStatus> {
+        self.resolve_directory_name(object_attributes, name)
+            .map(|name| name.path)
+    }
+
+    pub(crate) fn directory_object_exists(&self, path: &str) -> bool {
+        self.directory_namespace_lookup(path).is_some()
+    }
+
+    pub(crate) fn symbolic_link_object_exists(&self, path: &str) -> bool {
+        self.symbolic_link_namespace_lookup(path).is_some()
+    }
+
+    pub(crate) fn directory_parent_exists(&self, path: &str) -> bool {
         parent_path(path).is_some_and(|parent| self.directory_namespace_lookup(parent).is_some())
     }
 

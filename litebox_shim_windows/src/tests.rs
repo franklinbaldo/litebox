@@ -130,6 +130,8 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             symbolic_link_namespace: WindowsSymbolicLinkNamespace::<TestPlatform>::new(
                 crate::syscalls::directory_object::initial_symbolic_link_namespace(),
             ),
+            section_namespace: crate::WindowsSectionNamespace::<TestPlatform>::new(BTreeMap::new()),
+            section_views: crate::WindowsSectionViews::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: WindowsVirtualAllocations::<TestPlatform>::new(BTreeMap::new()),
             system_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
