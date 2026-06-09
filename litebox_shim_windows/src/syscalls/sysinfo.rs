@@ -11,6 +11,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::GroupAffinity;
+use crate::syscalls::Handle;
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task};
 
 const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
@@ -532,6 +533,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn sys_nt_trace_event(
+        &self,
+        trace_handle: Handle,
+        flags: u32,
+        field_size: u32,
+        fields: ConstPtr<Platform, u8>,
+    ) -> NtStatus {
+        let trace_handle_raw = trace_handle.as_raw();
+        litebox_util_log::debug!(
+            trace_handle:% = format_args!("{trace_handle_raw:#x}"),
+            flags:% = format_args!("{flags:#x}"),
+            field_size,
+            has_fields = fields.as_usize() != 0;
+            "Handled NtTraceEvent as an unsupported local ETW sink"
+        );
+
+        let Some(ntdll_mapping) = self.process.ntdll_mapping else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let ntdll_range =
+            ntdll_mapping.base_addr..ntdll_mapping.base_addr + ntdll_mapping.image_size;
+        if !ntdll_range.contains(&trace_handle_raw) {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if field_size != 0 && fields.as_usize() == 0 {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        // ReactOS leaves NtTraceEvent unimplemented and Wine only exposes the syscall/stub. On
+        // Windows, the ntdll-owned ETW trace handle used during process startup succeeds even when
+        // no consumer-visible event is needed, so LiteBox treats it as a platform-neutral local sink.
+        NtStatus::SUCCESS
+    }
+
     fn sys_nt_trace_control_activity_id_create(
         &self,
         output_buffer: MutPtr<Platform, u8>,
@@ -708,6 +743,8 @@ fn duration_as_qpc_ticks(duration: core::time::Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
+
     use crate::tests::{const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
     use core::mem::align_of;
     use core::time::Duration;
@@ -745,6 +782,13 @@ mod tests {
             output_buffer: *mut core::ffi::c_void,
             output_buffer_length: u32,
             return_length: *mut u32,
+        ) -> i32;
+
+        fn NtTraceEvent(
+            trace_handle: usize,
+            flags: u32,
+            field_size: u32,
+            fields: *const core::ffi::c_void,
         ) -> i32;
     }
 
@@ -1707,6 +1751,92 @@ mod tests {
                 Some(mut_ptr(&mut guest_return_length)),
             );
             assert_eq!(guest_security_status, host_security_status);
+        });
+    }
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn nt_trace_event_shallow_statuses_match_host_ntdll() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let fields = [0u8; 16];
+
+            // SAFETY: Null pointers are intentionally used to compare host validation status.
+            let host_null_status = unsafe { host_status(NtTraceEvent(0, 0, 0, core::ptr::null())) };
+            let guest_null_status =
+                task.sys_nt_trace_event(Handle::from_raw(0), 0, 0, null_const_ptr());
+            assert_eq!(guest_null_status, host_null_status);
+
+            // SAFETY: The event data pointer is a valid local buffer for the duration of the call.
+            let host_valid_buffer_status =
+                unsafe { host_status(NtTraceEvent(0, 0, 16, fields.as_ptr().cast())) };
+            let guest_valid_buffer_status =
+                task.sys_nt_trace_event(Handle::from_raw(0), 0, 16, const_ptr(&fields[0]));
+            assert_eq!(guest_valid_buffer_status, host_valid_buffer_status);
+        });
+    }
+
+    #[test]
+    fn nt_trace_event_accepts_ntdll_owned_trace_handle_as_local_sink() {
+        run_with_test_platform_pointers(|| {
+            let mut task = crate::tests::test_task();
+            let fields = [0u8; 16];
+            let process = Arc::get_mut(&mut task.process).expect("test task has unique process");
+            process.ntdll_mapping = Some(litebox_common_windows::loader::MappingInfo {
+                base_addr: 0x1800_0000,
+                image_size: 0x0020_0000,
+                entry_point: 0,
+            });
+            let ntdll_trace_handle = 0x1800_0000 + 0x178d80;
+
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    u32::try_from(fields.len()).unwrap(),
+                    const_ptr(&fields[0]),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    u32::try_from(fields.len()).unwrap(),
+                    null_const_ptr(),
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(0x1234),
+                    0x700,
+                    u32::try_from(fields.len()).unwrap(),
+                    const_ptr(&fields[0]),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    0,
+                    null_const_ptr(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let process = Arc::get_mut(&mut task.process).expect("test task has unique process");
+            process.ntdll_mapping = None;
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    0,
+                    null_const_ptr(),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
         });
     }
 }

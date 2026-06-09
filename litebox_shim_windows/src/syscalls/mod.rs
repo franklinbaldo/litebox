@@ -343,6 +343,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         output_buffer_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtTraceEvent {
+        trace_handle: Handle,
+        flags: u32,
+        field_size: u32,
+        fields: Platform::RawConstPointer<u8>,
+    },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
         base_address: Platform::RawMutPointer<usize>,
@@ -664,6 +670,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 output_buffer:*,
                 output_buffer_length,
                 return_length:*,
+            })),
+            NtSysno::NtTraceEvent => Some(sys_req!(NtTraceEvent {
+                trace_handle:{Handle::from_raw},
+                flags,
+                field_size,
+                fields:*,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
