@@ -3,6 +3,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use int_enum::IntEnum;
 use litebox::fd::TypedFd;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
 use litebox::fs::{FileType, Mode, OFlags};
@@ -19,11 +20,16 @@ pub(crate) const DEFAULT_LOCALE_ID: u32 = 0x0409;
 const ANSI_CODE_PAGE: u32 = 1252;
 const OEM_CODE_PAGE: u32 = 437;
 const UNICODE_CASE_TABLE: u32 = 10000;
-const NLS_SECTION_LOCALE: u32 = 2;
-const NLS_SECTION_SORTKEYS: u32 = 9;
-const NLS_SECTION_CASEMAP: u32 = 10;
-const NLS_SECTION_CODEPAGE: u32 = 11;
-const NLS_SECTION_NORMALIZE: u32 = 12;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum NlsSectionType {
+    Locale = 2,
+    SortKeys = 9,
+    CaseMap = 10,
+    CodePage = 11,
+    Normalize = 12,
+}
 
 struct NlsSectionRequest<Platform: RawPointerProvider> {
     section_type: u32,
@@ -53,6 +59,19 @@ struct NlsSectionFile<FS: ShimFS> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn initialize_process_nls_sections(&self) {
+        if let Err(status) =
+            self.initialize_process_nls_section(NlsSectionType::CodePage, UNICODE_CASE_TABLE)
+        {
+            litebox_util_log::debug!(
+                section_type = NlsSectionType::CodePage as u32,
+                section_data = UNICODE_CASE_TABLE,
+                status:? = status;
+                "Initial Unicode NLS case table is not available"
+            );
+        }
+    }
+
     pub(crate) fn sys_nt_get_nls_section_ptr(
         &self,
         section_type: u32,
@@ -61,7 +80,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         section_pointer: MutPtr<Platform, usize>,
         section_size: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
-        let request = NlsSectionRequest {
+        let request: NlsSectionRequest<Platform> = NlsSectionRequest {
             section_type,
             section_data,
             context_data,
@@ -76,25 +95,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        let cache_key = (request.section_type, request.section_data);
-        if let Some(mapped_section) = self.cached_nls_section(cache_key) {
-            return self.write_nls_section_result(request, mapped_section, true);
-        }
-
-        let mapped_section = match self.map_nls_section_file(request) {
-            Ok(mapped_section) => mapped_section,
-            Err(status) => {
-                litebox_util_log::debug!(
-                    section_type = request.section_type,
-                    section_data = request.section_data,
-                    status:? = status;
-                    "NtGetNlsSectionPtr section is not available"
-                );
-                return status;
-            }
+        let section_type = match NlsSectionType::try_from(request.section_type) {
+            Ok(section_type) => section_type,
+            Err(_) => return NtStatus::INVALID_PARAMETER_1,
         };
-
-        let (mapped_section, cached) = self.publish_nls_section_mapping(cache_key, mapped_section);
+        let cache_key = (request.section_type, request.section_data);
+        let (mapped_section, cached) =
+            match self.nls_section_mapping(section_type, request.section_data) {
+                Ok(mapping) => mapping,
+                Err(status) => {
+                    litebox_util_log::debug!(
+                        section_type = request.section_type,
+                        section_data = request.section_data,
+                        status:? = status;
+                        "NtGetNlsSectionPtr section is not available"
+                    );
+                    return status;
+                }
+            };
         let status = self.write_nls_section_result(request, mapped_section, cached);
         if status != NtStatus::SUCCESS && !cached {
             self.remove_owned_cached_nls_section(cache_key, mapped_section);
@@ -112,24 +130,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
 
-        let request = NlsSectionRequest {
-            section_type: NLS_SECTION_LOCALE,
-            section_data: 0,
-            context_data: 0,
-            section_pointer: base_address,
-            section_size: None,
+        let section_type = NlsSectionType::Locale;
+        let cache_key = (section_type as u32, 0);
+        let (mapped_section, cached) = match self.nls_section_mapping(section_type, 0) {
+            Ok(mapping) => mapping,
+            Err(status) => return status,
         };
-        let cache_key = (NLS_SECTION_LOCALE, 0);
-        let (mapped_section, cached) =
-            if let Some(mapped_section) = self.cached_nls_section(cache_key) {
-                (mapped_section, true)
-            } else {
-                let mapped_section = match self.map_nls_section_file(request) {
-                    Ok(mapped_section) => mapped_section,
-                    Err(status) => return status,
-                };
-                self.publish_nls_section_mapping(cache_key, mapped_section)
-            };
 
         let locale_id = self
             .process
@@ -224,9 +230,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn map_nls_section_file(
         &self,
-        request: NlsSectionRequest<Platform>,
+        section_type: NlsSectionType,
+        section_data: u32,
     ) -> Result<MappedNlsSection, NtStatus> {
-        let section_file = self.open_nls_section_file(request)?;
+        let section_file = self.open_nls_section_file(section_type, section_data)?;
         let section_len = section_file.len;
         let alloc_len = match nls_section_alloc_len(section_len) {
             Ok(alloc_len) => alloc_len,
@@ -267,9 +274,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn open_nls_section_file(
         &self,
-        request: NlsSectionRequest<Platform>,
+        section_type: NlsSectionType,
+        section_data: u32,
     ) -> Result<NlsSectionFile<FS>, NtStatus> {
-        let path = nls_section_file_path(request.section_type, request.section_data)?;
+        let path = nls_section_file_path(section_type, section_data)?;
         let fd = self
             .fs
             .open(path.as_str(), OFlags::RDONLY, Mode::empty())
@@ -378,6 +386,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .map(|(address, len)| MappedNlsSection { address, len })
     }
 
+    fn initialize_process_nls_section(
+        &self,
+        section_type: NlsSectionType,
+        section_data: u32,
+    ) -> Result<MappedNlsSection, NtStatus> {
+        let (mapped_section, _) = self.nls_section_mapping(section_type, section_data)?;
+
+        self.set_peb_nls_pointer(section_data, mapped_section.address);
+
+        litebox_util_log::debug!(
+            section_type = section_type as u32,
+            section_data,
+            mapped_address:% = format_args!("{:#x}", mapped_section.address),
+            section_len = mapped_section.len;
+            "Initialized process NLS section"
+        );
+
+        Ok(mapped_section)
+    }
+
+    fn nls_section_mapping(
+        &self,
+        section_type: NlsSectionType,
+        section_data: u32,
+    ) -> Result<(MappedNlsSection, bool), NtStatus> {
+        let cache_key = (section_type as u32, section_data);
+        if let Some(mapped_section) = self.cached_nls_section(cache_key) {
+            return Ok((mapped_section, true));
+        }
+
+        let mapped_section = self.map_nls_section_file(section_type, section_data)?;
+        Ok(self.publish_nls_section_mapping(cache_key, mapped_section))
+    }
+
     fn publish_nls_section_mapping(
         &self,
         cache_key: (u32, u32),
@@ -458,21 +500,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn nls_section_file_path(section_type: u32, section_data: u32) -> Result<String, NtStatus> {
+fn nls_section_file_path(
+    section_type: NlsSectionType,
+    section_data: u32,
+) -> Result<String, NtStatus> {
     match section_type {
-        NLS_SECTION_LOCALE if section_data == 0 => Ok(String::from("/Windows/System32/locale.nls")),
-        NLS_SECTION_SORTKEYS if section_data == 0 => Ok(String::from(
+        NlsSectionType::Locale if section_data == 0 => {
+            Ok(String::from("/Windows/System32/locale.nls"))
+        }
+        NlsSectionType::SortKeys if section_data == 0 => Ok(String::from(
             "/Windows/Globalization/Sorting/sortdefault.nls",
         )),
-        NLS_SECTION_CASEMAP if section_data == 0 => {
+        NlsSectionType::Locale | NlsSectionType::SortKeys => Err(NtStatus::INVALID_PARAMETER_1),
+        NlsSectionType::CaseMap if section_data == 0 => {
             Ok(String::from("/Windows/System32/l_intl.nls"))
         }
-        NLS_SECTION_CASEMAP => Err(NtStatus::UNSUCCESSFUL),
-        NLS_SECTION_CODEPAGE => Ok(format!("/Windows/System32/c_{section_data:03}.nls")),
-        NLS_SECTION_NORMALIZE => normalize_nls_file_name(section_data)
+        NlsSectionType::CaseMap => Err(NtStatus::UNSUCCESSFUL),
+        NlsSectionType::CodePage => Ok(format!("/Windows/System32/c_{section_data:03}.nls")),
+        NlsSectionType::Normalize => normalize_nls_file_name(section_data)
             .map(|name| format!("/Windows/System32/{name}.nls"))
             .ok_or(NtStatus::OBJECT_NAME_NOT_FOUND),
-        _ => Err(NtStatus::INVALID_PARAMETER_1),
     }
 }
 
@@ -610,7 +657,7 @@ mod tests {
 
         assert_eq!(
             task.sys_nt_get_nls_section_ptr(
-                NLS_SECTION_CODEPAGE,
+                NlsSectionType::CodePage as u32,
                 ANSI_CODE_PAGE,
                 0,
                 mut_ptr(&mut section_pointer),
@@ -632,7 +679,7 @@ mod tests {
         let mut second_section_pointer = 0usize;
         assert_eq!(
             task.sys_nt_get_nls_section_ptr(
-                NLS_SECTION_CODEPAGE,
+                NlsSectionType::CodePage as u32,
                 ANSI_CODE_PAGE,
                 0,
                 mut_ptr(&mut second_section_pointer),
@@ -658,7 +705,7 @@ mod tests {
         // the same supported codepage section requested by normal Windows process startup.
         let status = unsafe {
             NtGetNlsSectionPtr(
-                NLS_SECTION_CODEPAGE,
+                NlsSectionType::CodePage as u32,
                 ANSI_CODE_PAGE,
                 core::ptr::null_mut(),
                 core::ptr::addr_of_mut!(host_section_pointer),
@@ -672,7 +719,7 @@ mod tests {
         let mut section_size = 0u32;
         assert_eq!(
             task.sys_nt_get_nls_section_ptr(
-                NLS_SECTION_CODEPAGE,
+                NlsSectionType::CodePage as u32,
                 ANSI_CODE_PAGE,
                 0,
                 mut_ptr(&mut section_pointer),
@@ -707,7 +754,7 @@ mod tests {
 
         assert_eq!(
             task.sys_nt_get_nls_section_ptr(
-                NLS_SECTION_CODEPAGE,
+                NlsSectionType::CodePage as u32,
                 OEM_CODE_PAGE,
                 0,
                 MutPtr::<TestPlatform, usize>::from_usize(0),
@@ -717,7 +764,7 @@ mod tests {
         );
         assert_eq!(
             task.sys_nt_get_nls_section_ptr(
-                NLS_SECTION_CODEPAGE,
+                NlsSectionType::CodePage as u32,
                 ANSI_CODE_PAGE,
                 0,
                 mut_ptr(&mut section_pointer),
@@ -731,11 +778,11 @@ mod tests {
     #[test]
     fn nls_section_file_path_formats_codepage_names() {
         assert_eq!(
-            nls_section_file_path(NLS_SECTION_CODEPAGE, 37).unwrap(),
+            nls_section_file_path(NlsSectionType::CodePage, 37).unwrap(),
             "/Windows/System32/c_037.nls"
         );
         assert_eq!(
-            nls_section_file_path(NLS_SECTION_CODEPAGE, ANSI_CODE_PAGE).unwrap(),
+            nls_section_file_path(NlsSectionType::CodePage, ANSI_CODE_PAGE).unwrap(),
             "/Windows/System32/c_1252.nls"
         );
     }

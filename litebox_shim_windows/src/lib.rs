@@ -369,17 +369,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             thread_hidden_from_debugger: AtomicBool::new(false),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
+        let task = Task {
+            global: self.0.clone(),
+            process: process.clone(),
+            fs,
+            entry_point: load_info.entry_point,
+            stack_top: load_info.stack_top,
+            teb_address: load_info.environment.teb,
+            context: load_info.environment.context,
+        };
+        task.initialize_process_nls_sections();
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
-                task: Task {
-                    global: self.0.clone(),
-                    process: process.clone(),
-                    fs,
-                    entry_point: load_info.entry_point,
-                    stack_top: load_info.stack_top,
-                    teb_address: load_info.environment.teb,
-                    context: load_info.environment.context,
-                },
+                task,
                 _not_send: PhantomData,
             },
             process,
@@ -1441,6 +1443,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
         };
 
+        litebox_util_log::debug!(
+            syscall:? = NtSysno::from_raw(ctx.orig_rax),
+            status:? = result;
+            "Handled Windows syscall"
+        );
         ctx.rax = result.as_raw().cast_unsigned() as usize;
         op
     }
