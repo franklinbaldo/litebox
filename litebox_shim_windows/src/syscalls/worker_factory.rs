@@ -83,15 +83,19 @@ impl WorkerFactoryAccess {
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerFactoryInformationClass {
+    BindingCount = 3,
     ThreadMinimum = 4,
     ThreadMaximum = 5,
+    ThreadSoftMaximum = 14,
 }
 
 impl WorkerFactoryInformationClass {
     fn from_raw(raw: u32) -> Result<Self, NtStatus> {
         match raw {
+            3 => Ok(Self::BindingCount),
             4 => Ok(Self::ThreadMinimum),
             5 => Ok(Self::ThreadMaximum),
+            14 => Ok(Self::ThreadSoftMaximum),
             _ => Err(NtStatus::INVALID_INFO_CLASS),
         }
     }
@@ -117,8 +121,10 @@ pub(crate) struct WorkerFactoryObject<Platform: crate::ShimPlatform> {
     _completion_port: Arc<IoCompletionObject<Platform>>,
     _start_routine: usize,
     _start_parameter: usize,
+    binding_count: AtomicU32,
     thread_minimum: AtomicU32,
     thread_maximum: AtomicU32,
+    thread_soft_maximum: AtomicU32,
     shutdown: AtomicBool,
     _stack_reserve: usize,
     _stack_commit: usize,
@@ -288,8 +294,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             _completion_port: completion_port,
             _start_routine: params.start_routine,
             _start_parameter: params.start_parameter,
+            binding_count: AtomicU32::new(0),
             thread_minimum: AtomicU32::new(0),
             thread_maximum: AtomicU32::new(params.max_thread_count),
+            thread_soft_maximum: AtomicU32::new(params.max_thread_count),
             shutdown: AtomicBool::new(false),
             _stack_reserve: params.stack_reserve,
             _stack_commit: params.stack_commit,
@@ -313,6 +321,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         params: WorkerFactorySetInformationParameters<Platform>,
     ) -> NtStatus {
+        litebox_util_log::debug!(
+            information_class = params.information_class,
+            information_length = params.information_length;
+            "NtSetInformationWorkerFactory parameters"
+        );
         let Ok(information_class) =
             WorkerFactoryInformationClass::from_raw(params.information_class)
         else {
@@ -341,6 +354,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .granted_access
                     .require(WorkerFactoryAccess::SET_INFORMATION)?;
                 match information_class {
+                    WorkerFactoryInformationClass::BindingCount => {
+                        entry.factory.binding_count.store(value, Ordering::Relaxed);
+                    }
                     WorkerFactoryInformationClass::ThreadMinimum => {
                         let maximum = entry.factory.thread_maximum.load(Ordering::Relaxed);
                         if value > maximum {
@@ -354,6 +370,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             return Err(NtStatus::INVALID_PARAMETER);
                         }
                         entry.factory.thread_maximum.store(value, Ordering::Relaxed);
+                    }
+                    WorkerFactoryInformationClass::ThreadSoftMaximum => {
+                        let maximum = entry.factory.thread_maximum.load(Ordering::Relaxed);
+                        if value > maximum {
+                            return Err(NtStatus::INVALID_PARAMETER);
+                        }
+                        entry
+                            .factory
+                            .thread_soft_maximum
+                            .store(value, Ordering::Relaxed);
                     }
                 }
                 Ok(())
@@ -698,6 +724,28 @@ mod tests {
                 worker_factory,
                 information_class_value(WorkerFactoryInformationClass::ThreadMinimum),
                 information_ptr(&minimum),
+                u32_information_length(),
+            ),
+            NtStatus::SUCCESS
+        );
+        let soft_maximum = 1;
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                worker_factory,
+                information_class_value(WorkerFactoryInformationClass::ThreadSoftMaximum),
+                information_ptr(&soft_maximum),
+                u32_information_length(),
+            ),
+            NtStatus::SUCCESS
+        );
+        let binding_count = 1;
+        assert_eq!(
+            set_worker_factory_information(
+                &task,
+                worker_factory,
+                information_class_value(WorkerFactoryInformationClass::BindingCount),
+                information_ptr(&binding_count),
                 u32_information_length(),
             ),
             NtStatus::SUCCESS
