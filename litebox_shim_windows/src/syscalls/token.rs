@@ -187,12 +187,12 @@ struct CountHeader {
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_nt_open_thread_token(
+        &self,
         thread_handle: ThreadHandle,
-        _desired_access: u32,
+        desired_access: u32,
         open_as_self: u8,
         token_handle: MutPtr<Platform, Handle>,
     ) -> NtStatus {
-        let _ = open_as_self;
         if let Err(status) = probe_guest_output_preserving_value::<Platform, Handle>(token_handle) {
             return status;
         }
@@ -200,17 +200,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_HANDLE;
         }
 
-        NtStatus::NO_TOKEN
+        let access = TokenAccess::from_desired_access(desired_access);
+        let handle = match self.insert_token_handle(access, token_handle) {
+            Ok(handle) => handle,
+            Err(status) => return status,
+        };
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", handle.as_raw()),
+            thread_handle:% = format_args!("{:#x}", thread_handle.as_raw()),
+            desired_access,
+            open_as_self = open_as_self != 0;
+            "Handled NtOpenThreadToken syscall"
+        );
+
+        NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_open_thread_token_ex(
+        &self,
         thread_handle: ThreadHandle,
         desired_access: u32,
         open_as_self: u8,
         _handle_attributes: u32,
         token_handle: MutPtr<Platform, Handle>,
     ) -> NtStatus {
-        Self::sys_nt_open_thread_token(thread_handle, desired_access, open_as_self, token_handle)
+        self.sys_nt_open_thread_token(thread_handle, desired_access, open_as_self, token_handle)
     }
 
     pub(crate) fn sys_nt_open_process_token(
@@ -422,32 +437,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_HANDLE;
         }
 
-        let access = TokenAccess::from_desired_access(desired_access);
-        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
-        let typed = descriptor_table.insert::<TokenSubsystem>(TokenHandleObject {
-            granted_access: access,
-        });
-        drop(descriptor_table);
-
-        let handle = match insert_raw_handle(
-            &self.global.litebox,
-            &self.process.handles,
-            typed,
-            Self::close_token,
+        let handle = match self.insert_token_handle(
+            TokenAccess::from_desired_access(desired_access),
+            token_handle,
         ) {
             Ok(handle) => handle,
             Err(status) => return status,
         };
-
-        if token_handle.write_at_offset(0, handle).is_none() {
-            remove_raw_handle::<Platform, TokenSubsystem>(
-                &self.global.litebox,
-                &self.process.handles,
-                handle,
-                Self::close_token,
-            );
-            return NtStatus::ACCESS_VIOLATION;
-        }
 
         litebox_util_log::debug!(
             handle:% = format_args!("{:#x}", handle.as_raw()),
@@ -457,6 +453,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
 
         NtStatus::SUCCESS
+    }
+
+    fn insert_token_handle(
+        &self,
+        granted_access: TokenAccess,
+        token_handle: MutPtr<Platform, Handle>,
+    ) -> Result<Handle, NtStatus> {
+        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
+        let typed = descriptor_table.insert::<TokenSubsystem>(TokenHandleObject { granted_access });
+        drop(descriptor_table);
+
+        let handle = insert_raw_handle(
+            &self.global.litebox,
+            &self.process.handles,
+            typed,
+            Self::close_token,
+        )?;
+
+        if token_handle.write_at_offset(0, handle).is_none() {
+            remove_raw_handle::<Platform, TokenSubsystem>(
+                &self.global.litebox,
+                &self.process.handles,
+                handle,
+                Self::close_token,
+            );
+            return Err(NtStatus::ACCESS_VIOLATION);
+        }
+
+        Ok(handle)
     }
 
     fn token_handle(&self, token_handle: Handle) -> Result<TokenHandleObject, NtStatus> {
@@ -800,13 +825,6 @@ mod tests {
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     unsafe extern "system" {
-        fn NtOpenThreadToken(
-            thread_handle: *mut core::ffi::c_void,
-            desired_access: u32,
-            open_as_self: u8,
-            token_handle: *mut *mut core::ffi::c_void,
-        ) -> i32;
-
         fn NtOpenProcessToken(
             process_handle: *mut core::ffi::c_void,
             desired_access: u32,
@@ -839,38 +857,51 @@ mod tests {
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn nt_current_thread() -> *mut core::ffi::c_void {
-        (usize::MAX - 1) as *mut core::ffi::c_void
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     fn nt_current_process() -> *mut core::ffi::c_void {
         usize::MAX as *mut core::ffi::c_void
     }
 
     #[test]
-    fn nt_open_thread_token_without_impersonation_returns_no_token() {
+    fn nt_open_thread_token_returns_queryable_handle() {
         run_with_test_platform_pointers(|| {
-            let mut token_handle = Handle::from_raw(0x5555_5555);
+            let task = crate::tests::test_task();
+            let mut token_handle = Handle::from_raw(0);
 
             assert_eq!(
-                Task::<TestPlatform, crate::tests::TestFS>::sys_nt_open_thread_token(
+                task.sys_nt_open_thread_token(
                     ThreadHandle::CURRENT,
-                    TOKEN_QUERY,
+                    TOKEN_QUERY | TOKEN_QUERY_SOURCE,
                     1,
                     mut_ptr(&mut token_handle),
                 ),
-                NtStatus::NO_TOKEN
+                NtStatus::SUCCESS
             );
-            assert_eq!(token_handle, Handle::from_raw(0x5555_5555));
+            assert!(!token_handle.is_null());
+
+            let mut token_type = 0u32;
+            let mut return_length = 0u32;
+            assert_eq!(
+                task.sys_nt_query_information_token(
+                    token_handle,
+                    class_value(TokenInformationClass::Type),
+                    mut_byte_ptr(&mut token_type),
+                    information_len::<u32>(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(token_type, TOKEN_TYPE_PRIMARY);
+            assert_eq!(return_length, information_len::<u32>());
+            assert_eq!(task.sys_nt_close(token_handle), NtStatus::SUCCESS);
         });
     }
 
     #[test]
-    fn nt_open_thread_token_probes_output_before_no_token() {
+    fn nt_open_thread_token_probes_output_before_opening_handle() {
         run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
             assert_eq!(
-                Task::<TestPlatform, crate::tests::TestFS>::sys_nt_open_thread_token(
+                task.sys_nt_open_thread_token(
                     ThreadHandle::CURRENT,
                     TOKEN_QUERY,
                     1,
@@ -1005,33 +1036,6 @@ mod tests {
                 NtStatus::INFO_LENGTH_MISMATCH
             );
             assert_eq!(return_length, information_len::<u32>());
-        });
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn nt_open_thread_token_no_impersonation_matches_windows() {
-        let mut host_handle = 0x5555_5555usize as *mut core::ffi::c_void;
-        let host_status = unsafe {
-            host_status(NtOpenThreadToken(
-                nt_current_thread(),
-                TOKEN_QUERY,
-                1,
-                &raw mut host_handle,
-            ))
-        };
-
-        run_with_test_platform_pointers(|| {
-            let mut token_handle = Handle::from_raw(0x5555_5555);
-            assert_eq!(
-                Task::<TestPlatform, crate::tests::TestFS>::sys_nt_open_thread_token(
-                    ThreadHandle::CURRENT,
-                    TOKEN_QUERY,
-                    1,
-                    mut_ptr(&mut token_handle),
-                ),
-                host_status
-            );
         });
     }
 
