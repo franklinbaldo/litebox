@@ -6,6 +6,8 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::{MutPtr, ShimPlatform};
 
+const STATUS_NOT_FOUND: NtStatus = NtStatus::from_raw(0xC000_0225);
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum ApphelpCacheServiceClass {
@@ -35,7 +37,7 @@ pub(crate) fn sys_nt_apphelp_cache_control<Platform: ShimPlatform>(
         | ApphelpCacheServiceClass::LookupCdb
         | ApphelpCacheServiceClass::Remove
         | ApphelpCacheServiceClass::Update => {
-            service_data.map_or(NtStatus::INVALID_PARAMETER, |_| NtStatus::SUCCESS)
+            service_data.map_or(NtStatus::INVALID_PARAMETER, |_| STATUS_NOT_FOUND)
         }
         ApphelpCacheServiceClass::Flush
         | ApphelpCacheServiceClass::Dump
@@ -46,7 +48,7 @@ pub(crate) fn sys_nt_apphelp_cache_control<Platform: ShimPlatform>(
         service_class:? = service_class,
         has_service_data = service_data.is_some(),
         status:? = status;
-        "Handled NtApphelpCacheControl syscall as an empty apphelp cache"
+        "Handled NtApphelpCacheControl syscall as an apphelp cache miss"
     );
 
     status
@@ -67,13 +69,13 @@ mod tests {
     }
 
     #[test]
-    fn nt_apphelp_cache_control_accepts_empty_cache_lookups() {
+    fn nt_apphelp_cache_control_reports_cache_miss_for_lookups() {
         assert_eq!(
             sys_nt_apphelp_cache_control::<TestPlatform>(
                 service_value(ApphelpCacheServiceClass::Lookup),
                 Some(service_data_ptr()),
             ),
-            NtStatus::SUCCESS
+            STATUS_NOT_FOUND
         );
 
         assert_eq!(
@@ -81,7 +83,7 @@ mod tests {
                 service_value(ApphelpCacheServiceClass::LookupCdb),
                 Some(service_data_ptr()),
             ),
-            NtStatus::SUCCESS
+            STATUS_NOT_FOUND
         );
     }
 
@@ -92,7 +94,7 @@ mod tests {
                 service_value(ApphelpCacheServiceClass::Update),
                 Some(service_data_ptr()),
             ),
-            NtStatus::SUCCESS
+            STATUS_NOT_FOUND
         );
         assert_eq!(
             sys_nt_apphelp_cache_control::<TestPlatform>(

@@ -29,10 +29,13 @@ const PROCESS_TLS_REPLACE_VECTOR: u32 = 1;
 const PROCESS_TLS_OPERATION_TYPE_OFFSET: usize = 4;
 const PROCESS_TLS_THREAD_DATA_COUNT_OFFSET: usize = 8;
 const PROCESS_TLS_INDEX_OFFSET: usize = 12;
-const PROCESS_TLS_THREAD_DATA_OFFSET: usize = 20;
-const THREAD_TLS_INFORMATION_SIZE: usize = 20;
-const THREAD_TLS_NEW_DATA_OFFSET: usize = 4;
-const THREAD_TLS_OLD_DATA_OFFSET: usize = 12;
+const PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE: usize = 0x10;
+const THREAD_TLS_INFORMATION_SIZE_SIMPLE: usize = 0x18;
+const PROCESS_TLS_THREAD_DATA_OFFSET_EXTENDED: usize = 0x18;
+const THREAD_TLS_INFORMATION_SIZE_EXTENDED: usize = 0x20;
+const THREAD_TLS_NEW_DATA_OFFSET: usize = 0x08;
+const THREAD_TLS_OLD_DATA_OFFSET_SIMPLE: usize = 0x08;
+const THREAD_TLS_OLD_DATA_OFFSET_EXTENDED: usize = 0x10;
 const TEB_TLS_SLOT_COUNT: usize = 64;
 const MAXIMUM_HARDERROR_PARAMETERS: u32 = 5;
 const HARDERROR_OPTION_SHUTDOWN_SYSTEM: u32 = 6;
@@ -72,6 +75,56 @@ struct ProcessBasicInformation {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessDefaultHardErrorMode {
     default_hard_error_mode: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProcessTlsLayout {
+    header_size: usize,
+    entry_size: usize,
+    old_data_offset: usize,
+}
+
+impl ProcessTlsLayout {
+    fn detect(thread_data_count: u32, process_information_length: u32) -> Result<Self, NtStatus> {
+        let count =
+            usize::try_from(thread_data_count).map_err(|_| NtStatus::INFO_LENGTH_MISMATCH)?;
+        let Some(extended_len) = PROCESS_TLS_THREAD_DATA_OFFSET_EXTENDED.checked_add(
+            count
+                .checked_mul(THREAD_TLS_INFORMATION_SIZE_EXTENDED)
+                .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?,
+        ) else {
+            return Err(NtStatus::INFO_LENGTH_MISMATCH);
+        };
+        let Some(simple_len) = PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE.checked_add(
+            count
+                .checked_mul(THREAD_TLS_INFORMATION_SIZE_SIMPLE)
+                .ok_or(NtStatus::INFO_LENGTH_MISMATCH)?,
+        ) else {
+            return Err(NtStatus::INFO_LENGTH_MISMATCH);
+        };
+        let provided_len = usize::try_from(process_information_length).unwrap_or(0);
+
+        if provided_len >= extended_len {
+            Ok(Self {
+                header_size: PROCESS_TLS_THREAD_DATA_OFFSET_EXTENDED,
+                entry_size: THREAD_TLS_INFORMATION_SIZE_EXTENDED,
+                old_data_offset: THREAD_TLS_OLD_DATA_OFFSET_EXTENDED,
+            })
+        } else if provided_len >= simple_len {
+            Ok(Self {
+                header_size: PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE,
+                entry_size: THREAD_TLS_INFORMATION_SIZE_SIMPLE,
+                old_data_offset: THREAD_TLS_OLD_DATA_OFFSET_SIMPLE,
+            })
+        } else {
+            Err(NtStatus::INFO_LENGTH_MISMATCH)
+        }
+    }
+
+    fn thread_data_offset(self, index: u32) -> Option<usize> {
+        self.header_size
+            .checked_add(usize::try_from(index).ok()?.checked_mul(self.entry_size)?)
+    }
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -387,29 +440,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         };
 
-        let Some(required_len) = PROCESS_TLS_THREAD_DATA_OFFSET.checked_add(
-            usize::try_from(thread_data_count)
-                .ok()
-                .and_then(|count| count.checked_mul(THREAD_TLS_INFORMATION_SIZE))
-                .unwrap_or(usize::MAX),
-        ) else {
-            return NtStatus::INFO_LENGTH_MISMATCH;
+        let layout = match ProcessTlsLayout::detect(thread_data_count, process_information_length) {
+            Ok(layout) => layout,
+            Err(status) => return status,
         };
-        if usize::try_from(process_information_length).unwrap_or(0) < required_len {
-            return NtStatus::INFO_LENGTH_MISMATCH;
-        }
+
+        litebox_util_log::debug!(
+            operation_type,
+            thread_data_count,
+            tls_index,
+            process_information_length,
+            layout_header_size = layout.header_size,
+            layout_entry_size = layout.entry_size,
+            layout_old_data_offset = layout.old_data_offset;
+            "Handling ProcessTlsInformation"
+        );
 
         match operation_type {
             PROCESS_TLS_REPLACE_VECTOR => self.replace_tls_vector(
                 process_information,
                 process_information_length,
                 thread_data_count,
+                layout,
             ),
             PROCESS_TLS_REPLACE_INDEX => self.replace_tls_index(
                 process_information,
                 process_information_length,
                 thread_data_count,
                 tls_index,
+                layout,
             ),
             _ => {
                 litebox_util_log::debug!(
@@ -428,8 +487,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         process_information: ConstPtr<Platform, u8>,
         process_information_length: u32,
         thread_data_count: u32,
+        layout: ProcessTlsLayout,
     ) -> NtStatus {
-        for thread_data_offset in tls_thread_data_offsets(thread_data_count) {
+        for index in 0..thread_data_count {
+            let Some(thread_data_offset) = layout.thread_data_offset(index) else {
+                return NtStatus::INFO_LENGTH_MISMATCH;
+            };
             let Some(new_tls_data) = read_process_information_usize::<Platform>(
                 process_information,
                 thread_data_offset + THREAD_TLS_NEW_DATA_OFFSET,
@@ -444,11 +507,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return NtStatus::ACCESS_VIOLATION;
             };
 
+            litebox_util_log::debug!(
+                thread_data_index = index,
+                new_tls_data:% = format_args!("{new_tls_data:#x}"),
+                old_tls_data:% = format_args!("{old_tls_data:#x}");
+                "Replacing process TLS vector"
+            );
+
+            if let Err(status) = self.copy_initial_tls_slots(old_tls_data, new_tls_data) {
+                return status;
+            }
+            let old_tls_data_for_guest = self.guest_visible_old_tls_vector(old_tls_data);
+
             if write_process_information_usize::<Platform>(
                 process_information,
-                thread_data_offset + THREAD_TLS_OLD_DATA_OFFSET,
+                thread_data_offset + layout.old_data_offset,
                 process_information_length,
-                old_tls_data,
+                old_tls_data_for_guest,
             )
             .is_none()
                 || self
@@ -457,6 +532,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         new_tls_data,
                     )
                     .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            if old_tls_data_for_guest == 0
+                && write_process_information_u32::<Platform>(
+                    process_information,
+                    thread_data_offset,
+                    process_information_length,
+                    0x2,
+                )
+                .is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
@@ -471,6 +557,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         process_information_length: u32,
         thread_data_count: u32,
         tls_index: u32,
+        layout: ProcessTlsLayout,
     ) -> NtStatus {
         let Ok(tls_index) = usize::try_from(tls_index) else {
             return NtStatus::INVALID_PARAMETER;
@@ -478,11 +565,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if tls_index >= TEB_TLS_SLOT_COUNT {
             return NtStatus::INVALID_PARAMETER;
         }
-        let slot_offset = core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots)
-            .checked_add(tls_index * size_of::<usize>())
-            .expect("TEB TLS slot offset fits usize");
 
-        for thread_data_offset in tls_thread_data_offsets(thread_data_count) {
+        for index in 0..thread_data_count {
+            let Some(thread_data_offset) = layout.thread_data_offset(index) else {
+                return NtStatus::INFO_LENGTH_MISMATCH;
+            };
             let Some(new_tls_data) = read_process_information_usize::<Platform>(
                 process_information,
                 thread_data_offset + THREAD_TLS_NEW_DATA_OFFSET,
@@ -490,24 +577,102 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            let Some(old_tls_data) = self.read_teb_usize(slot_offset) else {
+            let Some(tls_array) = self.read_teb_usize(core::mem::offset_of!(
+                ThreadEnvironmentBlock,
+                thread_local_storage_pointer
+            )) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            if tls_array == 0 {
+                continue;
+            }
+            let Some(slot_address) = tls_array.checked_add(tls_index * size_of::<usize>()) else {
+                return NtStatus::INVALID_PARAMETER;
+            };
+            let slot = MutPtr::<Platform, usize>::from_usize(slot_address);
+            let Some(old_tls_data) = slot.read_at_offset(0) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
 
+            litebox_util_log::debug!(
+                thread_data_index = index,
+                tls_index,
+                tls_array:% = format_args!("{tls_array:#x}"),
+                slot_address:% = format_args!("{slot_address:#x}"),
+                new_tls_data:% = format_args!("{new_tls_data:#x}"),
+                old_tls_data:% = format_args!("{old_tls_data:#x}");
+                "Replacing process TLS index"
+            );
+
             if write_process_information_usize::<Platform>(
                 process_information,
-                thread_data_offset + THREAD_TLS_OLD_DATA_OFFSET,
+                thread_data_offset + layout.old_data_offset,
                 process_information_length,
                 old_tls_data,
             )
             .is_none()
-                || self.write_teb_usize(slot_offset, new_tls_data).is_none()
+                || slot.write_at_offset(0, new_tls_data).is_none()
+                || write_process_information_u32::<Platform>(
+                    process_information,
+                    thread_data_offset,
+                    process_information_length,
+                    0x2,
+                )
+                .is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
         }
 
         NtStatus::SUCCESS
+    }
+
+    fn guest_visible_old_tls_vector(&self, old_tls_data: usize) -> usize {
+        if old_tls_data > 0x10010
+            && old_tls_data >= self.teb_address
+            && old_tls_data
+                < self
+                    .teb_address
+                    .saturating_add(size_of::<ThreadEnvironmentBlock>())
+        {
+            0
+        } else {
+            old_tls_data
+        }
+    }
+
+    fn copy_initial_tls_slots(
+        &self,
+        old_tls_data: usize,
+        new_tls_data: usize,
+    ) -> Result<(), NtStatus> {
+        if old_tls_data <= 0x10010 || new_tls_data <= 0x10010 {
+            return Ok(());
+        }
+        let initial_tls_slots = self
+            .teb_address
+            .checked_add(core::mem::offset_of!(ThreadEnvironmentBlock, tls_slots))
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+        if old_tls_data != initial_tls_slots {
+            return Ok(());
+        }
+
+        for index in 0..TEB_TLS_SLOT_COUNT {
+            let offset = index * size_of::<usize>();
+            let Some(slot_value) =
+                ConstPtr::<Platform, usize>::from_usize(old_tls_data + offset).read_at_offset(0)
+            else {
+                return Err(NtStatus::ACCESS_VIOLATION);
+            };
+            if MutPtr::<Platform, usize>::from_usize(new_tls_data + offset)
+                .write_at_offset(0, slot_value)
+                .is_none()
+            {
+                return Err(NtStatus::ACCESS_VIOLATION);
+            }
+        }
+
+        Ok(())
     }
 
     fn read_teb_usize(&self, offset: usize) -> Option<usize> {
@@ -605,11 +770,6 @@ fn process_information_len<T>() -> u32 {
     u32::try_from(size_of::<T>()).expect("process information fits in ULONG")
 }
 
-fn tls_thread_data_offsets(thread_data_count: u32) -> impl Iterator<Item = usize> {
-    (0..thread_data_count as usize)
-        .map(|index| PROCESS_TLS_THREAD_DATA_OFFSET + index * THREAD_TLS_INFORMATION_SIZE)
-}
-
 fn read_process_information_u32<Platform: ShimPlatform>(
     process_information: ConstPtr<Platform, u8>,
     offset: usize,
@@ -632,6 +792,19 @@ fn read_process_information_usize<Platform: ShimPlatform>(
     }
     ConstPtr::<Platform, usize>::from_usize(process_information.as_usize().checked_add(offset)?)
         .read_at_offset(0)
+}
+
+fn write_process_information_u32<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+    offset: usize,
+    process_information_length: u32,
+    value: u32,
+) -> Option<()> {
+    if usize::try_from(process_information_length).ok()? < offset.checked_add(size_of::<u32>())? {
+        return None;
+    }
+    MutPtr::<Platform, u32>::from_usize(process_information.as_usize().checked_add(offset)?)
+        .write_at_offset(0, value)
 }
 
 fn write_process_information_usize<Platform: ShimPlatform>(
@@ -852,7 +1025,7 @@ mod tests {
             task.teb_address = core::ptr::from_mut(&mut teb) as usize;
 
             let mut process_tls_information =
-                [0u8; PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_INFORMATION_SIZE];
+                [0u8; PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE + THREAD_TLS_INFORMATION_SIZE_SIMPLE];
             write_u32(
                 &mut process_tls_information,
                 PROCESS_TLS_OPERATION_TYPE_OFFSET,
@@ -865,7 +1038,7 @@ mod tests {
             );
             write_usize(
                 &mut process_tls_information,
-                PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_NEW_DATA_OFFSET,
+                PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE + THREAD_TLS_NEW_DATA_OFFSET,
                 0x5555_6666_7777_8888,
             );
 
@@ -882,7 +1055,7 @@ mod tests {
             assert_eq!(
                 read_usize(
                     &process_tls_information,
-                    PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_OLD_DATA_OFFSET,
+                    PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE + THREAD_TLS_OLD_DATA_OFFSET_SIMPLE,
                 ),
                 0x1111_2222_3333_4444,
             );
@@ -893,13 +1066,14 @@ mod tests {
     fn nt_set_information_process_replaces_tls_index() {
         run_with_test_platform_pointers(|| {
             let mut teb = zeroed_teb();
+            teb.thread_local_storage_pointer = core::ptr::addr_of_mut!(teb.tls_slots[0]) as usize;
             teb.tls_slots[7] = 0x1111_2222_3333_4444;
 
             let mut task = crate::tests::test_task();
             task.teb_address = core::ptr::from_mut(&mut teb) as usize;
 
             let mut process_tls_information =
-                [0u8; PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_INFORMATION_SIZE];
+                [0u8; PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE + THREAD_TLS_INFORMATION_SIZE_SIMPLE];
             write_u32(
                 &mut process_tls_information,
                 PROCESS_TLS_OPERATION_TYPE_OFFSET,
@@ -913,7 +1087,7 @@ mod tests {
             write_u32(&mut process_tls_information, PROCESS_TLS_INDEX_OFFSET, 7);
             write_usize(
                 &mut process_tls_information,
-                PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_NEW_DATA_OFFSET,
+                PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE + THREAD_TLS_NEW_DATA_OFFSET,
                 0x5555_6666_7777_8888,
             );
 
@@ -930,7 +1104,7 @@ mod tests {
             assert_eq!(
                 read_usize(
                     &process_tls_information,
-                    PROCESS_TLS_THREAD_DATA_OFFSET + THREAD_TLS_OLD_DATA_OFFSET,
+                    PROCESS_TLS_THREAD_DATA_OFFSET_SIMPLE + THREAD_TLS_OLD_DATA_OFFSET_SIMPLE,
                 ),
                 0x1111_2222_3333_4444,
             );

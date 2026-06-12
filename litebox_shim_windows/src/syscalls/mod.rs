@@ -8,6 +8,7 @@ pub(crate) mod file;
 pub(crate) mod iocp;
 pub(crate) mod mm;
 pub(crate) mod nls;
+pub(crate) mod port;
 pub(crate) mod process;
 pub(crate) mod registry;
 pub(crate) mod section;
@@ -16,6 +17,7 @@ pub(crate) mod thread;
 pub(crate) mod timer;
 pub(crate) mod token;
 pub(crate) mod wait_completion_packet;
+pub(crate) mod wnf;
 pub(crate) mod worker_factory;
 
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
@@ -126,9 +128,38 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtClose {
         handle: Handle,
     },
+    NtDuplicateObject {
+        source_process_handle: ProcessHandle,
+        source_handle: Handle,
+        target_process_handle: ProcessHandle,
+        target_handle: Option<Platform::RawMutPointer<Handle>>,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: u32,
+    },
     NtApphelpCacheControl {
         service_class: u32,
         service_data: Option<Platform::RawMutPointer<u8>>,
+    },
+    NtConnectPort {
+        port_handle: Platform::RawMutPointer<Handle>,
+        port_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        security_quality_of_service: Option<Platform::RawConstPointer<u8>>,
+        client_view: Option<Platform::RawMutPointer<nt_types::PortView>>,
+        server_view: Option<Platform::RawMutPointer<nt_types::RemotePortView>>,
+        max_message_length: Option<Platform::RawMutPointer<u32>>,
+        connection_information: Option<Platform::RawMutPointer<u8>>,
+        connection_information_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtAlpcSendWaitReceivePort {
+        port_handle: Handle,
+        flags: u32,
+        send_message: Option<Platform::RawConstPointer<nt_types::PortMessage>>,
+        send_message_attributes: Option<Platform::RawConstPointer<u8>>,
+        receive_message: Option<Platform::RawMutPointer<nt_types::PortMessage>>,
+        buffer_length: Option<Platform::RawMutPointer<u32>>,
+        receive_message_attributes: Option<Platform::RawMutPointer<u8>>,
+        timeout: Option<Platform::RawConstPointer<i64>>,
     },
     NtCreateDirectoryObject {
         directory_handle: Platform::RawMutPointer<Handle>,
@@ -195,12 +226,22 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         wait_completion_packet_handle: Handle,
         remove_signaled_packet: u8,
     },
+    NtContinue {
+        context: Platform::RawConstPointer<nt_types::X64Context>,
+        test_alert: u8,
+    },
     NtCreateTimer2 {
         timer_handle: Platform::RawMutPointer<Handle>,
         timer_id: Option<Platform::RawConstPointer<u32>>,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         attributes: u32,
         desired_access: u32,
+    },
+    NtSetTimer2 {
+        timer_handle: Handle,
+        due_time: Option<Platform::RawConstPointer<i64>>,
+        period: Option<Platform::RawConstPointer<i64>>,
+        parameters: Option<Platform::RawConstPointer<u8>>,
     },
     NtCreateWaitCompletionPacket {
         wait_completion_packet_handle: Platform::RawMutPointer<Handle>,
@@ -231,6 +272,39 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     },
     NtSetWnfProcessNotificationEvent {
         notification_event: Handle,
+    },
+    NtQueryWnfStateData {
+        state_name: Option<Platform::RawConstPointer<u64>>,
+        type_id: Option<Platform::RawConstPointer<u8>>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        change_stamp: Option<Platform::RawMutPointer<u32>>,
+        buffer: Option<Platform::RawMutPointer<u8>>,
+        buffer_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryWnfStateNameInformation {
+        state_name: Option<Platform::RawConstPointer<u64>>,
+        name_information_class: u32,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        buffer: Option<Platform::RawMutPointer<u32>>,
+        buffer_length: u32,
+    },
+    NtSubscribeWnfStateChange {
+        state_name: Option<Platform::RawConstPointer<u64>>,
+        change_stamp: u32,
+        event_mask: u32,
+        subscription_id: Option<Platform::RawConstPointer<u64>>,
+    },
+    NtUnsubscribeWnfStateChange {
+        state_name: Option<Platform::RawConstPointer<u64>>,
+    },
+    NtUpdateWnfStateData {
+        state_name: Option<Platform::RawConstPointer<u64>>,
+        buffer: Option<Platform::RawConstPointer<u8>>,
+        length: u32,
+        type_id: Option<Platform::RawConstPointer<u8>>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        matching_change_stamp: u32,
+        check_stamp: u32,
     },
     NtOpenDirectoryObject {
         directory_handle: Platform::RawMutPointer<Handle>,
@@ -330,6 +404,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         create_options: u32,
         ea_buffer: Option<Platform::RawConstPointer<u8>>,
         ea_length: u32,
+    },
+    NtDeviceIoControlFile {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<Platform::RawConstPointer<u8>>,
+        apc_context: usize,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        io_control_code: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_length: u32,
+        output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_length: u32,
     },
     NtQueryVolumeInformationFile {
         file_handle: Handle,
@@ -442,6 +528,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         valid_response_options: u32,
         response: Platform::RawMutPointer<u32>,
     },
+    NtRaiseException {
+        exception_record: Platform::RawConstPointer<u8>,
+        context: Platform::RawConstPointer<u8>,
+        first_chance: u8,
+    },
     NtQuerySymbolicLinkObject {
         link_handle: Handle,
         link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
@@ -459,6 +550,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_information: Platform::RawConstPointer<u8>,
         thread_information_length: u32,
     },
+    NtTestAlert,
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
         source: Platform::RawConstPointer<u64>,
@@ -581,9 +673,38 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
             })),
+            NtSysno::NtDuplicateObject => Some(sys_req!(NtDuplicateObject {
+                source_process_handle: { ProcessHandle::from_raw },
+                source_handle: { Handle::from_raw },
+                target_process_handle: { ProcessHandle::from_raw },
+                target_handle:*,
+                desired_access,
+                handle_attributes,
+                options,
+            })),
             NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
                 service_class,
                 service_data:*,
+            })),
+            NtSysno::NtConnectPort => Some(sys_req!(NtConnectPort {
+                port_handle:*,
+                port_name:*,
+                security_quality_of_service:*,
+                client_view:*,
+                server_view:*,
+                max_message_length:*,
+                connection_information:*,
+                connection_information_length:*,
+            })),
+            NtSysno::NtAlpcSendWaitReceivePort => Some(sys_req!(NtAlpcSendWaitReceivePort {
+                port_handle:{Handle::from_raw},
+                flags,
+                send_message:*,
+                send_message_attributes:*,
+                receive_message:*,
+                buffer_length:*,
+                receive_message_attributes:*,
+                timeout:*,
             })),
             NtSysno::NtCreateDirectoryObject => Some(sys_req!(NtCreateDirectoryObject {
                 directory_handle:*,
@@ -652,12 +773,22 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 wait_completion_packet_handle: { Handle::from_raw },
                 remove_signaled_packet,
             })),
+            NtSysno::NtContinue => Some(sys_req!(NtContinue {
+                context:*,
+                test_alert,
+            })),
             NtSysno::NtCreateTimer2 => Some(sys_req!(NtCreateTimer2 {
                 timer_handle:*,
                 timer_id:*,
                 object_attributes:*,
                 attributes,
                 desired_access,
+            })),
+            NtSysno::NtSetTimer2 => Some(sys_req!(NtSetTimer2 {
+                timer_handle:{Handle::from_raw},
+                due_time:*,
+                period:*,
+                parameters:*,
             })),
             NtSysno::NtCreateWaitCompletionPacket => Some(sys_req!(NtCreateWaitCompletionPacket {
                 wait_completion_packet_handle:*,
@@ -693,6 +824,41 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     notification_event: { Handle::from_raw },
                 }))
             }
+            NtSysno::NtQueryWnfStateData => Some(sys_req!(NtQueryWnfStateData {
+                state_name:*,
+                type_id:*,
+                explicit_scope:*,
+                change_stamp:*,
+                buffer:*,
+                buffer_length:*,
+            })),
+            NtSysno::NtQueryWnfStateNameInformation => {
+                Some(sys_req!(NtQueryWnfStateNameInformation {
+                    state_name:*,
+                    name_information_class,
+                    explicit_scope:*,
+                    buffer:*,
+                    buffer_length,
+                }))
+            }
+            NtSysno::NtSubscribeWnfStateChange => Some(sys_req!(NtSubscribeWnfStateChange {
+                state_name:*,
+                change_stamp,
+                event_mask,
+                subscription_id:*,
+            })),
+            NtSysno::NtUnsubscribeWnfStateChange => Some(sys_req!(NtUnsubscribeWnfStateChange {
+                state_name:*,
+            })),
+            NtSysno::NtUpdateWnfStateData => Some(sys_req!(NtUpdateWnfStateData {
+                state_name:*,
+                buffer:*,
+                length,
+                type_id:*,
+                explicit_scope:*,
+                matching_change_stamp,
+                check_stamp,
+            })),
             NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
                 directory_handle:*,
                 desired_access,
@@ -791,6 +957,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 create_options,
                 ea_buffer:*,
                 ea_length,
+            })),
+            NtSysno::NtDeviceIoControlFile => Some(sys_req!(NtDeviceIoControlFile {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context,
+                io_status_block:*,
+                io_control_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
             })),
             NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(NtQueryVolumeInformationFile {
                 file_handle:{Handle::from_raw},
@@ -905,6 +1083,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 valid_response_options,
                 response:*,
             })),
+            NtSysno::NtRaiseException => Some(sys_req!(NtRaiseException {
+                exception_record:*,
+                context:*,
+                first_chance,
+            })),
             NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
                 link_handle:{Handle::from_raw},
                 link_target:*,
@@ -922,6 +1105,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_information:*,
                 thread_information_length,
             })),
+            NtSysno::NtTestAlert => Some(SyscallRequest::NtTestAlert),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
                     flag,

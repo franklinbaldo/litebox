@@ -7,14 +7,14 @@ use alloc::sync::Arc;
 use core::marker::PhantomData;
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, insert_raw_handle, probe_guest_output_preserving_value,
-    remove_raw_handle,
+    raw_handle_entry, remove_raw_handle,
 };
 
 const TIMER2_ATTRIBUTE_IR_TIMER: u32 = 0x0000_0002;
@@ -116,6 +116,13 @@ pub(crate) struct TimerCreateParameters<Platform: RawPointerProvider> {
     pub(crate) desired_access: u32,
 }
 
+pub(crate) struct TimerSetParameters<Platform: RawPointerProvider> {
+    pub(crate) timer_handle: Handle,
+    pub(crate) due_time: Option<ConstPtr<Platform, i64>>,
+    pub(crate) period: Option<ConstPtr<Platform, i64>>,
+    pub(crate) parameters: Option<ConstPtr<Platform, u8>>,
+}
+
 fn validate_timer2_before_output<Platform: RawPointerProvider>(
     params: &TimerCreateParameters<Platform>,
 ) -> Result<(), NtStatus> {
@@ -145,6 +152,18 @@ fn validate_timer2_after_output<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn timer_entry(
+        &self,
+        handle: Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, TimerSubsystem<Platform>>, NtStatus> {
+        raw_handle_entry::<Platform, TimerSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+        )
+        .ok_or(NtStatus::INVALID_HANDLE)
+    }
+
     fn insert_timer_handle(
         &self,
         timer: Arc<TimerObject<Platform>>,
@@ -205,6 +224,37 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         NtStatus::SUCCESS
     }
+
+    pub(crate) fn sys_nt_set_timer2(&self, params: TimerSetParameters<Platform>) -> NtStatus {
+        let timer = match self.timer_entry(params.timer_handle) {
+            Ok(timer) => timer,
+            Err(status) => return status,
+        };
+        if let Err(status) =
+            timer.with_entry(|timer| timer.require_access(TimerAccess::MODIFY_STATE))
+        {
+            return status;
+        }
+
+        let _due_time = match params.due_time {
+            Some(due_time) => match due_time.read_at_offset(0) {
+                Some(due_time) => Some(due_time),
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+        let _period = match params.period {
+            Some(period) => match period.read_at_offset(0) {
+                Some(period) => Some(period),
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+
+        let _ = params.parameters;
+
+        NtStatus::SUCCESS
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +295,20 @@ mod tests {
         })
     }
 
+    fn set_timer2(
+        task: &Task<TestPlatform, crate::tests::TestFS>,
+        handle: Handle,
+        due_time: Option<ConstPtr<TestPlatform, i64>>,
+        period: Option<ConstPtr<TestPlatform, i64>>,
+    ) -> NtStatus {
+        task.sys_nt_set_timer2(TimerSetParameters {
+            timer_handle: handle,
+            due_time,
+            period,
+            parameters: None,
+        })
+    }
+
     #[test]
     fn create_writes_closeable_timer2_handle_for_supported_attributes() {
         let task = test_task();
@@ -270,6 +334,41 @@ mod tests {
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(handle), NtStatus::INVALID_HANDLE);
         }
+    }
+
+    #[test]
+    fn set_timer2_accepts_created_timer() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let mut handle = Handle::default();
+            let due_time = -10_000i64;
+            let period = 0i64;
+
+            assert_eq!(
+                create_timer2(&task, &mut handle, None, None, 0),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                set_timer2(
+                    &task,
+                    handle,
+                    Some(const_ptr(&due_time)),
+                    Some(const_ptr(&period))
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn set_timer2_rejects_invalid_handle() {
+        let task = test_task();
+
+        assert_eq!(
+            set_timer2(&task, Handle::from_raw(0x1234), None, None),
+            NtStatus::INVALID_HANDLE
+        );
     }
 
     #[test]

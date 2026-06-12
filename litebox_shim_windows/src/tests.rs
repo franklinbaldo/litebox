@@ -121,6 +121,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         }),
         process: Arc::new(Process {
             ntdll_mapping: None,
+            ntdll_exception_dispatcher: None,
             peb_address: 0,
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
             event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
@@ -134,6 +135,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             section_views: crate::WindowsSectionViews::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: WindowsVirtualAllocations::<TestPlatform>::new(BTreeMap::new()),
+            image_mappings: crate::WindowsImageMappings::<TestPlatform>::new(BTreeMap::new()),
             system_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),

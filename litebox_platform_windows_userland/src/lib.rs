@@ -148,15 +148,12 @@ unsafe extern "system" fn vectored_exception_handler(
         assert!(exception_record_ptr.is_aligned());
         unsafe { exception_record_ptr.write(*exception_record) };
 
-        // Re-align the stack pointer.
-        let rsp = exception_record_ptr as usize & !15;
-
         // Ensure that `run_thread_arch` is linked in so that `exception_callback` is visible.
         let _ = run_thread_arch as *const () as usize;
 
         // Update the thread context to jump to the exception handler.
         context.Rip = exception_callback as *const () as usize as u64;
-        context.Rsp = rsp as u64;
+        context.Rsp = tls.host_sp.get() as u64;
         context.Rbp = tls.host_bp.get() as u64;
         context.Rdx = exception_record_ptr as u64;
     }
@@ -252,7 +249,7 @@ impl WindowsUserland {
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
         unsafe {
-            let _ = AddVectoredExceptionHandler(0, Some(vectored_exception_handler));
+            let _ = AddVectoredExceptionHandler(1, Some(vectored_exception_handler));
         }
 
         // Register a console control handler to receive Ctrl+C

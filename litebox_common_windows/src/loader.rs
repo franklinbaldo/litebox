@@ -83,6 +83,13 @@ pub struct PeDataDirectory {
     pub size: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeTrampolineRange {
+    /// Relative virtual address
+    pub rva: usize,
+    pub size: usize,
+}
+
 /// Maximum number of entries in `ntdll!KiUserInvertedFunctionTable`.
 pub const MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE: u32 = 512;
 
@@ -213,10 +220,34 @@ impl PeParsedFile {
         self.trampoline.is_some()
     }
 
+    /// Returns the parsed LiteBox syscall trampoline range, if present.
+    #[must_use]
+    pub fn trampoline_range(&self) -> Option<PeTrampolineRange> {
+        self.trampoline.map(|trampoline| PeTrampolineRange {
+            rva: trampoline.rva,
+            size: trampoline.size,
+        })
+    }
+
     /// Returns the PE image size from the optional header.
     #[must_use]
     pub fn image_size(&self) -> usize {
         self.image.size_of_image
+    }
+
+    /// Returns the mapped RVA and size for a named section.
+    #[must_use]
+    pub fn mapped_section_range(&self, name: &[u8]) -> Option<(usize, usize)> {
+        let section = self
+            .sections
+            .iter()
+            .find(|section| section_name_eq(section, name))?;
+        let rva = section.virtual_address.get(LE) as usize;
+        let size = cmp::max(
+            section.virtual_size.get(LE) as usize,
+            section.size_of_raw_data.get(LE) as usize,
+        );
+        Some((rva, size))
     }
 
     /// Returns the preferred image base from the optional header.

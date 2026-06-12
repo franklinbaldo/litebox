@@ -445,16 +445,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .registry
             .open_key(&path, desired_access)
             .inspect_err(|status| {
-                if *status != NtStatus::OBJECT_NAME_NOT_FOUND {
-                    litebox_util_log::debug!(
-                        desired_access:? = desired_access,
-                        root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
-                        name:% = key_name,
-                        path:% = path,
-                        status:? = status;
-                        "NtOpenKey failed"
-                    );
-                }
+                litebox_util_log::debug!(
+                    desired_access:? = desired_access,
+                    root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
+                    name:% = key_name,
+                    path:% = path,
+                    status:? = status;
+                    "NtOpenKey failed"
+                );
             })?;
         self.insert_registry_key_handle(RegistryKeyObject {
             path,
@@ -516,6 +514,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.global
                 .registry
                 .read_value_at_path(&key.path, &value_name)
+                .inspect_err(|status| {
+                    litebox_util_log::debug!(
+                        handle:% = format_args!("{:#x}", key_handle.as_raw()),
+                        path:% = key.path,
+                        value_name:% = value_name,
+                        key_value_information_class:? = key_value_information_class,
+                        status:? = status;
+                        "NtQueryValueKey failed"
+                    );
+                })
         })?;
         let name = utf16le(&value_name);
         match key_value_information_class {

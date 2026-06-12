@@ -4,6 +4,7 @@
 use core::mem::size_of;
 
 use int_enum::IntEnum;
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{
     Instant as _, PageManagementProvider, RawConstPointer as _, RawMutPointer as _,
 };
@@ -31,13 +32,24 @@ const LOGICAL_PROCESSOR_RELATION_GROUP: u32 = 4;
 const ETW_ACTIVITY_ID_LENGTH: u32 = 16;
 const ETW_UM_REGISTRATION_INFORMATION_LENGTH: u32 = 160;
 const ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE: usize = 160;
-const ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH: usize = 0x70;
+const ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH: usize = 0x28;
 const ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET: usize = 24;
-const ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET: usize = 0x2c;
+const ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET: usize = 0x28;
 const ETW_PROVIDER_TRAITS_INPUT_LENGTH: u32 = 24;
 const ETW_PROVIDER_TRAITS_OUTPUT_LENGTH: u32 = 120;
+const ETW_PROVIDER_TRAITS_MIN_LENGTH: usize = 3;
 #[cfg(test)]
 const ETW_ACTIVITY_ID_LENGTH_USIZE: usize = 16;
+
+struct EtwRegistrationSubsystem;
+
+impl FdEnabledSubsystem for EtwRegistrationSubsystem {
+    type Entry = EtwRegistrationObject;
+}
+
+impl FdEnabledSubsystemEntry for EtwRegistrationObject {}
+
+struct EtwRegistrationObject;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -718,16 +730,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::ACCESS_VIOLATION;
         };
+        let Ok(handle) = self.insert_etw_registration_handle() else {
+            return NtStatus::QUOTA_EXCEEDED;
+        };
         let mut reply = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
         reply[..ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH]
             .copy_from_slice(&registration.as_ref()[..ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH]);
+        let Ok(handle_raw) = u64::try_from(handle.as_raw()) else {
+            self.remove_etw_registration_handle(handle);
+            return NtStatus::QUOTA_EXCEEDED;
+        };
         reply[ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET
             ..ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET + size_of::<u64>()]
-            .copy_from_slice(&u64::from(self.process.cookie).to_le_bytes());
+            .copy_from_slice(&handle_raw.to_le_bytes());
         reply[ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET
             ..ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET + size_of::<u32>()]
             .copy_from_slice(&ETW_UM_REGISTRATION_INFORMATION_LENGTH.to_le_bytes());
         if output_buffer.write_slice_at_offset(0, &reply).is_none() {
+            self.remove_etw_registration_handle(handle);
             return NtStatus::ACCESS_VIOLATION;
         }
         if let Some(return_length) = return_length
@@ -735,6 +755,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .write_at_offset(0, ETW_UM_REGISTRATION_INFORMATION_LENGTH)
                 .is_none()
         {
+            self.remove_etw_registration_handle(handle);
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
@@ -755,20 +776,85 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return NtStatus::INVALID_PARAMETER;
         }
-        let Some(reg_handle_bytes) = input_buffer.to_owned_slice(size_of::<u32>()) else {
+        let Some(input) = input_buffer.to_owned_slice(ETW_PROVIDER_TRAITS_INPUT_LENGTH as usize)
+        else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        let reg_handle = u32::from_le_bytes(
-            reg_handle_bytes
-                .as_ref()
+        let reg_handle = u64::from_le_bytes(
+            input.as_ref()[..size_of::<u64>()]
                 .try_into()
-                .expect("HANDLE input is four bytes"),
+                .expect("HANDLE input is eight bytes"),
         );
-        if reg_handle != self.process.cookie {
+        let traits_ptr = u64::from_le_bytes(
+            input.as_ref()[size_of::<u64>()..size_of::<u64>() * 2]
+                .try_into()
+                .expect("pointer input is eight bytes"),
+        );
+        let traits_len = u16::from_le_bytes(
+            input.as_ref()[size_of::<u64>() * 2..size_of::<u64>() * 2 + size_of::<u16>()]
+                .try_into()
+                .expect("USHORT input is two bytes"),
+        );
+        let Ok(reg_handle) = usize::try_from(reg_handle) else {
+            return NtStatus::INVALID_HANDLE;
+        };
+        let Ok(traits_ptr) = usize::try_from(traits_ptr) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let traits_len = usize::from(traits_len);
+        if traits_ptr == 0 || traits_len == 0 {
             return NtStatus::INVALID_PARAMETER;
         }
-        NtStatus::FILE_CORRUPT_ERROR
+        if !self.is_etw_registration_handle(Handle::from_raw(reg_handle)) {
+            return NtStatus::INVALID_HANDLE;
+        }
+        let traits = ConstPtr::<Platform, u16>::from_usize(traits_ptr);
+        let Some(declared_len) = traits.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if traits_len < ETW_PROVIDER_TRAITS_MIN_LENGTH || usize::from(declared_len) != traits_len {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if let Some(return_length) = _return_length
+            && return_length.write_at_offset(0, 0).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
     }
+
+    fn insert_etw_registration_handle(&self) -> Result<Handle, NtStatus> {
+        let mut descriptor_table = self.global.litebox.descriptor_table_mut();
+        let typed = descriptor_table.insert::<EtwRegistrationSubsystem>(EtwRegistrationObject);
+        drop(descriptor_table);
+
+        crate::insert_raw_handle(
+            &self.global.litebox,
+            &self.process.handles,
+            typed,
+            Self::close_etw_registration,
+        )
+    }
+
+    fn remove_etw_registration_handle(&self, handle: Handle) {
+        crate::remove_raw_handle::<Platform, EtwRegistrationSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+            Self::close_etw_registration,
+        );
+    }
+
+    fn is_etw_registration_handle(&self, handle: Handle) -> bool {
+        crate::raw_handle_entry::<Platform, EtwRegistrationSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            handle,
+        )
+        .is_some()
+    }
+
+    fn close_etw_registration(_entry: EtwRegistrationObject) {}
 }
 
 fn system_basic_information<Platform: ShimPlatform>() -> SystemBasicInformation {
@@ -1761,9 +1847,10 @@ mod tests {
                 &[0; size_of::<u64>()]
             );
             assert_eq!(
-                &output[ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH..],
+                &output[ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET + size_of::<u32>()..],
                 &[0; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE
-                    - ETW_UM_REGISTRATION_REPLY_COPIED_LENGTH]
+                    - ETW_UM_REGISTRATION_REPLY_LENGTH_OFFSET
+                    - size_of::<u32>()]
             );
             assert_eq!(return_length, ETW_UM_REGISTRATION_INFORMATION_LENGTH);
         });
@@ -1802,16 +1889,43 @@ mod tests {
     }
 
     #[test]
-    fn nt_trace_control_set_provider_traits_returns_host_failure_for_local_etw() {
+    fn nt_trace_control_set_provider_traits_accepts_registration_handle() {
         run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let registration_input = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+            let mut registration_output = [0u8; ETW_UM_REGISTRATION_INFORMATION_LENGTH_USIZE];
+            let mut registration_return_length = 0u32;
+
+            assert_eq!(
+                task.sys_nt_trace_control(
+                    EtwTraceControlCode::RegisterGuids as u32,
+                    const_byte_ptr(&registration_input),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH,
+                    mut_byte_ptr(&mut registration_output),
+                    ETW_UM_REGISTRATION_INFORMATION_LENGTH,
+                    Some(mut_ptr(&mut registration_return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            let registration_handle = u64::from_le_bytes(
+                registration_output[ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET
+                    ..ETW_UM_REGISTRATION_REPLY_HANDLE_OFFSET + size_of::<u64>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            let mut traits = [0u8; 4];
+            traits[..size_of::<u16>()].copy_from_slice(&4u16.to_le_bytes());
             let mut input = [0u8; ETW_PROVIDER_TRAITS_INPUT_LENGTH as usize];
-            input[..size_of::<u32>()]
-                .copy_from_slice(&crate::syscalls::process::default_process_cookie().to_le_bytes());
+            input[..size_of::<u64>()].copy_from_slice(&registration_handle.to_le_bytes());
+            input[size_of::<u64>()..size_of::<u64>() * 2]
+                .copy_from_slice(&(core::ptr::from_ref(&traits).addr() as u64).to_le_bytes());
+            input[size_of::<u64>() * 2..size_of::<u64>() * 2 + size_of::<u16>()]
+                .copy_from_slice(&4u16.to_le_bytes());
             let mut output = [0xcc; ETW_PROVIDER_TRAITS_OUTPUT_LENGTH as usize];
             let mut return_length = u32::MAX;
 
             assert_eq!(
-                sys_nt_trace_control_with_input(
+                task.sys_nt_trace_control(
                     EtwTraceControlCode::SetProviderTraits as u32,
                     const_byte_ptr(&input),
                     ETW_PROVIDER_TRAITS_INPUT_LENGTH,
@@ -1819,17 +1933,25 @@ mod tests {
                     ETW_PROVIDER_TRAITS_OUTPUT_LENGTH,
                     Some(mut_ptr(&mut return_length)),
                 ),
-                NtStatus::FILE_CORRUPT_ERROR
+                NtStatus::SUCCESS
             );
             assert_eq!(output, [0xcc; ETW_PROVIDER_TRAITS_OUTPUT_LENGTH as usize]);
-            assert_eq!(return_length, u32::MAX);
+            assert_eq!(return_length, 0);
         });
     }
 
     #[test]
     fn nt_trace_control_set_provider_traits_rejects_unknown_registration_handle() {
         run_with_test_platform_pointers(|| {
-            let input = [0u8; ETW_PROVIDER_TRAITS_INPUT_LENGTH as usize];
+            let mut traits = [0u8; 4];
+            traits[..size_of::<u16>()].copy_from_slice(&4u16.to_le_bytes());
+            let mut input = [0u8; ETW_PROVIDER_TRAITS_INPUT_LENGTH as usize];
+            input[..size_of::<u64>()]
+                .copy_from_slice(&Handle::from_raw_fd(42).unwrap().as_raw().to_le_bytes());
+            input[size_of::<u64>()..size_of::<u64>() * 2]
+                .copy_from_slice(&(core::ptr::from_ref(&traits).addr() as u64).to_le_bytes());
+            input[size_of::<u64>() * 2..size_of::<u64>() * 2 + size_of::<u16>()]
+                .copy_from_slice(&4u16.to_le_bytes());
             let mut output = [0u8; ETW_PROVIDER_TRAITS_OUTPUT_LENGTH as usize];
             let mut return_length = 0u32;
 
@@ -1842,7 +1964,7 @@ mod tests {
                     ETW_PROVIDER_TRAITS_OUTPUT_LENGTH,
                     Some(mut_ptr(&mut return_length)),
                 ),
-                NtStatus::INVALID_PARAMETER
+                NtStatus::INVALID_HANDLE
             );
         });
     }

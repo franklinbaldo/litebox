@@ -26,7 +26,7 @@ use litebox::platform::{
     RawConstPointer as _, RawMutPointer as _, RawPointerProvider, StdioProvider,
     SystemInfoProvider, TimeProvider,
 };
-use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::sync::RawSyncPrimitivesProvider;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::{MappingInfo, PAGE_SIZE};
@@ -41,11 +41,14 @@ use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::mm;
+use crate::syscalls::port::{ConnectPortParameters, PortHandleObject, PortSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
-use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
+use crate::syscalls::timer::{
+    TimerCreateParameters, TimerHandleObject, TimerSetParameters, TimerSubsystem,
+};
 use crate::syscalls::token::{TokenHandleObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
@@ -65,6 +68,81 @@ mod syscalls;
 mod tests;
 
 const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
+const AMD64_EXCEPTION_RECORD_SIZE: usize = 0x98;
+const AMD64_MACHINE_FRAME_ALIGN: usize = 0x10;
+const AMD64_MACHINE_FRAME_SIZE: usize = core::mem::size_of::<GuestMachineFrame>();
+const AMD64_USER_CS: u16 = 0x33;
+const AMD64_USER_SS: u16 = 0x2b;
+const INITIAL_CONTEXT_MXCSR: u32 = 0x1f80;
+const LEGACY_EXCEPTION_RECORD_OFFSET_AMD64: usize = 0x4f0;
+const LEGACY_CONTEXT_PADDING_SIZE_AMD64: usize =
+    LEGACY_EXCEPTION_RECORD_OFFSET_AMD64 - core::mem::size_of::<nt_types::X64Context>();
+const LEGACY_CONTEXT_PADDING_AMD64: [u8; LEGACY_CONTEXT_PADDING_SIZE_AMD64] =
+    [0; LEGACY_CONTEXT_PADDING_SIZE_AMD64];
+const STATUS_INTEGER_DIVIDE_BY_ZERO: NtStatus = NtStatus::from_raw(0xc000_0094);
+
+const _: () = assert!(core::mem::size_of::<GuestExceptionRecord>() == AMD64_EXCEPTION_RECORD_SIZE);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+struct GuestExceptionRecord {
+    exception_code: u32,
+    exception_flags: u32,
+    exception_record: u64,
+    exception_address: u64,
+    number_parameters: u32,
+    unused_alignment: u32,
+    exception_information: [u64; 15],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+struct GuestMachineFrame {
+    rip: u64,
+    cs: u64,
+    eflags: u64,
+    rsp: u64,
+    ss: u64,
+}
+
+fn align_up_pow2(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (value + (align - 1)) & !(align - 1)
+}
+
+fn exception_frame_rsp(rsp: usize, frame_size: usize) -> Option<usize> {
+    Some(rsp.checked_sub(frame_size)? & !0x3f)
+}
+
+fn exception_frame_address(frame_base: usize, offset: usize) -> Option<usize> {
+    frame_base.checked_add(offset)
+}
+
+fn ki_user_exception_dispatcher_machine_frame_offset(exception_record_offset: usize) -> usize {
+    align_up_pow2(
+        exception_record_offset + AMD64_EXCEPTION_RECORD_SIZE,
+        AMD64_MACHINE_FRAME_ALIGN,
+    )
+}
+
+fn ki_user_exception_dispatcher_frame_size(exception_record_offset: usize) -> usize {
+    align_up_pow2(
+        ki_user_exception_dispatcher_machine_frame_offset(exception_record_offset)
+            + AMD64_MACHINE_FRAME_SIZE,
+        0x40,
+    )
+}
+
+fn read_value<Platform, T>(address: usize) -> Option<T>
+where
+    Platform: RawPointerProvider,
+    T: zerocopy::FromBytes,
+{
+    let ptr = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<T>::from_usize(
+        address,
+    );
+    ptr.read_at_offset(0)
+}
 
 /// A LiteBox platform with the services required by the Windows shim.
 pub trait ShimPlatform:
@@ -87,6 +165,43 @@ impl<T> ShimPlatform for T where
 {
 }
 
+fn initial_image_mappings<Platform: ShimPlatform>(
+    image_path: &str,
+    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+    application_mapping: MappingInfo,
+    ntdll_mapping: Option<MappingInfo>,
+    ntdll_path: Option<&str>,
+) -> WindowsImageMappings<Platform> {
+    let ntdll_base = ntdll_mapping.map(|mapping| mapping.base_addr);
+    let mut image_mappings = BTreeMap::new();
+    for (&base, allocation) in virtual_allocations.read().iter() {
+        if allocation.type_ != mm::MemoryType::MEM_IMAGE.bits() {
+            continue;
+        }
+        let name = if Some(base) == ntdll_base {
+            ntdll_path.unwrap_or("/Windows/System32/ntdll.dll")
+        } else {
+            image_path
+        };
+        let entry_point = if Some(base) == ntdll_base {
+            ntdll_mapping.map_or(0, |mapping| mapping.entry_point)
+        } else if base == application_mapping.base_addr {
+            application_mapping.entry_point
+        } else {
+            0
+        };
+        image_mappings.insert(
+            base,
+            WindowsImageMapping {
+                name: String::from(name),
+                size: allocation.size,
+                entry_point,
+            },
+        );
+    }
+    WindowsImageMappings::<Platform>::new(image_mappings)
+}
+
 pub(crate) type ConstPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 pub(crate) type MutPtr<Platform, T> =
@@ -98,6 +213,8 @@ pub(crate) type WindowsNlsSectionMappings<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<(u32, u32), (usize, usize)>>;
 pub(crate) type WindowsVirtualAllocations<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsVirtualAllocation>>;
+pub(crate) type WindowsImageMappings<Platform> =
+    litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsImageMapping>>;
 pub(crate) type WindowsEventNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<EventObject<Platform>>>>;
 pub(crate) type WindowsDirectoryNamespace<Platform> =
@@ -108,6 +225,22 @@ pub(crate) type WindowsSectionNamespace<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<String, Weak<SectionObject>>>;
 pub(crate) type WindowsSectionViews<Platform> =
     litebox::sync::RwLock<Platform, BTreeMap<usize, WindowsSectionView>>;
+
+fn exception_to_ntstatus(info: &ExceptionInfo) -> NtStatus {
+    match info.exception {
+        Exception::DIVIDE_ERROR => {
+            if info.error_code == 0 {
+                STATUS_INTEGER_DIVIDE_BY_ZERO
+            } else {
+                NtStatus::from_raw(info.error_code)
+            }
+        }
+        Exception::BREAKPOINT => NtStatus::BREAKPOINT,
+        Exception::INVALID_OPCODE => NtStatus::ILLEGAL_INSTRUCTION,
+        Exception::GENERAL_PROTECTION_FAULT | Exception::PAGE_FAULT => NtStatus::ACCESS_VIOLATION,
+        _ => NtStatus::UNSUCCESSFUL,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsSectionView {
@@ -121,6 +254,13 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) allocation_protect: syscalls::mm::PageProtection,
     pub(crate) type_: u32,
     pub(crate) pages: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsImageMapping {
+    pub(crate) name: String,
+    pub(crate) size: usize,
+    pub(crate) entry_point: usize,
 }
 
 pub type DefaultFS<Platform> = WindowsFS<Platform>;
@@ -240,6 +380,30 @@ where
     litebox.descriptor_table().entry_handle(&typed)
 }
 
+pub(crate) fn duplicate_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
+    litebox: &LiteBox<Platform>,
+    handles: &WindowsHandleStore<Platform>,
+    handle: syscalls::Handle,
+) -> Result<Option<syscalls::Handle>, NtStatus>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
+    let Some(raw_fd) = handle.raw_fd() else {
+        return Ok(None);
+    };
+    let typed = {
+        let handles = handles.read();
+        handles.fd_from_raw_integer::<Subsystem>(raw_fd).ok()
+    };
+    let Some(typed) = typed else {
+        return Ok(None);
+    };
+    let Some(duplicated) = litebox.descriptor_table_mut().duplicate(&typed) else {
+        return Ok(None);
+    };
+    insert_raw_handle::<Platform, Subsystem>(litebox, handles, duplicated, drop).map(Some)
+}
+
 pub(crate) fn remove_raw_handle<Platform, Subsystem: litebox::fd::FdEnabledSubsystem>(
     litebox: &LiteBox<Platform>,
     handles: &WindowsHandleStore<Platform>,
@@ -343,8 +507,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
     ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
         let load_info =
             loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager).load(path)?;
+        let image_mappings = initial_image_mappings::<Platform>(
+            path,
+            &load_info.virtual_allocations,
+            load_info.application_mapping,
+            load_info.ntdll_mapping,
+            load_info.ntdll_path.as_deref(),
+        );
         let process = Arc::new(Process {
             ntdll_mapping: load_info.ntdll_mapping,
+            ntdll_exception_dispatcher: load_info.ntdll_exception_dispatcher,
             peb_address: load_info.environment.peb,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
             event_namespace: WindowsEventNamespace::<Platform>::new(BTreeMap::new()),
@@ -360,6 +532,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             // TODO: Register stack, PEB/TEB, and process parameters once VM metadata can
             // distinguish those loader-owned mappings from guest-releasable allocations.
             virtual_allocations: load_info.virtual_allocations,
+            image_mappings,
             system_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
@@ -402,6 +575,7 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
 /// Per-process Windows state shared by every thread in the process.
 pub struct Process<Platform: ShimPlatform> {
     ntdll_mapping: Option<MappingInfo>,
+    ntdll_exception_dispatcher: Option<usize>,
     peb_address: usize,
     handles: WindowsHandleStore<Platform>,
     event_namespace: WindowsEventNamespace<Platform>,
@@ -411,6 +585,7 @@ pub struct Process<Platform: ShimPlatform> {
     section_views: WindowsSectionViews<Platform>,
     nls_section_mappings: WindowsNlsSectionMappings<Platform>,
     virtual_allocations: WindowsVirtualAllocations<Platform>,
+    image_mappings: WindowsImageMappings<Platform>,
     system_lcid: AtomicU32,
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
@@ -491,6 +666,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let status = self.sys_nt_close(handle);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtDuplicateObject {
+                source_process_handle,
+                source_handle,
+                target_process_handle,
+                target_handle,
+                desired_access,
+                handle_attributes,
+                options,
+            } => {
+                let status = self.sys_nt_duplicate_object(
+                    source_process_handle,
+                    source_handle,
+                    target_process_handle,
+                    target_handle,
+                    desired_access,
+                    handle_attributes,
+                    options,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtApphelpCacheControl {
                 service_class,
                 service_data,
@@ -498,6 +693,53 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let status = syscalls::apphelp::sys_nt_apphelp_cache_control::<Platform>(
                     service_class,
                     service_data,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtConnectPort {
+                port_handle,
+                port_name,
+                security_quality_of_service,
+                client_view,
+                server_view,
+                max_message_length,
+                connection_information,
+                connection_information_length,
+            } => {
+                let status = self.sys_nt_connect_port(ConnectPortParameters {
+                    port_handle,
+                    port_name,
+                    security_quality_of_service,
+                    client_view,
+                    server_view,
+                    max_message_length,
+                    connection_information: connection_information
+                        .map(|ptr| MutPtr::<Platform, _>::from_usize(ptr.as_usize())),
+                    connection_information_length,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtAlpcSendWaitReceivePort {
+                port_handle,
+                flags,
+                send_message,
+                send_message_attributes,
+                receive_message,
+                buffer_length,
+                receive_message_attributes,
+                timeout,
+            } => {
+                let status = self.sys_nt_alpc_send_wait_receive_port(
+                    syscalls::port::AlpcSendWaitReceivePortParameters {
+                        port_handle,
+                        flags,
+                        send_message,
+                        send_message_attributes,
+                        receive_message,
+                        buffer_length,
+                        receive_message_attributes,
+                        timeout,
+                    },
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -653,6 +895,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtContinue {
+                context,
+                test_alert,
+            } => {
+                let status = Self::sys_nt_continue(ctx, context, test_alert);
+                litebox_util_log::debug!(
+                    syscall:? = NtSysno::from_raw(ctx.orig_rax),
+                    status:? = status;
+                    "Handled Windows syscall"
+                );
+                if status.is_success() {
+                    return ContinueOperation::Resume;
+                }
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtCreateTimer2 {
                 timer_handle,
                 timer_id,
@@ -666,6 +923,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     object_attributes,
                     attributes,
                     desired_access,
+                });
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetTimer2 {
+                timer_handle,
+                due_time,
+                period,
+                parameters,
+            } => {
+                let status = self.sys_nt_set_timer2(TimerSetParameters {
+                    timer_handle,
+                    due_time,
+                    period,
+                    parameters,
                 });
                 (status, ContinueOperation::Resume)
             }
@@ -885,6 +1156,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     create_options,
                     ea_buffer,
                     ea_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtDeviceIoControlFile {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                io_control_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+            } => {
+                let status = self.sys_nt_device_io_control_file(
+                    file_handle,
+                    event,
+                    apc_routine,
+                    apc_context,
+                    io_status_block,
+                    io_control_code,
+                    input_buffer,
+                    input_buffer_length,
+                    output_buffer,
+                    output_buffer_length,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1139,6 +1436,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtRaiseException {
+                exception_record,
+                context,
+                first_chance,
+            } => self.sys_nt_raise_exception(ctx, exception_record, context, first_chance),
             SyscallRequest::NtSetInformationProcess {
                 process_handle,
                 process_information_class,
@@ -1167,13 +1469,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtTestAlert => (NtStatus::SUCCESS, ContinueOperation::Resume),
             SyscallRequest::NtOpenThreadToken {
                 thread_handle,
                 desired_access,
                 open_as_self,
                 token_handle,
             } => {
-                let status = Self::sys_nt_open_thread_token(
+                let status = self.sys_nt_open_thread_token(
                     thread_handle,
                     desired_access,
                     open_as_self,
@@ -1188,7 +1491,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 handle_attributes,
                 token_handle,
             } => {
-                let status = Self::sys_nt_open_thread_token_ex(
+                let status = self.sys_nt_open_thread_token_ex(
                     thread_handle,
                     desired_access,
                     open_as_self,
@@ -1436,7 +1739,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             SyscallRequest::NtSetWnfProcessNotificationEvent { notification_event } => {
                 let _ = notification_event.as_raw();
-                (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
+                let status = syscalls::wnf::sys_nt_set_wnf_process_notification_event();
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryWnfStateData {
+                state_name,
+                type_id,
+                explicit_scope,
+                change_stamp,
+                buffer,
+                buffer_length,
+            } => {
+                let status = syscalls::wnf::sys_nt_query_wnf_state_data::<Platform>(
+                    state_name,
+                    type_id,
+                    explicit_scope,
+                    change_stamp,
+                    buffer,
+                    buffer_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryWnfStateNameInformation {
+                state_name,
+                name_information_class,
+                explicit_scope,
+                buffer,
+                buffer_length,
+            } => {
+                let status = syscalls::wnf::sys_nt_query_wnf_state_name_information::<Platform>(
+                    state_name,
+                    name_information_class,
+                    explicit_scope,
+                    buffer,
+                    buffer_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSubscribeWnfStateChange {
+                state_name,
+                change_stamp,
+                event_mask,
+                subscription_id,
+            } => {
+                let _ = (state_name, change_stamp, event_mask, subscription_id);
+                let status = syscalls::wnf::sys_nt_subscribe_wnf_state_change();
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUnsubscribeWnfStateChange { state_name } => {
+                let _ = state_name;
+                let status = syscalls::wnf::sys_nt_unsubscribe_wnf_state_change();
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtUpdateWnfStateData {
+                state_name,
+                buffer,
+                length,
+                type_id,
+                explicit_scope,
+                matching_change_stamp,
+                check_stamp,
+            } => {
+                let status = syscalls::wnf::sys_nt_update_wnf_state_data::<Platform>(
+                    state_name,
+                    buffer,
+                    length,
+                    type_id,
+                    explicit_scope,
+                    matching_change_stamp,
+                    check_stamp,
+                );
+                (status, ContinueOperation::Resume)
             }
             SyscallRequest::NtManageHotPatch => {
                 (NtStatus::NOT_IMPLEMENTED, ContinueOperation::Resume)
@@ -1457,6 +1830,151 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_HANDLE;
         };
         self.close_raw_fd(raw_fd, CloseRawHandleVisitor { task: self })
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "models the Windows syscall ABI")]
+    pub(crate) fn sys_nt_duplicate_object(
+        &self,
+        source_process_handle: syscalls::ProcessHandle,
+        source_handle: syscalls::Handle,
+        target_process_handle: syscalls::ProcessHandle,
+        target_handle: Option<MutPtr<Platform, syscalls::Handle>>,
+        _desired_access: u32,
+        _handle_attributes: u32,
+        options: u32,
+    ) -> NtStatus {
+        const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
+
+        litebox_util_log::debug!(
+            source_process_handle:% = format_args!("{:#x}", source_process_handle.as_handle().as_raw()),
+            source_handle:% = format_args!("{:#x}", source_handle.as_raw()),
+            target_process_handle:% = format_args!("{:#x}", target_process_handle.as_handle().as_raw()),
+            target_handle:% = format_args!("{:#x}", target_handle.map_or(0, |ptr| ptr.as_usize())),
+            options = options;
+            "Handling NtDuplicateObject syscall"
+        );
+
+        if !source_process_handle.is_current() || !target_process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+
+        if let Some(target_handle) = target_handle
+            && let Err(status) = probe_guest_output_preserving_value::<Platform, _>(target_handle)
+        {
+            return status;
+        }
+
+        let Some(raw_fd) = source_handle.raw_fd() else {
+            return NtStatus::INVALID_HANDLE;
+        };
+        let Ok(duplicated_handle) = self.duplicate_raw_fd(raw_fd) else {
+            return NtStatus::INVALID_HANDLE;
+        };
+
+        if let Some(target_handle) = target_handle
+            && target_handle
+                .write_at_offset(0, duplicated_handle)
+                .is_none()
+        {
+            let _ = self.sys_nt_close(duplicated_handle);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        if options & DUPLICATE_CLOSE_SOURCE != 0 {
+            let _ = self.close_raw_fd(raw_fd, CloseRawHandleVisitor { task: self });
+        }
+
+        NtStatus::SUCCESS
+    }
+
+    fn duplicate_raw_fd(&self, raw_fd: usize) -> Result<syscalls::Handle, NtStatus> {
+        if let Some(handle) = duplicate_raw_handle::<Platform, FileObjectSubsystem<FS>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, RegistryKeySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, EventSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, DirectoryObjectSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, SymbolicLinkSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, IoCompletionSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, PortSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, TimerSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) =
+            duplicate_raw_handle::<Platform, WaitCompletionPacketSubsystem<Platform>>(
+                &self.global.litebox,
+                &self.process.handles,
+                syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+            )?
+        {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, WorkerFactorySubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, SectionSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        if let Some(handle) = duplicate_raw_handle::<Platform, TokenSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            syscalls::Handle::from_raw_fd(raw_fd).ok_or(NtStatus::INVALID_HANDLE)?,
+        )? {
+            return Ok(handle);
+        }
+        Err(NtStatus::INVALID_HANDLE)
     }
 
     fn close_raw_fd(
@@ -1509,6 +2027,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.process.handles,
             raw_fd,
             |io_completion| visitor.io_completion(io_completion),
+        ) {
+            return NtStatus::SUCCESS;
+        }
+        if remove_raw_handle_by_raw_fd::<Platform, PortSubsystem<Platform>>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |port| visitor.port(port),
         ) {
             return NtStatus::SUCCESS;
         }
@@ -1565,6 +2091,214 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         ContinueOperation::Resume
     }
+
+    fn sys_nt_raise_exception(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+        exception_record: ConstPtr<Platform, u8>,
+        context: ConstPtr<Platform, u8>,
+        first_chance: u8,
+    ) -> (NtStatus, ContinueOperation) {
+        let status = read_value::<Platform, u32>(exception_record.as_usize())
+            .map_or(NtStatus::ACCESS_VIOLATION, NtStatus::from_raw);
+        if first_chance == 0 {
+            self.process
+                .exit_code
+                .store(status.as_raw(), Ordering::Relaxed);
+            return (status, ContinueOperation::Terminate);
+        }
+
+        let Some(context) = read_value::<Platform, nt_types::X64Context>(context.as_usize()) else {
+            return (NtStatus::ACCESS_VIOLATION, ContinueOperation::Resume);
+        };
+        let Some(exception_record) =
+            read_value::<Platform, GuestExceptionRecord>(exception_record.as_usize())
+        else {
+            return (NtStatus::ACCESS_VIOLATION, ContinueOperation::Resume);
+        };
+
+        if self.redirect_to_guest_seh(ctx, &context, exception_record) {
+            (NtStatus::SUCCESS, ContinueOperation::Resume)
+        } else {
+            self.process
+                .exit_code
+                .store(NtStatus::ACCESS_VIOLATION.as_raw(), Ordering::Relaxed);
+            (NtStatus::ACCESS_VIOLATION, ContinueOperation::Terminate)
+        }
+    }
+
+    fn handle_exception_request(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+        info: &ExceptionInfo,
+    ) -> ContinueOperation {
+        litebox_util_log::debug!(
+            exception:? = info.exception,
+            rip:% = format_args!("{:#x}", ctx.rip),
+            cr2:% = format_args!("{:#x}", info.cr2);
+            "Windows guest exception"
+        );
+
+        let status = exception_to_ntstatus(info);
+        let context = Self::x64_context_from_regs(ctx);
+        let exception_record = Self::guest_exception_record(ctx.rip, info, status);
+        if self.redirect_to_guest_seh(ctx, &context, exception_record) {
+            ContinueOperation::Resume
+        } else {
+            self.process
+                .exit_code
+                .store(status.as_raw(), Ordering::Relaxed);
+            ContinueOperation::Terminate
+        }
+    }
+
+    fn redirect_to_guest_seh(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+        context: &nt_types::X64Context,
+        exception_record: GuestExceptionRecord,
+    ) -> bool {
+        let Some(dispatcher) = self.process.ntdll_exception_dispatcher else {
+            litebox_util_log::debug!(
+                "Cannot forward Windows guest exception: missing guest ntdll!KiUserExceptionDispatcher"
+            );
+            return false;
+        };
+
+        let exception_record_offset = LEGACY_EXCEPTION_RECORD_OFFSET_AMD64;
+        let frame_size = ki_user_exception_dispatcher_frame_size(exception_record_offset);
+        let Some(new_rsp) = exception_frame_rsp(ctx.rsp, frame_size) else {
+            return false;
+        };
+
+        let Some(exception_record_address) =
+            exception_frame_address(new_rsp, exception_record_offset)
+        else {
+            return false;
+        };
+        let Some(machine_frame_address) = exception_frame_address(
+            new_rsp,
+            ki_user_exception_dispatcher_machine_frame_offset(exception_record_offset),
+        ) else {
+            return false;
+        };
+
+        if write_value::<Platform, _>(new_rsp, *context).is_none()
+            || write_slice::<Platform, _>(
+                new_rsp + core::mem::size_of::<nt_types::X64Context>(),
+                &LEGACY_CONTEXT_PADDING_AMD64,
+            )
+            .is_none()
+            || write_value::<Platform, _>(exception_record_address, exception_record).is_none()
+            || write_value::<Platform, _>(
+                machine_frame_address,
+                GuestMachineFrame {
+                    rip: context.rip,
+                    cs: u64::from(AMD64_USER_CS),
+                    eflags: u64::from(context.e_flags),
+                    rsp: context.rsp,
+                    ss: u64::from(AMD64_USER_SS),
+                },
+            )
+            .is_none()
+        {
+            return false;
+        }
+
+        ctx.rsp = new_rsp;
+        ctx.rip = dispatcher;
+        ctx.rcx = dispatcher;
+        ctx.rax = 0;
+        true
+    }
+
+    fn x64_context_from_regs(ctx: &litebox_common_linux::PtRegs) -> nt_types::X64Context {
+        nt_types::X64Context {
+            context_flags: nt_types::X64_CONTEXT_CONTROL
+                | nt_types::X64_CONTEXT_INTEGER
+                | nt_types::X64_CONTEXT_FLOATING_POINT
+                | nt_types::X64_CONTEXT_DEBUG_REGISTERS,
+            mx_csr: INITIAL_CONTEXT_MXCSR,
+            seg_cs: AMD64_USER_CS,
+            seg_ss: AMD64_USER_SS,
+            e_flags: u32::try_from(ctx.eflags).unwrap_or(u32::MAX),
+            rax: ctx.rax as u64,
+            rcx: ctx.rcx as u64,
+            rdx: ctx.rdx as u64,
+            rbx: ctx.rbx as u64,
+            rsp: ctx.rsp as u64,
+            rbp: ctx.rbp as u64,
+            rsi: ctx.rsi as u64,
+            rdi: ctx.rdi as u64,
+            r8: ctx.r8 as u64,
+            r9: ctx.r9 as u64,
+            r10: ctx.r10 as u64,
+            r11: ctx.r11 as u64,
+            r12: ctx.r12 as u64,
+            r13: ctx.r13 as u64,
+            r14: ctx.r14 as u64,
+            r15: ctx.r15 as u64,
+            rip: ctx.rip as u64,
+            ..nt_types::X64Context::default()
+        }
+    }
+
+    fn sys_nt_continue(
+        ctx: &mut litebox_common_linux::PtRegs,
+        context: ConstPtr<Platform, nt_types::X64Context>,
+        test_alert: u8,
+    ) -> NtStatus {
+        let Some(context) = context.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let _ = test_alert;
+
+        ctx.rax = context.rax as usize;
+        ctx.rcx = context.rcx as usize;
+        ctx.rdx = context.rdx as usize;
+        ctx.rbx = context.rbx as usize;
+        ctx.rsp = context.rsp as usize;
+        ctx.rbp = context.rbp as usize;
+        ctx.rsi = context.rsi as usize;
+        ctx.rdi = context.rdi as usize;
+        ctx.r8 = context.r8 as usize;
+        ctx.r9 = context.r9 as usize;
+        ctx.r10 = context.r10 as usize;
+        ctx.r11 = context.r11 as usize;
+        ctx.r12 = context.r12 as usize;
+        ctx.r13 = context.r13 as usize;
+        ctx.r14 = context.r14 as usize;
+        ctx.r15 = context.r15 as usize;
+        ctx.rip = context.rip as usize;
+        ctx.eflags = context.e_flags as usize;
+
+        NtStatus::SUCCESS
+    }
+
+    fn guest_exception_record(
+        exception_address: usize,
+        info: &ExceptionInfo,
+        status: NtStatus,
+    ) -> GuestExceptionRecord {
+        let mut exception_information = [0; 15];
+        let number_parameters = if info.exception == Exception::PAGE_FAULT {
+            exception_information[0] = u64::from((info.error_code & (1 << 1)) != 0);
+            exception_information[1] = info.cr2 as u64;
+            2
+        } else {
+            0
+        };
+
+        GuestExceptionRecord {
+            exception_code: u32::from_ne_bytes(status.as_raw().to_ne_bytes()),
+            exception_flags: 0,
+            exception_record: 0,
+            exception_address: exception_address as u64,
+            number_parameters,
+            unused_alignment: 0,
+            exception_information,
+        }
+    }
 }
 
 trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
@@ -1579,6 +2313,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>);
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
+
+    fn port(&self, port: PortHandleObject);
 
     fn timer(&self, timer: TimerHandleObject<Platform>);
 
@@ -1623,6 +2359,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
         Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn port(&self, port: PortHandleObject) {
+        Task::<Platform, FS>::close_port(port);
     }
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {
@@ -1678,14 +2418,7 @@ where
         ctx: &mut Self::ExecutionContext,
         info: &ExceptionInfo,
     ) -> ContinueOperation {
-        litebox_util_log::debug!(
-            exception:? = info.exception,
-            rip:% = format_args!("{:#x}", ctx.rip),
-            cr2:% = format_args!("{:#x}", info.cr2);
-            "Windows guest exception"
-        );
-        // TODO: Translate hardware exceptions into Windows SEH where appropriate.
-        ContinueOperation::Terminate
+        self.task.handle_exception_request(ctx, info)
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {

@@ -237,6 +237,28 @@ impl UnicodeString {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct PortView {
+    pub(crate) length: u32,
+    pub(crate) padding_0: u32,
+    pub(crate) section_handle: u64,
+    pub(crate) section_offset: u32,
+    pub(crate) padding_1: u32,
+    pub(crate) view_size: u64,
+    pub(crate) view_base: u64,
+    pub(crate) view_remote_base: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct RemotePortView {
+    pub(crate) length: u32,
+    pub(crate) padding_0: u32,
+    pub(crate) view_size: u64,
+    pub(crate) view_base: u64,
+}
+
 bitflags::bitflags! {
     /// Packed process flags stored in `PEB.BitField`.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +271,16 @@ bitflags::bitflags! {
         const IS_APP_CONTAINER = 1 << 5;
         const IS_PROTECTED_PROCESS_LIGHT = 1 << 6;
         const IS_LONG_PATH_AWARE_PROCESS = 1 << 7;
+    }
+}
+
+bitflags::bitflags! {
+    /// Flags stored in `LDR_DATA_TABLE_ENTRY.Flags`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct LdrDataTableEntryFlags: u32 {
+        const IMAGE_DLL = 0x0000_0004;
+        const ENTRY_PROCESSED = 0x0000_4000;
+        const PROCESS_ATTACH_CALLED = 0x0008_0000;
     }
 }
 
@@ -384,17 +416,92 @@ pub struct GdiTebBatch {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable)]
 pub struct ClientId {
     pub unique_process: usize,
     pub unique_thread: usize,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct PortMessage {
+    pub data_length: u16,
+    pub total_length: u16,
+    pub message_type: u16,
+    pub data_info_offset: u16,
+    pub client_id: ClientId,
+    pub message_id: u32,
+    pub reserved: u32,
+    pub callback_id: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ListEntry {
     pub flink: usize,
     pub blink: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct PebLdrData {
+    pub(crate) length: u32,
+    pub(crate) initialized: u8,
+    pub(crate) padding_0: [u8; 3],
+    pub(crate) ss_handle: usize,
+    pub(crate) in_load_order_module_list: ListEntry,
+    pub(crate) in_memory_order_module_list: ListEntry,
+    pub(crate) in_initialization_order_module_list: ListEntry,
+    pub(crate) entry_in_progress: usize,
+    pub(crate) shutdown_in_progress: u8,
+    pub(crate) padding_1: [u8; 7],
+    pub(crate) shutdown_thread_id: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct RtlBalancedNode {
+    pub(crate) left: usize,
+    pub(crate) right: usize,
+    pub(crate) parent_value: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+pub(crate) struct LdrDataTableEntry {
+    pub(crate) in_load_order_links: ListEntry,
+    pub(crate) in_memory_order_links: ListEntry,
+    pub(crate) in_initialization_order_links: ListEntry,
+    pub(crate) dll_base: usize,
+    pub(crate) entry_point: usize,
+    pub(crate) size_of_image: u32,
+    pub(crate) padding_0: [u8; 4],
+    pub(crate) full_dll_name: UnicodeString,
+    pub(crate) base_dll_name: UnicodeString,
+    pub(crate) flags: u32,
+    pub(crate) obsolete_load_count: u16,
+    pub(crate) tls_index: u16,
+    pub(crate) hash_links: ListEntry,
+    pub(crate) time_date_stamp: u32,
+    pub(crate) padding_1: [u8; 4],
+    pub(crate) entry_point_activation_context: usize,
+    pub(crate) lock: usize,
+    pub(crate) ddag_node: usize,
+    pub(crate) node_module_link: ListEntry,
+    pub(crate) load_context: usize,
+    pub(crate) parent_dll_base: usize,
+    pub(crate) switch_back_context: usize,
+    pub(crate) base_address_index_node: RtlBalancedNode,
+    pub(crate) mapping_info_index_node: RtlBalancedNode,
+    pub(crate) original_base: usize,
+    pub(crate) load_time: i64,
+    pub(crate) base_name_hash_value: u32,
+    pub(crate) load_reason: u32,
+    pub(crate) implicit_path_options: u32,
+    pub(crate) reference_count: u32,
+    pub(crate) dependent_load_flags: u32,
+    pub(crate) signing_level: u8,
+    pub(crate) padding_2: [u8; 3],
 }
 
 #[repr(C)]
@@ -713,6 +820,21 @@ pub struct RtlUserProcessParameters {
 
 const _: [(); 0x1878] = [(); core::mem::size_of::<ThreadEnvironmentBlock>()];
 const _: [(); 0x7d0] = [(); core::mem::size_of::<ProcessEnvironmentBlock>()];
+const _: () = assert!(offset_of!(ProcessEnvironmentBlock, ldr) == 0x18);
 const _: () = assert!(offset_of!(ProcessEnvironmentBlock, api_set_map) == 0x68);
+const _: () = assert!(offset_of!(ProcessEnvironmentBlock, loader_lock) == 0x110);
+const _: () = assert!(core::mem::size_of::<PebLdrData>() == 0x58);
+const _: () = assert!(offset_of!(PebLdrData, in_load_order_module_list) == 0x10);
+const _: () = assert!(offset_of!(PebLdrData, in_memory_order_module_list) == 0x20);
+const _: () = assert!(offset_of!(PebLdrData, in_initialization_order_module_list) == 0x30);
+const _: () = assert!(core::mem::size_of::<LdrDataTableEntry>() == 0x120);
+const _: () = assert!(offset_of!(LdrDataTableEntry, in_memory_order_links) == 0x10);
+const _: () = assert!(offset_of!(LdrDataTableEntry, in_initialization_order_links) == 0x20);
+const _: () = assert!(offset_of!(LdrDataTableEntry, dll_base) == 0x30);
+const _: () = assert!(offset_of!(LdrDataTableEntry, full_dll_name) == 0x48);
+const _: () = assert!(offset_of!(LdrDataTableEntry, base_dll_name) == 0x58);
+const _: () = assert!(offset_of!(LdrDataTableEntry, flags) == 0x68);
+const _: () = assert!(offset_of!(LdrDataTableEntry, hash_links) == 0x70);
+const _: () = assert!(offset_of!(LdrDataTableEntry, base_name_hash_value) == 0x108);
 const _: [(); 0x4d0] = [(); core::mem::size_of::<X64Context>()];
 const _: [(); 0x448] = [(); core::mem::size_of::<RtlUserProcessParameters>()];

@@ -16,10 +16,12 @@ use super::Handle;
 use super::ProcessHandle;
 use super::directory_object::directory_key;
 use super::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
+use crate::nt_types::{
+    AccessMask, ObjectAttributes, ProcessEnvironmentBlock, UnicodeString, read_object_attributes,
+};
 use crate::{
     ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView, insert_raw_handle,
-    probe_guest_output_preserving_value, remove_raw_handle,
+    probe_guest_output_preserving_value, read_value, remove_raw_handle,
 };
 
 const SEC_RESERVE: u32 = 0x0400_0000;
@@ -42,6 +44,7 @@ const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SectionBacking {
     Pagefile,
+    CsrSharedSection,
     ImageFile,
 }
 
@@ -356,7 +359,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 size: WINDOWS_SHARED_SECTION_SIZE,
                 attributes: SEC_COMMIT,
                 protection: PageProtection::PAGE_READWRITE,
-                backing: SectionBacking::Pagefile,
+                backing: SectionBacking::CsrSharedSection,
             });
             return self.publish_section_handle(section_handle, section, granted_access);
         }
@@ -474,6 +477,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 page_protection,
                 permissions,
             ),
+            SectionBacking::CsrSharedSection => self.map_csr_shared_section(
+                request,
+                &section,
+                requested_view_size,
+                section_offset,
+                page_protection,
+                permissions,
+            ),
             SectionBacking::ImageFile => self.map_image_section(request, &section),
         }
     }
@@ -509,6 +520,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::UNABLE_TO_FREE_VM;
         }
         self.process.virtual_allocations.write().remove(&view_base);
+        self.process.image_mappings.write().remove(&view_base);
         NtStatus::SUCCESS
     }
 
@@ -630,6 +642,143 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    fn map_csr_shared_section(
+        &self,
+        request: MapViewOfSectionParameters<Platform>,
+        section: &SectionObject,
+        requested_view_size: usize,
+        section_offset: usize,
+        page_protection: PageProtection,
+        permissions: MemoryRegionPermissions,
+    ) -> NtStatus {
+        if section_offset != 0 {
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let view_size = if requested_view_size == 0 {
+            section.size
+        } else {
+            requested_view_size
+        };
+        if view_size == 0 || view_size > section.size {
+            return NtStatus::INVALID_VIEW_SIZE;
+        }
+        let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
+            return NtStatus::INVALID_VIEW_SIZE;
+        };
+        let csr_server_read_only_shared_memory_base = read_value::<Platform, u64>(
+            self.process.peb_address
+                + core::mem::offset_of!(
+                    ProcessEnvironmentBlock,
+                    csr_server_read_only_shared_memory_base
+                ),
+        )
+        .map_or(0, |base| base as usize);
+        let Ok(mapping) = create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            permissions,
+            |base| {
+                let server_base = if csr_server_read_only_shared_memory_base == 0 {
+                    base.as_usize()
+                } else {
+                    csr_server_read_only_shared_memory_base
+                };
+                crate::loader::initialize_windows_static_server_data_for_server_base::<Platform>(
+                    base.as_usize(),
+                    server_base,
+                )
+                .map_err(|_| litebox::mm::linux::MappingError::OutOfMemory)?;
+                Ok(0)
+            },
+        ) else {
+            return NtStatus::NO_MEMORY;
+        };
+        let base = mapping.as_usize();
+        if request.base_address.write_at_offset(0, base).is_none()
+            || request.view_size.write_at_offset(0, view_size).is_none()
+        {
+            let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        self.process
+            .section_views
+            .write()
+            .insert(base, WindowsSectionView { size: mapped_size });
+        self.process.virtual_allocations.write().insert(
+            base,
+            crate::WindowsVirtualAllocation {
+                base,
+                size: mapped_size,
+                allocation_protect: section.protection,
+                type_: MemoryType::MEM_MAPPED.bits(),
+                pages: committed_pages(base, mapped_size, page_protection),
+            },
+        );
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn map_port_section_view(
+        &self,
+        section_handle: Handle,
+        requested_view_size: usize,
+    ) -> Result<(usize, usize), NtStatus> {
+        let entry = self.section_entry(section_handle)?;
+        let section = entry.with_entry(|entry| {
+            entry
+                .granted_access
+                .require(SectionAccess::MAP_READ | SectionAccess::MAP_WRITE)
+                .map(|()| entry.section.clone())
+        })?;
+        if section.backing != SectionBacking::Pagefile {
+            return Err(NtStatus::INVALID_HANDLE);
+        }
+        let view_size = if requested_view_size == 0 {
+            section.size
+        } else {
+            requested_view_size
+        };
+        if view_size == 0 || view_size > section.size {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        }
+        let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        };
+        let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(mapped_size) else {
+            return Err(NtStatus::INVALID_VIEW_SIZE);
+        };
+        let permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+        let mapping = create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            permissions,
+            |_| Ok(0),
+        )
+        .map_err(|_| NtStatus::NO_MEMORY)?;
+        let base = mapping.as_usize();
+        self.process
+            .section_views
+            .write()
+            .insert(base, WindowsSectionView { size: mapped_size });
+        self.process.virtual_allocations.write().insert(
+            base,
+            crate::WindowsVirtualAllocation {
+                base,
+                size: mapped_size,
+                allocation_protect: PageProtection::PAGE_READWRITE,
+                type_: MemoryType::MEM_MAPPED.bits(),
+                pages: committed_pages(base, mapped_size, PageProtection::PAGE_READWRITE),
+            },
+        );
+        Ok((base, mapped_size))
+    }
+
     fn map_image_section(
         &self,
         request: MapViewOfSectionParameters<Platform>,
@@ -670,12 +819,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .virtual_allocations
                 .write()
                 .remove(&mapping.base_addr);
+            self.process
+                .image_mappings
+                .write()
+                .remove(&mapping.base_addr);
             return NtStatus::ACCESS_VIOLATION;
         }
         self.process.section_views.write().insert(
             mapping.base_addr,
             WindowsSectionView {
                 size: mapping.image_size,
+            },
+        );
+        self.process.image_mappings.write().insert(
+            mapping.base_addr,
+            crate::WindowsImageMapping {
+                name: fs_path.clone(),
+                size: mapping.image_size,
+                entry_point: mapping.entry_point,
             },
         );
         NtStatus::SUCCESS
