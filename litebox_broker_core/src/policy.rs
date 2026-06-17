@@ -51,8 +51,8 @@ impl PolicyEngine {
         })
     }
 
-    pub(crate) fn authorize_create_object(
-        &mut self,
+    pub(super) fn authorize_create_object(
+        &self,
         caller_credential: CallerCredential,
         object_type: ObjectType,
     ) -> Result<ObjectRights, BrokerError> {
@@ -65,8 +65,8 @@ impl PolicyEngine {
         }
     }
 
-    pub(crate) fn authorize_use_object(
-        &mut self,
+    pub(super) fn authorize_use_object(
+        &self,
         caller_credential: CallerCredential,
         object_type: ObjectType,
         rights: ObjectRights,
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn event_only_policy_allows_only_current_event_surface() {
-        let mut policy = PolicyEngine::event_only();
+        let policy = PolicyEngine::event_only();
 
         assert_eq!(
             policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectType::Event),
@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn explicit_event_reference_rights_do_not_narrow_event_use_policy() {
-        let mut policy = PolicyEngine::event_only_with_reference_rights(ObjectRights::WAIT);
+        let policy = PolicyEngine::event_only_with_reference_rights(ObjectRights::WAIT);
 
         assert_eq!(
             policy.authorize_create_object(CallerCredential::Unauthenticated, ObjectType::Event),
