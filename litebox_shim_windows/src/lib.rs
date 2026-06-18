@@ -151,6 +151,7 @@ pub(crate) type WindowsImageMappings<Platform> =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WindowsSectionView {
     pub(crate) size: usize,
+    pub(crate) remove_pages_on_unmap: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

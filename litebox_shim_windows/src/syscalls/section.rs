@@ -516,12 +516,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some((view_base, view)) = self.remove_section_view_for_address(base_address) else {
             return NtStatus::NOT_MAPPED_VIEW;
         };
-        let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
-        // SAFETY: Section views are tracked only after this shim successfully creates the pages;
-        // unmapping consumes the tracked view and removes the exact owned range.
-        if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
-            self.process.section_views.write().insert(view_base, view);
-            return NtStatus::UNABLE_TO_FREE_VM;
+        if view.remove_pages_on_unmap {
+            let ptr = MutPtr::<Platform, u8>::from_usize(view_base);
+            // SAFETY: Owned section views are tracked only after this shim successfully creates the
+            // pages; unmapping consumes the tracked view and removes the exact owned range.
+            if unsafe { self.global.page_manager.remove_pages(ptr, view.size) }.is_err() {
+                self.process.section_views.write().insert(view_base, view);
+                return NtStatus::UNABLE_TO_FREE_VM;
+            }
         }
         self.process.virtual_allocations.write().remove(&view_base);
         self.process.image_mappings.write().remove(&view_base);
@@ -629,10 +631,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
             return NtStatus::ACCESS_VIOLATION;
         }
-        self.process
-            .section_views
-            .write()
-            .insert(base, WindowsSectionView { size: mapped_size });
+        self.process.section_views.write().insert(
+            base,
+            WindowsSectionView {
+                size: mapped_size,
+                remove_pages_on_unmap: true,
+            },
+        );
         self.process.virtual_allocations.write().insert(
             base,
             crate::WindowsVirtualAllocation {
@@ -682,6 +687,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         .and_then(|base| usize::try_from(base).ok())
         .unwrap_or(0);
         if csr_server_read_only_shared_memory_base != 0 {
+            // This aliases loader-owned permanent CSR memory. Track the view for query/unmap
+            // consistency, but never free the pages while the PEB still points into them.
             if request
                 .base_address
                 .write_at_offset(0, csr_server_read_only_shared_memory_base)
@@ -690,6 +697,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
+            self.process.section_views.write().insert(
+                csr_server_read_only_shared_memory_base,
+                WindowsSectionView {
+                    size: mapped_size,
+                    remove_pages_on_unmap: false,
+                },
+            );
+            self.process.virtual_allocations.write().insert(
+                csr_server_read_only_shared_memory_base,
+                crate::WindowsVirtualAllocation {
+                    base: csr_server_read_only_shared_memory_base,
+                    size: mapped_size,
+                    allocation_protect: section.protection,
+                    type_: MemoryType::MEM_MAPPED,
+                    pages: committed_pages(
+                        csr_server_read_only_shared_memory_base,
+                        mapped_size,
+                        page_protection,
+                    ),
+                },
+            );
             return NtStatus::SUCCESS;
         }
         let Ok(mapping) = create_pages(
@@ -717,10 +745,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = remove_view_pages::<Platform>(&self.global.page_manager, base, mapped_size);
             return NtStatus::ACCESS_VIOLATION;
         }
-        self.process
-            .section_views
-            .write()
-            .insert(base, WindowsSectionView { size: mapped_size });
+        self.process.section_views.write().insert(
+            base,
+            WindowsSectionView {
+                size: mapped_size,
+                remove_pages_on_unmap: true,
+            },
+        );
         self.process.virtual_allocations.write().insert(
             base,
             crate::WindowsVirtualAllocation {
@@ -791,6 +822,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             mapping.base_addr,
             WindowsSectionView {
                 size: mapping.mapping_size,
+                remove_pages_on_unmap: true,
             },
         );
         self.process.image_mappings.write().insert(
@@ -1252,6 +1284,42 @@ mod tests {
         );
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+    struct TestMemoryBasicInformation {
+        base_address: usize,
+        allocation_base: usize,
+        allocation_protect: u32,
+        partition_id: u16,
+        _padding0: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        type_: u32,
+        _padding1: u32,
+    }
+
+    fn query_basic_information(
+        task: &Task<TestPlatform, TestFS>,
+        base: usize,
+    ) -> TestMemoryBasicInformation {
+        let mut info = TestMemoryBasicInformation::default();
+        let mut return_length = 0usize;
+        assert_eq!(
+            task.sys_nt_query_virtual_memory(
+                ProcessHandle::CURRENT,
+                base,
+                0,
+                mut_byte_ptr(&mut info),
+                size_of::<TestMemoryBasicInformation>(),
+                Some(mut_ptr(&mut return_length)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(return_length, size_of::<TestMemoryBasicInformation>());
+        info
+    }
+
     #[test]
     fn nt_map_view_of_csr_shared_section_reuses_loader_shared_base() {
         let mut task = crate::tests::test_task();
@@ -1293,6 +1361,35 @@ mod tests {
         );
         assert_eq!(base, shared_base);
         assert_eq!(view_size, WINDOWS_SHARED_SECTION_SIZE);
+        let info = query_basic_information(&task, shared_base);
+        assert_eq!(info.state, 0x1000);
+        assert_eq!(info.type_, 0x40000);
+        assert_eq!(info.protect, PageProtection::PAGE_READONLY.bits());
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, shared_base),
+            NtStatus::SUCCESS
+        );
+        let info = query_basic_information(&task, shared_base);
+        assert_eq!(info.state, 0x10000);
+
+        base = 0;
+        view_size = 0;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_UNMAP,
+                allocation_type: MEM_TOP_DOWN | MEM_PHYSICAL,
+                page_protection: PageProtection::PAGE_READONLY.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(base, shared_base);
     }
 
     #[test]
