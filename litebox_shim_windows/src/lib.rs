@@ -1029,6 +1029,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtDeviceIoControlFile {
+                file_handle,
+                _event: _,
+                _apc_routine: _,
+                _apc_context: _,
+                io_status_block,
+                io_control_code,
+                _input_buffer: _,
+                _input_buffer_length: _,
+                _output_buffer: _,
+                output_buffer_length,
+            } => {
+                let status = self.sys_nt_device_io_control_file(
+                    file_handle,
+                    io_status_block,
+                    io_control_code,
+                    output_buffer_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
                 io_status_block,

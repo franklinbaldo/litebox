@@ -334,6 +334,18 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         ea_buffer: Option<Platform::RawConstPointer<u8>>,
         ea_length: u32,
     },
+    NtDeviceIoControlFile {
+        file_handle: Handle,
+        _event: Handle,
+        _apc_routine: usize,
+        _apc_context: usize,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        io_control_code: u32,
+        _input_buffer: Option<Platform::RawConstPointer<u8>>,
+        _input_buffer_length: u32,
+        _output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_length: u32,
+    },
     NtQueryVolumeInformationFile {
         file_handle: Handle,
         io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
@@ -774,6 +786,18 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 create_options,
                 ea_buffer:*,
                 ea_length,
+            })),
+            NtSysno::NtDeviceIoControlFile => Some(sys_req!(NtDeviceIoControlFile {
+                file_handle:{Handle::from_raw},
+                _event:{Handle::from_raw},
+                _apc_routine,
+                _apc_context,
+                io_status_block:*,
+                io_control_code,
+                _input_buffer:*,
+                _input_buffer_length,
+                _output_buffer:*,
+                output_buffer_length,
             })),
             NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(
                 NtQueryVolumeInformationFile {
