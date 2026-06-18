@@ -358,7 +358,10 @@ fn hook_syscalls_in_section(
         // Forward search for `syscall`
         match arch {
             Arch::X86_64 => {
-                if inst.code() != iced_x86::Code::Syscall {
+                if !matches!(
+                    inst.code(),
+                    iced_x86::Code::Syscall | iced_x86::Code::Sysenter
+                ) {
                     continue;
                 }
             }

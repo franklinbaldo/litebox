@@ -264,9 +264,14 @@ impl TaStack {
         <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut canary);
         self.push_bytes(&canary)?;
 
-        // ensure stack is aligned
+        // LiteBox jumps directly into the TA entry point, so emulate the x86-64
+        // post-call stack alignment expected by compiled functions.
         self.pos = align_down(self.pos, Self::STACK_ALIGNMENT);
-        assert_eq!(self.pos, align_down(self.pos, Self::STACK_ALIGNMENT));
+        self.pos = self.pos.checked_sub(core::mem::size_of::<usize>())?;
+        assert_eq!(
+            self.pos % Self::STACK_ALIGNMENT,
+            core::mem::size_of::<usize>()
+        );
         Some(())
     }
 
