@@ -65,7 +65,18 @@ struct RemotePortView {
     view_base: usize,
 }
 
-/// Win10 x64 `CSR_API_CONNECTINFO`/`CSR_CONNECTION_INFO` layout.
+/// x64 `CSR_API_CONNECTINFO` — the CSR client/server connection handshake
+/// payload ntdll passes through `NtConnectPort(\Windows\ApiPort)`.
+///
+/// Field order and semantics follow ReactOS
+/// `sdk/include/reactos/subsys/csr/csrmsg.h` (`SharedSectionBase`,
+/// `SharedStaticServerData`, `SharedSectionHeap`, `DebugFlags`,
+/// `SizeOfPebData`, `SizeOfTebData`, `NumberOfServerDllNames`,
+/// `ServerProcessId`), which `C_ASSERT`s `sizeof == 0x24` on x86. We omit the
+/// leading `HANDLE ObjectDirectory` that ReactOS documents as "Unused on
+/// Windows >= 2k3", so the x64 size is `0x30` (three 8-byte pointers + four
+/// 4-byte ULONGs + one 8-byte HANDLE) — matching the `ConnectionInfoLength =
+/// 0x30` this train captured from the guest ntdll's connect request.
 ///
 /// The guest supplies the expected byte length, which must match this 0x30-byte
 /// layout before Phase-1 fills it. A different ntdll layout therefore fails
