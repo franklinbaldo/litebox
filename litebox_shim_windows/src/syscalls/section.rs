@@ -677,6 +677,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
         .and_then(|base| usize::try_from(base).ok())
         .unwrap_or(0);
+        if csr_server_read_only_shared_memory_base != 0 {
+            if request
+                .base_address
+                .write_at_offset(0, csr_server_read_only_shared_memory_base)
+                .is_none()
+                || request.view_size.write_at_offset(0, view_size).is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            return NtStatus::SUCCESS;
+        }
         let Ok(mapping) = create_pages(
             &self.global.page_manager,
             None,
@@ -996,9 +1007,10 @@ mod tests {
     use core::mem::{size_of, size_of_val};
 
     use litebox_common_windows::nt_status::NtStatus;
+    use zerocopy::FromZeros as _;
 
     use super::*;
-    use crate::nt_types::{ObjectAttributes, UnicodeString};
+    use crate::nt_types::{ObjectAttributes, ProcessEnvironmentBlock, UnicodeString};
     use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr};
 
     fn wide(value: &str) -> alloc::vec::Vec<u16> {
@@ -1238,6 +1250,49 @@ mod tests {
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::SUCCESS
         );
+    }
+
+    #[test]
+    fn nt_map_view_of_csr_shared_section_reuses_loader_shared_base() {
+        let mut task = crate::tests::test_task();
+        let mut peb = ProcessEnvironmentBlock::new_zeroed();
+        let shared_base = 0x7000_0000usize;
+        peb.csr_server_read_only_shared_memory_base = shared_base as u64;
+        alloc::sync::Arc::get_mut(&mut task.process)
+            .expect("test task has a unique process reference")
+            .peb_address = core::ptr::from_mut(&mut peb) as usize;
+        let name = wide(WINDOWS_SHARED_SECTION_OBJECT);
+        let unicode = unicode(&name);
+        let object_attributes = object_attributes(&unicode);
+        let mut handle = Handle::from_raw(0);
+        assert_eq!(
+            task.sys_nt_open_section(
+                mut_ptr(&mut handle),
+                SectionAccess::ALL_ACCESS.bits(),
+                Some(const_ptr(&object_attributes)),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_UNMAP,
+                allocation_type: MEM_TOP_DOWN | MEM_PHYSICAL,
+                page_protection: PageProtection::PAGE_READONLY.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(base, shared_base);
+        assert_eq!(view_size, WINDOWS_SHARED_SECTION_SIZE);
     }
 
     #[test]
