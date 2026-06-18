@@ -35,8 +35,7 @@ const VIEW_UNMAP: u32 = 2;
 const MEM_TOP_DOWN: u32 = 0x0010_0000;
 const MEM_PHYSICAL: u32 = 0x0040_0000;
 const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x0080_0000;
-const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
-    MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
+const SUPPORTED_MAP_ALLOCATION_TYPES: u32 = MEM_TOP_DOWN | MEM_DIFFERENT_IMAGE_BASE_OK;
 
 const WINDOWS_SHARED_SECTION_OBJECT: &str = r"\Windows\SharedSection";
 const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
@@ -447,7 +446,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             || request.commit_size != 0
             || !section_offset.is_multiple_of(PAGE_SIZE)
             || !matches!(request.inherit_disposition, VIEW_SHARE | VIEW_UNMAP)
-            || request.allocation_type & !SUPPORTED_MAP_ALLOCATION_TYPES != 0
+            || request.allocation_type & !(SUPPORTED_MAP_ALLOCATION_TYPES | MEM_PHYSICAL) != 0
         {
             return NtStatus::INVALID_PARAMETER;
         }
@@ -468,6 +467,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(section) => section,
             Err(status) => return status,
         };
+        if section.backing != SectionBacking::CsrSharedSection
+            && request.allocation_type & MEM_PHYSICAL != 0
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
         match section.backing {
             SectionBacking::Pagefile => self.map_pagefile_section(
                 request,
@@ -1225,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn nt_map_view_of_section_accepts_mem_physical() {
+    fn nt_map_view_of_pagefile_section_rejects_mem_physical() {
         let task = crate::tests::test_task();
         let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
         let mut base = 0usize;
@@ -1244,11 +1248,7 @@ mod tests {
                 allocation_type: MEM_PHYSICAL,
                 page_protection: PageProtection::PAGE_READWRITE.bits(),
             }),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
-            NtStatus::SUCCESS
+            NtStatus::INVALID_PARAMETER
         );
     }
 
