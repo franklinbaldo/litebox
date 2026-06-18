@@ -1938,6 +1938,7 @@ mod layered {
 
 mod stdio {
     use crate::LiteBox;
+    use crate::fs::errors::OpenError;
     use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -1987,6 +1988,62 @@ mod stdio {
         assert_eq!(bytes_read, 13);
         assert_eq!(&buffer, b"Hello, stdin!");
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
+    }
+
+    #[test]
+    fn stdio_open_accepts_direction_with_benign_flags_and_mode() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = crate::fs::devices::FileSystem::new(&litebox);
+
+        let fd_stdin = fs
+            .open(
+                "/dev/stdin",
+                OFlags::RDWR | OFlags::NOFOLLOW,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("Failed to open /dev/stdin with Windows-style flags");
+        fs.close(&fd_stdin).unwrap();
+
+        let fd_stdout = fs
+            .open(
+                "/dev/stdout",
+                OFlags::WRONLY | OFlags::NOFOLLOW,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("Failed to open /dev/stdout with benign flags");
+        fs.close(&fd_stdout).unwrap();
+
+        let fd_stderr = fs
+            .open(
+                "/dev/stderr",
+                OFlags::WRONLY | OFlags::NOFOLLOW,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .expect("Failed to open /dev/stderr with benign flags");
+        fs.close(&fd_stderr).unwrap();
+    }
+
+    #[test]
+    fn stdio_open_unsupported_modes_fail_without_panic() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = crate::fs::devices::FileSystem::new(&litebox);
+
+        assert!(matches!(
+            fs.open("/dev/stdin", OFlags::WRONLY, Mode::empty()),
+            Err(OpenError::AccessNotAllowed)
+        ));
+        assert!(matches!(
+            fs.open("/dev/stdout", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::AccessNotAllowed)
+        ));
+        assert!(matches!(
+            fs.open(
+                "/dev/stdin",
+                OFlags::RDONLY | OFlags::NONBLOCK,
+                Mode::empty()
+            ),
+            Err(OpenError::AccessNotAllowed)
+        ));
     }
 
     #[test]

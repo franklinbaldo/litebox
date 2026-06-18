@@ -154,7 +154,7 @@ impl<
         &self,
         path: impl Arg,
         flags: OFlags,
-        mode: Mode,
+        _mode: Mode,
     ) -> Result<FileFd<Platform>, OpenError> {
         let open_directory = flags.contains(OFlags::DIRECTORY);
         let flags = flags - OFlags::DIRECTORY;
@@ -165,27 +165,19 @@ impl<
         let truncate = flags.contains(OFlags::TRUNC);
         let flags = flags - OFlags::TRUNC;
         let path = self.absolute_path(path)?;
+        let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let device = match path.as_str() {
-            "/dev/stdin" => {
-                if flags == OFlags::RDONLY && mode.is_empty() {
-                    Device::Stdin
-                } else {
-                    unimplemented!()
-                }
+            "/dev/stdin" if access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR => {
+                Device::Stdin
             }
-            "/dev/stdout" => {
-                if flags == OFlags::WRONLY && mode.is_empty() {
-                    Device::Stdout
-                } else {
-                    unimplemented!()
-                }
+            "/dev/stdout" if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR => {
+                Device::Stdout
             }
-            "/dev/stderr" => {
-                if flags == OFlags::WRONLY && mode.is_empty() {
-                    Device::Stderr
-                } else {
-                    unimplemented!()
-                }
+            "/dev/stderr" if access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR => {
+                Device::Stderr
+            }
+            "/dev/stdin" | "/dev/stdout" | "/dev/stderr" => {
+                return Err(OpenError::AccessNotAllowed);
             }
             "/dev/null" => Device::Null,
             "/dev/urandom" => Device::URandom,
@@ -200,7 +192,7 @@ impl<
                 Device::Stdin | Device::Stderr | Device::Stdout | Device::URandom
             )
         {
-            unimplemented!("Non-blocking I/O is not supported for {:?}", device);
+            return Err(OpenError::AccessNotAllowed);
         }
         let fd = self.litebox.descriptor_table_mut().insert(device);
         if truncate {
