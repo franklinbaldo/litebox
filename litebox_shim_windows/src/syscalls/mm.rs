@@ -1124,7 +1124,7 @@ fn permissions_to_page_protect(permissions: MemoryRegionPermissions) -> PageProt
     }
 }
 
-fn create_pages<Platform: ShimPlatform>(
+pub(crate) fn create_pages<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
     length: NonZeroPageSize<PAGE_SIZE>,

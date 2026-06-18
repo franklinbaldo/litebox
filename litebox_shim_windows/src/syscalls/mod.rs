@@ -10,7 +10,9 @@ pub(crate) mod nls;
 pub(crate) mod process;
 pub(crate) mod registry;
 mod sysinfo;
+pub(crate) mod thread;
 pub(crate) mod timer;
+pub(crate) mod token;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod worker_factory;
 
@@ -90,6 +92,29 @@ impl ProcessHandle {
     #[must_use]
     pub(crate) const fn as_handle(self) -> Handle {
         self.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ThreadHandle(Handle);
+
+impl ThreadHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX - 1);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0.as_raw()
     }
 }
 
@@ -246,6 +271,30 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         share_access: u32,
         open_options: u32,
     },
+    NtOpenThreadToken {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u8,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenThreadTokenEx {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u8,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessToken {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessTokenEx {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
     NtCreateFile {
         file_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -332,6 +381,33 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         process_information: Platform::RawMutPointer<u8>,
         process_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryInformationToken {
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: Platform::RawMutPointer<u8>,
+        token_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQuerySecurityAttributesToken {
+        token_handle: Handle,
+        attributes: Option<Platform::RawConstPointer<u8>>,
+        number_of_attributes: u32,
+        buffer: Option<Platform::RawMutPointer<u8>>,
+        length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtSetInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawConstPointer<u8>,
+        process_information_length: u32,
+    },
+    NtSetInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawConstPointer<u8>,
+        thread_information_length: u32,
     },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
@@ -562,6 +638,30 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 share_access,
                 open_options,
             })),
+            NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
+                thread_handle:{ThreadHandle::from_raw},
+                desired_access,
+                open_as_self,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenThreadTokenEx => Some(sys_req!(NtOpenThreadTokenEx {
+                thread_handle:{ThreadHandle::from_raw},
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessToken => Some(sys_req!(NtOpenProcessToken {
+                process_handle:{ProcessHandle::from_raw},
+                desired_access,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessTokenEx => Some(sys_req!(NtOpenProcessTokenEx {
+                process_handle:{ProcessHandle::from_raw},
+                desired_access,
+                handle_attributes,
+                token_handle:*,
+            })),
             NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
                 file_handle:*,
                 desired_access,
@@ -650,6 +750,35 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 process_information:*,
                 process_information_length,
                 return_length:*,
+            })),
+            NtSysno::NtQueryInformationToken => Some(sys_req!(NtQueryInformationToken {
+                token_handle:{Handle::from_raw},
+                token_information_class,
+                token_information:*,
+                token_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySecurityAttributesToken => Some(sys_req!(
+                NtQuerySecurityAttributesToken {
+                    token_handle:{Handle::from_raw},
+                    attributes:*,
+                    number_of_attributes,
+                    buffer:*,
+                    length,
+                    return_length:*,
+                }
+            )),
+            NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {
+                process_handle:{ProcessHandle::from_raw},
+                process_information_class,
+                process_information:*,
+                process_information_length,
+            })),
+            NtSysno::NtSetInformationThread => Some(sys_req!(NtSetInformationThread {
+                thread_handle:{ThreadHandle::from_raw},
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {

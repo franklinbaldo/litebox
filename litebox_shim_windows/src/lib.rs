@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -43,6 +43,7 @@ use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::timer::{
     TimerCreateParameters, TimerHandleObject, TimerSetParameters, TimerSubsystem,
 };
+use crate::syscalls::token::{TokenHandleObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
     WaitCompletionPacketAssociateParameters, WaitCompletionPacketCancelParameters,
     WaitCompletionPacketCreateParameters, WaitCompletionPacketHandleObject,
@@ -362,6 +363,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             default_hard_error_mode: AtomicU32::new(0),
             cookie: syscalls::process::default_process_cookie(),
+            scheduler_shared_data: AtomicUsize::new(0),
+            thread_hidden_from_debugger: AtomicBool::new(false),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
         });
         Ok(LoadedProgram {
@@ -407,6 +410,8 @@ pub struct Process<Platform: ShimPlatform> {
     user_ui_language: AtomicU32,
     default_hard_error_mode: AtomicU32,
     cookie: u32,
+    scheduler_shared_data: AtomicUsize,
+    thread_hidden_from_debugger: AtomicBool,
     exit_code: AtomicI32,
 }
 
@@ -809,6 +814,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtOpenThreadToken {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                token_handle,
+            } => {
+                let status = self.sys_nt_open_thread_token(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenThreadTokenEx {
+                thread_handle,
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle,
+            } => {
+                let status = self.sys_nt_open_thread_token_ex(
+                    thread_handle,
+                    desired_access,
+                    open_as_self,
+                    handle_attributes,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenProcessToken {
+                process_handle,
+                desired_access,
+                token_handle,
+            } => {
+                let status =
+                    self.sys_nt_open_process_token(process_handle, desired_access, token_handle);
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtOpenProcessTokenEx {
+                process_handle,
+                desired_access,
+                handle_attributes,
+                token_handle,
+            } => {
+                let status = self.sys_nt_open_process_token_ex(
+                    process_handle,
+                    desired_access,
+                    handle_attributes,
+                    token_handle,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtCreateFile {
                 file_handle,
                 desired_access,
@@ -992,6 +1050,68 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     process_information,
                     process_information_length,
                     return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQueryInformationToken {
+                token_handle,
+                token_information_class,
+                token_information,
+                token_information_length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_information_token(
+                    token_handle,
+                    token_information_class,
+                    token_information,
+                    token_information_length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtQuerySecurityAttributesToken {
+                token_handle,
+                attributes,
+                number_of_attributes,
+                buffer,
+                length,
+                return_length,
+            } => {
+                let status = self.sys_nt_query_security_attributes_token(
+                    token_handle,
+                    attributes,
+                    number_of_attributes,
+                    buffer,
+                    length,
+                    return_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationProcess {
+                process_handle,
+                process_information_class,
+                process_information,
+                process_information_length,
+            } => {
+                let status = self.sys_nt_set_information_process(
+                    process_handle,
+                    process_information_class,
+                    process_information,
+                    process_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
+            SyscallRequest::NtSetInformationThread {
+                thread_handle,
+                thread_information_class,
+                thread_information,
+                thread_information_length,
+            } => {
+                let status = self.sys_nt_set_information_thread(
+                    thread_handle,
+                    thread_information_class,
+                    thread_information,
+                    thread_information_length,
                 );
                 (status, ContinueOperation::Resume)
             }
@@ -1204,6 +1324,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, TokenSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |token| visitor.token(token),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         NtStatus::INVALID_HANDLE
     }
 
@@ -1240,6 +1368,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     );
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>);
+
+    fn token(&self, token: TokenHandleObject);
 }
 
 struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
@@ -1286,6 +1416,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
         Task::<Platform, FS>::close_worker_factory(worker_factory);
+    }
+
+    fn token(&self, token: TokenHandleObject) {
+        Task::<Platform, FS>::close_token(token);
     }
 }
 
