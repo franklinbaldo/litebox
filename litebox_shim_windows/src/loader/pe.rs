@@ -619,7 +619,7 @@ struct LoadedImage {
     mapping: MappingInfo,
     pages: RangeMap<usize, PageProtection>,
     parsed: PeParsedFile,
-    contains_raw_syscall_instruction: bool,
+    contains_syscall_instruction: bool,
 }
 
 impl LoadedImage {
@@ -1235,12 +1235,17 @@ pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
     virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
 ) -> Result<MappingInfo, WindowsLoadError> {
     let image = load_image(platform, fs, path, page_manager)?;
-    if !image.parsed.has_trampoline() && image.contains_raw_syscall_instruction {
-        return Err(WindowsLoadError::UnrewrittenImageSection);
-    }
+    ensure_image_section_rewritten(&image)?;
     let mapping = image.mapping;
     register_image_virtual_allocation(virtual_allocations, mapping, image.pages);
     Ok(mapping)
+}
+
+fn ensure_image_section_rewritten(image: &LoadedImage) -> Result<(), WindowsLoadError> {
+    if image.contains_syscall_instruction {
+        return Err(WindowsLoadError::UnrewrittenImageSection);
+    }
+    Ok(())
 }
 
 fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
@@ -1255,8 +1260,8 @@ fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
     parsed
         .parse_trampoline(&mut &file, platform.get_syscall_entry_point())
         .map_err(WindowsLoadError::Parse)?;
-    let contains_raw_syscall_instruction = parsed
-        .contains_raw_syscall_instruction(&mut &file)
+    let contains_syscall_instruction = parsed
+        .contains_syscall_instruction(&mut &file)
         .map_err(WindowsLoadError::Parse)?;
     let mut mapper = PeImageMapper {
         file: &file,
@@ -1272,7 +1277,7 @@ fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
         mapping,
         pages: mapper.pages,
         parsed,
-        contains_raw_syscall_instruction,
+        contains_syscall_instruction,
     })
 }
 
@@ -1820,6 +1825,188 @@ fn utf16_byte_len(units: usize) -> Result<u16, PeImageAccessError> {
         .checked_mul(core::mem::size_of::<u16>())
         .and_then(|bytes| u16::try_from(bytes).ok())
         .ok_or(PeImageAccessError::AddressOverflow)
+}
+
+#[cfg(test)]
+mod image_section_tests {
+    use alloc::{vec, vec::Vec};
+
+    use litebox_common_windows::loader::ReadAt;
+
+    use super::*;
+
+    const NT_HEADERS_OFFSET: usize = 0x80;
+    const COFF_FILE_HEADER_SIZE: usize = 20;
+    const OPTIONAL_HEADER_SIZE: usize = 0xf0;
+    const SECTION_HEADER_OFFSET: usize =
+        NT_HEADERS_OFFSET + 4 + COFF_FILE_HEADER_SIZE + OPTIONAL_HEADER_SIZE;
+    const SIZE_OF_HEADERS: usize = 0x200;
+    const TEXT_RAW_OFFSET: usize = 0x200;
+    const TEXT_RAW_SIZE: usize = 0x200;
+    const TEXT_RVA: u32 = 0x1000;
+    const IMAGE_SIZE: u32 = 0x2000;
+    const TRAMPOLINE_FILE_OFFSET: usize = 0x2000;
+    const TRAMPOLINE_RVA: u64 = 0x2000;
+    const TRAMPOLINE_SIZE: usize = PAGE_SIZE;
+
+    #[test]
+    fn footered_image_section_with_residual_syscall_is_rejected() {
+        let bytes = footered_pe_with_execute_only_syscall_section();
+        let mut reader = SliceReadAt(&bytes);
+        let mut parsed = PeParsedFile::parse(&mut reader).expect("synthetic PE parses");
+        parsed
+            .parse_trampoline(&mut SliceReadAt(&bytes), 0x100000)
+            .expect("synthetic footer parses");
+        assert!(parsed.has_trampoline());
+
+        let contains_syscall_instruction = parsed
+            .contains_syscall_instruction(&mut SliceReadAt(&bytes))
+            .expect("synthetic PE scans");
+        assert!(contains_syscall_instruction);
+
+        let image = LoadedImage {
+            mapping: MappingInfo {
+                base_addr: 0x10000000,
+                image_size: parsed.image_size(),
+                mapping_size: parsed.image_size() + PAGE_SIZE,
+                entry_point: 0x10001000,
+            },
+            pages: RangeMap::new(),
+            parsed,
+            contains_syscall_instruction,
+        };
+
+        assert!(matches!(
+            ensure_image_section_rewritten(&image),
+            Err(WindowsLoadError::UnrewrittenImageSection)
+        ));
+    }
+
+    struct SliceReadAt<'a>(&'a [u8]);
+
+    impl ReadAt for SliceReadAt<'_> {
+        type Error = ();
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
+            let offset = usize::try_from(offset).map_err(|_| ())?;
+            let end = offset.checked_add(buf.len()).ok_or(())?;
+            buf.copy_from_slice(self.0.get(offset..end).ok_or(())?);
+            Ok(())
+        }
+
+        fn size(&mut self) -> Result<u64, Self::Error> {
+            self.0.len().try_into().map_err(|_| ())
+        }
+    }
+
+    fn footered_pe_with_execute_only_syscall_section() -> Vec<u8> {
+        let header_offset = TRAMPOLINE_FILE_OFFSET + TRAMPOLINE_SIZE;
+        let mut bytes = vec![0; header_offset + 32];
+
+        put_u16(&mut bytes, 0, 0x5a4d);
+        put_u32(
+            &mut bytes,
+            0x3c,
+            u32::try_from(NT_HEADERS_OFFSET).expect("PE offset fits u32"),
+        );
+
+        bytes[NT_HEADERS_OFFSET..NT_HEADERS_OFFSET + 4].copy_from_slice(b"PE\0\0");
+        put_u16(&mut bytes, NT_HEADERS_OFFSET + 4, 0x8664);
+        put_u16(&mut bytes, NT_HEADERS_OFFSET + 6, 1);
+        put_u16(
+            &mut bytes,
+            NT_HEADERS_OFFSET + 20,
+            u16::try_from(OPTIONAL_HEADER_SIZE).expect("optional header size fits u16"),
+        );
+        put_u16(&mut bytes, NT_HEADERS_OFFSET + 22, 0x0002);
+
+        let optional_header = NT_HEADERS_OFFSET + 4 + COFF_FILE_HEADER_SIZE;
+        put_u16(&mut bytes, optional_header, 0x020b);
+        put_u32(
+            &mut bytes,
+            optional_header + 4,
+            u32::try_from(TEXT_RAW_SIZE).expect("text raw size fits u32"),
+        );
+        put_u32(&mut bytes, optional_header + 16, TEXT_RVA);
+        put_u32(&mut bytes, optional_header + 20, TEXT_RVA);
+        put_u64(&mut bytes, optional_header + 24, 0x140000000);
+        put_u32(
+            &mut bytes,
+            optional_header + 32,
+            u32::try_from(PAGE_SIZE).expect("page size fits u32"),
+        );
+        put_u32(&mut bytes, optional_header + 36, 0x200);
+        put_u16(&mut bytes, optional_header + 48, 6);
+        put_u32(&mut bytes, optional_header + 56, IMAGE_SIZE);
+        put_u32(
+            &mut bytes,
+            optional_header + 60,
+            u32::try_from(SIZE_OF_HEADERS).expect("headers size fits u32"),
+        );
+        put_u16(&mut bytes, optional_header + 68, 2);
+        put_u64(&mut bytes, optional_header + 72, 0x100000);
+        put_u64(
+            &mut bytes,
+            optional_header + 80,
+            u64::try_from(PAGE_SIZE).expect("page size fits u64"),
+        );
+        put_u64(&mut bytes, optional_header + 88, 0x100000);
+        put_u64(
+            &mut bytes,
+            optional_header + 96,
+            u64::try_from(PAGE_SIZE).expect("page size fits u64"),
+        );
+        put_u32(&mut bytes, optional_header + 108, 16);
+
+        bytes[SECTION_HEADER_OFFSET..SECTION_HEADER_OFFSET + 5].copy_from_slice(b".xsys");
+        put_u32(
+            &mut bytes,
+            SECTION_HEADER_OFFSET + 8,
+            u32::try_from(TEXT_RAW_SIZE).expect("text raw size fits u32"),
+        );
+        put_u32(&mut bytes, SECTION_HEADER_OFFSET + 12, TEXT_RVA);
+        put_u32(
+            &mut bytes,
+            SECTION_HEADER_OFFSET + 16,
+            u32::try_from(TEXT_RAW_SIZE).expect("text raw size fits u32"),
+        );
+        put_u32(
+            &mut bytes,
+            SECTION_HEADER_OFFSET + 20,
+            u32::try_from(TEXT_RAW_OFFSET).expect("text raw offset fits u32"),
+        );
+        put_u32(&mut bytes, SECTION_HEADER_OFFSET + 36, 0x20000000);
+
+        bytes[TEXT_RAW_OFFSET..TEXT_RAW_OFFSET + 2].copy_from_slice(&[0x0f, 0x05]);
+
+        let header_offset = TRAMPOLINE_FILE_OFFSET + TRAMPOLINE_SIZE;
+        bytes[header_offset..header_offset + 8].copy_from_slice(b"LITEBOX0");
+        put_u64(
+            &mut bytes,
+            header_offset + 8,
+            u64::try_from(TRAMPOLINE_FILE_OFFSET).expect("trampoline file offset fits u64"),
+        );
+        put_u64(&mut bytes, header_offset + 16, TRAMPOLINE_RVA);
+        put_u64(
+            &mut bytes,
+            header_offset + 24,
+            u64::try_from(TRAMPOLINE_SIZE).expect("trampoline size fits u64"),
+        );
+
+        bytes
+    }
+
+    fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]
@@ -2888,7 +3075,7 @@ mod tests {
             },
             pages: RangeMap::new(),
             parsed,
-            contains_raw_syscall_instruction: false,
+            contains_syscall_instruction: false,
         }
     }
 

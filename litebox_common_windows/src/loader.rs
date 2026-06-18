@@ -471,8 +471,8 @@ impl PeParsedFile {
         self.trampoline.is_some()
     }
 
-    /// Returns whether any executable section still contains a raw x86-64 `syscall`.
-    pub fn contains_raw_syscall_instruction<F: ReadAt>(
+    /// Returns whether any executable section still decodes to an x86-64 `syscall`.
+    pub fn contains_syscall_instruction<F: ReadAt>(
         &self,
         file: &mut F,
     ) -> Result<bool, PeParseError<F::Error>> {
@@ -489,7 +489,10 @@ impl PeParsedFile {
             let mut bytes = alloc::vec![0; raw_size];
             file.read_at(raw_offset, &mut bytes)
                 .map_err(PeParseError::Io)?;
-            if bytes.windows(2).any(|window| window == [0x0f, 0x05]) {
+            if section_contains_syscall_instruction(
+                &bytes,
+                u64::from(section.virtual_address.get(LE)),
+            ) {
                 return Ok(true);
             }
         }
@@ -1284,6 +1287,37 @@ pub trait ReadAt {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error>;
 
     fn size(&mut self) -> Result<u64, Self::Error>;
+}
+
+fn section_contains_syscall_instruction(section_data: &[u8], section_base_addr: u64) -> bool {
+    let mut decoder = iced_x86::Decoder::new(64, section_data, iced_x86::DecoderOptions::NONE);
+    decoder.set_ip(section_base_addr);
+    let mut instruction = iced_x86::Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        if instruction.code() == iced_x86::Code::Syscall {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::section_contains_syscall_instruction;
+
+    #[test]
+    fn syscall_detector_ignores_bytes_inside_call_displacement() {
+        assert!(!section_contains_syscall_instruction(
+            &[0xe8, 0xb0, 0x0f, 0x05, 0x00],
+            0x1000,
+        ));
+    }
+
+    #[test]
+    fn syscall_detector_finds_decoded_syscall_instruction() {
+        assert!(section_contains_syscall_instruction(&[0x0f, 0x05], 0x1000));
+    }
 }
 
 /// Trait for reserving, mapping, and protecting PE image memory.

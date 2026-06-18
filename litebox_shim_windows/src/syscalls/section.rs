@@ -733,11 +733,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             &self.process.virtual_allocations,
         ) {
             Ok(mapping) => mapping,
-            Err(crate::loader::WindowsLoadError::Access(_)) => {
-                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            Err(error) => {
+                litebox_util_log::debug!(
+                    path:% = fs_path,
+                    error:? = error;
+                    "NtMapViewOfSection image load failed"
+                );
+                return match error {
+                    crate::loader::WindowsLoadError::Access(_) => NtStatus::OBJECT_NAME_NOT_FOUND,
+                    crate::loader::WindowsLoadError::Load(_) => NtStatus::NO_MEMORY,
+                    _ => NtStatus::INVALID_FILE_FOR_SECTION,
+                };
             }
-            Err(crate::loader::WindowsLoadError::Load(_)) => return NtStatus::NO_MEMORY,
-            Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
         };
         if request
             .base_address

@@ -1552,6 +1552,7 @@ dependencies = [
 name = "litebox_common_windows"
 version = "0.1.0"
 dependencies = [
+ "iced-x86",
  "object",
  "thiserror",
  "zerocopy",
