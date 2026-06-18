@@ -651,16 +651,22 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .read_at_offset(0)
             .ok_or(NtStatus::ACCESS_VIOLATION)?;
         let object_name = object_name.read_string::<Platform>()?;
-        if object_attributes.root_directory.is_null() || is_absolute_windows_path(&object_name) {
+        if object_attributes.root_directory.is_null() {
             return absolute_nt_file_name_to_fs_path(&object_name);
         }
 
         let root_file = self.file_entry(object_attributes.root_directory)?;
         root_file.with_entry(|root_file| {
+            let relative_name = object_name.trim_start_matches(['\\', '/']);
             if !root_file.is_directory {
+                if root_file.path == "/dev/null"
+                    && let Some(path) = condrv_device_file(relative_name)
+                {
+                    return Ok(path);
+                }
                 return Err(NtStatus::NOT_A_DIRECTORY);
             }
-            relative_nt_file_name_to_fs_path(&root_file.path, &object_name)
+            relative_nt_file_name_to_fs_path(&root_file.path, relative_name)
         })
     }
 
@@ -1279,6 +1285,45 @@ mod tests {
             )
             .unwrap();
         assert_ne!(child_handle, Handle::default());
+        assert_eq!(information, FileCreateInformation::Opened);
+    }
+
+    #[test]
+    fn condrv_relative_reference_resolves_against_condrv_root_handle() {
+        let task = crate::tests::test_task();
+        let mut io_status = IoStatusBlock::new(NtStatus::SUCCESS, 0);
+        let (_path, _name, root_attributes) = open_object_attributes(r"\Device\ConDrv\Connect");
+        let root_handle = task
+            .do_nt_create_file(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                root_attributes,
+                mut_ptr(&mut io_status),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CreateDisposition::Open,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                None,
+                0,
+            )
+            .unwrap()
+            .0;
+        let (_path, _name, mut reference_attributes) = open_object_attributes(r"\Reference");
+        reference_attributes.root_directory = root_handle;
+        let (reference_handle, information) = task
+            .do_nt_create_file(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                reference_attributes,
+                mut_ptr(&mut io_status),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CreateDisposition::Open,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                None,
+                0,
+            )
+            .unwrap();
+
+        assert_ne!(reference_handle, Handle::default());
         assert_eq!(information, FileCreateInformation::Opened);
     }
 
