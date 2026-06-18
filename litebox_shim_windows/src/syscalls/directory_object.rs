@@ -412,6 +412,10 @@ fn checked_offset(value: usize) -> Result<isize, NtStatus> {
     isize::try_from(value).map_err(|_| NtStatus::BUFFER_TOO_SMALL)
 }
 
+fn checked_guest_pointer(base: usize, offset: usize) -> Result<usize, NtStatus> {
+    base.checked_add(offset).ok_or(NtStatus::ACCESS_VIOLATION)
+}
+
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn directory_object_entry(
         &self,
@@ -1062,18 +1066,33 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Ok(type_length) = u16::try_from(type_bytes.len()) else {
                 return NtStatus::BUFFER_TOO_SMALL;
             };
+            let name_buffer = match checked_guest_pointer(buffer.as_usize(), string_offset) {
+                Ok(buffer) => buffer,
+                Err(status) => return status,
+            };
+            let type_offset = match string_offset
+                .checked_add(name_bytes.len())
+                .and_then(|offset| offset.checked_add(WCHAR_SIZE))
+            {
+                Some(offset) => offset,
+                None => return NtStatus::ACCESS_VIOLATION,
+            };
+            let type_buffer = match checked_guest_pointer(buffer.as_usize(), type_offset) {
+                Ok(buffer) => buffer,
+                Err(status) => return status,
+            };
             let info = ObjectDirectoryInformation {
                 name: UnicodeString {
                     length: name_length,
                     maximum_length: name_length.saturating_add(WCHAR_SIZE_U16),
                     padding_0: [0; 4],
-                    buffer: buffer.as_usize() + string_offset,
+                    buffer: name_buffer,
                 },
                 type_name: UnicodeString {
                     length: type_length,
                     maximum_length: type_length.saturating_add(WCHAR_SIZE_U16),
                     padding_0: [0; 4],
-                    buffer: buffer.as_usize() + string_offset + name_bytes.len() + WCHAR_SIZE,
+                    buffer: type_buffer,
                 },
             };
             if buffer
@@ -1294,6 +1313,27 @@ mod tests {
         assert_eq!(status, NtStatus::MORE_ENTRIES);
         assert_eq!(context, 1);
         assert!(return_length as usize >= 2 * size_of::<ObjectDirectoryInformation>());
+    }
+
+    #[test]
+    fn query_directory_rejects_wrapped_embedded_string_pointers_without_panic() {
+        let task = test_task();
+        let root = open_directory(&task, r"\", DirectoryObjectAccess::QUERY.bits());
+        let mut context = 0u32;
+        let mut return_length = 0u32;
+        let near_wrap_buffer = MutPtr::<TestPlatform, u8>::from_usize(usize::MAX - WCHAR_SIZE);
+
+        let status = task.sys_nt_query_directory_object(QueryDirectoryObjectParameters {
+            directory_handle: root,
+            buffer: near_wrap_buffer,
+            length: 512,
+            return_single_entry: 1,
+            restart_scan: 1,
+            context: mut_ptr(&mut context),
+            return_length: Some(mut_ptr(&mut return_length)),
+        });
+
+        assert_eq!(status, NtStatus::ACCESS_VIOLATION);
     }
 
     #[test]
