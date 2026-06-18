@@ -33,10 +33,8 @@ const SUPPORTED_CREATE_ATTRIBUTES: u32 = SEC_RESERVE | SEC_COMMIT;
 const VIEW_SHARE: u32 = 1;
 const VIEW_UNMAP: u32 = 2;
 const MEM_TOP_DOWN: u32 = 0x0010_0000;
-const MEM_PHYSICAL: u32 = 0x0040_0000;
 const MEM_DIFFERENT_IMAGE_BASE_OK: u32 = 0x0080_0000;
-const SUPPORTED_MAP_ALLOCATION_TYPES: u32 =
-    MEM_TOP_DOWN | MEM_PHYSICAL | MEM_DIFFERENT_IMAGE_BASE_OK;
+const SUPPORTED_MAP_ALLOCATION_TYPES: u32 = MEM_TOP_DOWN | MEM_DIFFERENT_IMAGE_BASE_OK;
 
 const WINDOWS_SHARED_SECTION_OBJECT: &str = r"\Windows\SharedSection";
 const WINDOWS_SHARED_SECTION_SIZE: usize = 0x1_0000;
@@ -753,7 +751,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = remove_view_pages::<Platform>(
                 &self.global.page_manager,
                 mapping.base_addr,
-                mapping.image_size,
+                mapping.mapping_size,
             );
             self.process
                 .virtual_allocations
@@ -768,7 +766,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.process.section_views.write().insert(
             mapping.base_addr,
             WindowsSectionView {
-                size: mapping.image_size,
+                size: mapping.mapping_size,
             },
         );
         self.process.image_mappings.write().insert(
@@ -881,11 +879,9 @@ fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
 
 fn required_map_access(protection: PageProtection) -> Result<SectionAccess, NtStatus> {
     let base = protection.base();
-    let required = if matches!(
-        base,
-        value if value == PageProtection::PAGE_READWRITE.bits()
-            || value == PageProtection::PAGE_EXECUTE_READWRITE.bits()
-    ) {
+    let required = if base == PageProtection::PAGE_EXECUTE_READWRITE.bits() {
+        SectionAccess::MAP_WRITE | SectionAccess::MAP_EXECUTE
+    } else if base == PageProtection::PAGE_READWRITE.bits() {
         SectionAccess::MAP_WRITE
     } else if matches!(
         base,
@@ -1151,6 +1147,85 @@ mod tests {
         assert_eq!(
             task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
             NtStatus::SUCCESS
+        );
+    }
+
+    #[test]
+    fn nt_map_view_of_section_requires_execute_access_for_execute_readwrite() {
+        let task = crate::tests::test_task();
+        let write_only_handle = create_pagefile_section(
+            &task,
+            (SectionAccess::QUERY | SectionAccess::MAP_WRITE).bits(),
+            0x2000,
+        );
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: write_only_handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_EXECUTE_READWRITE.bits(),
+            }),
+            NtStatus::ACCESS_DENIED
+        );
+
+        let execute_write_handle = create_pagefile_section(
+            &task,
+            (SectionAccess::QUERY | SectionAccess::MAP_WRITE | SectionAccess::MAP_EXECUTE).bits(),
+            0x2000,
+        );
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: execute_write_handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: PageProtection::PAGE_EXECUTE_READWRITE.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
+    }
+
+    #[test]
+    fn nt_map_view_of_section_rejects_mem_physical() {
+        const MEM_PHYSICAL: u32 = 0x0040_0000;
+
+        let task = crate::tests::test_task();
+        let handle = create_pagefile_section(&task, SectionAccess::ALL_ACCESS.bits(), 0x2000);
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: MEM_PHYSICAL,
+                page_protection: PageProtection::PAGE_READWRITE.bits(),
+            }),
+            NtStatus::INVALID_PARAMETER
         );
     }
 

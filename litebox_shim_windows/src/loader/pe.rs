@@ -1234,6 +1234,9 @@ pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
     virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
 ) -> Result<MappingInfo, WindowsLoadError> {
     let image = load_image(platform, fs, path, page_manager)?;
+    if !image.parsed.has_trampoline() {
+        return Err(WindowsLoadError::UnrewrittenImageSection);
+    }
     let mapping = image.mapping;
     register_image_virtual_allocation(virtual_allocations, mapping, image.pages);
     Ok(mapping)
@@ -1330,6 +1333,9 @@ pub enum WindowsLoadError {
     /// Guest ntdll.dll has not been rewritten for LiteBox syscall/GS handling.
     #[error("guest ntdll.dll must be rewritten for LiteBox before entering its loader")]
     UnrewrittenNtDll,
+    /// Guest image section has not been rewritten for LiteBox syscall/GS handling.
+    #[error("guest image sections must be rewritten for LiteBox before mapping")]
+    UnrewrittenImageSection,
 }
 
 fn is_missing_file_error(error: &WindowsLoadError) -> bool {
