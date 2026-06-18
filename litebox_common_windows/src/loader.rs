@@ -478,9 +478,6 @@ impl PeParsedFile {
     ) -> Result<bool, PeParseError<F::Error>> {
         for section in &self.sections {
             let characteristics = section.characteristics.get(LE);
-            if characteristics & pe::IMAGE_SCN_CNT_CODE == 0 {
-                continue;
-            }
             if characteristics & pe::IMAGE_SCN_MEM_EXECUTE == 0 {
                 continue;
             }
