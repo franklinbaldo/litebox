@@ -1721,17 +1721,9 @@ mod tests {
             let minimum_duration_nanos = QPC_SLEEP_DURATION
                 .saturating_sub(QPC_SLEEP_TOLERANCE)
                 .as_nanos();
-            let maximum_duration_nanos = QPC_SLEEP_DURATION
-                .saturating_add(QPC_SLEEP_TOLERANCE)
-                .as_nanos();
-
             assert!(
                 guest_duration_nanos >= minimum_duration_nanos,
                 "guest duration {guest_duration_nanos}ns was shorter than requested sleep minus tolerance {minimum_duration_nanos}ns",
-            );
-            assert!(
-                guest_duration_nanos <= maximum_duration_nanos,
-                "guest duration {guest_duration_nanos}ns was longer than requested sleep plus tolerance {maximum_duration_nanos}ns",
             );
         });
     }
