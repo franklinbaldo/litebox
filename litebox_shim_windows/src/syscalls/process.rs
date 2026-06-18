@@ -11,6 +11,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::PAGE_SIZE;
+use crate::nt_types::ThreadEnvironmentBlock;
 use crate::syscalls::ProcessHandle;
 use crate::syscalls::mm::create_pages;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
@@ -23,6 +24,12 @@ const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
+// Valve/Wine's ProcessTlsInformation patch defines the single-thread entry layout and
+// THREAD_TLS_INFORMATION_ASSIGNED value; ReactOS currently marks this class IQS_NONE.
+const PROCESS_TLS_REPLACE_VECTOR: u32 = 1;
+const THREAD_TLS_INFORMATION_ASSIGNED: u32 = 0x2;
+const APPHELP_CACHE_SERVICE_LOOKUP: u32 = 0;
+const APPHELP_CACHE_SERVICE_LOOKUP_CDB: u32 = 6;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -58,7 +65,38 @@ struct ProcessDefaultHardErrorMode {
     default_hard_error_mode: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessTlsInformationHeader {
+    flags: u32,
+    operation_type: u32,
+    thread_data_count: u32,
+    tls_vector_length: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ThreadTlsInformation {
+    flags: u32,
+    _reserved: u32,
+    tls_vector: usize,
+    thread_id: usize,
+}
+
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_apphelp_cache_control(
+        &self,
+        service_class: u32,
+        _service_context: MutPtr<Platform, u8>,
+    ) -> NtStatus {
+        match service_class {
+            APPHELP_CACHE_SERVICE_LOOKUP | APPHELP_CACHE_SERVICE_LOOKUP_CDB => NtStatus::NOT_FOUND,
+            // TODO(apphelp): update/remove/cache-maintenance classes are unimplemented; the only
+            // live witness is ApphelpCacheServiceLookupCdb with no guest-observable write-back.
+            _ => NtStatus::INVALID_PARAMETER,
+        }
+    }
+
     pub(crate) fn sys_nt_query_information_process(
         &self,
         process_handle: ProcessHandle,
@@ -180,6 +218,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ProcessInformationClass::SchedulerSharedData => {
                 self.write_scheduler_shared_data(process_information, process_information_length)
             }
+            ProcessInformationClass::TlsInformation => {
+                self.set_process_tls_information(process_information, process_information_length)
+            }
             _ => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
@@ -211,6 +252,113 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(NtStatus::ACCESS_VIOLATION);
         };
         T::read_from_bytes(bytes.as_ref()).map_err(|_| NtStatus::ACCESS_VIOLATION)
+    }
+
+    fn set_process_tls_information(
+        &self,
+        process_information: ConstPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        let Some(header) = read_process_tls_information_header::<Platform>(process_information)
+        else {
+            return if process_information_length as usize
+                >= size_of::<ProcessTlsInformationHeader>()
+            {
+                NtStatus::ACCESS_VIOLATION
+            } else {
+                NtStatus::INFO_LENGTH_MISMATCH
+            };
+        };
+        let Some(expected_len) = process_tls_information_len(header.thread_data_count) else {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        };
+        if process_information_length as usize != expected_len {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        if header.operation_type != PROCESS_TLS_REPLACE_VECTOR || header.thread_data_count != 1 {
+            // TODO(tls): ReplaceIndex and multi-thread vector swaps require full cross-thread TEB
+            // mutation. Keep them fail-closed until a live witness needs them.
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+
+        let Some(thread_data) =
+            read_process_tls_information_thread_data::<Platform>(process_information)
+        else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if thread_data.thread_id != 0 {
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+        if probe_process_tls_information_writeback::<Platform>(process_information, &thread_data)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        let Some(old_vector) = self.teb_thread_local_storage_pointer() else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if self
+            .write_teb_thread_local_storage_pointer(thread_data.tls_vector)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        if write_process_tls_information_thread_data::<Platform>(
+            process_information,
+            ThreadTlsInformation {
+                flags: thread_data.flags | THREAD_TLS_INFORMATION_ASSIGNED,
+                _reserved: thread_data._reserved,
+                // Wine's ProcessTlsInformation exchange returns the old vector, but LiteBox's
+                // bootstrap vector is the in-TEB tls_slots array, not a heap allocation the guest
+                // loader may free. Return NULL for this first single-thread vector install.
+                tls_vector: 0,
+                thread_id: INITIAL_THREAD_ID,
+            },
+        )
+        .is_none()
+        {
+            litebox_util_log::debug!(
+                old_vector = old_vector,
+                new_vector = thread_data.tls_vector;
+                "ProcessTlsInformation write-back failed after TEB TLS vector swap"
+            );
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            old_vector = old_vector,
+            new_vector = thread_data.tls_vector,
+            tls_vector_length = header.tls_vector_length;
+            "Handled single-thread ProcessTlsInformation ReplaceVector"
+        );
+        NtStatus::SUCCESS
+    }
+
+    fn teb_thread_local_storage_pointer(&self) -> Option<usize> {
+        self.process_teb_usize(core::mem::offset_of!(
+            ThreadEnvironmentBlock,
+            thread_local_storage_pointer
+        ))
+    }
+
+    fn write_teb_thread_local_storage_pointer(&self, value: usize) -> Option<()> {
+        self.write_process_teb_usize(
+            core::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+            value,
+        )
+    }
+
+    fn process_teb_usize(&self, offset: usize) -> Option<usize> {
+        let address = self.teb_address.checked_add(offset)?;
+        ConstPtr::<Platform, usize>::from_usize(address).read_at_offset(0)
+    }
+
+    fn write_process_teb_usize(&self, offset: usize, value: usize) -> Option<()> {
+        let address = self.teb_address.checked_add(offset)?;
+        MutPtr::<Platform, usize>::from_usize(address).write_at_offset(0, value)
     }
 
     fn write_scheduler_shared_data(
@@ -310,6 +458,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
+fn process_tls_information_len(thread_data_count: u32) -> Option<usize> {
+    size_of::<ProcessTlsInformationHeader>()
+        .checked_add((thread_data_count as usize).checked_mul(size_of::<ThreadTlsInformation>())?)
+}
+
+fn read_process_tls_information_header<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+) -> Option<ProcessTlsInformationHeader> {
+    let bytes = process_information.to_owned_slice(size_of::<ProcessTlsInformationHeader>())?;
+    ProcessTlsInformationHeader::read_from_bytes(bytes.as_ref()).ok()
+}
+
+fn read_process_tls_information_thread_data<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+) -> Option<ThreadTlsInformation> {
+    let address = process_information
+        .as_usize()
+        .checked_add(size_of::<ProcessTlsInformationHeader>())?;
+    let bytes = ConstPtr::<Platform, u8>::from_usize(address)
+        .to_owned_slice(size_of::<ThreadTlsInformation>())?;
+    ThreadTlsInformation::read_from_bytes(bytes.as_ref()).ok()
+}
+
+fn probe_process_tls_information_writeback<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+    thread_data: &ThreadTlsInformation,
+) -> Option<()> {
+    write_process_tls_information_thread_data::<Platform>(process_information, *thread_data)
+}
+
+fn write_process_tls_information_thread_data<Platform: ShimPlatform>(
+    process_information: ConstPtr<Platform, u8>,
+    thread_data: ThreadTlsInformation,
+) -> Option<()> {
+    let output = MutPtr::<Platform, ThreadTlsInformation>::from_usize(
+        process_information
+            .as_usize()
+            .checked_add(size_of::<ProcessTlsInformationHeader>())?,
+    );
+    output.write_at_offset(0, thread_data)
+}
+
 pub(crate) const fn default_process_cookie() -> u32 {
     // TODO: use CrngProvider to generate a random cookie
     PROCESS_COOKIE
@@ -317,17 +507,91 @@ pub(crate) const fn default_process_cookie() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
+    use crate::nt_types::ThreadEnvironmentBlock;
     use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
     use litebox::platform::ThreadProvider;
+    use zerocopy::FromZeros as _;
 
     const RETURN_LENGTH_SENTINEL: u32 = 0xaaaa_aaaa;
 
     type TestPlatform = crate::tests::TestPlatform;
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+    struct ProcessTlsInformation {
+        header: ProcessTlsInformationHeader,
+        thread_data: ThreadTlsInformation,
+    }
+
     fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
         let _ = crate::tests::test_platform();
         <TestPlatform as ThreadProvider>::run_test_thread(f)
+    }
+
+    fn const_byte_ptr<T: FromBytes>(value: &T) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
+    fn mut_const_byte_ptr<T: FromBytes>(value: &mut T) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_mut(value).cast::<u8>() as usize)
+    }
+
+    fn task_with_teb(teb: &mut ThreadEnvironmentBlock) -> Task<TestPlatform, crate::tests::TestFS> {
+        let mut task = crate::tests::test_task();
+        task.teb_address = core::ptr::from_mut(teb) as usize;
+        task
+    }
+
+    fn process_tls_information(
+        operation_type: u32,
+        thread_data_count: u32,
+        tls_vector_length: u32,
+        tls_vector: usize,
+        thread_id: usize,
+    ) -> ProcessTlsInformation {
+        ProcessTlsInformation {
+            header: ProcessTlsInformationHeader {
+                flags: 0,
+                operation_type,
+                thread_data_count,
+                tls_vector_length,
+            },
+            thread_data: ThreadTlsInformation {
+                flags: 0,
+                _reserved: 0,
+                tls_vector,
+                thread_id,
+            },
+        }
+    }
+
+    #[test]
+    fn nt_apphelp_cache_control_returns_cache_miss_for_lookup_classes() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+
+            assert_eq!(
+                task.sys_nt_apphelp_cache_control(
+                    APPHELP_CACHE_SERVICE_LOOKUP,
+                    null_mut_ptr::<u8>()
+                ),
+                NtStatus::NOT_FOUND
+            );
+            assert_eq!(
+                task.sys_nt_apphelp_cache_control(
+                    APPHELP_CACHE_SERVICE_LOOKUP_CDB,
+                    null_mut_ptr::<u8>()
+                ),
+                NtStatus::NOT_FOUND
+            );
+            assert_eq!(
+                task.sys_nt_apphelp_cache_control(99, null_mut_ptr::<u8>()),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
     }
 
     #[test]
@@ -480,6 +744,79 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(second_shared_data, first_shared_data);
+        });
+    }
+
+    #[test]
+    fn nt_set_information_process_rejects_out_of_scope_tls_information() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let replace_index = process_tls_information(0, 1, 0, 0x50000, 0);
+            let replace_vector =
+                process_tls_information(PROCESS_TLS_REPLACE_VECTOR, 1, 0, 0x50000, 0);
+            let mut two_thread = vec![0u8; process_tls_information_len(2).unwrap()];
+            two_thread[4..8].copy_from_slice(&PROCESS_TLS_REPLACE_VECTOR.to_le_bytes());
+            two_thread[8..12].copy_from_slice(&2u32.to_le_bytes());
+            let len: u32 = size_of::<ProcessTlsInformation>().trunc();
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    const_byte_ptr(&replace_vector),
+                    len - 1,
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    const_byte_ptr(&replace_index),
+                    len,
+                ),
+                NtStatus::INVALID_INFO_CLASS
+            );
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    ConstPtr::<TestPlatform, u8>::from_usize(two_thread.as_ptr() as usize),
+                    process_tls_information_len(2).unwrap().trunc(),
+                ),
+                NtStatus::INVALID_INFO_CLASS
+            );
+        });
+    }
+
+    #[test]
+    fn nt_set_information_process_tls_replace_vector_updates_teb_and_writeback() {
+        run_with_test_platform_pointers(|| {
+            let mut teb = ThreadEnvironmentBlock::new_zeroed();
+            let old_vector = 0x70000;
+            let new_vector = 0x557c0;
+            teb.thread_local_storage_pointer = old_vector;
+            let task = task_with_teb(&mut teb);
+            let mut information =
+                process_tls_information(PROCESS_TLS_REPLACE_VECTOR, 1, 0, new_vector, 0);
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    mut_const_byte_ptr(&mut information),
+                    size_of::<ProcessTlsInformation>().trunc(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            assert_eq!(teb.thread_local_storage_pointer, new_vector);
+            assert_eq!(
+                information.thread_data.flags,
+                THREAD_TLS_INFORMATION_ASSIGNED
+            );
+            assert_eq!(information.thread_data.tls_vector, 0);
+            assert_eq!(information.thread_data.thread_id, INITIAL_THREAD_ID);
         });
     }
 

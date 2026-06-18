@@ -197,6 +197,7 @@ impl NtStatus {
             0xC000010D => "STATUS_CANNOT_IMPERSONATE: Cannot impersonate",
             0xC0000120 => "STATUS_CANCELLED: The operation was cancelled",
             0xC0000121 => "STATUS_CANNOT_DELETE: Cannot delete",
+            0xC0000225 => "STATUS_NOT_FOUND: The object was not found",
             0xC0000128 => "STATUS_FILE_CLOSED: File closed",
             0xC0000142 => "STATUS_DLL_INIT_FAILED: DLL initialization failed",
             0xC0000161 => "STATUS_ILLEGAL_CHARACTER: Illegal character",
@@ -561,6 +562,9 @@ impl NtStatus {
 
     /// STATUS_CANNOT_DELETE
     pub const CANNOT_DELETE: Self = Self::from_raw(0xC0000121);
+
+    /// STATUS_NOT_FOUND
+    pub const NOT_FOUND: Self = Self::from_raw(0xC0000225);
 
     /// STATUS_FILE_CLOSED
     pub const FILE_CLOSED: Self = Self::from_raw(0xC0000128);

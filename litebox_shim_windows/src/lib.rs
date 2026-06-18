@@ -1103,6 +1103,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let status = self.sys_nt_trace_event(trace_handle, flags, field_size, fields);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtApphelpCacheControl {
+                service_class,
+                service_context,
+            } => {
+                let status = self.sys_nt_apphelp_cache_control(service_class, service_context);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,

@@ -436,6 +436,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         field_size: u32,
         fields: Platform::RawConstPointer<u8>,
     },
+    NtApphelpCacheControl {
+        service_class: u32,
+        service_context: Platform::RawMutPointer<u8>,
+    },
     NtSetInformationProcess {
         process_handle: ProcessHandle,
         process_information_class: u32,
@@ -876,6 +880,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 flags,
                 field_size,
                 fields:*,
+            })),
+            NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
+                service_class,
+                service_context:*,
             })),
             NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {
                 process_handle:{ProcessHandle::from_raw},
