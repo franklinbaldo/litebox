@@ -171,6 +171,7 @@ pub(crate) struct WindowsProcessEnvironment {
 pub(crate) struct PeLoadInfo<Platform: crate::ShimPlatform> {
     pub(crate) entry_point: usize,
     pub(crate) stack_top: usize,
+    pub(crate) application_mapping: MappingInfo,
     pub(crate) ntdll_mapping: Option<MappingInfo>,
     pub(crate) virtual_allocations: crate::WindowsVirtualAllocations<Platform>,
     pub(crate) environment: WindowsProcessEnvironment,
@@ -280,6 +281,7 @@ impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
         Ok(PeLoadInfo {
             entry_point,
             stack_top,
+            application_mapping: image.mapping,
             ntdll_mapping,
             virtual_allocations,
             environment,
@@ -1222,6 +1224,19 @@ fn load_image<Platform: crate::ShimPlatform, FS: ShimFS>(
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<LoadedImage, WindowsLoadError> {
     load_image_with_writable_sections(fs, path, platform, page_manager, &[])
+}
+
+pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
+    platform: &'static Platform,
+    fs: Arc<FS>,
+    path: &str,
+    page_manager: &crate::WindowsPageManager<Platform>,
+    virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
+) -> Result<MappingInfo, WindowsLoadError> {
+    let image = load_image(platform, fs, path, page_manager)?;
+    let mapping = image.mapping;
+    register_image_virtual_allocation(virtual_allocations, mapping, image.pages);
+    Ok(mapping)
 }
 
 fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(

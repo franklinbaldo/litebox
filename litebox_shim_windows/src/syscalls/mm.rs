@@ -42,7 +42,7 @@ bitflags::bitflags! {
 impl PageProtection {
     const BASE_MASK: u32 = 0xff;
 
-    fn base(self) -> u32 {
+    pub(crate) fn base(self) -> u32 {
         self.bits() & Self::BASE_MASK
     }
 
@@ -1065,7 +1065,9 @@ fn mark_pages_decommitted<Platform: ShimPlatform>(
     allocation.pages.remove(base..end);
 }
 
-fn parse_page_protection(protect: u32) -> Option<(PageProtection, MemoryRegionPermissions)> {
+pub(crate) fn parse_page_protection(
+    protect: u32,
+) -> Option<(PageProtection, MemoryRegionPermissions)> {
     let protect = PageProtection::from_bits(protect)?;
     let permissions = page_protect_to_permissions(protect)?;
     Some((protect, permissions))

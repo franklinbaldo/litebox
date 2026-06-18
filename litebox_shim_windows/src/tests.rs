@@ -17,8 +17,8 @@ use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
 use crate::{
     ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsDirectoryNamespace,
-    WindowsHandleStore, WindowsNlsSectionMappings, WindowsPageManager,
-    WindowsSymbolicLinkNamespace,
+    WindowsHandleStore, WindowsImageMappings, WindowsNlsSectionMappings, WindowsPageManager,
+    WindowsSectionNamespace, WindowsSectionViews, WindowsSymbolicLinkNamespace,
 };
 
 #[cfg(target_os = "linux")]
@@ -155,10 +155,13 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             symbolic_link_namespace: WindowsSymbolicLinkNamespace::<TestPlatform>::new(
                 crate::syscalls::directory_object::initial_symbolic_link_namespace(),
             ),
+            section_namespace: WindowsSectionNamespace::<TestPlatform>::new(BTreeMap::new()),
+            section_views: WindowsSectionViews::<TestPlatform>::new(BTreeMap::new()),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(
                 BTreeMap::new(),
             ),
+            image_mappings: WindowsImageMappings::<TestPlatform>::new(BTreeMap::new()),
             system_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_lcid: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(crate::syscalls::nls::DEFAULT_LOCALE_ID),

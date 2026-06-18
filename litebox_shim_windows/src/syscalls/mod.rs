@@ -9,6 +9,7 @@ pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod process;
 pub(crate) mod registry;
+pub(crate) mod section;
 mod sysinfo;
 pub(crate) mod thread;
 pub(crate) mod timer;
@@ -178,6 +179,31 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
+    },
+    NtCreateSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        maximum_size: Option<Platform::RawConstPointer<i64>>,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+    },
+    NtCreateSectionEx {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        maximum_size: Option<Platform::RawConstPointer<i64>>,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+        extended_parameters: Option<Platform::RawConstPointer<u8>>,
+        extended_parameter_count: u32,
+    },
+    NtOpenSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
     NtCreateWaitCompletionPacket {
         wait_completion_packet_handle: Platform::RawMutPointer<Handle>,
@@ -397,6 +423,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
+    NtQuerySection {
+        section_handle: Handle,
+        section_information_class: u32,
+        section_information: Platform::RawMutPointer<u8>,
+        section_information_length: usize,
+        return_length: Option<Platform::RawMutPointer<usize>>,
+    },
     NtSetInformationProcess {
         process_handle: ProcessHandle,
         process_information_class: u32,
@@ -408,6 +441,38 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_information_class: u32,
         thread_information: Platform::RawConstPointer<u8>,
         thread_information_length: u32,
+    },
+    NtMapViewOfSection {
+        section_handle: Handle,
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        zero_bits: usize,
+        commit_size: usize,
+        section_offset: Option<Platform::RawConstPointer<i64>>,
+        view_size: Platform::RawMutPointer<usize>,
+        inherit_disposition: u32,
+        allocation_type: u32,
+        page_protection: u32,
+    },
+    NtMapViewOfSectionEx {
+        section_handle: Handle,
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        section_offset: Option<Platform::RawConstPointer<i64>>,
+        view_size: Platform::RawMutPointer<usize>,
+        allocation_type: u32,
+        page_protection: u32,
+        extended_parameters: Option<Platform::RawConstPointer<u8>>,
+        extended_parameter_count: u32,
+    },
+    NtUnmapViewOfSection {
+        process_handle: ProcessHandle,
+        base_address: usize,
+    },
+    NtUnmapViewOfSectionEx {
+        process_handle: ProcessHandle,
+        base_address: usize,
+        flags: u32,
     },
     NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
         flag: u32,
@@ -539,6 +604,31 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
                 number_of_concurrent_threads,
+            })),
+            NtSysno::NtCreateSection => Some(sys_req!(NtCreateSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+                maximum_size:*,
+                section_page_protection,
+                allocation_attributes,
+                file_handle:{Handle::from_raw},
+            })),
+            NtSysno::NtCreateSectionEx => Some(sys_req!(NtCreateSectionEx {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+                maximum_size:*,
+                section_page_protection,
+                allocation_attributes,
+                file_handle:{Handle::from_raw},
+                extended_parameters:*,
+                extended_parameter_count,
+            })),
+            NtSysno::NtOpenSection => Some(sys_req!(NtOpenSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
             })),
             NtSysno::NtCreateWaitCompletionPacket => Some(sys_req!(
                 NtCreateWaitCompletionPacket {
@@ -768,6 +858,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     return_length:*,
                 }
             )),
+            NtSysno::NtQuerySection => Some(sys_req!(NtQuerySection {
+                section_handle:{Handle::from_raw},
+                section_information_class,
+                section_information:*,
+                section_information_length,
+                return_length:*,
+            })),
             NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {
                 process_handle:{ProcessHandle::from_raw},
                 process_information_class,
@@ -779,6 +876,38 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_information_class,
                 thread_information:*,
                 thread_information_length,
+            })),
+            NtSysno::NtMapViewOfSection => Some(sys_req!(NtMapViewOfSection {
+                section_handle:{Handle::from_raw},
+                process_handle:{ProcessHandle::from_raw},
+                base_address:*,
+                zero_bits,
+                commit_size,
+                section_offset:*,
+                view_size:*,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+            })),
+            NtSysno::NtMapViewOfSectionEx => Some(sys_req!(NtMapViewOfSectionEx {
+                section_handle:{Handle::from_raw},
+                process_handle:{ProcessHandle::from_raw},
+                base_address:*,
+                section_offset:*,
+                view_size:*,
+                allocation_type,
+                page_protection,
+                extended_parameters:*,
+                extended_parameter_count,
+            })),
+            NtSysno::NtUnmapViewOfSection => Some(sys_req!(NtUnmapViewOfSection {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
+            })),
+            NtSysno::NtUnmapViewOfSectionEx => Some(sys_req!(NtUnmapViewOfSectionEx {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
+                flags,
             })),
             NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
                 sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {

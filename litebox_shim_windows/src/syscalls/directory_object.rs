@@ -580,6 +580,23 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         parent_path(path).is_some_and(|parent| self.directory_namespace_lookup(parent).is_some())
     }
 
+    pub(crate) fn resolve_object_name_path(
+        &self,
+        object_attributes: &ObjectAttributes,
+        name: &str,
+    ) -> Result<String, NtStatus> {
+        self.resolve_directory_name(object_attributes, name)
+            .map(|name| name.path)
+    }
+
+    pub(crate) fn directory_object_exists(&self, path: &str) -> bool {
+        self.directory_namespace_lookup(path).is_some()
+    }
+
+    pub(crate) fn symbolic_link_object_exists(&self, path: &str) -> bool {
+        self.symbolic_link_namespace_lookup(path).is_some()
+    }
+
     pub(crate) fn sys_nt_create_directory_object(
         &self,
         directory_handle: MutPtr<Platform, Handle>,
