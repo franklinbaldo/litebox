@@ -16,8 +16,9 @@ use litebox::platform::RawConstPointer as _;
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsHandleStore,
-    WindowsNlsSectionMappings, WindowsPageManager,
+    ConstPtr, DefaultFS, GlobalState, MutPtr, Process, Task, WindowsDirectoryNamespace,
+    WindowsHandleStore, WindowsNlsSectionMappings, WindowsPageManager,
+    WindowsSymbolicLinkNamespace,
 };
 
 #[cfg(target_os = "linux")]
@@ -148,6 +149,12 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             peb_address: 0,
             handles: WindowsHandleStore::<TestPlatform>::new(RawDescriptorStorage::new()),
             event_namespace: crate::WindowsEventNamespace::<TestPlatform>::new(BTreeMap::new()),
+            directory_namespace: WindowsDirectoryNamespace::<TestPlatform>::new(
+                crate::syscalls::directory_object::initial_directory_namespace(),
+            ),
+            symbolic_link_namespace: WindowsSymbolicLinkNamespace::<TestPlatform>::new(
+                crate::syscalls::directory_object::initial_symbolic_link_namespace(),
+            ),
             nls_section_mappings: WindowsNlsSectionMappings::<TestPlatform>::new(BTreeMap::new()),
             virtual_allocations: crate::WindowsVirtualAllocations::<TestPlatform>::new(
                 BTreeMap::new(),

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+pub(crate) mod directory_object;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod iocp;
@@ -97,6 +98,48 @@ impl ProcessHandle {
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtClose {
         handle: Handle,
+    },
+    NtCreateDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtCreateDirectoryObjectEx {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        shadow_directory_handle: Handle,
+        flags: u32,
+    },
+    NtOpenDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQueryDirectoryObject {
+        directory_handle: Handle,
+        buffer: Platform::RawMutPointer<u8>,
+        length: u32,
+        return_single_entry: u8,
+        restart_scan: u8,
+        context: Platform::RawMutPointer<u32>,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtCreateSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        link_target: Platform::RawConstPointer<nt_types::UnicodeString>,
+    },
+    NtOpenSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQuerySymbolicLinkObject {
+        link_handle: Handle,
+        link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
+        return_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtCreateEvent {
         event_handle: Platform::RawMutPointer<Handle>,
@@ -358,6 +401,48 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         match NtSysno::from_raw(pt_regs.orig_rax)? {
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
+            })),
+            NtSysno::NtCreateDirectoryObject => Some(sys_req!(NtCreateDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtCreateDirectoryObjectEx => Some(sys_req!(NtCreateDirectoryObjectEx {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+                shadow_directory_handle:{Handle::from_raw},
+                flags,
+            })),
+            NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQueryDirectoryObject => Some(sys_req!(NtQueryDirectoryObject {
+                directory_handle:{Handle::from_raw},
+                buffer:*,
+                length,
+                return_single_entry,
+                restart_scan,
+                context:*,
+                return_length:*,
+            })),
+            NtSysno::NtCreateSymbolicLinkObject => Some(sys_req!(NtCreateSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+                link_target:*,
+            })),
+            NtSysno::NtOpenSymbolicLinkObject => Some(sys_req!(NtOpenSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
+                link_handle:{Handle::from_raw},
+                link_target:*,
+                return_length:*,
             })),
             NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
                 event_handle:*,
