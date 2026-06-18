@@ -619,6 +619,7 @@ struct LoadedImage {
     mapping: MappingInfo,
     pages: RangeMap<usize, PageProtection>,
     parsed: PeParsedFile,
+    contains_raw_syscall_instruction: bool,
 }
 
 impl LoadedImage {
@@ -1234,7 +1235,7 @@ pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
     virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
 ) -> Result<MappingInfo, WindowsLoadError> {
     let image = load_image(platform, fs, path, page_manager)?;
-    if !image.parsed.has_trampoline() {
+    if !image.parsed.has_trampoline() && image.contains_raw_syscall_instruction {
         return Err(WindowsLoadError::UnrewrittenImageSection);
     }
     let mapping = image.mapping;
@@ -1254,6 +1255,9 @@ fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
     parsed
         .parse_trampoline(&mut &file, platform.get_syscall_entry_point())
         .map_err(WindowsLoadError::Parse)?;
+    let contains_raw_syscall_instruction = parsed
+        .contains_raw_syscall_instruction(&mut &file)
+        .map_err(WindowsLoadError::Parse)?;
     let mut mapper = PeImageMapper {
         file: &file,
         page_manager,
@@ -1268,6 +1272,7 @@ fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
         mapping,
         pages: mapper.pages,
         parsed,
+        contains_raw_syscall_instruction,
     })
 }
 
@@ -2883,6 +2888,7 @@ mod tests {
             },
             pages: RangeMap::new(),
             parsed,
+            contains_raw_syscall_instruction: false,
         }
     }
 

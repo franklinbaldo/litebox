@@ -471,6 +471,34 @@ impl PeParsedFile {
         self.trampoline.is_some()
     }
 
+    /// Returns whether any executable section still contains a raw x86-64 `syscall`.
+    pub fn contains_raw_syscall_instruction<F: ReadAt>(
+        &self,
+        file: &mut F,
+    ) -> Result<bool, PeParseError<F::Error>> {
+        for section in &self.sections {
+            let characteristics = section.characteristics.get(LE);
+            if characteristics & pe::IMAGE_SCN_CNT_CODE == 0 {
+                continue;
+            }
+            if characteristics & pe::IMAGE_SCN_MEM_EXECUTE == 0 {
+                continue;
+            }
+            let raw_size = section.size_of_raw_data.get(LE) as usize;
+            if raw_size < 2 {
+                continue;
+            }
+            let raw_offset = u64::from(section.pointer_to_raw_data.get(LE));
+            let mut bytes = alloc::vec![0; raw_size];
+            file.read_at(raw_offset, &mut bytes)
+                .map_err(PeParseError::Io)?;
+            if bytes.windows(2).any(|window| window == [0x0f, 0x05]) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Returns the PE image size from the optional header.
     #[must_use]
     pub fn image_size(&self) -> usize {
