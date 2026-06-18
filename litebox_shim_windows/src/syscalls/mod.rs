@@ -5,6 +5,7 @@ pub(crate) mod directory_object;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod iocp;
+pub(crate) mod lpc;
 pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod process;
@@ -447,6 +448,16 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         flags: u32,
         field_size: u32,
         fields: Platform::RawConstPointer<u8>,
+    },
+    NtConnectPort {
+        port_handle: Platform::RawMutPointer<Handle>,
+        port_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        security_qos: Option<Platform::RawConstPointer<u8>>,
+        client_view: Option<Platform::RawMutPointer<u8>>,
+        server_view: Option<Platform::RawMutPointer<u8>>,
+        max_message_length: Option<Platform::RawMutPointer<u32>>,
+        connection_information: Option<Platform::RawMutPointer<u8>>,
+        connection_information_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtApphelpCacheControl {
         service_class: u32,
@@ -904,6 +915,16 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 flags,
                 field_size,
                 fields:*,
+            })),
+            NtSysno::NtConnectPort => Some(sys_req!(NtConnectPort {
+                port_handle:*,
+                port_name:*,
+                security_qos:*,
+                client_view:*,
+                server_view:*,
+                max_message_length:*,
+                connection_information:*,
+                connection_information_length:*,
             })),
             NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
                 service_class,

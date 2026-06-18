@@ -39,6 +39,7 @@ use crate::syscalls::directory_object::{
 use crate::syscalls::event::{EventHandleObject, EventObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
+use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
@@ -1124,6 +1125,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let status = self.sys_nt_trace_event(trace_handle, flags, field_size, fields);
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtConnectPort {
+                port_handle,
+                port_name,
+                security_qos,
+                client_view,
+                server_view,
+                max_message_length,
+                connection_information,
+                connection_information_length,
+            } => {
+                let status = self.sys_nt_connect_port(
+                    port_handle,
+                    port_name,
+                    security_qos,
+                    client_view,
+                    server_view,
+                    max_message_length,
+                    connection_information,
+                    connection_information_length,
+                );
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtApphelpCacheControl {
                 service_class,
                 service_context,
@@ -1557,6 +1580,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ) {
             return NtStatus::SUCCESS;
         }
+        if remove_raw_handle_by_raw_fd::<Platform, LpcPortSubsystem>(
+            &self.global.litebox,
+            &self.process.handles,
+            raw_fd,
+            |port| visitor.lpc_port(port),
+        ) {
+            return NtStatus::SUCCESS;
+        }
         if remove_raw_handle_by_raw_fd::<Platform, TimerSubsystem<Platform>>(
             &self.global.litebox,
             &self.process.handles,
@@ -1625,6 +1656,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>);
 
+    fn lpc_port(&self, port: LpcPortHandleObject);
+
     fn timer(&self, timer: TimerHandleObject<Platform>);
 
     fn wait_completion_packet(
@@ -1668,6 +1701,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
         Task::<Platform, FS>::close_io_completion(io_completion);
+    }
+
+    fn lpc_port(&self, port: LpcPortHandleObject) {
+        Task::<Platform, FS>::close_lpc_port(port);
     }
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {
