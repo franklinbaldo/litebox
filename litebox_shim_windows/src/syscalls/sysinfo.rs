@@ -12,6 +12,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::GroupAffinity;
+use crate::syscalls::Handle;
 use crate::syscalls::mm::ALLOCATION_GRANULARITY;
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task};
 
@@ -621,6 +622,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Wine reports auxiliary counter conversion as unsupported after validating the source.
         NtStatus::NOT_SUPPORTED
     }
+
+    pub(crate) fn sys_nt_trace_event(
+        &self,
+        trace_handle: Handle,
+        flags: u32,
+        field_size: u32,
+        fields: ConstPtr<Platform, u8>,
+    ) -> NtStatus {
+        let trace_handle_raw = trace_handle.as_raw();
+        litebox_util_log::debug!(
+            trace_handle:% = format_args!("{trace_handle_raw:#x}"),
+            flags:% = format_args!("{flags:#x}"),
+            field_size,
+            has_fields = fields.as_usize() != 0;
+            "Handled NtTraceEvent as a local ETW sink"
+        );
+
+        let Some(ntdll_mapping) = self.process.ntdll_mapping else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let Some(ntdll_end) = ntdll_mapping
+            .base_addr
+            .checked_add(ntdll_mapping.image_size)
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if !(ntdll_mapping.base_addr..ntdll_end).contains(&trace_handle_raw) {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if field_size != 0 && fields.as_usize() == 0 {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        // ReactOS leaves NtTraceEvent unimplemented and Wine exposes only the syscall/stub.
+        // Windows ntdll's startup ETW trace handle succeeds when no consumer-visible event is
+        // needed, so LiteBox treats validated ntdll-owned events as a platform-neutral local sink.
+        NtStatus::SUCCESS
+    }
 }
 
 fn system_basic_information<Platform: ShimPlatform>() -> SystemBasicInformation {
@@ -762,6 +801,7 @@ mod tests {
     use crate::tests::{const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr};
     use core::time::Duration;
     use litebox::platform::ThreadProvider;
+    use litebox_common_windows::loader::MappingInfo;
 
     extern crate std;
 
@@ -840,6 +880,73 @@ mod tests {
 
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
+    #[test]
+    fn nt_trace_event_accepts_ntdll_owned_trace_handle_as_local_sink() {
+        run_with_test_platform_pointers(|| {
+            let mut task = crate::tests::test_task();
+            let fields = [0u8; 16];
+            let process =
+                alloc::sync::Arc::get_mut(&mut task.process).expect("test task has unique process");
+            process.ntdll_mapping = Some(MappingInfo {
+                base_addr: 0x1800_0000,
+                image_size: 0x0020_0000,
+                mapping_size: 0x0020_0000,
+                entry_point: 0,
+            });
+            let ntdll_trace_handle = 0x1800_0000 + 0x178d80;
+
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    u32::try_from(fields.len()).unwrap(),
+                    const_byte_ptr(&fields[0]),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    u32::try_from(fields.len()).unwrap(),
+                    null_const_ptr(),
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(0x1234),
+                    0x700,
+                    u32::try_from(fields.len()).unwrap(),
+                    const_byte_ptr(&fields[0]),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    0,
+                    null_const_ptr(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let process =
+                alloc::sync::Arc::get_mut(&mut task.process).expect("test task has unique process");
+            process.ntdll_mapping = None;
+            assert_eq!(
+                task.sys_nt_trace_event(
+                    Handle::from_raw(ntdll_trace_handle),
+                    0x700,
+                    0,
+                    null_const_ptr(),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+        });
     }
 
     #[test]

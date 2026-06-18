@@ -1094,6 +1094,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 );
                 (status, ContinueOperation::Resume)
             }
+            SyscallRequest::NtTraceEvent {
+                trace_handle,
+                flags,
+                field_size,
+                fields,
+            } => {
+                let status = self.sys_nt_trace_event(trace_handle, flags, field_size, fields);
+                (status, ContinueOperation::Resume)
+            }
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,
