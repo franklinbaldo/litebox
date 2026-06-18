@@ -569,15 +569,15 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if object_attributes.object_name == 0 {
             return Err(NtStatus::INVALID_PARAMETER);
         }
-        if ea_buffer.is_some() || ea_length != 0 {
-            return Err(NtStatus::EAS_NOT_SUPPORTED);
-        }
         let desired_access = FileAccess::from_desired_access(desired_access);
         let create_options = FileCreateOptions::from_bits_retain(create_options);
         validate_create_options(desired_access, create_disposition, create_options)?;
 
         let share_access = FileShareAccess::from_share_access(share_access)?;
         let resolved_path = self.object_attributes_to_resolved_file_path(object_attributes)?;
+        if resolved_path.device != FileDevice::ConDrv && (ea_buffer.is_some() || ea_length != 0) {
+            return Err(NtStatus::EAS_NOT_SUPPORTED);
+        }
         self.check_file_sharing(&resolved_path.path, desired_access, share_access)?;
 
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
@@ -1401,6 +1401,71 @@ mod tests {
 
         assert_ne!(reference_handle, Handle::default());
         assert_eq!(information, FileCreateInformation::Opened);
+    }
+
+    #[test]
+    fn condrv_relative_connect_ignores_ea_buffer() {
+        let task = crate::tests::test_task();
+        let mut io_status = IoStatusBlock::new(NtStatus::SUCCESS, 0);
+        let (_path, _name, root_attributes) = open_object_attributes(r"\Device\ConDrv\Connect");
+        let root_handle = task
+            .do_nt_create_file(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                root_attributes,
+                mut_ptr(&mut io_status),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CreateDisposition::Open,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                None,
+                0,
+            )
+            .unwrap()
+            .0;
+        let (_path, _name, mut connect_attributes) = open_object_attributes(r"\Connect");
+        connect_attributes.root_directory = root_handle;
+        let ea_buffer = [0xcc; 16];
+
+        let (connect_handle, information) = task
+            .do_nt_create_file(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                connect_attributes,
+                mut_ptr(&mut io_status),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CreateDisposition::Open,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                Some(const_ptr(&ea_buffer[0])),
+                1355,
+            )
+            .unwrap();
+
+        assert_ne!(connect_handle, Handle::default());
+        assert_eq!(information, FileCreateInformation::Opened);
+    }
+
+    #[test]
+    fn ordinary_file_open_with_ea_still_fails_closed() {
+        let task = crate::tests::test_task();
+        let (_path, _name, attributes) = open_object_attributes("/tmp/file-with-ea.txt");
+        let mut io_status = IoStatusBlock::new(NtStatus::SUCCESS, 0);
+        let ea_buffer = [0xcc; 16];
+
+        let status = task
+            .do_nt_create_file(
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                attributes,
+                mut_ptr(&mut io_status),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CreateDisposition::Create,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                Some(const_ptr(&ea_buffer[0])),
+                u32::try_from(ea_buffer.len()).unwrap(),
+            )
+            .unwrap_err();
+
+        assert_eq!(status, NtStatus::EAS_NOT_SUPPORTED);
     }
 
     #[test]
