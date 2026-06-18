@@ -3,6 +3,7 @@
 
 use alloc::string::String;
 use core::marker::PhantomData;
+use core::mem::size_of;
 
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
@@ -10,6 +11,7 @@ use litebox::fs::errors::{FileStatusError, MkdirError, OpenError, PathError};
 use litebox::fs::{FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{
     AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
@@ -44,6 +46,22 @@ enum FileCreateInformation {
     Overwritten = 3,
     Exists = 4,
     DoesNotExist = 5,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum FsInformationClass {
+    Device = 4,
+}
+
+const FILE_DEVICE_DISK: u32 = 0x0000_0007;
+const FILE_DEVICE_IS_MOUNTED: u32 = 0x0000_0020;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct FileFsDeviceInformation {
+    device_type: u32,
+    characteristics: u32,
 }
 
 pub(crate) struct FileObjectSubsystem<FS>(PhantomData<fn(FS)>);
@@ -441,6 +459,44 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         })
     }
 
+    pub(crate) fn sys_nt_query_volume_information_file(
+        &self,
+        file_handle: Handle,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        fs_information: MutPtr<Platform, u8>,
+        fs_information_length: u32,
+        fs_information_class: u32,
+    ) -> NtStatus {
+        if self.file_entry(file_handle).is_err() {
+            return write_io_status::<Platform>(io_status_block, NtStatus::INVALID_HANDLE);
+        }
+        let Ok(FsInformationClass::Device) = FsInformationClass::try_from(fs_information_class)
+        else {
+            return write_io_status::<Platform>(io_status_block, NtStatus::INVALID_INFO_CLASS);
+        };
+        let information = FileFsDeviceInformation {
+            device_type: FILE_DEVICE_DISK,
+            characteristics: FILE_DEVICE_IS_MOUNTED,
+        };
+        let information_bytes = information.as_bytes();
+        let status = write_fs_information::<Platform>(
+            fs_information,
+            usize::try_from(fs_information_length).unwrap_or(usize::MAX),
+            size_of::<FileFsDeviceInformation>(),
+            information_bytes,
+            io_status_block,
+        );
+        litebox_util_log::debug!(
+            handle:? = file_handle,
+            fs_information_class,
+            fs_information_length,
+            returned_length = information_bytes.len(),
+            status:? = status;
+            "Handled NtQueryVolumeInformationFile syscall"
+        );
+        status
+    }
+
     // Microsoft Learn documents `NtCreateFile` as the common create/open primitive,
     // with `NtOpenFile` being its open-existing subset.
     #[expect(
@@ -684,6 +740,57 @@ fn write_file_success<Platform: RawPointerProvider>(
     file_handle.write_at_offset(0, handle)
 }
 
+fn write_fs_information<Platform: RawPointerProvider>(
+    fs_information: MutPtr<Platform, u8>,
+    fs_information_length: usize,
+    minimum_length: usize,
+    information: &[u8],
+    io_status_block: MutPtr<Platform, IoStatusBlock>,
+) -> NtStatus {
+    if fs_information_length < minimum_length {
+        return write_io_status::<Platform>(io_status_block, NtStatus::INFO_LENGTH_MISMATCH);
+    }
+
+    let write_length = fs_information_length.min(information.len());
+    if fs_information
+        .write_slice_at_offset(0, &information[..write_length])
+        .is_none()
+    {
+        return write_io_status::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION);
+    }
+
+    if fs_information_length < information.len() {
+        return write_io_status_with_information::<Platform>(
+            io_status_block,
+            NtStatus::BUFFER_OVERFLOW,
+            write_length,
+        );
+    }
+
+    write_io_status_with_information::<Platform>(
+        io_status_block,
+        NtStatus::SUCCESS,
+        information.len(),
+    )
+}
+
+fn write_io_status<Platform: RawPointerProvider>(
+    io_status_block: MutPtr<Platform, IoStatusBlock>,
+    status: NtStatus,
+) -> NtStatus {
+    write_io_status_with_information::<Platform>(io_status_block, status, 0)
+}
+
+fn write_io_status_with_information<Platform: RawPointerProvider>(
+    io_status_block: MutPtr<Platform, IoStatusBlock>,
+    status: NtStatus,
+    information: usize,
+) -> NtStatus {
+    io_status_block
+        .write_at_offset(0, IoStatusBlock::new(status, information))
+        .map_or(NtStatus::ACCESS_VIOLATION, |()| status)
+}
+
 fn failure_information(status: NtStatus) -> usize {
     match status {
         NtStatus::OBJECT_NAME_COLLISION => FileCreateInformation::Exists.into(),
@@ -909,9 +1016,12 @@ fn map_mkdir_error(error: MkdirError) -> NtStatus {
 
 #[cfg(test)]
 mod tests {
+    use core::mem::size_of;
+
     use super::*;
     use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, unicode_string,
+        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_mut_ptr, object_attributes,
+        unicode_string,
     };
     use litebox::fs::FileSystem as _;
 
@@ -987,6 +1097,125 @@ mod tests {
             0,
         );
         (status, handle, io_status)
+    }
+
+    #[test]
+    fn nt_query_volume_information_file_reports_device_information() {
+        let task = crate::tests::test_task();
+        let (status, handle, _) = create_file(
+            &task,
+            "/tmp/query-volume-device.txt",
+            FILE_GENERIC_READ,
+            FILE_CREATE,
+        );
+        assert_eq!(status, NtStatus::SUCCESS);
+        let mut io_status = IoStatusBlock::default();
+        let mut information = FileFsDeviceInformation {
+            device_type: u32::MAX,
+            characteristics: u32::MAX,
+        };
+
+        let status = task.sys_nt_query_volume_information_file(
+            handle,
+            mut_ptr(&mut io_status),
+            mut_byte_ptr(&mut information),
+            u32::try_from(size_of::<FileFsDeviceInformation>()).unwrap(),
+            FsInformationClass::Device as u32,
+        );
+
+        assert_eq!(status, NtStatus::SUCCESS);
+        assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(io_status.information, size_of::<FileFsDeviceInformation>());
+        assert_eq!(information.device_type, FILE_DEVICE_DISK);
+        assert_eq!(
+            information.characteristics & FILE_DEVICE_IS_MOUNTED,
+            FILE_DEVICE_IS_MOUNTED
+        );
+        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn nt_query_volume_information_file_rejects_invalid_handle() {
+        let task = crate::tests::test_task();
+        let mut io_status = IoStatusBlock::default();
+        let mut information = FileFsDeviceInformation {
+            device_type: u32::MAX,
+            characteristics: u32::MAX,
+        };
+
+        let status = task.sys_nt_query_volume_information_file(
+            Handle::from_raw(usize::MAX),
+            mut_ptr(&mut io_status),
+            mut_byte_ptr(&mut information),
+            u32::try_from(size_of::<FileFsDeviceInformation>()).unwrap(),
+            FsInformationClass::Device as u32,
+        );
+
+        assert_eq!(status, NtStatus::INVALID_HANDLE);
+        assert_eq!(io_status.status, NtStatus::INVALID_HANDLE.as_raw());
+        assert_eq!(io_status.information, 0);
+        assert_eq!(information.device_type, u32::MAX);
+        assert_eq!(information.characteristics, u32::MAX);
+    }
+
+    #[test]
+    fn nt_query_volume_information_file_rejects_invalid_class() {
+        let task = crate::tests::test_task();
+        let (status, handle, _) = create_file(
+            &task,
+            "/tmp/query-volume-invalid-class.txt",
+            FILE_GENERIC_READ,
+            FILE_CREATE,
+        );
+        assert_eq!(status, NtStatus::SUCCESS);
+        let mut io_status = IoStatusBlock::default();
+        let mut information = FileFsDeviceInformation {
+            device_type: u32::MAX,
+            characteristics: u32::MAX,
+        };
+
+        let status = task.sys_nt_query_volume_information_file(
+            handle,
+            mut_ptr(&mut io_status),
+            mut_byte_ptr(&mut information),
+            u32::try_from(size_of::<FileFsDeviceInformation>()).unwrap(),
+            99,
+        );
+
+        assert_eq!(status, NtStatus::INVALID_INFO_CLASS);
+        assert_eq!(io_status.status, NtStatus::INVALID_INFO_CLASS.as_raw());
+        assert_eq!(io_status.information, 0);
+        assert_eq!(information.device_type, u32::MAX);
+        assert_eq!(information.characteristics, u32::MAX);
+        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn nt_query_volume_information_file_rejects_too_short_device_buffer() {
+        let task = crate::tests::test_task();
+        let (status, handle, _) = create_file(
+            &task,
+            "/tmp/query-volume-short-device.txt",
+            FILE_GENERIC_READ,
+            FILE_CREATE,
+        );
+        assert_eq!(status, NtStatus::SUCCESS);
+        let mut io_status = IoStatusBlock::default();
+        let mut buffer = [0xcc; size_of::<FileFsDeviceInformation>() - 1];
+
+        let status = task.sys_nt_query_volume_information_file(
+            handle,
+            mut_ptr(&mut io_status),
+            mut_byte_ptr(&mut buffer[0]),
+            u32::try_from(buffer.len()).unwrap(),
+            FsInformationClass::Device as u32,
+        );
+
+        assert_eq!(status, NtStatus::INFO_LENGTH_MISMATCH);
+        assert_eq!(io_status.status, NtStatus::INFO_LENGTH_MISMATCH.as_raw());
+        assert_eq!(io_status.information, 0);
+        assert_eq!(buffer, [0xcc; size_of::<FileFsDeviceInformation>() - 1]);
+        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
     }
 
     #[test]
@@ -1633,6 +1862,13 @@ mod tests {
                 ShareAccess: u32,
                 OpenOptions: u32,
             ) -> i32;
+            fn NtQueryVolumeInformationFile(
+                FileHandle: *mut c_void,
+                IoStatusBlock: *mut IoStatusBlock,
+                FsInformation: *mut c_void,
+                Length: u32,
+                FsInformationClass: u32,
+            ) -> i32;
             fn NtClose(Handle: *mut c_void) -> i32;
         }
 
@@ -1703,6 +1939,90 @@ mod tests {
             assert_eq!(host_status, litebox_status.as_raw());
             assert_eq!(host_io_status.status, litebox_io_status.status);
             assert_eq!(host_io_status.information, litebox_io_status.information);
+        }
+
+        #[test]
+        fn nt_query_volume_information_file_device_matches_host() {
+            let test_dir = test_tmp_dir("nt_query_volume_information_file_device_matches_host");
+            let _ = std::fs::remove_dir_all(&test_dir);
+            std::fs::create_dir_all(&test_dir).unwrap();
+            let host_file = test_dir.join("existing.txt");
+            std::fs::write(&host_file, b"host").unwrap();
+
+            let host_name_units = utf16(&host_nt_path(&host_file));
+            let host_name = unicode_string(&host_name_units);
+            let host_attributes = host_object_attributes(&host_name);
+            let mut host_handle = core::ptr::null_mut();
+            let mut host_open_io_status = IoStatusBlock::default();
+            // SAFETY: All pointers reference live test locals, and ObjectName is an NT path
+            // to the temporary file created above.
+            let host_open_status = unsafe {
+                NtOpenFile(
+                    &raw mut host_handle,
+                    FILE_GENERIC_READ,
+                    &raw const host_attributes,
+                    &raw mut host_open_io_status,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    0,
+                )
+            };
+            assert_eq!(host_open_status, NtStatus::SUCCESS.as_raw());
+
+            let mut host_query_io_status = IoStatusBlock::default();
+            let mut host_information = FileFsDeviceInformation {
+                device_type: 0,
+                characteristics: 0,
+            };
+            // SAFETY: The host handle is open and all output pointers reference live locals
+            // sized exactly as FILE_FS_DEVICE_INFORMATION.
+            let host_query_status = unsafe {
+                NtQueryVolumeInformationFile(
+                    host_handle,
+                    &raw mut host_query_io_status,
+                    core::ptr::from_mut(&mut host_information).cast(),
+                    u32::try_from(size_of::<FileFsDeviceInformation>()).unwrap(),
+                    FsInformationClass::Device as u32,
+                )
+            };
+            close_host_handle(host_handle);
+
+            let task = crate::tests::test_task();
+            let (litebox_open_status, litebox_handle, _) = create_file(
+                &task,
+                "/tmp/query-volume-host-fidelity.txt",
+                FILE_GENERIC_READ,
+                FILE_CREATE,
+            );
+            assert_eq!(litebox_open_status, NtStatus::SUCCESS);
+            let mut litebox_query_io_status = IoStatusBlock::default();
+            let mut litebox_information = FileFsDeviceInformation {
+                device_type: 0,
+                characteristics: 0,
+            };
+            let litebox_query_status = task.sys_nt_query_volume_information_file(
+                litebox_handle,
+                mut_ptr(&mut litebox_query_io_status),
+                mut_byte_ptr(&mut litebox_information),
+                u32::try_from(size_of::<FileFsDeviceInformation>()).unwrap(),
+                FsInformationClass::Device as u32,
+            );
+
+            assert_eq!(host_query_status, litebox_query_status.as_raw());
+            assert_eq!(host_query_io_status.status, litebox_query_io_status.status);
+            assert_eq!(
+                host_query_io_status.information,
+                litebox_query_io_status.information
+            );
+            assert_eq!(
+                host_information.device_type,
+                litebox_information.device_type
+            );
+            assert_ne!(host_information.characteristics & FILE_DEVICE_IS_MOUNTED, 0);
+            assert_eq!(
+                litebox_information.characteristics & FILE_DEVICE_IS_MOUNTED,
+                FILE_DEVICE_IS_MOUNTED
+            );
+            assert_eq!(task.sys_nt_close(litebox_handle), NtStatus::SUCCESS);
         }
 
         #[test]
