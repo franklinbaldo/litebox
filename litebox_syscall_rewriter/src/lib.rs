@@ -459,12 +459,14 @@ fn hook_syscalls_in_section(
 
         let return_addr = inst.next_ip();
 
-        // LEA RCX, [RIP + 6] — load RCX with the address of the in-trampoline
+        // Load the original instruction's continuation register with the
+        // address of the in-trampoline
         // `post_jmp` (the instruction immediately after the indirect JMP into
         // the callback). The SA_RESTART handler relies on the invariant that
-        // pt_regs.rcx - 6 points at the indirect JMP itself, so it can rewind
-        // ctx.rip and re-enter the callback.
-        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
+        // the continuation register - 6 points at the indirect JMP itself, so
+        // it can rewind ctx.rip and re-enter the callback.
+        push_sysenter_compat(trampoline_data, inst);
+        trampoline_data.extend_from_slice(&continuation_lea_bytes(inst));
 
         // Add jmp [rip + offset_to_entry_point]
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
@@ -676,6 +678,31 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
+fn continuation_lea_bytes(_inst: &iced_x86::Instruction) -> [u8; 7] {
+    // The Linux userland callback expects the synthetic return IP in RCX.
+    [0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]
+}
+
+fn trampoline_preamble_len(inst: &iced_x86::Instruction) -> u64 {
+    let sysenter_compat_len = if inst.code() == iced_x86::Code::Sysenter {
+        3
+    } else {
+        0
+    };
+    13 + sysenter_compat_len
+}
+
+fn push_sysenter_compat(trampoline_data: &mut Vec<u8>, inst: &iced_x86::Instruction) {
+    if inst.code() == iced_x86::Code::Sysenter {
+        // OP-TEE SYSENTER stubs use the normal x86-64 C ABI at the call site,
+        // where arg3 is in RCX. The common LiteBox callback/decoder expects
+        // the Linux SYSCALL ABI, where arg3 is in R10 because RCX is clobbered
+        // by the transition. Move RCX before overwriting it with our synthetic
+        // return IP.
+        trampoline_data.extend_from_slice(&[0x49, 0x89, 0xca]);
+    }
+}
+
 /// This is the runtime counterpart to [`hook_syscalls_in_elf`]. Instead of
 /// processing a whole ELF file, it operates on a single already-mapped code
 /// region — the caller is responsible for making the region writable before
@@ -729,7 +756,10 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
     let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
     let mut count = 0;
     for inst in &instructions {
-        if inst.code() == iced_x86::Code::Syscall {
+        if matches!(
+            inst.code(),
+            iced_x86::Code::Syscall | iced_x86::Code::Sysenter
+        ) {
             replace_with_trap(code, code_vaddr, inst);
             count += 1;
         }
@@ -950,8 +980,7 @@ fn hook_syscall_and_after(
 
     // Compute preamble size so we can determine where post-syscall
     // instructions will land and encode them before committing anything.
-    // x86_64: LEA RCX,[RIP+disp32] (7) + JMP [RIP+disp32] (6) = 13
-    let preamble_len: u64 = 13;
+    let preamble_len = trampoline_preamble_len(syscall_inst);
 
     // Encode the post-syscall instructions for the trampoline, re-encoding
     // any RIP-relative memory operands for the new location.
@@ -969,11 +998,13 @@ fn hook_syscall_and_after(
         Vec::new()
     };
 
-    // LEA RCX, [RIP + 6] — make RCX point at the instruction immediately
+    // Load the original instruction's continuation register with the address
+    // of the instruction immediately
     // following the indirect JMP: the start of postsyscall_bytes (or, when
     // none, the unconditional JMP back to guest). The SA_RESTART handler
-    // relies on pt_regs.rcx - 6 pointing at the indirect JMP itself.
-    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
+    // relies on the continuation register - 6 pointing at the indirect JMP itself.
+    push_sysenter_compat(trampoline_data, syscall_inst);
+    trampoline_data.extend_from_slice(&continuation_lea_bytes(syscall_inst));
     // Add jmp [rip + offset_to_entry_point]
     trampoline_data.extend_from_slice(&[0xFF, 0x25]);
     // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
@@ -1021,4 +1052,32 @@ fn hook_syscall_and_after(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trap_all_syscalls_in_code_traps_sysenter() {
+        let mut code = [0x0f, 0x34];
+
+        let count = trap_all_syscalls_in_code(&mut code, 0x1000).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(code, [0xf1, 0xf4]);
+    }
+
+    #[test]
+    fn hook_sysenter_in_code_preserves_sysenter_return_register() {
+        let mut code = [0x0f, 0x34, 0x90, 0x90, 0x90];
+
+        let (trampoline, skipped) = patch_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+
+        assert!(skipped.is_empty());
+        assert_eq!(code[0], 0xe9);
+        assert!(
+            trampoline.starts_with(&[0x49, 0x89, 0xca, 0x48, 0x8d, 0x0d, 0x06, 0x00, 0x00, 0x00,])
+        );
+    }
 }
