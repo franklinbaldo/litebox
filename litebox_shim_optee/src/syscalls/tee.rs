@@ -172,9 +172,11 @@ impl Task {
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
-        ret_orig
-            .write_at_offset(0, TeeOrigin::Tee)
-            .ok_or(TeeResult::AccessDenied)?;
+        if ret_orig.as_usize() != 0 {
+            ret_orig
+                .write_at_offset(0, TeeOrigin::Tee)
+                .ok_or(TeeResult::AccessDenied)?;
+        }
         if is_pta(&ta_uuid, &usr_params) {
             // `open_ta_session` syscall lets a user-mode TA open a session to a PTA which provides
             // several import services (it works as a proxy for extra system calls).
@@ -214,7 +216,7 @@ impl Task {
         ta_sess_id: u32,
         _cancel_req_to: u32,
         cmd_id: u32,
-        params: UteeParams,
+        params: &mut UteeParams,
         ret_orig: UserMutPtr<TeeOrigin>,
     ) -> Result<(), TeeResult> {
         // `cancel_req_to` is a timeout value. Ignore it for now.
@@ -223,7 +225,7 @@ impl Task {
             .ok_or(TeeResult::AccessDenied)?;
         if is_pta_session(ta_sess_id) {
             // TODO: check whether `ta_sess_id` is associated with the system PTA.
-            self.handle_system_pta_command(cmd_id, &params)
+            self.handle_system_pta_command(cmd_id, params)
         } else {
             #[cfg(debug_assertions)]
             todo!("support inter TA interaction");

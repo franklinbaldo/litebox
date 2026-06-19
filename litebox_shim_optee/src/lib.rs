@@ -459,8 +459,19 @@ impl Task {
                 params,
                 ret_orig,
             } => {
-                if let Some(params) = params.read_at_offset(0) {
-                    self.sys_invoke_ta_command(ta_sess_id, cancel_req_to, cmd_id, params, ret_orig)
+                if let Some(mut utee_params) = params.read_at_offset(0) {
+                    self.sys_invoke_ta_command(
+                        ta_sess_id,
+                        cancel_req_to,
+                        cmd_id,
+                        &mut utee_params,
+                        ret_orig,
+                    )
+                    .and_then(|()| {
+                        params
+                            .write_at_offset(0, utee_params)
+                            .ok_or(TeeResult::AccessDenied)
+                    })
                 } else {
                     Err(TeeResult::BadParameters)
                 }

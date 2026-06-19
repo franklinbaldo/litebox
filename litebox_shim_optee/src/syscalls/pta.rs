@@ -8,12 +8,13 @@ use crate::{Task, UserConstPtr, UserMutPtr};
 use alloc::vec;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
+use litebox::mm::linux::PAGE_SIZE;
 use litebox::platform::{
     DerivedKeyError, DerivedKeyProvider, KDFParams, RawConstPointer as _, RawMutPointer as _,
 };
 use litebox::utils::TruncateExt;
 use litebox_common_optee::{
-    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, TeeParamType, TeeResult, TeeUuid, UteeParams,
+    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, TeeParamType, TeeResult, TeeUuid, UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;
@@ -99,12 +100,13 @@ impl Task {
     pub fn handle_system_pta_command(
         &self,
         cmd_id: u32,
-        params: &UteeParams,
+        params: &mut UteeParams,
     ) -> Result<(), TeeResult> {
-        #[allow(clippy::single_match_else)]
         match PtaSystemCommandId::try_from(cmd_id).map_err(|_| TeeResult::BadParameters)? {
             PtaSystemCommandId::DeriveTaUniqueKey => self.derive_ta_unique_key(params),
             PtaSystemCommandId::DeriveTaSvnKeyStack => self.derive_ta_svn_key_stack(params),
+            PtaSystemCommandId::MapZi => self.system_map_zi(params),
+            PtaSystemCommandId::Unmap => self.system_unmap(params),
             _ => {
                 #[cfg(debug_assertions)]
                 todo!("support other system PTA commands {cmd_id}");
@@ -112,6 +114,70 @@ impl Task {
                 Err(TeeResult::NotSupported)
             }
         }
+    }
+
+    fn system_map_zi(&self, params: &mut UteeParams) -> Result<(), TeeResult> {
+        use TeeParamType::{None, ValueInout, ValueInput};
+
+        if !params.has_types([ValueInput, ValueInout, ValueInput, None]) {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (num_bytes_u64, flags_u64) = params
+            .get_values(0)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let (addr_hi, addr_lo) = params
+            .get_values(1)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let (pad_begin_u64, pad_end_u64) = params
+            .get_values(2)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+
+        let mut addr = ((addr_hi << 32) | addr_lo).trunc();
+        self.sys_map_zi(
+            UserMutPtr::<usize>::from_usize((&mut addr as *mut usize) as usize),
+            num_bytes_u64.trunc(),
+            pad_begin_u64.trunc(),
+            pad_end_u64.trunc(),
+            LdelfMapFlags::from_bits_truncate(flags_u64.trunc()),
+        )?;
+
+        params
+            .set_values(1, (addr as u64) >> 32, (addr as u64) & 0xffff_ffff)
+            .map_err(|_| TeeResult::BadParameters)?;
+        Ok(())
+    }
+
+    fn system_unmap(&self, params: &UteeParams) -> Result<(), TeeResult> {
+        use TeeParamType::{None, ValueInput};
+
+        if !params.has_types([ValueInput, ValueInput, None, None]) {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (size_u64, must_be_zero) = params
+            .get_values(0)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        if must_be_zero != 0 {
+            return Err(TeeResult::BadParameters);
+        }
+
+        let (addr_hi, addr_lo) = params
+            .get_values(1)
+            .map_err(|_| TeeResult::BadParameters)?
+            .ok_or(TeeResult::BadParameters)?;
+        let addr = ((addr_hi << 32) | addr_lo).trunc();
+        let size: usize = size_u64.trunc();
+        let size = size
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(TeeResult::BadParameters)?;
+
+        self.sys_munmap(UserMutPtr::<u8>::from_usize(addr), size)
+            .map_err(|_| TeeResult::BadParameters)
     }
 
     /// Derives a unique key for a TA using HUK.
@@ -201,7 +267,7 @@ impl Task {
             .get_values(0)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let key_size: usize = key_size_u64.truncate();
+        let key_size: usize = key_size_u64.trunc();
         let svn_key_stack_size =
             u32::try_from(svn_key_stack_size_u64).map_err(|_| TeeResult::BadParameters)?;
 
@@ -209,13 +275,13 @@ impl Task {
             .get_values(1)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let extra_data_size: usize = extra_data_size_u64.truncate();
+        let extra_data_size: usize = extra_data_size_u64.trunc();
 
         let (key_stack_addr, key_stack_buffer_size_u64) = params
             .get_values(2)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let key_stack_buffer_size: usize = key_stack_buffer_size_u64.truncate();
+        let key_stack_buffer_size: usize = key_stack_buffer_size_u64.trunc();
 
         if !(TA_DERIVED_KEY_MIN_SIZE..=TA_DERIVED_KEY_MAX_SIZE).contains(&key_size)
             || extra_data_size > TA_DERIVED_EXTRA_DATA_MAX_SIZE
@@ -238,7 +304,7 @@ impl Task {
         let extra_data = if extra_data_size == 0 {
             Vec::new().into_boxed_slice()
         } else {
-            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.truncate());
+            let extra_data_ptr = UserConstPtr::<u8>::from_usize(extra_data_addr.trunc());
             extra_data_ptr
                 .to_owned_slice(extra_data_size)
                 .ok_or(TeeResult::BadParameters)?
@@ -247,7 +313,7 @@ impl Task {
         // Unlike OP-TEE OS, `UserMutPtr` (and `UserConstPtr`) in LiteBox ensure this
         // pointer can never be used to access normal-world memory. That is, we don't
         // need extra security check for detecting key leakage here.
-        let key_stack_ptr = UserMutPtr::<u8>::from_usize(key_stack_addr.truncate());
+        let key_stack_ptr = UserMutPtr::<u8>::from_usize(key_stack_addr.trunc());
 
         // First stage: derive base key = KDF(huk, usage || ta_uuid || extra data)
         let uuid_bytes = self.ta_app_id.to_le_bytes();
