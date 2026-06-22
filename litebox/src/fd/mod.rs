@@ -36,6 +36,30 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Self { entries: vec![] }
     }
 
+    /// Duplicate an entry at the given raw slot index into a new slot, returning
+    /// a new [`OwnedFd`] for the new slot.
+    ///
+    /// The new slot shares the underlying `DescriptorEntry` (via `Arc::clone`)
+    /// with the source slot. This is used by child process creation to give
+    /// each process independent slots that share the same open file descriptions.
+    ///
+    /// Returns `None` if the source fd is already closed.
+    fn duplicate_slot(&mut self, source: &OwnedFd) -> Option<OwnedFd> {
+        let src_idx = source.as_usize()?;
+        let shared_entry = Arc::clone(&self.entries[src_idx].as_ref().unwrap().x);
+        let idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries.push(None);
+                self.entries.len() - 1
+            });
+        let old = self.entries[idx].replace(IndividualEntry::new(shared_entry));
+        assert!(old.is_none());
+        Some(OwnedFd::new(idx))
+    }
+
     /// Insert `entry` into the descriptor table, returning an `OwnedFd` to this entry.
     #[expect(
         clippy::missing_panics_doc,
@@ -105,8 +129,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 
     /// Removes the entry at `fd`, closing out the file descriptor.
     ///
-    /// Returns the descriptor entry if it is unique (i.e., it was not duplicated, or all duplicates
-    /// have been cleared out) AND no other process holds a fork reference to this slot.
+    /// Returns the descriptor entry if this was the last reference (i.e., no
+    /// other slots share the same entry via dup or child process inheritance).
     ///
     /// If the `fd` was already closed out, then (obviously) it does not return an entry.
     #[expect(
@@ -118,30 +142,24 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         fd: &TypedFd<Subsystem>,
     ) -> Option<Subsystem::Entry> {
         let idx = fd.x.as_usize()?;
-        let entry = self.entries[idx].as_mut().unwrap();
-        fd.x.mark_as_closed();
-
-        assert!(entry.process_refcount > 0);
-        entry.process_refcount -= 1;
-        if entry.process_refcount > 0 {
-            // Another process still references this slot — don't remove the entry.
-            return None;
-        }
-
-        // Last fork reference — truly vacate the slot.
         let old = self.entries[idx].take().unwrap();
+        fd.x.mark_as_closed();
         Arc::into_inner(old.x)
             .map(RwLock::into_inner)
             .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
     }
 
-    /// Close the provided `fd`, and remove the corresponding entry if it is unique.
-    /// If not unique, duplicate the `fd` for future closure.
+    /// Close the provided `fd`, removing its slot from the descriptor table.
     ///
     /// This method takes a closure `can_close_immediately` that is called with the entry to determine
     /// whether the file descriptor can be closed immediately. This allows the caller to implement
     /// custom logic (e.g., checking for pending data) before allowing the close to proceed.
-    pub(crate) fn close_and_duplicate_if_shared<
+    ///
+    /// When other references exist (from dup or child process inheritance), the
+    /// slot is freed without teardown — the entry remains alive via the other
+    /// reference's slot. The `Deferred` result is only returned when this is the
+    /// last reference AND `can_close_immediately` returns false.
+    pub(crate) fn close_and_remove<
         Subsystem: FdEnabledSubsystem,
         F: FnOnce(&Subsystem::Entry) -> bool,
     >(
@@ -150,42 +168,31 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         can_close_immediately: F,
     ) -> Option<CloseResult<Subsystem>> {
         let idx = fd.x.as_usize()?;
-        let entry = self.entries[idx].as_mut().unwrap();
+        let entry = self.entries[idx].as_ref().unwrap();
 
-        // If another process holds a fork reference, just decrement and don't truly close.
-        assert!(entry.process_refcount > 0);
-        if entry.process_refcount > 1 {
-            fd.x.mark_as_closed();
-            entry.process_refcount -= 1;
-            return Some(CloseResult::SharedDecremented);
+        // Only check pending data when we're the last reference.
+        // If other refs exist, they'll keep the entry alive after we release our slot.
+        if Arc::strong_count(&entry.x) == 1
+            && !can_close_immediately(entry.x.read().as_subsystem::<Subsystem>())
+        {
+            // Last ref, pending data — keep entry in slot for later polling.
+            return Some(CloseResult::Deferred);
         }
 
-        // process_refcount == 1: this is the last process. Proceed with normal close logic.
+        // Always remove the slot.
         let old = self.entries[idx].take().unwrap();
-        if Arc::strong_count(&old.x) == 1 {
-            // Unique, so we can just return it if allowed.
-            if can_close_immediately(old.x.read().as_subsystem::<Subsystem>()) {
-                fd.x.mark_as_closed();
-                let entry = Arc::into_inner(old.x)
-                    .map(RwLock::into_inner)
-                    .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
-                    .unwrap();
+        fd.x.mark_as_closed();
+
+        match Arc::into_inner(old.x) {
+            Some(rwlock) => {
+                // Last reference — extract entry for teardown.
+                let entry = RwLock::into_inner(rwlock).into_subsystem_entry::<Subsystem>();
                 Some(CloseResult::Closed(entry))
-            } else {
-                // Put it back
-                let old = self.entries[idx].replace(old);
-                assert!(old.is_none());
-                Some(CloseResult::Deferred)
             }
-        } else {
-            fd.x.mark_as_closed();
-            // Shared (via dup), so we need to duplicate it.
-            let old = self.entries[idx].replace(old);
-            assert!(old.is_none());
-            Some(CloseResult::Duplicated(TypedFd {
-                _phantom: PhantomData,
-                x: OwnedFd::new(idx),
-            }))
+            None => {
+                // Other references exist (dup or child). Slot freed, done.
+                Some(CloseResult::Released)
+            }
         }
     }
 
@@ -210,26 +217,23 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     ) -> Vec<Subsystem::Entry> {
         // Each FD corresponds to an `IndividualEntry`, which has an Arc to a `DescriptorEntry`. If
         // we have the same number of FDs as matching to the strong-count of a descriptor entry,
-        // AND the slot has process_refcount == 1 (no other process references it),
         // then it must be the case that we have everything needed to close the entries out.
         let removable_entries: Vec<*const RwLock<_, _>> = {
-            let mut strong_count_and_count = HashMap::<*const _, (usize, usize, bool)>::new();
+            let mut strong_count_and_count = HashMap::<*const _, (usize, usize)>::new();
             for fd in fds.iter() {
                 let entry = &self.entries[fd.x.as_usize().unwrap()];
                 // It would not be "incorrect" to see a closed out entry, but as it currently stands, I
                 // believe that we'll only see alive entries, so this `unwrap` is confirming that; if we
                 // need to expand it out, we'd simply have a `continue` here.
                 let entry = entry.as_ref().unwrap();
-                let has_shared_refs = entry.process_refcount > 1;
                 let record = strong_count_and_count
                     .entry(Arc::as_ptr(&entry.x))
-                    .or_insert((Arc::strong_count(&entry.x), 0, false));
+                    .or_insert((Arc::strong_count(&entry.x), 0));
                 record.1 += 1;
-                record.2 |= has_shared_refs;
             }
             strong_count_and_count
                 .into_iter()
-                .filter(|(_ptr, (sc, c, has_fork))| sc == c && !has_fork)
+                .filter(|(_ptr, (sc, c))| sc == c)
                 .map(|(ptr, _)| ptr)
                 .collect()
         };
@@ -579,17 +583,15 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     }
 }
 
-/// Result of a [`Descriptors::close_and_duplicate_if_shared`] operation
+/// Result of a [`Descriptors::close_and_remove`] operation
 pub(crate) enum CloseResult<Subsystem: FdEnabledSubsystem> {
     /// The FD was the last reference and has been closed, returning the entry
     Closed(Subsystem::Entry),
-    /// There are other references, so a new duplicate was created for queued closure
-    Duplicated(TypedFd<Subsystem>),
     /// The FD was unique but couldn't be closed immediately (e.g., due to pending data)
     Deferred,
-    /// Another process still holds a reference to this slot. The process_refcount
-    /// was decremented and the FD was marked closed; no further action needed.
-    SharedDecremented,
+    /// Other references exist (via dup or child process inheritance).
+    /// The slot was freed; the entry remains alive via other slots.
+    Released,
 }
 
 /// Safe(r) conversions between safely-typed file descriptors and unsafely-typed integers.
@@ -725,17 +727,17 @@ impl RawDescriptorStorage {
     }
 
     /// Clone this FD table for a child process, optionally selecting which raw FD
-    /// indices to inherit, and increment the process reference counts in the
-    /// provided [`Descriptors`] for all inherited slots.
+    /// indices to inherit.
     ///
     /// - `inherit = None` — inherit all open FDs (bulk inheritance).
     /// - `inherit = Some(fds)` — inherit only the listed raw FD indices (selective
     ///   inheritance). Indices not present in the slice are skipped.
     /// - `inherit = Some(&[])` — inherit nothing (child gets an empty FD table).
     ///
-    /// Each slot in the new storage gets a **new, independent** `OwnedFd`
-    /// (with the same raw index as the parent's), avoiding shared `AtomicBool`
-    /// poisoning when either process closes the FD independently.
+    /// For each inherited FD, a new slot is created in the [`Descriptors`] table
+    /// (via [`Descriptors::duplicate_slot`]), sharing the underlying entry via
+    /// `Arc::clone`. The child's FD table points to these new slots, so parent
+    /// and child can close FDs independently.
     #[must_use]
     #[expect(
         clippy::missing_panics_doc,
@@ -752,16 +754,11 @@ impl RawDescriptorStorage {
                 if inherit.is_some_and(|fds| !fds.contains(&fd_index)) {
                     return None;
                 }
-                let raw = stored
-                    .x
-                    .as_usize()
+                let new_owned = descriptors
+                    .duplicate_slot(&stored.x)
                     .expect("FD should not be closed during child creation");
-                let entry = descriptors.entries[raw]
-                    .as_mut()
-                    .expect("child creation: descriptor slot must exist");
-                entry.process_refcount += 1;
                 Some(StoredFd {
-                    x: Arc::new(OwnedFd::new(raw)),
+                    x: Arc::new(new_owned),
                     subsystem_entry_type_id: stored.subsystem_entry_type_id,
                 })
             });
@@ -907,9 +904,6 @@ pub enum MetadataError {
 struct IndividualEntry<Platform: RawSyncPrimitivesProvider> {
     x: Arc<RwLock<Platform, DescriptorEntry>>,
     metadata: AnyMap,
-    /// Number of processes referencing this slot (incremented on fork, decremented on close).
-    /// Starts at 1 when created or duplicated. When this reaches 0, the slot is truly vacated.
-    process_refcount: usize,
 }
 impl<Platform: RawSyncPrimitivesProvider> core::ops::Deref for IndividualEntry<Platform> {
     type Target = Arc<RwLock<Platform, DescriptorEntry>>;
@@ -922,7 +916,6 @@ impl<Platform: RawSyncPrimitivesProvider> IndividualEntry<Platform> {
         Self {
             x,
             metadata: AnyMap::new(),
-            process_refcount: 1,
         }
     }
 }

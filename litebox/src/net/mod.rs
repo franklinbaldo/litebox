@@ -834,7 +834,7 @@ where
         let mut dt = self.litebox.descriptor_table_mut();
         // We close immediately if we can
         match dt
-            .close_and_duplicate_if_shared(fd, |entry| {
+            .close_and_remove(fd, |entry| {
                 match behavior {
                     CloseBehavior::Immediate => {
                         let socket_handle = &entry.entry;
@@ -869,14 +869,8 @@ where
                 drop(dt);
                 self.close_handle(socket_handle.entry);
             }
-            super::fd::CloseResult::Duplicated(dup_fd) => {
-                // It seems like there might be other duplicates around (e.g., due to `dup`), so we
-                // can't immediately close it out.
-                // We attempt to queue it for future closure and then just return.
-                self.queued_for_closure.push(dup_fd);
-            }
-            super::fd::CloseResult::SharedDecremented => {
-                // Another process still holds a reference. Our close is done.
+            super::fd::CloseResult::Released => {
+                // Other references exist (dup or child). Slot freed, done.
             }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)

@@ -78,10 +78,9 @@ impl<FS: ShimFS> FilesState<FS> {
 
     /// Clone the file descriptor table for fork.
     ///
-    /// The child gets its own `RawDescriptorStorage` with independent `OwnedFd`
-    /// instances (so close in the child does not poison the parent's FDs).
-    /// The underlying open file descriptions are shared via Arc in the global
-    /// descriptor table, tracked by `process_refcount`.
+    /// The child gets its own `RawDescriptorStorage` with independent slots
+    /// in the descriptor table (so close in the child does not affect the
+    /// parent's FDs). The underlying open file descriptions are shared via Arc.
     pub(crate) fn clone_for_fork(
         &self,
         descriptors: &mut litebox::fd::Descriptors<Platform>,

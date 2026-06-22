@@ -854,7 +854,7 @@ impl<FS: ShimFS> Task<FS> {
             .next_thread_id
             .fetch_max(child_pid.saturating_add(1), Ordering::Relaxed);
 
-        // Clone the FD table for the child, incrementing process_refcounts in the global descriptor table.
+        // Clone the FD table for the child, creating new slots in the global descriptor table.
         let child_files = {
             let mut dt = self.global.litebox.descriptor_table_mut();
             Arc::new(self.files.borrow().clone_for_fork(&mut dt))

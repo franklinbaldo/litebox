@@ -6,10 +6,10 @@ use alloc::string::ToString as _;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::LiteBox;
 use crate::fd::FdEnabledSubsystemEntry;
 use crate::fd::{ErrRawIntFd, FdEnabledSubsystem, TypedFd};
 use crate::platform::mock::MockPlatform;
+use crate::LiteBox;
 
 struct MockSubsystem;
 impl FdEnabledSubsystem for MockSubsystem {
