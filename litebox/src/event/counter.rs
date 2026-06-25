@@ -142,18 +142,18 @@ where
     }
 
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
-        match self
+        let response = self
             .broker
             .request(BrokerRequest::Event(request))
             .map_err(BrokerObjectError::from)
-            .map_err(|error| self.handle_request_error(error))?
-        {
-            BrokerResponse::Event(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(self.handle_request_error(error.into())),
-            response @ BrokerResponse::ObjectClosed => {
-                panic!("broker returned unexpected event response: {response:?}")
-            }
+            .map_err(|error| self.handle_request_error(error))?;
+        if let BrokerResponse::Error(error) = response {
+            return Err(self.handle_request_error(error.into()));
         }
+        let BrokerResponse::Event(response) = response else {
+            panic!("broker returned unexpected event response: {response:?}");
+        };
+        Ok(response)
     }
 
     fn handle_request_error(&self, error: BrokerObjectError) -> BrokerObjectError {
