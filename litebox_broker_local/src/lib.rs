@@ -43,12 +43,17 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// response that does not match the negotiation request.
     pub fn negotiate(mut channel: Channel) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
-        match raw_handshake_request(
-            &mut channel,
-            BrokerHandshakeRequest::Negotiate {
-                protocol_version: requested,
-            },
-        )? {
+        let request = BrokerHandshakeRequest::Negotiate {
+            protocol_version: requested,
+        };
+        channel
+            .send_handshake_request(&request)
+            .map_err(BrokerLocalError::Channel)?;
+        match channel
+            .recv_handshake_response()
+            .map_err(BrokerLocalError::Channel)?
+            .ok_or(BrokerLocalError::ChannelClosed)?
+        {
             response @ BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
             } => {
@@ -81,7 +86,15 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match an active request.
     pub fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, Channel::Error> {
-        match raw_request(&mut self.channel, request)? {
+        self.channel
+            .send_request(&request)
+            .map_err(BrokerLocalError::Channel)?;
+        match self
+            .channel
+            .recv_response()
+            .map_err(BrokerLocalError::Channel)?
+            .ok_or(BrokerLocalError::ChannelClosed)?
+        {
             BrokerResponse::Error(error) => match error {
                 ErrorCode::PolicyDenied
                 | ErrorCode::UnknownObject
@@ -98,32 +111,6 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             response @ BrokerResponse::Event(_) => Ok(response),
         }
     }
-}
-
-fn raw_handshake_request<Channel: LocalControlChannel>(
-    channel: &mut Channel,
-    request: BrokerHandshakeRequest,
-) -> Result<BrokerHandshakeResponse, Channel::Error> {
-    channel
-        .send_handshake_request(&request)
-        .map_err(BrokerLocalError::Channel)?;
-    channel
-        .recv_handshake_response()
-        .map_err(BrokerLocalError::Channel)?
-        .ok_or(BrokerLocalError::ChannelClosed)
-}
-
-fn raw_request<Channel: LocalControlChannel>(
-    channel: &mut Channel,
-    request: BrokerRequest,
-) -> Result<BrokerResponse, Channel::Error> {
-    channel
-        .send_request(&request)
-        .map_err(BrokerLocalError::Channel)?;
-    channel
-        .recv_response()
-        .map_err(BrokerLocalError::Channel)?
-        .ok_or(BrokerLocalError::ChannelClosed)
 }
 
 #[cfg(test)]
