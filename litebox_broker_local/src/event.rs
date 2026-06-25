@@ -84,13 +84,9 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     }
 
     fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
-        let response = self.request(BrokerRequest::Event(request))?;
-        if let BrokerResponse::Error(error) = response {
-            return Err(BrokerLocalError::Broker(error));
+        match self.request(BrokerRequest::Event(request))? {
+            BrokerResponse::Event(response) => Ok(response),
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
         }
-        let BrokerResponse::Event(response) = response else {
-            panic!("broker returned unexpected event response: {response:?}");
-        };
-        Ok(response)
     }
 }

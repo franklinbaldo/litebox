@@ -111,10 +111,6 @@ where
 fn handle_request(session: &BrokerSession, request: BrokerRequest) -> BrokerResponse {
     match request {
         BrokerRequest::Event(request) => handle_event_request(session, request),
-        BrokerRequest::CloseObject(handle) => match session.close_object_reference(handle) {
-            Ok(()) => BrokerResponse::ObjectClosed,
-            Err(error) => BrokerResponse::Error(error.into()),
-        },
     }
 }
 

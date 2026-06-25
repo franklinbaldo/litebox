@@ -4,7 +4,6 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::error::ErrorCode;
 pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest, ReadinessState,
@@ -142,18 +141,15 @@ where
     }
 
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
-        let response = self
+        match self
             .broker
             .request(BrokerRequest::Event(request))
             .map_err(BrokerObjectError::from)
-            .map_err(|error| self.handle_request_error(error))?;
-        if let BrokerResponse::Error(error) = response {
-            return Err(self.handle_request_error(error.into()));
+            .map_err(|error| self.handle_request_error(error))?
+        {
+            BrokerResponse::Event(response) => Ok(response),
+            BrokerResponse::Error(error) => Err(self.handle_request_error(error.into())),
         }
-        let BrokerResponse::Event(response) = response else {
-            panic!("broker returned unexpected event response: {response:?}");
-        };
-        Ok(response)
     }
 
     fn handle_request_error(&self, error: BrokerObjectError) -> BrokerObjectError {
@@ -192,29 +188,5 @@ where
             events |= Events::OUT;
         }
         events
-    }
-}
-
-impl<Platform> Drop for EventCounter<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + TimeProvider,
-{
-    fn drop(&mut self) {
-        let result = match self.broker.request(BrokerRequest::CloseObject(self.handle)) {
-            Ok(BrokerResponse::ObjectClosed) => Ok(()),
-            Ok(BrokerResponse::Error(error)) => Err(match error {
-                ErrorCode::UnknownObject | ErrorCode::InvalidRights => {
-                    BrokerObjectError::InvalidObject
-                }
-                ErrorCode::WouldBlock => BrokerObjectError::WouldBlock,
-                ErrorCode::ResourceExhausted => BrokerObjectError::ResourceExhausted,
-                ErrorCode::PolicyDenied => BrokerObjectError::PermissionDenied,
-                _ => BrokerObjectError::Control,
-            }),
-            Ok(BrokerResponse::Event(_)) | Err(_) => Err(BrokerObjectError::Control),
-        };
-        if let Err(error) = result {
-            litebox_util_log::warn!("failed to close broker event counter: {error:?}");
-        }
     }
 }
