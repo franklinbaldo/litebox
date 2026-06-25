@@ -398,9 +398,7 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         let request = self.inner.recv_request()?;
         if matches!(
             request,
-            Some(litebox_broker_protocol::message::BrokerRequest::Core(
-                litebox_broker_protocol::message::CoreRequest::Event(_)
-            ))
+            Some(litebox_broker_protocol::message::BrokerRequest::Event(_))
         ) {
             self.event_request_count += 1;
         }

@@ -20,7 +20,7 @@ use litebox_broker_protocol::channel::{HostControlChannel, PeerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
 use litebox_broker_protocol::message::{
-    BrokerRequest, BrokerResponse, CoreRequest, CoreResponse, EventRequest, EventResponse,
+    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
 };
 
 mod error;
@@ -97,7 +97,7 @@ fn handle_request(
                     }
                 }
             }
-            BrokerRequest::Core(_) => BrokerDispatch {
+            BrokerRequest::Event(_) => BrokerDispatch {
                 response: BrokerResponse::Error(ErrorCode::ProtocolState),
                 outcome: DispatchOutcome::Close(CloseReason::ProtocolViolation),
             },
@@ -112,7 +112,7 @@ fn handle_active_request(session: &BrokerSession, request: BrokerRequest) -> Bro
             response: BrokerResponse::Error(ErrorCode::ProtocolState),
             outcome: DispatchOutcome::Close(CloseReason::ProtocolViolation),
         },
-        BrokerRequest::Core(CoreRequest::Event(request)) => BrokerDispatch {
+        BrokerRequest::Event(request) => BrokerDispatch {
             response: handle_event_request(session, request),
             outcome: DispatchOutcome::Continue,
         },
@@ -123,33 +123,31 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
     match request {
         EventRequest::Create(request) => {
             match litebox_broker_core::event::create(session, request.initial_count) {
-                Ok(handle) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(
-                    CreateEventResponse { handle },
-                ))),
+                Ok(handle) => {
+                    BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }))
+                }
                 Err(error) => BrokerResponse::Error(error.into()),
             }
         }
         EventRequest::Wait(request) => {
             match litebox_broker_core::event::wait(session, request.handle) {
-                Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Wait(
-                    WaitEventResponse { readiness },
-                ))),
+                Ok(readiness) => {
+                    BrokerResponse::Event(EventResponse::Wait(WaitEventResponse { readiness }))
+                }
                 Err(error) => BrokerResponse::Error(error.into()),
             }
         }
         EventRequest::Add(request) => {
             match litebox_broker_core::event::add(session, request.handle, request.value) {
-                Ok(readiness) => BrokerResponse::Core(CoreResponse::Event(EventResponse::Add(
-                    AddEventResponse { readiness },
-                ))),
+                Ok(readiness) => {
+                    BrokerResponse::Event(EventResponse::Add(AddEventResponse { readiness }))
+                }
                 Err(error) => BrokerResponse::Error(error.into()),
             }
         }
         EventRequest::Consume(request) => {
             match litebox_broker_core::event::consume(session, request.handle, request.mode) {
-                Ok(consumption) => {
-                    BrokerResponse::Core(CoreResponse::Event(EventResponse::Consume(consumption)))
-                }
+                Ok(consumption) => BrokerResponse::Event(EventResponse::Consume(consumption)),
                 Err(error) => BrokerResponse::Error(error.into()),
             }
         }
@@ -238,9 +236,7 @@ mod tests {
             }
         );
         let handle = match &channel.responses[1] {
-            BrokerResponse::Core(CoreResponse::Event(EventResponse::Create(response))) => {
-                response.handle
-            }
+            BrokerResponse::Event(EventResponse::Create(response)) => response.handle,
             response => panic!("unexpected response: {response:?}"),
         };
         assert_ne!(handle.0, 0);
@@ -281,7 +277,7 @@ mod tests {
     }
 
     const fn event_request(request: EventRequest) -> BrokerRequest {
-        BrokerRequest::Core(CoreRequest::Event(request))
+        BrokerRequest::Event(request)
     }
 
     const fn event_create_request(initial_count: u64) -> BrokerRequest {

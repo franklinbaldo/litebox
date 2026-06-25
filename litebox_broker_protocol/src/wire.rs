@@ -6,15 +6,14 @@
 //! The wire codec mirrors the protocol DTO hierarchy:
 //! - this module owns public encode/decode entry points and top-level broker
 //!   envelope tags;
-//! - `core_message` owns `CoreRequest`/`CoreResponse` family tags;
 //! - object-family modules such as `event` own their operation and nested value
 //!   tags;
 //! - `primitive` owns shared scalar/value encoders.
 //!
-//! New object families should add a core family tag and a private family codec
-//! module instead of adding flat helpers here. Existing payloads are positional;
-//! changing fields is an ABI change, so prefer a new operation tag or explicit
-//! negotiated-version gate for payload evolution.
+//! New object families should add a top-level broker message tag and a private
+//! family codec module instead of adding flat helpers here. Existing payloads
+//! are positional; changing fields is an ABI change, so prefer a new operation
+//! tag or explicit negotiated-version gate for payload evolution.
 
 use alloc::vec::Vec;
 use thiserror::Error;
@@ -24,15 +23,14 @@ use crate::message::{BrokerRequest, BrokerResponse};
 
 use primitive::{Decoder, Encoder};
 
-mod core_message;
 mod event;
 mod primitive;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
-const REQUEST_TAG_CORE: u8 = 1;
+const REQUEST_TAG_EVENT: u8 = 1;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
-const RESPONSE_TAG_CORE: u8 = 1;
+const RESPONSE_TAG_EVENT: u8 = 1;
 const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
 
@@ -63,9 +61,9 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.u8(REQUEST_TAG_NEGOTIATE);
             encoder.protocol_version(protocol_version);
         }
-        BrokerRequest::Core(request) => {
-            encoder.u8(REQUEST_TAG_CORE);
-            core_message::encode_core_request(&mut encoder, request);
+        BrokerRequest::Event(request) => {
+            encoder.u8(REQUEST_TAG_EVENT);
+            event::encode_event_request(&mut encoder, request);
         }
     }
     encoder.finish()
@@ -79,7 +77,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_NEGOTIATE => BrokerRequest::Negotiate {
             protocol_version: decoder.protocol_version()?,
         },
-        REQUEST_TAG_CORE => BrokerRequest::Core(core_message::decode_core_request(&mut decoder)?),
+        REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -105,9 +103,9 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_VERSION_MISMATCH);
             encoder.protocol_version(broker_protocol_version);
         }
-        BrokerResponse::Core(response) => {
-            encoder.u8(RESPONSE_TAG_CORE);
-            core_message::encode_core_response(&mut encoder, response);
+        BrokerResponse::Event(response) => {
+            encoder.u8(RESPONSE_TAG_EVENT);
+            event::encode_event_response(&mut encoder, response);
         }
         BrokerResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -128,9 +126,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_VERSION_MISMATCH => BrokerResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_CORE => {
-            BrokerResponse::Core(core_message::decode_core_response(&mut decoder)?)
-        }
+        RESPONSE_TAG_EVENT => BrokerResponse::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResponse::Error(error)
@@ -149,7 +145,7 @@ mod tests {
         CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
         WaitEventResponse,
     };
-    use crate::message::{CoreRequest, CoreResponse, EventRequest, EventResponse};
+    use crate::message::{EventRequest, EventResponse};
     use crate::{ObjectHandle, ProtocolVersion};
 
     #[test]
@@ -262,7 +258,7 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
-            decode_response(&[1, 0, 1, 0xff]),
+            decode_response(&[1, 1, 0xff]),
             Err(WireError::InvalidBoolean)
         );
         assert_eq!(
@@ -270,14 +266,14 @@ mod tests {
             Err(WireError::InvalidTag)
         );
 
-        let mut invalid_bool = [1, 0, 2, 2, 0];
+        let mut invalid_bool = [1, 2, 2, 0];
         assert_eq!(
             decode_response(&invalid_bool),
             Err(WireError::InvalidBoolean)
         );
 
+        invalid_bool[2] = 1;
         invalid_bool[3] = 1;
-        invalid_bool[4] = 1;
         let mut frame = invalid_bool.to_vec();
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
@@ -292,7 +288,7 @@ mod tests {
                     write_ready: false,
                 },
             }))),
-            [1, 0, 2, 1, 0]
+            [1, 2, 1, 0]
         );
     }
 
@@ -301,10 +297,10 @@ mod tests {
     }
 
     const fn event_request(request: EventRequest) -> BrokerRequest {
-        BrokerRequest::Core(CoreRequest::Event(request))
+        BrokerRequest::Event(request)
     }
 
     const fn event_response(response: EventResponse) -> BrokerResponse {
-        BrokerResponse::Core(CoreResponse::Event(response))
+        BrokerResponse::Event(response)
     }
 }

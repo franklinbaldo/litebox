@@ -18,7 +18,9 @@ mod event;
 use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse, CoreRequest, CoreResponse};
+use litebox_broker_protocol::message::{
+    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -69,21 +71,21 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unexpected negotiation error: {error}"),
             },
-            response @ BrokerResponse::Core(_) => {
+            response @ BrokerResponse::Event(_) => {
                 panic!("broker returned unexpected negotiation response: {response:?}")
             }
         }
     }
 
-    /// Sends one active BrokerCore request.
+    /// Sends one active event request.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
-    /// response that does not match an active core request.
-    pub fn request(&mut self, request: CoreRequest) -> Result<CoreResponse, Channel::Error> {
-        match raw_request(&mut self.channel, BrokerRequest::Core(request))? {
-            BrokerResponse::Core(response) => Ok(response),
+    /// response that does not match an active event request.
+    pub fn request(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
+        match raw_request(&mut self.channel, BrokerRequest::Event(request))? {
+            BrokerResponse::Event(response) => Ok(response),
             BrokerResponse::Error(error) => match error {
                 ErrorCode::PolicyDenied
                 | ErrorCode::UnknownObject
@@ -140,27 +142,23 @@ mod tests {
     }
 
     #[test]
-    fn active_request_sends_core_request() {
+    fn active_request_sends_event_request() {
         let handle = ObjectHandle(7);
-        let request = CoreRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
-        let response = CoreResponse::Event(EventResponse::Create(CreateEventResponse { handle }));
-        let channel = FakeControlChannel::new(Some(BrokerResponse::Core(response.clone())));
+        let request = EventRequest::Create(CreateEventRequest { initial_count: 0 });
+        let response = EventResponse::Create(CreateEventResponse { handle });
+        let channel = FakeControlChannel::new(Some(BrokerResponse::Event(response.clone())));
         let mut local = BrokerLocal { channel };
 
         assert_eq!(local.request(request.clone()).unwrap(), response);
         assert_eq!(
             local.channel.sent_request,
-            Some(BrokerRequest::Core(request))
+            Some(BrokerRequest::Event(request))
         );
     }
 
     #[test]
     fn active_request_returns_recoverable_broker_error() {
-        let request = CoreRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
+        let request = EventRequest::Create(CreateEventRequest { initial_count: 0 });
         let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::WouldBlock)));
         let mut local = BrokerLocal { channel };
 
@@ -173,9 +171,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "broker returned unrecoverable error")]
     fn active_request_panics_on_unrecoverable_broker_error() {
-        let request = CoreRequest::Event(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        }));
+        let request = EventRequest::Create(CreateEventRequest { initial_count: 0 });
         let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::Internal)));
         let mut local = BrokerLocal { channel };
 

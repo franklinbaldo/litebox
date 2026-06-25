@@ -10,9 +10,8 @@ use crate::event::{
 
 /// Broker request sent over the control channel.
 ///
-/// The outer broker request is intentionally small. Object-family and
-/// domain-specific operations are grouped below it so new object families do not
-/// accumulate as unrelated top-level broker variants.
+/// Connection-level protocol operations and broker object operation families live
+/// at this layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerRequest {
     /// Protocol negotiation request.
@@ -20,13 +19,6 @@ pub enum BrokerRequest {
         /// Required protocol version.
         protocol_version: ProtocolVersion,
     },
-    /// BrokerCore authority request.
-    Core(CoreRequest),
-}
-
-/// Request adapted by the broker host into a BrokerCore domain call.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CoreRequest {
     /// Event object request family.
     Event(EventRequest),
 }
@@ -46,9 +38,8 @@ pub enum EventRequest {
 
 /// Broker response sent over the control channel.
 ///
-/// Common connection/protocol outcomes stay at this layer. Domain payloads are
-/// grouped under [`CoreResponse`] so future object families can evolve without
-/// turning the broker envelope into a flat operation/result list.
+/// Connection-level protocol outcomes and broker object operation families live
+/// at this layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResponse {
     /// Negotiation result.
@@ -68,17 +59,10 @@ pub enum BrokerResponse {
         /// Broker protocol version supported by this endpoint.
         broker_protocol_version: ProtocolVersion,
     },
-    /// BrokerCore authority response.
-    Core(CoreResponse),
-    /// Operation failed with an ABI-neutral broker error.
-    Error(ErrorCode),
-}
-
-/// Response returned by a BrokerCore domain request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CoreResponse {
     /// Event object response family.
     Event(EventResponse),
+    /// Operation failed with an ABI-neutral broker error.
+    Error(ErrorCode),
 }
 
 /// Broker-owned event object response.
