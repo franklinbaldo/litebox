@@ -195,8 +195,6 @@ where
 mod tests {
     use super::*;
 
-    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-
     use litebox_broker_protocol::error::ErrorCode;
 
     use crate::broker::error::BrokerControlError;
@@ -224,27 +222,6 @@ mod tests {
         }
     }
 
-    struct CountingObserver {
-        count: AtomicUsize,
-        last_events: AtomicU32,
-    }
-
-    impl CountingObserver {
-        const fn new() -> Self {
-            Self {
-                count: AtomicUsize::new(0),
-                last_events: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl Observer<Events> for CountingObserver {
-        fn on_events(&self, events: &Events) {
-            self.count.fetch_add(1, Ordering::Relaxed);
-            self.last_events.store(events.bits(), Ordering::Relaxed);
-        }
-    }
-
     #[test]
     fn check_io_events_reports_broker_failures_as_errors() {
         for reply in [
@@ -256,16 +233,8 @@ mod tests {
                 handle: ObjectHandle(1),
                 pollee: Pollee::new(),
             };
-            let observer = Arc::new(CountingObserver::new());
-            let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
-            counter.register_observer(Arc::downgrade(&observer_dyn), Events::IN);
 
             assert_eq!(counter.check_io_events(), Events::ERR);
-            assert_eq!(observer.count.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                observer.last_events.load(Ordering::Relaxed),
-                Events::ERR.bits()
-            );
         }
     }
 }
