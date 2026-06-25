@@ -48,6 +48,8 @@ pub enum WireError {
     InvalidBoolean,
     #[error("invalid broker wire tag")]
     InvalidTag,
+    #[error("broker wire message is not valid in this protocol phase")]
+    WrongMessagePhase,
     #[error("broker wire offset overflow")]
     OffsetOverflow,
 }
@@ -71,6 +73,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest {
             protocol_version: decoder.protocol_version()?,
         },
+        REQUEST_TAG_EVENT => return Err(WireError::WrongMessagePhase),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -97,6 +100,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let request = match tag {
+        REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
         REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
         _ => return Err(WireError::InvalidTag),
     };
@@ -139,6 +143,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
         },
+        RESPONSE_TAG_EVENT => return Err(WireError::WrongMessagePhase),
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
@@ -176,6 +181,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let response = match tag {
+        RESPONSE_TAG_NEGOTIATED | RESPONSE_TAG_VERSION_MISMATCH => {
+            return Err(WireError::WrongMessagePhase);
+        }
         RESPONSE_TAG_EVENT => BrokerResponse::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
@@ -320,7 +328,7 @@ mod tests {
             decode_handshake_request(&encode_request(BrokerRequest::Event(EventRequest::Create(
                 CreateEventRequest { initial_count: 0 },
             )))),
-            Err(WireError::InvalidTag)
+            Err(WireError::WrongMessagePhase)
         );
         let mut frame = encode_handshake_request(BrokerHandshakeRequest {
             protocol_version: ProtocolVersion(1),
@@ -339,7 +347,7 @@ mod tests {
             decode_request(&encode_handshake_request(BrokerHandshakeRequest {
                 protocol_version: ProtocolVersion(1),
             })),
-            Err(WireError::InvalidTag)
+            Err(WireError::WrongMessagePhase)
         );
         let mut unknown_consume_mode = encode_request(BrokerRequest::Event(EventRequest::Consume(
             ConsumeEventRequest {
@@ -379,7 +387,7 @@ mod tests {
                     handle: ObjectHandle(13),
                 }),
             ))),
-            Err(WireError::InvalidTag)
+            Err(WireError::WrongMessagePhase)
         );
 
         let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
@@ -404,7 +412,7 @@ mod tests {
                     broker_protocol_version: ProtocolVersion(1),
                 },
             )),
-            Err(WireError::InvalidTag)
+            Err(WireError::WrongMessagePhase)
         );
         assert_eq!(
             decode_response(&[1, 1, 0xff]),

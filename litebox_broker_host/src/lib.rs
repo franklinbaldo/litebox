@@ -14,7 +14,7 @@ extern crate std;
 
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-use litebox_broker_protocol::channel::{HostControlChannel, PeerCredential};
+use litebox_broker_protocol::channel::{HostControlChannel, HostReceive, PeerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
 use litebox_broker_protocol::message::{
@@ -43,11 +43,20 @@ where
     let session = core.create_session(caller_credential)?;
 
     loop {
-        let Some(request) = channel
+        let request = match channel
             .recv_handshake_request()
             .map_err(BrokerHostError::Channel)?
-        else {
-            return Ok(ConnectionTermination::PeerClosed);
+        {
+            HostReceive::Message(request) => request,
+            HostReceive::ProtocolViolation => {
+                channel
+                    .send_handshake_response(&BrokerHandshakeResponse::Error(
+                        ErrorCode::ProtocolState,
+                    ))
+                    .map_err(BrokerHostError::Channel)?;
+                return Ok(ConnectionTermination::ProtocolViolation);
+            }
+            HostReceive::PeerClosed => return Ok(ConnectionTermination::PeerClosed),
         };
 
         let negotiated = request.protocol_version == BROKER_PROTOCOL_VERSION;
@@ -79,8 +88,15 @@ where
     Channel: HostControlChannel,
 {
     loop {
-        let Some(request) = channel.recv_request().map_err(BrokerHostError::Channel)? else {
-            break;
+        let request = match channel.recv_request().map_err(BrokerHostError::Channel)? {
+            HostReceive::Message(request) => request,
+            HostReceive::ProtocolViolation => {
+                channel
+                    .send_response(&BrokerResponse::Error(ErrorCode::ProtocolState))
+                    .map_err(BrokerHostError::Channel)?;
+                return Ok(ConnectionTermination::ProtocolViolation);
+            }
+            HostReceive::PeerClosed => break,
         };
 
         let response = handle_request(session, request);
@@ -139,6 +155,8 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
 pub enum ConnectionTermination {
     /// The peer cleanly closed the channel.
     PeerClosed,
+    /// The broker closed the channel after the peer violated protocol sequencing.
+    ProtocolViolation,
 }
 
 #[cfg(test)]
@@ -158,19 +176,21 @@ mod tests {
 
         serve_connection_negotiates_routes_one_request_and_returns_peer_closed(&broker);
         serve_connection_retries_after_version_mismatch(&broker);
+        serve_connection_rejects_active_request_before_negotiation(&broker);
+        serve_connection_rejects_handshake_request_after_negotiation(&broker);
         serve_connection_returns_channel_error_when_response_send_fails(&broker);
     }
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(
-            std::vec::Vec::from([Ok(Some(BrokerHandshakeRequest {
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::from([
-                Ok(Some(BrokerRequest::Event(EventRequest::Create(
-                    CreateEventRequest { initial_count: 0 },
-                )))),
-                Ok(None),
+                Ok(HostReceive::Message(BrokerRequest::Event(
+                    EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+                ))),
+                Ok(HostReceive::PeerClosed),
             ]),
         );
 
@@ -194,14 +214,14 @@ mod tests {
     fn serve_connection_retries_after_version_mismatch(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([
-                Ok(Some(BrokerHandshakeRequest {
+                Ok(HostReceive::Message(BrokerHandshakeRequest {
                     protocol_version: ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1),
                 })),
-                Ok(Some(BrokerHandshakeRequest {
+                Ok(HostReceive::Message(BrokerHandshakeRequest {
                     protocol_version: BROKER_PROTOCOL_VERSION,
                 })),
             ]),
-            std::vec::Vec::from([Ok(None)]),
+            std::vec::Vec::from([Ok(HostReceive::PeerClosed)]),
         );
 
         assert_eq!(
@@ -221,9 +241,50 @@ mod tests {
         );
     }
 
+    fn serve_connection_rejects_active_request_before_negotiation(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
+            std::vec::Vec::new(),
+        );
+
+        assert_eq!(
+            serve_connection(broker, &mut channel).unwrap(),
+            ConnectionTermination::ProtocolViolation
+        );
+        assert_eq!(
+            channel.handshake_responses,
+            [BrokerHandshakeResponse::Error(ErrorCode::ProtocolState)]
+        );
+        assert!(channel.responses.is_empty());
+    }
+
+    fn serve_connection_rejects_handshake_request_after_negotiation(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
+        );
+
+        assert_eq!(
+            serve_connection(broker, &mut channel).unwrap(),
+            ConnectionTermination::ProtocolViolation
+        );
+        assert_eq!(
+            channel.handshake_responses,
+            [BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION
+            }]
+        );
+        assert_eq!(
+            channel.responses,
+            [BrokerResponse::Error(ErrorCode::ProtocolState)]
+        );
+    }
+
     fn serve_connection_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(
-            std::vec::Vec::from([Ok(Some(BrokerHandshakeRequest {
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::new(),
@@ -238,8 +299,9 @@ mod tests {
     }
 
     struct FakeHostControlChannel {
-        handshake_requests: std::vec::Vec<core::result::Result<Option<BrokerHandshakeRequest>, ()>>,
-        requests: std::vec::Vec<core::result::Result<Option<BrokerRequest>, ()>>,
+        handshake_requests:
+            std::vec::Vec<core::result::Result<HostReceive<BrokerHandshakeRequest>, ()>>,
+        requests: std::vec::Vec<core::result::Result<HostReceive<BrokerRequest>, ()>>,
         handshake_responses: std::vec::Vec<BrokerHandshakeResponse>,
         responses: std::vec::Vec<BrokerResponse>,
         send_error: bool,
@@ -248,9 +310,9 @@ mod tests {
     impl FakeHostControlChannel {
         fn new(
             handshake_requests: std::vec::Vec<
-                core::result::Result<Option<BrokerHandshakeRequest>, ()>,
+                core::result::Result<HostReceive<BrokerHandshakeRequest>, ()>,
             >,
-            requests: std::vec::Vec<core::result::Result<Option<BrokerRequest>, ()>>,
+            requests: std::vec::Vec<core::result::Result<HostReceive<BrokerRequest>, ()>>,
         ) -> Self {
             Self {
                 handshake_requests,
@@ -271,9 +333,9 @@ mod tests {
 
         fn recv_handshake_request(
             &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeRequest>, Self::Error> {
+        ) -> core::result::Result<HostReceive<BrokerHandshakeRequest>, Self::Error> {
             if self.handshake_requests.is_empty() {
-                Ok(None)
+                Ok(HostReceive::PeerClosed)
             } else {
                 self.handshake_requests.remove(0)
             }
@@ -290,9 +352,11 @@ mod tests {
             Ok(())
         }
 
-        fn recv_request(&mut self) -> core::result::Result<Option<BrokerRequest>, Self::Error> {
+        fn recv_request(
+            &mut self,
+        ) -> core::result::Result<HostReceive<BrokerRequest>, Self::Error> {
             if self.requests.is_empty() {
-                Ok(None)
+                Ok(HostReceive::PeerClosed)
             } else {
                 self.requests.remove(0)
             }

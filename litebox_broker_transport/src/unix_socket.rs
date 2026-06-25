@@ -12,7 +12,9 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use litebox_broker_protocol::channel::{HostControlChannel, LocalControlChannel, PeerCredential};
+use litebox_broker_protocol::channel::{
+    HostControlChannel, HostReceive, LocalControlChannel, PeerCredential,
+};
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
 };
@@ -112,13 +114,15 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         Ok(PeerCredential::Unauthenticated)
     }
 
-    fn recv_handshake_request(&mut self) -> IoResult<Option<BrokerHandshakeRequest>> {
+    fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
         let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
-            return Ok(None);
+            return Ok(HostReceive::PeerClosed);
         };
-        decode_handshake_request(&frame)
-            .map(Some)
-            .map_err(wire_error)
+        match decode_handshake_request(&frame) {
+            Ok(request) => Ok(HostReceive::Message(request)),
+            Err(WireError::WrongMessagePhase) => Ok(HostReceive::ProtocolViolation),
+            Err(error) => Err(wire_error(error)),
+        }
     }
 
     fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
@@ -129,11 +133,15 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         )
     }
 
-    fn recv_request(&mut self) -> IoResult<Option<BrokerRequest>> {
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
         let Some(frame) = read_frame_with_deadline(&mut self.stream, None)? else {
-            return Ok(None);
+            return Ok(HostReceive::PeerClosed);
         };
-        decode_request(&frame).map(Some).map_err(wire_error)
+        match decode_request(&frame) {
+            Ok(request) => Ok(HostReceive::Message(request)),
+            Err(WireError::WrongMessagePhase) => Ok(HostReceive::ProtocolViolation),
+            Err(error) => Err(wire_error(error)),
+        }
     }
 
     fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
@@ -334,6 +342,41 @@ mod tests {
         assert!(
             matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
             "unexpected timeout error kind: {error:?}"
+        );
+    }
+
+    #[test]
+    fn host_reports_wrong_phase_request_frames_as_protocol_violations() {
+        let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        write_frame_with_deadline(
+            &mut peer_stream,
+            &encode_request(BrokerRequest::Event(
+                litebox_broker_protocol::message::EventRequest::Create(
+                    litebox_broker_protocol::event::CreateEventRequest { initial_count: 0 },
+                ),
+            )),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.recv_handshake_request().unwrap(),
+            HostReceive::ProtocolViolation
+        );
+
+        let (mut peer_stream, host_stream) = UnixStream::pair().unwrap();
+        let mut channel = UnixStreamHostControlChannel::from_accepted(host_stream);
+        write_frame_with_deadline(
+            &mut peer_stream,
+            &encode_handshake_request(BrokerHandshakeRequest {
+                protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            channel.recv_request().unwrap(),
+            HostReceive::ProtocolViolation
         );
     }
 }

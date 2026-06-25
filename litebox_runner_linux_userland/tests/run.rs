@@ -379,7 +379,12 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
 
     fn recv_handshake_request(
         &mut self,
-    ) -> Result<Option<litebox_broker_protocol::message::BrokerHandshakeRequest>, Self::Error> {
+    ) -> Result<
+        litebox_broker_protocol::channel::HostReceive<
+            litebox_broker_protocol::message::BrokerHandshakeRequest,
+        >,
+        Self::Error,
+    > {
         self.inner.recv_handshake_request()
     }
 
@@ -392,11 +397,18 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
 
     fn recv_request(
         &mut self,
-    ) -> Result<Option<litebox_broker_protocol::message::BrokerRequest>, Self::Error> {
+    ) -> Result<
+        litebox_broker_protocol::channel::HostReceive<
+            litebox_broker_protocol::message::BrokerRequest,
+        >,
+        Self::Error,
+    > {
         let request = self.inner.recv_request()?;
         if matches!(
-            request,
-            Some(litebox_broker_protocol::message::BrokerRequest::Event(_))
+            &request,
+            litebox_broker_protocol::channel::HostReceive::Message(
+                litebox_broker_protocol::message::BrokerRequest::Event(_)
+            )
         ) {
             self.event_request_count += 1;
         }

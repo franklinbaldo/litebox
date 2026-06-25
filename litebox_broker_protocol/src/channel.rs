@@ -22,6 +22,17 @@ pub enum PeerCredential {
     Unauthenticated,
 }
 
+/// Host-side receive outcome for peer-to-broker control messages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostReceive<T> {
+    /// The peer sent a well-formed message for the current protocol phase.
+    Message(T),
+    /// The peer sent a well-formed message for a different protocol phase.
+    ProtocolViolation,
+    /// The peer closed the channel cleanly before starting another frame.
+    PeerClosed,
+}
+
 /// Local-side control channel for broker authority calls.
 pub trait LocalControlChannel {
     /// Channel-specific error type.
@@ -58,10 +69,9 @@ pub trait HostControlChannel {
     fn peer_credential(&self) -> Result<PeerCredential, Self::Error>;
 
     /// Receives one broker handshake request.
-    ///
-    /// Returns `Ok(None)` when the peer closed the channel cleanly before
-    /// starting another request frame.
-    fn recv_handshake_request(&mut self) -> Result<Option<BrokerHandshakeRequest>, Self::Error>;
+    fn recv_handshake_request(
+        &mut self,
+    ) -> Result<HostReceive<BrokerHandshakeRequest>, Self::Error>;
 
     /// Sends one broker handshake response.
     fn send_handshake_response(
@@ -70,10 +80,7 @@ pub trait HostControlChannel {
     ) -> Result<(), Self::Error>;
 
     /// Receives one broker request.
-    ///
-    /// Returns `Ok(None)` when the peer closed the channel cleanly before
-    /// starting another request frame.
-    fn recv_request(&mut self) -> Result<Option<BrokerRequest>, Self::Error>;
+    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
 
     /// Sends one broker response.
     fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
