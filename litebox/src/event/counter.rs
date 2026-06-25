@@ -10,7 +10,7 @@ use litebox_broker_protocol::event::{
     WaitEventRequest,
 };
 use litebox_broker_protocol::message::{
-    BrokerOperationRequest, BrokerResponse, EventRequest, EventResponse,
+    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
 };
 use thiserror::Error;
 
@@ -65,7 +65,7 @@ where
             return Err(EventCounterError::Unavailable);
         };
         let response = broker
-            .request(BrokerOperationRequest::Event(EventRequest::Create(
+            .request(BrokerRequest::Event(EventRequest::Create(
                 CreateEventRequest { initial_count },
             )))
             .map_err(BrokerObjectError::from)
@@ -143,11 +143,13 @@ where
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
         match self
             .broker
-            .request(BrokerOperationRequest::Event(request))
+            .request(BrokerRequest::Event(request))
             .map_err(BrokerObjectError::from)?
         {
             BrokerResponse::Event(response) => Ok(response),
-            response => panic!("broker returned unexpected event response: {response:?}"),
+            response @ BrokerResponse::Error(_) => {
+                panic!("broker returned unexpected event response: {response:?}")
+            }
         }
     }
 }

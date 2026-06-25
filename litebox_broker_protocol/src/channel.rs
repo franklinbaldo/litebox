@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::message::{BrokerRequest, BrokerResponse};
+use crate::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+};
 
 /// Peer identity information supplied by the channel or host layer.
 ///
@@ -25,6 +27,18 @@ pub trait LocalControlChannel {
     /// Channel-specific error type.
     type Error;
 
+    /// Sends one broker handshake request.
+    fn send_handshake_request(
+        &mut self,
+        request: &BrokerHandshakeRequest,
+    ) -> Result<(), Self::Error>;
+
+    /// Receives one broker handshake response.
+    ///
+    /// Returns `Ok(None)` when the broker closed the channel cleanly before
+    /// starting another response frame.
+    fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error>;
+
     /// Sends one broker request.
     fn send_request(&mut self, request: &BrokerRequest) -> Result<(), Self::Error>;
 
@@ -42,6 +56,18 @@ pub trait HostControlChannel {
 
     /// Returns the peer credential authenticated for this channel endpoint.
     fn peer_credential(&self) -> Result<PeerCredential, Self::Error>;
+
+    /// Receives one broker handshake request.
+    ///
+    /// Returns `Ok(None)` when the peer closed the channel cleanly before
+    /// starting another request frame.
+    fn recv_handshake_request(&mut self) -> Result<Option<BrokerHandshakeRequest>, Self::Error>;
+
+    /// Sends one broker handshake response.
+    fn send_handshake_response(
+        &mut self,
+        response: &BrokerHandshakeResponse,
+    ) -> Result<(), Self::Error>;
 
     /// Receives one broker request.
     ///

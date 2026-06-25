@@ -377,6 +377,19 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         self.inner.peer_credential()
     }
 
+    fn recv_handshake_request(
+        &mut self,
+    ) -> Result<Option<litebox_broker_protocol::message::BrokerHandshakeRequest>, Self::Error> {
+        self.inner.recv_handshake_request()
+    }
+
+    fn send_handshake_response(
+        &mut self,
+        response: &litebox_broker_protocol::message::BrokerHandshakeResponse,
+    ) -> Result<(), Self::Error> {
+        self.inner.send_handshake_response(response)
+    }
+
     fn recv_request(
         &mut self,
     ) -> Result<Option<litebox_broker_protocol::message::BrokerRequest>, Self::Error> {
