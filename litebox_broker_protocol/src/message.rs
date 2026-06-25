@@ -23,6 +23,13 @@ pub enum BrokerRequest {
     Event(EventRequest),
 }
 
+/// Broker operation request sent after protocol negotiation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrokerOperationRequest {
+    /// Event object request family.
+    Event(EventRequest),
+}
+
 /// Broker-owned event object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EventRequest {

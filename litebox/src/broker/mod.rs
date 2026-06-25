@@ -3,7 +3,7 @@
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::channel::LocalControlChannel;
-use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::message::{BrokerOperationRequest, BrokerResponse};
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
@@ -19,7 +19,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     /// Sends one active broker request and returns its response.
     fn request(
         &self,
-        request: BrokerRequest,
+        request: BrokerOperationRequest,
     ) -> core::result::Result<BrokerResponse, BrokerControlError>;
 }
 
@@ -49,7 +49,7 @@ where
 {
     fn request(
         &self,
-        request: BrokerRequest,
+        request: BrokerOperationRequest,
     ) -> core::result::Result<BrokerResponse, BrokerControlError> {
         Ok(self.local.lock().request(request)?)
     }

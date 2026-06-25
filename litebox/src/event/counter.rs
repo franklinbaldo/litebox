@@ -10,7 +10,7 @@ use litebox_broker_protocol::event::{
     WaitEventRequest,
 };
 use litebox_broker_protocol::message::{
-    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
+    BrokerOperationRequest, BrokerResponse, EventRequest, EventResponse,
 };
 use thiserror::Error;
 
@@ -65,7 +65,7 @@ where
             return Err(EventCounterError::Unavailable);
         };
         let response = broker
-            .request(BrokerRequest::Event(EventRequest::Create(
+            .request(BrokerOperationRequest::Event(EventRequest::Create(
                 CreateEventRequest { initial_count },
             )))
             .map_err(BrokerObjectError::from)
@@ -143,7 +143,7 @@ where
     fn request_event(&self, request: EventRequest) -> Result<EventResponse, BrokerObjectError> {
         match self
             .broker
-            .request(BrokerRequest::Event(request))
+            .request(BrokerOperationRequest::Event(request))
             .map_err(BrokerObjectError::from)?
         {
             BrokerResponse::Event(response) => Ok(response),
