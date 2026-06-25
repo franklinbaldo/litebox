@@ -48,7 +48,7 @@ fn connect_with_retry(socket_path: &Path, setup_deadline: Instant) -> Result<Loc
                 let mut local =
                     BrokerLocal::negotiate(channel).context("broker negotiation failed")?;
                 local
-                    .channel
+                    .control_channel_mut()
                     .set_io_deadline(None)
                     .context("failed to clear broker setup deadline")?;
                 return Ok(local);
