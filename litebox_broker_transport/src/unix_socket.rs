@@ -8,8 +8,6 @@
 //! no_std protocol, local, core, and host crates.
 
 use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -49,11 +47,15 @@ impl UnixStreamLocalControlChannel {
     }
 
     /// Connects to a userland broker Unix socket with a deadline for setup I/O.
+    ///
+    /// TODO(broker): `UnixStream` does not expose a connect timeout, so this
+    /// deadline currently covers handshake I/O after the initial connect
+    /// succeeds, but not a blocking connect call.
     pub fn connect_with_setup_deadline(
         path: impl AsRef<Path>,
         deadline: Instant,
     ) -> IoResult<Self> {
-        connect_unix_stream_with_deadline(path.as_ref(), deadline).map(|stream| Self {
+        UnixStream::connect(path).map(|stream| Self {
             stream,
             setup_deadline: Some(deadline),
         })
@@ -222,88 +224,6 @@ fn write_all_with_deadline(
     Ok(())
 }
 
-fn connect_unix_stream_with_deadline(path: &Path, deadline: Instant) -> IoResult<UnixStream> {
-    let (addr, addr_len) = unix_socket_addr(path)?;
-    let timeout = io_timeout_for_deadline(deadline)?;
-    let socket_type = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
-    // SAFETY: `socket` is called with constant AF_UNIX/SOCK_STREAM parameters
-    // and returns either a new owned file descriptor or -1 with errno set.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
-    if fd < 0 {
-        return Err(Error::last_os_error());
-    }
-
-    // SAFETY: `fd` was returned by `socket` above and is uniquely owned here.
-    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    stream.set_write_timeout(Some(timeout))?;
-
-    loop {
-        // SAFETY: `stream` owns a valid AF_UNIX stream socket, and `addr`/`addr_len`
-        // describe a live sockaddr_un built from `path` for the duration of this call.
-        let result = unsafe {
-            libc::connect(
-                stream.as_raw_fd(),
-                std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
-                addr_len,
-            )
-        };
-        if result == 0 {
-            stream.set_write_timeout(None)?;
-            return Ok(stream);
-        }
-
-        let error = Error::last_os_error();
-        if error.kind() == ErrorKind::Interrupted {
-            stream.set_write_timeout(Some(io_timeout_for_deadline(deadline)?))?;
-            continue;
-        }
-        if error.kind() == ErrorKind::WouldBlock && Instant::now() >= deadline {
-            return Err(Error::new(
-                ErrorKind::TimedOut,
-                "broker connect deadline expired",
-            ));
-        }
-        return Err(error);
-    }
-}
-
-fn unix_socket_addr(path: &Path) -> IoResult<(libc::sockaddr_un, libc::socklen_t)> {
-    let path = path.as_os_str().as_bytes();
-    if path.contains(&0) {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "broker socket path contains NUL byte",
-        ));
-    }
-
-    // SAFETY: `sockaddr_un` is a plain C socket address type; all-zero is a
-    // valid initialized value before setting the address family and path.
-    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-    addr.sun_family =
-        libc::sa_family_t::try_from(libc::AF_UNIX).expect("AF_UNIX fits in libc::sa_family_t");
-    if path.len() >= addr.sun_path.len() {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "broker socket path is too long",
-        ));
-    }
-
-    // SAFETY: `path.len() < addr.sun_path.len()` above, so the copy stays
-    // within `sun_path`; `sockaddr_un` was zeroed, leaving the required NUL.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            path.as_ptr(),
-            addr.sun_path.as_mut_ptr().cast::<u8>(),
-            path.len(),
-        );
-    }
-
-    let addr_len =
-        libc::socklen_t::try_from(std::mem::size_of::<libc::sa_family_t>() + path.len() + 1)
-            .map_err(|_| Error::new(ErrorKind::InvalidInput, "broker socket path is too long"))?;
-    Ok((addr, addr_len))
-}
-
 fn refresh_stream_io_deadline(stream: &UnixStream, deadline: Option<Instant>) -> IoResult<()> {
     if let Some(deadline) = deadline {
         let timeout = io_timeout_for_deadline(deadline)?;
@@ -335,8 +255,6 @@ fn wire_error(error: WireError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn frame_round_trip() {
@@ -408,48 +326,6 @@ mod tests {
     }
 
     #[test]
-    fn local_connect_setup_deadline_applies_before_connect() {
-        let path = temporary_socket_path("expired-connect");
-        let deadline = Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .expect("test deadline should be representable");
-        let Err(error) =
-            UnixStreamLocalControlChannel::connect_with_setup_deadline(&path, deadline)
-        else {
-            panic!("connect unexpectedly succeeded after setup deadline");
-        };
-        assert_eq!(error.kind(), ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn local_connect_setup_deadline_returns_blocking_stream() {
-        let path = temporary_socket_path("blocking-connect");
-        let listener = UnixListener::bind(&path).unwrap();
-
-        let mut local = UnixStreamLocalControlChannel::connect_with_setup_deadline(
-            &path,
-            Instant::now() + Duration::from_secs(1),
-        )
-        .unwrap();
-        let (host_stream, _) = listener.accept().unwrap();
-        let mut host = UnixStreamHostControlChannel::from_accepted(host_stream);
-
-        local
-            .send_handshake_request(&BrokerHandshakeRequest {
-                protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
-            })
-            .unwrap();
-        assert_eq!(
-            host.recv_handshake_request().unwrap(),
-            HostReceive::Message(BrokerHandshakeRequest {
-                protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
-            })
-        );
-
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn local_handshake_read_setup_deadline_is_wall_clock() {
         let (mut host_stream, local_stream) = UnixStream::pair().unwrap();
         let mut channel = UnixStreamLocalControlChannel {
@@ -506,16 +382,5 @@ mod tests {
             channel.recv_request().unwrap(),
             HostReceive::ProtocolViolation
         );
-    }
-
-    fn temporary_socket_path(name: &str) -> std::path::PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "litebox-broker-transport-{name}-{}-{now}.sock",
-            std::process::id()
-        ))
     }
 }
