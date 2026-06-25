@@ -11,7 +11,7 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, EventRequest, EventResponse,
 };
 
-use crate::{BrokerLocal, Result};
+use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// Creates a broker-owned event object with initial readiness credits.
@@ -86,9 +86,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     fn request_event(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
         match self.request(BrokerRequest::Event(request))? {
             BrokerResponse::Event(response) => Ok(response),
-            response @ BrokerResponse::Error(_) => {
-                panic!("broker returned unexpected event response: {response:?}")
-            }
+            BrokerResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
         }
     }
 }

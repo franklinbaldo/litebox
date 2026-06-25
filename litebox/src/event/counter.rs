@@ -147,9 +147,7 @@ where
             .map_err(BrokerObjectError::from)?
         {
             BrokerResponse::Event(response) => Ok(response),
-            response @ BrokerResponse::Error(_) => {
-                panic!("broker returned unexpected event response: {response:?}")
-            }
+            BrokerResponse::Error(error) => Err(error.into()),
         }
     }
 }
