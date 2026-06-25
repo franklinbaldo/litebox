@@ -50,10 +50,10 @@ pub trait LocalControlChannel {
     /// starting another response frame.
     fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error>;
 
-    /// Sends one broker request.
+    /// Sends one active broker request.
     fn send_request(&mut self, request: &BrokerRequest) -> Result<(), Self::Error>;
 
-    /// Receives one broker response.
+    /// Receives one active broker response.
     ///
     /// Returns `Ok(None)` when the broker closed the channel cleanly before
     /// starting another response frame.
@@ -79,9 +79,9 @@ pub trait HostControlChannel {
         response: &BrokerHandshakeResponse,
     ) -> Result<(), Self::Error>;
 
-    /// Receives one broker request.
+    /// Receives one active broker request.
     fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
 
-    /// Sends one broker response.
+    /// Sends one active broker response.
     fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
 }

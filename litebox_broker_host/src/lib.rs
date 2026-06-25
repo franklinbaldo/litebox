@@ -25,7 +25,7 @@ mod error;
 
 pub use error::{BrokerHostError, Result};
 
-/// Serves one broker connection over the provided connected control channel.
+/// Authenticates, negotiates, and serves one broker connection over the control channel.
 pub fn serve_connection<Channel>(
     core: &BrokerCore,
     channel: &mut Channel,
@@ -149,13 +149,13 @@ fn handle_event_request(session: &BrokerSession, request: EventRequest) -> Broke
     }
 }
 
-/// Terminal outcome for a successfully served broker connection.
+/// Terminal outcome after processing one broker connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionTermination {
     /// The peer cleanly closed the channel.
     PeerClosed,
-    /// The broker closed the channel after the peer violated protocol sequencing.
+    /// The broker sent a protocol-state error before closing the channel.
     ProtocolViolation,
 }
 
