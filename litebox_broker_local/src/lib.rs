@@ -18,9 +18,7 @@ mod event;
 use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::{
-    BrokerRequest, BrokerResponse, EventRequest, EventResponse,
-};
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 
 pub use error::{BrokerLocalError, Result};
 
@@ -77,15 +75,18 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Sends one active event request.
+    /// Sends one active broker request.
     ///
     /// # Panics
     ///
-    /// Panics if the broker reports an unrecoverable error or returns a protocol
-    /// response that does not match an active event request.
-    pub fn request(&mut self, request: EventRequest) -> Result<EventResponse, Channel::Error> {
-        match raw_request(&mut self.channel, BrokerRequest::Event(request))? {
-            BrokerResponse::Event(response) => Ok(response),
+    /// Panics if the request is a negotiation request, or if the broker reports
+    /// an unrecoverable error or returns a protocol response that does not match
+    /// an active request.
+    pub fn request(&mut self, request: BrokerRequest) -> Result<BrokerResponse, Channel::Error> {
+        if matches!(request, BrokerRequest::Negotiate { .. }) {
+            panic!("active broker request cannot be a negotiation request");
+        }
+        match raw_request(&mut self.channel, request)? {
             BrokerResponse::Error(error) => match error {
                 ErrorCode::PolicyDenied
                 | ErrorCode::UnknownObject
@@ -99,7 +100,11 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unsupported error: {error}"),
             },
-            response => panic!("broker returned unexpected active response: {response:?}"),
+            response @ (BrokerResponse::Negotiated { .. }
+            | BrokerResponse::VersionMismatch { .. }) => {
+                panic!("broker returned unexpected active response: {response:?}")
+            }
+            response => Ok(response),
         }
     }
 }
@@ -144,21 +149,22 @@ mod tests {
     #[test]
     fn active_request_sends_event_request() {
         let handle = ObjectHandle(7);
-        let request = EventRequest::Create(CreateEventRequest { initial_count: 0 });
-        let response = EventResponse::Create(CreateEventResponse { handle });
-        let channel = FakeControlChannel::new(Some(BrokerResponse::Event(response.clone())));
+        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        }));
+        let response = BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle }));
+        let channel = FakeControlChannel::new(Some(response.clone()));
         let mut local = BrokerLocal { channel };
 
         assert_eq!(local.request(request.clone()).unwrap(), response);
-        assert_eq!(
-            local.channel.sent_request,
-            Some(BrokerRequest::Event(request))
-        );
+        assert_eq!(local.channel.sent_request, Some(request));
     }
 
     #[test]
     fn active_request_returns_recoverable_broker_error() {
-        let request = EventRequest::Create(CreateEventRequest { initial_count: 0 });
+        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        }));
         let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::WouldBlock)));
         let mut local = BrokerLocal { channel };
 
@@ -171,7 +177,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "broker returned unrecoverable error")]
     fn active_request_panics_on_unrecoverable_broker_error() {
-        let request = EventRequest::Create(CreateEventRequest { initial_count: 0 });
+        let request = BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
+            initial_count: 0,
+        }));
         let channel = FakeControlChannel::new(Some(BrokerResponse::Error(ErrorCode::Internal)));
         let mut local = BrokerLocal { channel };
 
