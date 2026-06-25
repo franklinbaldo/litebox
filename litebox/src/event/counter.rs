@@ -144,11 +144,19 @@ where
         match self
             .broker
             .request(BrokerRequest::Event(request))
-            .map_err(BrokerObjectError::from)?
+            .map_err(BrokerObjectError::from)
+            .map_err(|error| self.handle_request_error(error))?
         {
             BrokerResponse::Event(response) => Ok(response),
-            BrokerResponse::Error(error) => Err(error.into()),
+            BrokerResponse::Error(error) => Err(self.handle_request_error(error.into())),
         }
+    }
+
+    fn handle_request_error(&self, error: BrokerObjectError) -> BrokerObjectError {
+        if error != BrokerObjectError::WouldBlock {
+            self.pollee.notify_observers(Events::ERR);
+        }
+        error
     }
 }
 
@@ -161,10 +169,12 @@ where
     }
 
     fn check_io_events(&self) -> Events {
-        let Ok(response) = self.request_event(EventRequest::Wait(WaitEventRequest {
+        let response = match self.request_event(EventRequest::Wait(WaitEventRequest {
             handle: self.handle,
-        })) else {
-            return Events::empty();
+        })) {
+            Ok(response) => response,
+            Err(BrokerObjectError::WouldBlock) => return Events::empty(),
+            Err(_) => return Events::ERR,
         };
         let EventResponse::Wait(response) = response else {
             panic!("broker returned unexpected event response: {response:?}");
@@ -178,5 +188,84 @@ where
             events |= Events::OUT;
         }
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    use litebox_broker_protocol::error::ErrorCode;
+
+    use crate::broker::error::BrokerControlError;
+    use crate::platform::mock::MockPlatform;
+
+    #[derive(Clone, Copy)]
+    enum BrokerReply {
+        TransportError,
+        BrokerError(ErrorCode),
+    }
+
+    struct StaticBrokerControl {
+        reply: BrokerReply,
+    }
+
+    impl BrokerControl for StaticBrokerControl {
+        fn request(
+            &self,
+            _request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, BrokerControlError> {
+            match self.reply {
+                BrokerReply::TransportError => Err(BrokerControlError::Transport),
+                BrokerReply::BrokerError(error) => Ok(BrokerResponse::Error(error)),
+            }
+        }
+    }
+
+    struct CountingObserver {
+        count: AtomicUsize,
+        last_events: AtomicU32,
+    }
+
+    impl CountingObserver {
+        const fn new() -> Self {
+            Self {
+                count: AtomicUsize::new(0),
+                last_events: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl Observer<Events> for CountingObserver {
+        fn on_events(&self, events: &Events) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+            self.last_events.store(events.bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn check_io_events_reports_broker_failures_as_errors() {
+        for reply in [
+            BrokerReply::TransportError,
+            BrokerReply::BrokerError(ErrorCode::UnknownObject),
+        ] {
+            let counter = EventCounter::<MockPlatform> {
+                broker: Arc::new(StaticBrokerControl { reply }),
+                handle: ObjectHandle(1),
+                pollee: Pollee::new(),
+            };
+            let observer = Arc::new(CountingObserver::new());
+            let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
+            counter.register_observer(Arc::downgrade(&observer_dyn), Events::IN);
+
+            assert_eq!(counter.check_io_events(), Events::ERR);
+            assert_eq!(observer.count.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                observer.last_events.load(Ordering::Relaxed),
+                Events::ERR.bits()
+            );
+        }
     }
 }
