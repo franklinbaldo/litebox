@@ -326,9 +326,10 @@ fn spawn_test_broker(
                 stream
                     .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
                     .expect("failed to configure broker test write timeout");
-                let mut channel = CountingHostControlChannel::new(
-                    litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
-                );
+                let mut channel = CountingHostControlChannel {
+                    inner: litebox_broker_transport::unix_socket::UnixStreamHostControlChannel::from_accepted(stream),
+                    event_request_count: 0,
+                };
                 let termination = litebox_broker_host::serve_connection(&broker, &mut channel)
                     .expect("broker host failed");
                 assert_eq!(
@@ -336,7 +337,7 @@ fn spawn_test_broker(
                     litebox_broker_host::ConnectionTermination::PeerClosed
                 );
                 event_request_count_tx
-                    .send(channel.event_request_count())
+                    .send(channel.event_request_count)
                     .expect("failed to report broker event request count");
             }
         }));
@@ -362,22 +363,6 @@ fn spawn_test_broker(
 struct CountingHostControlChannel<Channel: litebox_broker_protocol::channel::HostControlChannel> {
     inner: Channel,
     event_request_count: usize,
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
-    CountingHostControlChannel<Channel>
-{
-    const fn new(inner: Channel) -> Self {
-        Self {
-            inner,
-            event_request_count: 0,
-        }
-    }
-
-    const fn event_request_count(&self) -> usize {
-        self.event_request_count
-    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

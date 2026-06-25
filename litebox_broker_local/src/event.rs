@@ -14,11 +14,6 @@ use litebox_broker_protocol::message::{
 use crate::{BrokerLocal, Result};
 
 impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
-    /// Creates a broker-owned event object.
-    pub fn create_event(&mut self) -> Result<ObjectHandle, Channel::Error> {
-        self.create_event_with_count(0)
-    }
-
     /// Creates a broker-owned event object with initial readiness credits.
     ///
     /// # Panics
