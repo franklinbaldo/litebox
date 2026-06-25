@@ -43,7 +43,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     /// response that does not match the negotiation request.
     pub fn negotiate(mut channel: Channel) -> Result<Self, Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
-        let request = BrokerHandshakeRequest::Negotiate {
+        let request = BrokerHandshakeRequest {
             protocol_version: requested,
         };
         channel
@@ -134,7 +134,7 @@ mod tests {
 
         assert_eq!(
             local.channel.sent_handshake_request,
-            Some(BrokerHandshakeRequest::Negotiate {
+            Some(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION
             })
         );

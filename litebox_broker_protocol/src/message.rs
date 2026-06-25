@@ -10,12 +10,9 @@ use crate::event::{
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BrokerHandshakeRequest {
-    /// Protocol negotiation request.
-    Negotiate {
-        /// Required protocol version.
-        protocol_version: ProtocolVersion,
-    },
+pub struct BrokerHandshakeRequest {
+    /// Required protocol version.
+    pub protocol_version: ProtocolVersion,
 }
 
 /// Broker request sent over an active control channel.

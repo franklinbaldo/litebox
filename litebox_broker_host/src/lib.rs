@@ -18,8 +18,7 @@ use litebox_broker_protocol::channel::{HostControlChannel, PeerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse, WaitEventResponse};
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse, EventRequest,
-    EventResponse,
+    BrokerHandshakeResponse, BrokerRequest, BrokerResponse, EventRequest, EventResponse,
 };
 
 mod error;
@@ -51,8 +50,7 @@ where
             return Ok(ConnectionTermination::PeerClosed);
         };
 
-        let BrokerHandshakeRequest::Negotiate { protocol_version } = request;
-        let negotiated = protocol_version == BROKER_PROTOCOL_VERSION;
+        let negotiated = request.protocol_version == BROKER_PROTOCOL_VERSION;
         let response = if negotiated {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
@@ -149,6 +147,7 @@ mod tests {
     use litebox_broker_core::{PolicyEngine, PrincipalRights};
     use litebox_broker_protocol::ProtocolVersion;
     use litebox_broker_protocol::event::CreateEventRequest;
+    use litebox_broker_protocol::message::BrokerHandshakeRequest;
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
@@ -164,7 +163,7 @@ mod tests {
 
     fn serve_connection_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(
-            std::vec::Vec::from([Ok(Some(BrokerHandshakeRequest::Negotiate {
+            std::vec::Vec::from([Ok(Some(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::from([
@@ -195,10 +194,10 @@ mod tests {
     fn serve_connection_retries_after_version_mismatch(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([
-                Ok(Some(BrokerHandshakeRequest::Negotiate {
+                Ok(Some(BrokerHandshakeRequest {
                     protocol_version: ProtocolVersion(BROKER_PROTOCOL_VERSION.0 + 1),
                 })),
-                Ok(Some(BrokerHandshakeRequest::Negotiate {
+                Ok(Some(BrokerHandshakeRequest {
                     protocol_version: BROKER_PROTOCOL_VERSION,
                 })),
             ]),
@@ -224,7 +223,7 @@ mod tests {
 
     fn serve_connection_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(
-            std::vec::Vec::from([Ok(Some(BrokerHandshakeRequest::Negotiate {
+            std::vec::Vec::from([Ok(Some(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::new(),

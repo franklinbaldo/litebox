@@ -58,12 +58,8 @@ pub enum WireError {
 /// message tag.
 pub fn encode_handshake_request(request: BrokerHandshakeRequest) -> Vec<u8> {
     let mut encoder = Encoder::default();
-    match request {
-        BrokerHandshakeRequest::Negotiate { protocol_version } => {
-            encoder.u8(REQUEST_TAG_NEGOTIATE);
-            encoder.protocol_version(protocol_version);
-        }
-    }
+    encoder.u8(REQUEST_TAG_NEGOTIATE);
+    encoder.protocol_version(request.protocol_version);
     encoder.finish()
 }
 
@@ -72,7 +68,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     let request = match tag {
-        REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest::Negotiate {
+        REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest {
             protocol_version: decoder.protocol_version()?,
         },
         _ => return Err(WireError::InvalidTag),
@@ -204,7 +200,7 @@ mod tests {
 
     #[test]
     fn handshake_request_codec_round_trips_all_variants() {
-        let requests = [BrokerHandshakeRequest::Negotiate {
+        let requests = [BrokerHandshakeRequest {
             protocol_version: ProtocolVersion(1),
         }];
 
@@ -326,7 +322,7 @@ mod tests {
             )))),
             Err(WireError::InvalidTag)
         );
-        let mut frame = encode_handshake_request(BrokerHandshakeRequest::Negotiate {
+        let mut frame = encode_handshake_request(BrokerHandshakeRequest {
             protocol_version: ProtocolVersion(1),
         });
         frame.push(0xff);
@@ -340,11 +336,9 @@ mod tests {
     fn decode_rejects_malformed_request_frames() {
         assert_eq!(decode_request(&[0xff, 1, 2, 3]), Err(WireError::InvalidTag));
         assert_eq!(
-            decode_request(&encode_handshake_request(
-                BrokerHandshakeRequest::Negotiate {
-                    protocol_version: ProtocolVersion(1),
-                }
-            )),
+            decode_request(&encode_handshake_request(BrokerHandshakeRequest {
+                protocol_version: ProtocolVersion(1),
+            })),
             Err(WireError::InvalidTag)
         );
         let mut unknown_consume_mode = encode_request(BrokerRequest::Event(EventRequest::Consume(
