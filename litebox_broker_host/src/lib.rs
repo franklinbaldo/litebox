@@ -221,7 +221,9 @@ mod tests {
             Ok(Some(BrokerRequest::Negotiate {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             })),
-            Ok(Some(event_create_request(0))),
+            Ok(Some(BrokerRequest::Event(EventRequest::Create(
+                CreateEventRequest { initial_count: 0 },
+            )))),
             Ok(None),
         ]));
 
@@ -244,7 +246,9 @@ mod tests {
 
     fn serve_connection_closes_after_protocol_violation(broker: &BrokerCore) {
         let mut channel = FakeHostControlChannel::new(std::vec::Vec::from([
-            Ok(Some(event_create_request(0))),
+            Ok(Some(BrokerRequest::Event(EventRequest::Create(
+                CreateEventRequest { initial_count: 0 },
+            )))),
             Ok(Some(BrokerRequest::Negotiate {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             })),
@@ -274,14 +278,6 @@ mod tests {
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert!(channel.responses.is_empty());
-    }
-
-    const fn event_request(request: EventRequest) -> BrokerRequest {
-        BrokerRequest::Event(request)
-    }
-
-    const fn event_create_request(initial_count: u64) -> BrokerRequest {
-        event_request(EventRequest::Create(CreateEventRequest { initial_count }))
     }
 
     struct FakeHostControlChannel {

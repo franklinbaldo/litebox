@@ -150,24 +150,24 @@ mod tests {
 
     #[test]
     fn request_codec_round_trips_all_variants() {
-        let handle = sample_handle();
+        let handle = ObjectHandle(13);
         let requests = [
             BrokerRequest::Negotiate {
                 protocol_version: ProtocolVersion(1),
             },
-            event_request(EventRequest::Create(CreateEventRequest {
+            BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
-            event_request(EventRequest::Create(CreateEventRequest {
+            BrokerRequest::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 7,
             })),
-            event_request(EventRequest::Wait(WaitEventRequest { handle })),
-            event_request(EventRequest::Add(AddEventRequest { handle, value: 3 })),
-            event_request(EventRequest::Consume(ConsumeEventRequest {
+            BrokerRequest::Event(EventRequest::Wait(WaitEventRequest { handle })),
+            BrokerRequest::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
+            BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle,
                 mode: EventConsumeMode::All,
             })),
-            event_request(EventRequest::Consume(ConsumeEventRequest {
+            BrokerRequest::Event(EventRequest::Consume(ConsumeEventRequest {
                 handle,
                 mode: EventConsumeMode::One,
             })),
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn response_codec_round_trips_all_variants() {
-        let handle = sample_handle();
+        let handle = ObjectHandle(13);
         let responses = [
             BrokerResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
@@ -191,26 +191,26 @@ mod tests {
             BrokerResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
             },
-            event_response(EventResponse::Create(CreateEventResponse { handle })),
-            event_response(EventResponse::Wait(WaitEventResponse {
+            BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle })),
+            BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
                 readiness: ReadinessState {
                     read_ready: true,
                     write_ready: false,
                 },
             })),
-            event_response(EventResponse::Wait(WaitEventResponse {
+            BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
                 readiness: ReadinessState {
                     read_ready: false,
                     write_ready: true,
                 },
             })),
-            event_response(EventResponse::Add(AddEventResponse {
+            BrokerResponse::Event(EventResponse::Add(AddEventResponse {
                 readiness: ReadinessState {
                     read_ready: true,
                     write_ready: true,
                 },
             })),
-            event_response(EventResponse::Consume(EventConsumption {
+            BrokerResponse::Event(EventResponse::Consume(EventConsumption {
                 value: 3,
                 readiness: ReadinessState {
                     read_ready: false,
@@ -233,20 +233,21 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_request_frames() {
         assert_eq!(decode_request(&[0xff, 1, 2, 3]), Err(WireError::InvalidTag));
-        let mut unknown_consume_mode =
-            encode_request(event_request(EventRequest::Consume(ConsumeEventRequest {
-                handle: sample_handle(),
+        let mut unknown_consume_mode = encode_request(BrokerRequest::Event(EventRequest::Consume(
+            ConsumeEventRequest {
+                handle: ObjectHandle(13),
                 mode: EventConsumeMode::All,
-            })));
+            },
+        )));
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
         assert_eq!(decode_request(&[0, 1]), Err(WireError::TruncatedFrame));
-        let mut frame = encode_request(event_request(EventRequest::Create(CreateEventRequest {
-            initial_count: 0,
-        })));
+        let mut frame = encode_request(BrokerRequest::Event(EventRequest::Create(
+            CreateEventRequest { initial_count: 0 },
+        )));
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
     }
@@ -282,25 +283,15 @@ mod tests {
     #[test]
     fn event_add_response_wire_shape_is_pinned() {
         assert_eq!(
-            encode_response(event_response(EventResponse::Add(AddEventResponse {
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
-            }))),
+            encode_response(BrokerResponse::Event(EventResponse::Add(
+                AddEventResponse {
+                    readiness: ReadinessState {
+                        read_ready: true,
+                        write_ready: false,
+                    },
+                }
+            ))),
             [1, 2, 1, 0]
         );
-    }
-
-    const fn sample_handle() -> ObjectHandle {
-        ObjectHandle(13)
-    }
-
-    const fn event_request(request: EventRequest) -> BrokerRequest {
-        BrokerRequest::Event(request)
-    }
-
-    const fn event_response(response: EventResponse) -> BrokerResponse {
-        BrokerResponse::Event(response)
     }
 }
