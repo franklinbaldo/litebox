@@ -103,7 +103,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unsupported error: {error}"),
             },
-            response @ BrokerResponse::Event(_) => Ok(response),
+            response @ (BrokerResponse::Event(_) | BrokerResponse::ObjectClosed) => Ok(response),
         }
     }
 }

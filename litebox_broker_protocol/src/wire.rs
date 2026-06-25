@@ -30,11 +30,13 @@ mod primitive;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
+const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
 const RESPONSE_TAG_ERROR: u8 = 2;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
+const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -73,7 +75,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         REQUEST_TAG_NEGOTIATE => BrokerHandshakeRequest {
             protocol_version: decoder.protocol_version()?,
         },
-        REQUEST_TAG_EVENT => return Err(WireError::WrongMessagePhase),
+        REQUEST_TAG_EVENT | REQUEST_TAG_CLOSE_OBJECT => return Err(WireError::WrongMessagePhase),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -91,6 +93,10 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.u8(REQUEST_TAG_EVENT);
             event::encode_event_request(&mut encoder, request);
         }
+        BrokerRequest::CloseObject(handle) => {
+            encoder.u8(REQUEST_TAG_CLOSE_OBJECT);
+            encoder.handle(handle);
+        }
     }
     encoder.finish()
 }
@@ -102,6 +108,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
     let request = match tag {
         REQUEST_TAG_NEGOTIATE => return Err(WireError::WrongMessagePhase),
         REQUEST_TAG_EVENT => BrokerRequest::Event(event::decode_event_request(&mut decoder)?),
+        REQUEST_TAG_CLOSE_OBJECT => BrokerRequest::CloseObject(decoder.handle()?),
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -143,7 +150,9 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
         },
-        RESPONSE_TAG_EVENT => return Err(WireError::WrongMessagePhase),
+        RESPONSE_TAG_EVENT | RESPONSE_TAG_OBJECT_CLOSED => {
+            return Err(WireError::WrongMessagePhase);
+        }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
@@ -168,6 +177,9 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_EVENT);
             event::encode_event_response(&mut encoder, response);
         }
+        BrokerResponse::ObjectClosed => {
+            encoder.u8(RESPONSE_TAG_OBJECT_CLOSED);
+        }
         BrokerResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.u16(error.as_raw());
@@ -185,6 +197,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_EVENT => BrokerResponse::Event(event::decode_event_response(&mut decoder)?),
+        RESPONSE_TAG_OBJECT_CLOSED => BrokerResponse::ObjectClosed,
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResponse::Error(error)
@@ -240,6 +253,7 @@ mod tests {
                 handle,
                 mode: EventConsumeMode::One,
             })),
+            BrokerRequest::CloseObject(handle),
         ];
 
         for request in requests {
@@ -301,6 +315,7 @@ mod tests {
                     write_ready: true,
                 },
             })),
+            BrokerResponse::ObjectClosed,
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
             BrokerResponse::Error(ErrorCode::Internal),
