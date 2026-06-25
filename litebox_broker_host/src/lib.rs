@@ -43,22 +43,12 @@ where
     };
     let session = core.create_session(caller_credential)?;
 
-    let Some(()) = negotiate_connection(channel)? else {
-        return Ok(ConnectionTermination::PeerClosed);
-    };
-    serve_request_loop(channel, &session)
-}
-
-fn negotiate_connection<Channel>(channel: &mut Channel) -> Result<Option<()>, Channel::Error>
-where
-    Channel: HostControlChannel,
-{
     loop {
         let Some(request) = channel
             .recv_handshake_request()
             .map_err(BrokerHostError::Channel)?
         else {
-            return Ok(None);
+            return Ok(ConnectionTermination::PeerClosed);
         };
 
         let BrokerHandshakeRequest::Negotiate { protocol_version } = request;
@@ -76,9 +66,11 @@ where
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;
         if negotiated {
-            return Ok(Some(()));
+            break;
         }
     }
+
+    serve_request_loop(channel, &session)
 }
 
 fn serve_request_loop<Channel>(
