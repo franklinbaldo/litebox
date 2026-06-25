@@ -48,7 +48,7 @@ impl UnixStreamLocalControlChannel {
 
     /// Connects to a userland broker Unix socket with a deadline for setup I/O.
     ///
-    /// TODO(broker): `UnixStream` does not expose a connect timeout, so this
+    /// TODO: `UnixStream` does not expose a connect timeout, so this
     /// deadline currently covers handshake I/O after the initial connect
     /// succeeds, but not a blocking connect call.
     pub fn connect_with_setup_deadline(
