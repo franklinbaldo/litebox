@@ -85,24 +85,6 @@ impl UnixStreamLocalControlChannel {
         self.active_request_deadline = Some(deadline);
         Ok(Some(deadline))
     }
-
-    fn send_frame(&mut self, frame: &[u8]) -> IoResult<()> {
-        let deadline = self.current_deadline()?;
-        let result = write_frame_with_deadline(&mut self.stream, frame, deadline);
-        if result.is_err() {
-            self.active_request_deadline = None;
-        }
-        result
-    }
-
-    fn recv_frame(&mut self) -> IoResult<Option<Vec<u8>>> {
-        let deadline = self.current_deadline()?;
-        let result = read_frame_with_deadline(&mut self.stream, deadline);
-        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
-            self.set_stream_io_timeout(self.io_timeout)?;
-        }
-        result
-    }
 }
 
 /// Host-side Unix-domain-socket control channel for the hosted userland POC.
@@ -132,25 +114,28 @@ impl UnixStreamHostControlChannel {
             self.stream.set_write_timeout(None)
         }
     }
-
-    fn recv_frame(&mut self) -> IoResult<Option<Vec<u8>>> {
-        read_frame_with_deadline(&mut self.stream, self.io_deadline)
-    }
-
-    fn send_frame(&mut self, frame: &[u8]) -> IoResult<()> {
-        write_frame_with_deadline(&mut self.stream, frame, self.io_deadline)
-    }
 }
 
 impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        self.send_frame(&encode_handshake_request(request.clone()))
+        let frame = encode_handshake_request(request.clone());
+        let deadline = self.current_deadline()?;
+        let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
+        if result.is_err() {
+            self.active_request_deadline = None;
+        }
+        result
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        match self.recv_frame()? {
+        let deadline = self.current_deadline()?;
+        let frame = read_frame_with_deadline(&mut self.stream, deadline);
+        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
+            self.set_stream_io_timeout(self.io_timeout)?;
+        }
+        match frame? {
             Some(frame) => decode_handshake_response(&frame)
                 .map(Some)
                 .map_err(wire_error),
@@ -159,11 +144,22 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
     }
 
     fn send_request(&mut self, request: &BrokerRequest) -> IoResult<()> {
-        self.send_frame(&encode_request(request.clone()))
+        let frame = encode_request(request.clone());
+        let deadline = self.current_deadline()?;
+        let result = write_frame_with_deadline(&mut self.stream, &frame, deadline);
+        if result.is_err() {
+            self.active_request_deadline = None;
+        }
+        result
     }
 
     fn recv_response(&mut self) -> IoResult<Option<BrokerResponse>> {
-        match self.recv_frame()? {
+        let deadline = self.current_deadline()?;
+        let frame = read_frame_with_deadline(&mut self.stream, deadline);
+        if self.io_deadline.is_none() && self.active_request_deadline.take().is_some() {
+            self.set_stream_io_timeout(self.io_timeout)?;
+        }
+        match frame? {
             Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
             None => Ok(None),
         }
@@ -180,7 +176,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<Option<BrokerHandshakeRequest>> {
-        let Some(frame) = self.recv_frame()? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
             return Ok(None);
         };
         decode_handshake_request(&frame)
@@ -189,18 +185,26 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     }
 
     fn send_handshake_response(&mut self, response: &BrokerHandshakeResponse) -> IoResult<()> {
-        self.send_frame(&encode_handshake_response(response.clone()))
+        write_frame_with_deadline(
+            &mut self.stream,
+            &encode_handshake_response(response.clone()),
+            self.io_deadline,
+        )
     }
 
     fn recv_request(&mut self) -> IoResult<Option<BrokerRequest>> {
-        let Some(frame) = self.recv_frame()? else {
+        let Some(frame) = read_frame_with_deadline(&mut self.stream, self.io_deadline)? else {
             return Ok(None);
         };
         decode_request(&frame).map(Some).map_err(wire_error)
     }
 
     fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
-        self.send_frame(&encode_response(response.clone()))
+        write_frame_with_deadline(
+            &mut self.stream,
+            &encode_response(response.clone()),
+            self.io_deadline,
+        )
     }
 }
 
