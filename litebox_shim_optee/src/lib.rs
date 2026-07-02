@@ -269,8 +269,6 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                #[cfg(target_arch = "x86_64")]
-                tls_base_addr: Cell::new(0),
             },
         };
         if let Some(ta_bin) = ta_bin
@@ -783,14 +781,8 @@ impl Task {
             let ta_entry_point = self.get_ta_entry_point();
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
-            self.allocate_guest_tls(None).map_err(|_| {
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
-            })?;
             self.ta_prepared.set(true);
         }
-
-        #[cfg(target_arch = "x86_64")]
-        self.restore_guest_tls();
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
@@ -799,6 +791,18 @@ impl Task {
         ta_stack
             .init(self.global.platform, params)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
+
+        // Point the FS base at the TA stack canary so the compiler's
+        // stack-guard reads resolve to it. Must run after
+        // `ta_stack.init` (which pushes the canary) and on every entry,
+        // because the guest FS base does not persist across shim<->guest
+        // transitions (see `set_guest_stack_guard_fs_base`).
+        #[cfg(target_arch = "x86_64")]
+        Self::set_guest_stack_guard_fs_base(
+            ta_stack
+                .canary_addr()
+                .ok_or(ElfLoaderError::InvalidStackAddr)?,
+        )?;
 
         Ok(ThreadInitState::Ta {
             cmd_id: cmd_id.unwrap_or(0) as usize,
@@ -839,52 +843,31 @@ impl Task {
         }
     }
 
-    /// Allocate the guest TLS for an OP-TEE TA.
+    /// Point the guest FS base at the TA stack canary so the compiler's stack
+    /// guard read resolves onto it.
     ///
-    /// This function is required to overcome the compatibility issue coming from
-    /// system and build toolchain differences. OP-TEE OS only supports a single thread and
-    /// thus does not explicitly set up the TLS area. In contrast, we do use an x86 toolchain to
-    /// compile OP-TEE TAs and this toolchain assumes there is a valid TLS areas for various purposes
-    /// including stack protection. To this end, the toolchain generates binaries using
-    /// the `FS` register for TLS access.
-    /// This function allocates a TLS area on behalf of the TA to satisfy the toolchain's assumption.
-    /// Instead of using this function, we could change the flags of the toolchain to not use TLS
-    /// (e.g., `-fno-stack-protector`), but this might be insecure. Also, the toolchain might have
-    /// other features relying on TLS.
-    #[cfg(target_arch = "x86_64")]
-    fn allocate_guest_tls(
-        &self,
-        tls_size: Option<usize>,
-    ) -> Result<(), litebox_common_linux::errno::Errno> {
-        let tls_size = tls_size.unwrap_or(PAGE_SIZE).next_multiple_of(PAGE_SIZE);
-        let addr = self.sys_mmap(
-            0,
-            tls_size,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            -1,
-            0,
-        )?;
-        // Store TLS address for later restoration
-        self.tls_base_addr.set(addr.as_usize());
-        self.restore_guest_tls();
-        Ok(())
-    }
-
-    /// Restore the guest TLS (FS base) before entering the TA.
+    /// OP-TEE TAs are single-threaded and have no TLS block, but the x86-64
+    /// toolchain still emits stack-protector reads of `%fs:0x28`. To satisfy
+    /// those reads without allocating a TLS area, we set the FS base to
+    /// `canary_addr - ABI_STACK_GUARD_FS_OFFSET` (an ABI-fixed offset, not a
+    /// tunable), so the compiler's guard read lands on the TA stack canary.
     ///
-    /// FS base is cleared across VTL switches, so we must restore it before
-    /// every TA entry.
+    /// This must be called on every TA entry: the guest FS base is not
+    /// guaranteed to persist across a shim<->guest transition. Re-establishing
+    /// it here keeps the shim platform-agnostic.
+    ///
+    /// Returns [`ElfLoaderError::InvalidStackAddr`] if `canary_addr` is below
+    /// `ABI_STACK_GUARD_FS_OFFSET`.
     #[cfg(target_arch = "x86_64")]
-    fn restore_guest_tls(&self) {
+    fn set_guest_stack_guard_fs_base(canary_addr: usize) -> Result<(), ElfLoaderError> {
         use litebox::platform::ArchSpecificProvider as _;
-        let addr = self.tls_base_addr.get();
-        if addr == 0 {
-            return; // TLS not allocated yet
-        }
+        let fs_base = canary_addr
+            .checked_sub(crate::loader::ta_stack::ABI_STACK_GUARD_FS_OFFSET)
+            .ok_or(ElfLoaderError::InvalidStackAddr)?;
         litebox_platform_multiplex::platform()
-            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, addr)
+            .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, fs_base)
             .expect("requires guaranteed platform support for FsBase");
+        Ok(())
     }
 
     /// Retrieve the result of the `ldelf` execution.
@@ -1363,9 +1346,6 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
-    /// TLS base address for x86_64 (stored to restore FS before each TA entry)
-    #[cfg(target_arch = "x86_64")]
-    tls_base_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
 
@@ -1530,8 +1510,6 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
-                #[cfg(target_arch = "x86_64")]
-                tls_base_addr: Cell::new(0),
             }
         }
     }

@@ -12,6 +12,22 @@ use zerocopy::IntoBytes;
 
 use crate::{Platform, UserMutPtr};
 
+/// ABI-mandated offset of the stack-protector guard from the x86-64 thread
+/// pointer (`%fs`). This is a fixed ABI constant, **not** a tunable.
+///
+/// On x86-64, GCC and Clang hardcode the stack-guard access as `%fs:0x28` when
+/// using the default TLS-based stack protector. This offset is a fixed part of
+/// that codegen ABI, independent of the C library.
+///
+/// The guard itself is a single pointer-sized word, i.e., **8 bytes** on x86-64.
+/// The read therefore spans `[%fs:0x28 .. %fs:0x30)`.
+///
+/// OP-TEE TAs have no TLS block, so the shim sets the guest FS base to
+/// `canary_addr - ABI_STACK_GUARD_FS_OFFSET`, making that read resolve onto the
+/// CRNG canary pushed by [`TaStack::init`].
+#[cfg(target_arch = "x86_64")]
+pub(crate) const ABI_STACK_GUARD_FS_OFFSET: usize = 0x28;
+
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -62,6 +78,9 @@ pub struct TaStack {
     num_params: usize,
     /// Position where LdelfArg was pushed (if any)
     ldelf_arg_pos: Option<usize>,
+    #[cfg(target_arch = "x86_64")]
+    /// Position where the TA stack canary was pushed (if any).
+    canary_pos: Option<usize>,
 }
 
 impl TaStack {
@@ -84,6 +103,7 @@ impl TaStack {
             params: UteeParams::new(),
             num_params: 0,
             ldelf_arg_pos: None,
+            canary_pos: None,
         })
     }
 
@@ -99,6 +119,13 @@ impl TaStack {
     /// Get the address of `UteeParams` on the stack.
     pub(crate) fn get_params_address(&self) -> usize {
         self.stack_top.as_usize() + self.len - core::mem::size_of::<UteeParams>()
+    }
+
+    /// Get the address of the TA stack canary pushed by [`Self::init`].
+    /// Returns `None` if no canary has been pushed yet.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn canary_addr(&self) -> Option<usize> {
+        self.canary_pos.map(|pos| self.stack_top.as_usize() + pos)
     }
 
     /// Get the address of `LdelfArg` on the stack.
@@ -121,6 +148,16 @@ impl TaStack {
     fn push_bytes(&mut self, bytes: &[u8]) -> Option<()> {
         self.pos = self.pos.checked_sub(bytes.len())?;
         self.stack_top.copy_from_slice(self.pos, bytes)?;
+        Some(())
+    }
+
+    /// Push the TA stack canary and record its address.
+    fn push_canary(&mut self, canary: &[u8; 16]) -> Option<()> {
+        self.push_bytes(canary)?;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.canary_pos = Some(self.pos);
+        }
         Some(())
     }
 
@@ -259,7 +296,7 @@ impl TaStack {
         // Random 16-byte stack canary
         let mut canary = [0u8; 16];
         <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut canary);
-        self.push_bytes(&canary)?;
+        self.push_canary(&canary)?;
 
         // `reenter_thread` *jumps* into the TA entry point (which is a function) rather than
         // calls it. Adjust the stack pointer to ensure post-call stack alignment.
