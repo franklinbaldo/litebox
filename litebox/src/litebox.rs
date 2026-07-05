@@ -87,6 +87,8 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
     /// potential deadlocks.
+    #[cfg_attr(rlock, rlock::requires(no_conflict(resource(descriptor_table), read)))]
+    #[cfg_attr(rlock, rlock::ensures(acquires(resource(descriptor_table), read)))]
     pub fn descriptor_table(
         &self,
     ) -> impl core::ops::Deref<Target = Descriptors<Platform>> + use<'_, Platform> {
@@ -97,6 +99,8 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ///
     /// Note: this takes a lock, and thus should ideally not be held on to for too long to prevent
     /// potential deadlocks.
+    #[cfg_attr(rlock, rlock::requires(no_conflict(resource(descriptor_table), write)))]
+    #[cfg_attr(rlock, rlock::ensures(acquires(resource(descriptor_table), write)))]
     pub fn descriptor_table_mut(
         &self,
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {

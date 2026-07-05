@@ -245,6 +245,10 @@ impl<FS: ShimFS> GlobalState<FS> {
             .with_metadata(fd, |opt| f(opt))
             .unwrap()
     }
+    #[cfg_attr(
+        rlock,
+        rlock::ensures(call_requires(arg2, held(resource(descriptor_table), write)))
+    )]
     fn with_socket_options_mut<R>(
         &self,
         fd: &SocketFd,
@@ -273,6 +277,7 @@ impl<FS: ShimFS> GlobalState<FS> {
     /// - `optval`: A pointer to the option value in user memory.
     /// - `optlen`: The length of the option value.
     /// - `set_option` - Callback invoked with the parsed option and value for storage.
+    #[cfg_attr(rlock, rlock::ensures(call_requires(arg4, forwarded(arg1.downcastSocket_1.field0, arg0))))]
     pub(super) fn setsockopt_common<F>(
         &self,
         optname: SocketOptionName,
@@ -378,6 +383,7 @@ impl<FS: ShimFS> GlobalState<FS> {
                     _ => unimplemented!(),
                 }
             }
+
             Ok(())
         }) {
             Err(Errno::ENOPROTOOPT) => {} // fallthrough to handle other options

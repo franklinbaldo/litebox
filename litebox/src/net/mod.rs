@@ -1507,6 +1507,7 @@ where
     }
 
     /// Set TCP options
+    #[cfg_attr(rlock, rlock::requires(!held(resource(descriptor_table), write)))]
     pub fn set_tcp_option(
         &mut self,
         fd: &SocketFd<Platform>,

@@ -50,6 +50,9 @@ default-members = [
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy
 # but not _too_ ridiculous.
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rlock)'] }
+
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unreadable_literal = "allow"

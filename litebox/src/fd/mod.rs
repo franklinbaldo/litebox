@@ -408,6 +408,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         clippy::missing_panics_doc,
         reason = "the invariants guarantee that the unwrap panics cannot occur"
     )]
+    #[cfg_attr(rlock, rlock::requires(call_requires(arg2)))]
     pub fn with_metadata_mut<Subsystem, T, R>(
         &mut self,
         fd: &TypedFd<Subsystem>,
