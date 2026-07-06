@@ -1,0 +1,62 @@
+[epoll-diag] ADD fd=5 type=Eventfd mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[epoll-diag] ADD fd=9 type=BrokerSocketPair mask=Events(IN | RDHUP | 0x80000000) events=Events(0x0) host_poll=false ready=false
+[PE.14-diag] ts=1780469117197755449 CONN HANDLER EXIT conn_id=2 fd=8 peer_pid=26 peer_uid=0 peer_gid=0 (UnixStream about to drop)
+backtrace:
+[epoll-diag] ADD fd=5 type=BrokerPipe mask=Events(IN) events=Events(0x0) host_poll=false ready=false
+   0: <litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner::CloseGuard as core::ops::drop::Drop>::drop
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:977:22
+   1: core::ptr::drop_in_place<litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner::CloseGuard>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+   2: litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:1627:1
+   3: litebox_broker::cwfd::fd_token_socket::handle_control_connection::{{closure}}
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:867:9
+   4: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+   5: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+   6: __rust_try
+   7: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+   8: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+   9: litebox_broker::cwfd::fd_token_socket::handle_control_connection
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:866:18
+  10: litebox_broker::cwfd::fd_token_socket::spawn_control_listener::{{closure}}::{{closure}}
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:1663:37
+  11: std::sys::backtrace::__rust_begin_short_backtrace
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/sys/backtrace.rs:166:18
+  12: std::thread::lifecycle::spawn_unchecked::{{closure}}::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:91:13
+  13: <core::panic::unwind_safe::AssertUnwindSafe<F> as core::ops::function::FnOnce<()>>::call_once
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:274:9
+  14: std::panicking::catch_unwind::do_call
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:581:40
+  15: __rust_try
+  16: std::panicking::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:544:19
+  17: std::panic::catch_unwind
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+  18: std::thread::lifecycle::spawn_unchecked::{{closure}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/thread/lifecycle.rs:89:26
+  19: core::ops::function::FnOnce::call_once{{vtable.shim}}
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  20: <alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send> as core::ops::function::FnOnce<()>>::call_once
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/alloc/src/boxed.rs:2240:9
+  21: <std::sys::thread::unix::Thread>::new::thread_start
+             at ./rustc/59807616e1fa2540724bfbac14d7976d7e4a3860/library/std/src/sys/thread/unix.rs:118:17
+  22: <unknown>
+  23: clone
+
+[PE.14-diag] ts=1780469119227802339 PIPE READ-END soft-unread handle=8: unread=2 writes=2 reads=0 (reader never tried — legitimate or potential leak)
+[PE.10-diag] BrokerSocketPair Drop: endpoint=A a_open=true b_open=true
+[PE.10-diag] BrokerSocketPair Drop: endpoint=B a_open=false b_open=true
+[PE.14-diag] ts=1780469119255333509 CONN HANDLER EXIT conn_id=1 fd=6 peer_pid=10 peer_uid=0 peer_gid=0 (UnixStream about to drop)
+backtrace:
+   0: <litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner::CloseGuard as core::ops::drop::Drop>::drop
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:977:22
+   1: core::ptr::drop_in_place<litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner::CloseGuard>
+             at ./home/wportnoy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ptr/mod.rs:805:1
+   2: litebox_broker::cwfd::fd_token_socket::handle_control_connection_inner
+             at ./home/wportnoy/src/litebox-hypb-narrow/litebox_broker/src/cwfd/fd_token_socket.rs:1627:1
+   3: litebox_broker::cwfd::fd_token_socket::handle_control_connection
