@@ -849,8 +849,8 @@ impl Task {
     /// OP-TEE TAs are single-threaded and have no TLS block, but the x86-64
     /// toolchain still emits stack-protector reads of `%fs:0x28`. To satisfy
     /// those reads without allocating a TLS area, we set the FS base to
-    /// `canary_addr - ABI_STACK_GUARD_FS_OFFSET` (an ABI-fixed offset, not a
-    /// tunable), so the compiler's guard read lands on the TA stack canary.
+    /// `canary_addr - ABI_STACK_GUARD_FS_OFFSET` (shared by GCC, Clang, glibc,
+    /// and musl), so the compiler's guard read lands on the TA stack canary.
     ///
     /// This must be called on every TA entry: the guest FS base is not
     /// guaranteed to persist across a shim<->guest transition. Re-establishing

@@ -12,12 +12,14 @@ use zerocopy::IntoBytes;
 
 use crate::{Platform, UserMutPtr};
 
-/// ABI-mandated offset of the stack-protector guard from the x86-64 thread
-/// pointer (`%fs`). This is a fixed ABI constant, **not** a tunable.
+/// Offset of the stack-protector guard from the x86-64 thread pointer (`%fs`).
 ///
-/// On x86-64, GCC and Clang hardcode the stack-guard access as `%fs:0x28` when
-/// using the default TLS-based stack protector. This offset is a fixed part of
-/// that codegen ABI, independent of the C library.
+/// This is a compiler + C-library convention: when using the default TLS-based
+/// stack protector, both GCC and Clang emit the stack-guard access as
+/// `%fs:0x28`, matching the `stack_guard` slot in the glibc/musl `tcbhead_t`.
+/// The offset is nominally tunable via `-mstack-protector-guard-offset`, but
+/// `0x28` is the fixed default across GCC, Clang, glibc, and musl on x86-64,
+/// so we treat it as a constant here.
 ///
 /// The guard itself is a single pointer-sized word, i.e., **8 bytes** on x86-64.
 /// The read therefore spans `[%fs:0x28 .. %fs:0x30)`.
