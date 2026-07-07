@@ -1,0 +1,31 @@
+[2m2026-06-03T06:45:14.635041Z[0m [32m INFO[0m [2mlitebox_broker::cwfd::fd_token_socket[0m[2m:[0m fd-token control listener bound [3mpath[0m[2m=[0m/tmp/litebox-fdtoken-7.sock
+[2m2026-06-03T06:45:14.635418Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m fd-token broker listener started [3mpath[0m[2m=[0m/tmp/litebox-fdtoken-7.sock
+[2m2026-06-03T06:45:14.635470Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m audit log opened [3mpath[0m[2m=[0m"/tmp/litebox-vscode-server-logs/2026-06-03T06-45-14.jsonl"
+[2m2026-06-03T06:45:14.635496Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m starting network proxy mode (listen) [3maddr[0m[2m=[0m/tmp/litebox-broker-7.sock
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libc.so.6 (2142754 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 (239261 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.33 (2592256 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libm.so.6 (952648 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 (183056 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libdl.so.2 (14440 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libpthread.so.0 (14440 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/bin/bash (1446056 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/bin/cat (39416 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/bin/echo (35240 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/bin/grep (186856 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/bin/tr (47656 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/bin/true (26968 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0.11.2 (625376 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/lib/x86_64-linux-gnu/libtinfo.so.6.4 (208360 bytes)
+[broker] pre-warmed ELF cache HIT (disk): /usr/local/bin/node (122502424 bytes)
+[2m2026-06-03T06:45:14.935013Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m network proxy listening [3maddr[0m[2m=[0m/tmp/litebox-broker-7.sock
+[2m2026-06-03T06:45:14.935240Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m registered 9P file service on virtual port 5640
+[2m2026-06-03T06:45:14.956441Z[0m [32m INFO[0m [2mlitebox_broker::net_proxy[0m[2m:[0m accepted valid LBNP client, handshake complete [3mversion[0m[2m=[0m1 [3mmtu[0m[2m=[0m1600
+[2m2026-06-03T06:45:14.956532Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m network proxy client connected
+[2m2026-06-03T06:45:14.956620Z[0m [32m INFO[0m [2mlitebox_broker::net_proxy[0m[2m:[0m network proxy starting
+[2m2026-06-03T06:45:14.956710Z[0m [32m INFO[0m [2mlitebox_broker::net_proxy::host_dns[0m[2m:[0m host DNS resolver: 192.168.65.7 from /etc/resolv.conf.host
+[2m2026-06-03T06:45:14.956730Z[0m [32m INFO[0m [2mlitebox_broker::net_proxy[0m[2m:[0m network proxy ready, entering event loop
+[2m2026-06-03T06:45:14.959086Z[0m [32m INFO[0m [2mlitebox_broker::net_proxy::lb9p_handshake[0m[2m:[0m direct 9P channel connected (shared memory)
+[2m2026-06-03T06:45:17.262133Z[0m [32m INFO[0m [2mlitebox_broker::cwfd::fd_token_socket[0m[2m:[0m fd-token control: registry post-cleanup state (non-zero after last connection = leak) [3mstate_remaining[0m[2m=[0m11 [3mprocess_remaining[0m[2m=[0m3
+[2m2026-06-03T06:45:17.262260Z[0m [32m INFO[0m [2mlitebox_broker::cwfd::fd_token_socket[0m[2m:[0m fd-token control: state-registry leak preview [3mstate_remaining[0m[2m=[0m11 [3mtruncated_to[0m[2m=[0m11 [3mpreview[0m[2m=[0m[DiagnosticEntry { handle_id: 1, subsystem_tag: Eventfd, refcount: 1 }, DiagnosticEntry { handle_id: 2, subsystem_tag: UnixSocket, refcount: 2 }, DiagnosticEntry { handle_id: 3, subsystem_tag: UnixSocket, refcount: 1 }, DiagnosticEntry { handle_id: 4, subsystem_tag: Pipe, refcount: 1 }, DiagnosticEntry { handle_id: 5, subsystem_tag: Pipe, refcount: 2 }, DiagnosticEntry { handle_id: 6, subsystem_tag: Pipe, refcount: 1 }, DiagnosticEntry { handle_id: 7, subsystem_tag: Pipe, refcount: 2 }, DiagnosticEntry { handle_id: 8, subsystem_tag: Pipe, refcount: 2 }, DiagnosticEntry { handle_id: 9, subsystem_tag: Pipe, refcount: 2 }, DiagnosticEntry { handle_id: 10, subsystem_tag: Pipe, refcount: 1 }, DiagnosticEntry { handle_id: 11, subsystem_tag: Pipe, refcount: 1 }]
+[2m2026-06-03T06:45:19.251853Z[0m [32m INFO[0m [2mlitebox_broker[0m[2m:[0m 9P local service session ended (shared memory)
