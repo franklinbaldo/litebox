@@ -5,6 +5,7 @@ pub(crate) mod apphelp;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod iocp;
+pub(crate) mod lpc;
 pub(crate) mod mm;
 pub(crate) mod nls;
 pub(crate) mod object_manager;
@@ -181,6 +182,19 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
     },
+    NtConnectPort {
+        port_handle: Platform::RawMutPointer<Handle>,
+        port_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        security_qos: Platform::RawConstPointer<lpc::SecurityQualityOfService>,
+        client_view: Option<Platform::RawMutPointer<lpc::PortView>>,
+        server_view: Option<Platform::RawMutPointer<lpc::RemotePortView>>,
+        max_message_length: Option<Platform::RawMutPointer<u32>>,
+        connection_information: Option<Platform::RawMutPointer<u8>>,
+        connection_information_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    /// `NtSecureConnectPort` carries SID and server-view semantics that are
+    /// deliberately outside the current CSR `NtConnectPort` subset.
+    NtSecureConnectPort,
     NtCreateSection {
         section_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -587,6 +601,17 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 object_attributes:*,
                 number_of_concurrent_threads,
             })),
+            NtSysno::NtConnectPort => Some(sys_req!(NtConnectPort {
+                port_handle:*,
+                port_name:*,
+                security_qos:*,
+                client_view:*,
+                server_view:*,
+                max_message_length:*,
+                connection_information:*,
+                connection_information_length:*,
+            })),
+            NtSysno::NtSecureConnectPort => Some(SyscallRequest::NtSecureConnectPort),
             NtSysno::NtCreateSection => Some(sys_req!(NtCreateSection {
                 section_handle:*,
                 desired_access,
