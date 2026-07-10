@@ -24,8 +24,7 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 #[cfg(feature = "optee_syscall")]
 use litebox_common_linux::vmap::{
-    PhysPageAddr, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-    VmapManager,
+    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use x86_64::{
     VirtAddr,
@@ -1320,23 +1319,6 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 }
 
 #[cfg(feature = "optee_syscall")]
-/// Checks whether the given physical addresses are contiguous with respect to ALIGN.
-fn is_contiguous<const ALIGN: usize>(addrs: &[PhysPageAddr<ALIGN>]) -> bool {
-    for window in addrs.windows(2) {
-        let first = window[0].as_usize();
-        let second = window[1].as_usize();
-        if let Some(expected) = first.checked_add(ALIGN) {
-            if second != expected {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(feature = "optee_syscall")]
 impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
     unsafe fn vmap(
         &self,
@@ -1357,94 +1339,58 @@ impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel
             flags |= PageTableFlags::WRITABLE;
         }
 
-        // If pages are contiguous, use `map_phys_frame_range_direct` which is efficient and
-        // doesn't require vmap VA space.
-        if is_contiguous(pages) {
-            let phys_start = x86_64::PhysAddr::new(pages[0].as_usize() as u64);
-            let phys_end = x86_64::PhysAddr::new(
-                pages
-                    .last()
-                    .unwrap()
-                    .as_usize()
-                    .checked_add(ALIGN)
-                    .ok_or(PhysPointerError::Overflow)? as u64,
-            );
-            let frame_range = PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(phys_start),
-                PhysFrame::<Size4KiB>::containing_address(phys_end),
-            );
+        // Always allocate a fresh, private virtual address window for the mapping. This lets
+        // multiple cores map the same physical frame concurrently at distinct VAs (only for
+        // data copy in/out with raw pointers), so a core unmapping its window never disturbs
+        // another core's access to the same frame.
 
-            match self
-                .page_table_manager
-                .current_page_table()
-                .map_phys_frame_range_direct(frame_range, flags, None)
-            {
-                Ok(page_addr) => Ok(PhysPageMapInfo {
-                    base: page_addr,
-                    size: pages.len() * ALIGN,
-                }),
-                Err(MapToError::PageAlreadyMapped(_)) => {
-                    Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
-                }
-                Err(MapToError::FrameAllocationFailed) => {
-                    Err(PhysPointerError::FrameAllocationFailed)
-                }
-                Err(MapToError::ParentEntryHugePage) => Err(
-                    PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
-                ),
-            }
-        } else {
-            // Reject duplicate page addresses
-            {
-                let mut seen = hashbrown::HashSet::with_capacity(pages.len());
-                for page in pages {
-                    if !seen.insert(page.as_usize()) {
-                        return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
-                    }
+        // Reject duplicate page addresses
+        {
+            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+            for page in pages {
+                if !seen.insert(page.as_usize()) {
+                    return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
                 }
             }
+        }
 
-            let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
-                .iter()
-                .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
-                .collect();
+        let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
+            .iter()
+            .map(|p| PhysFrame::containing_address(x86_64::PhysAddr::new(p.as_usize() as u64)))
+            .collect();
 
-            let base_va = vmap_allocator()
-                .allocate_va_and_register_map(&frames)
-                .map_err(|e| match e {
-                    crate::mm::vmap::VmapAllocError::EmptyInput => {
-                        PhysPointerError::InvalidPhysicalAddress(0)
-                    }
-                    crate::mm::vmap::VmapAllocError::DuplicateMapping => {
-                        PhysPointerError::AlreadyMapped(pages[0].as_usize())
-                    }
-                    crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
-                        PhysPointerError::VaSpaceExhausted
-                    }
-                })?;
+        let base_va = vmap_allocator()
+            .allocate_va_and_register_map(&frames)
+            .map_err(|e| match e {
+                crate::mm::vmap::VmapAllocError::EmptyInput => {
+                    PhysPointerError::InvalidPhysicalAddress(0)
+                }
+                crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
+                    PhysPointerError::VaSpaceExhausted
+                }
+            })?;
 
-            match self
-                .page_table_manager
-                .current_page_table()
-                .map_non_contiguous_phys_frames(&frames, base_va, flags)
-            {
-                Ok(page_addr) => Ok(PhysPageMapInfo {
-                    base: page_addr,
-                    size: pages.len() * ALIGN,
-                }),
-                Err(e) => {
-                    let _ = vmap_allocator().unregister_allocation(base_va);
-                    match e {
-                        MapToError::PageAlreadyMapped(_) => {
-                            Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
-                        }
-                        MapToError::FrameAllocationFailed => {
-                            Err(PhysPointerError::FrameAllocationFailed)
-                        }
-                        MapToError::ParentEntryHugePage => Err(
-                            PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
-                        ),
+        match self
+            .page_table_manager
+            .current_page_table()
+            .map_non_contiguous_phys_frames(&frames, base_va, flags)
+        {
+            Ok(page_addr) => Ok(PhysPageMapInfo {
+                base: page_addr,
+                size: pages.len() * ALIGN,
+            }),
+            Err(e) => {
+                let _ = vmap_allocator().unregister_allocation(base_va);
+                match e {
+                    MapToError::PageAlreadyMapped(_) => {
+                        Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
                     }
+                    MapToError::FrameAllocationFailed => {
+                        Err(PhysPointerError::FrameAllocationFailed)
+                    }
+                    MapToError::ParentEntryHugePage => Err(
+                        PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
+                    ),
                 }
             }
         }

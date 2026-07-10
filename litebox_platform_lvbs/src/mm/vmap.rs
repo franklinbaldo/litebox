@@ -24,9 +24,6 @@ pub enum VmapAllocError {
     /// The input frame slice was empty.
     #[error("empty frame slice")]
     EmptyInput,
-    /// At least one physical frame is already mapped.
-    #[error("physical frame already mapped")]
-    DuplicateMapping,
     /// The vmap virtual address region has no contiguous range large enough.
     #[error("vmap virtual address space exhausted")]
     VaSpaceExhausted,
@@ -50,15 +47,16 @@ struct VmapAllocation {
 
 /// Inner state for the vmap region allocator.
 ///
-/// Uses a bump allocator with a `RangeSet` free list for virtual page numbers
-/// and HashMap for maintaining mappings between physical and virtual addresses.
+/// Uses a bump allocator with a `RangeSet` free list for virtual page numbers.
+///
+/// The same physical frame may be mapped at multiple virtual addresses simultaneously: each
+/// mapping is a private, transient window (used only to copy data in/out). Allocations are
+/// tracked by their base virtual address.
 struct VmapRegionAllocatorInner {
     /// Next available virtual page number for allocation (bump allocator).
     next_vpn: usize,
     /// Free set of previously allocated and freed VPN ranges (auto-coalescing).
     free_set: RangeSet<usize>,
-    /// Map from physical frame to virtual address.
-    pa_to_va_map: HashMap<PhysFrame<Size4KiB>, VirtAddr>,
     /// Allocation metadata indexed by starting virtual address.
     allocations: HashMap<VirtAddr, VmapAllocation>,
 }
@@ -69,7 +67,6 @@ impl VmapRegionAllocatorInner {
         Self {
             next_vpn: VMAP_START_VPN,
             free_set: RangeSet::new(),
-            pa_to_va_map: HashMap::new(),
             allocations: HashMap::new(),
         }
     }
@@ -146,14 +143,13 @@ impl VmapRegionAllocator {
         }
     }
 
-    /// Atomically allocates VA range, registers mappings, and records allocation.
+    /// Atomically allocates VA range and records the allocation.
     ///
     /// This ensures consistency: either the entire operation succeeds or nothing changes.
     ///
     /// # Errors
     ///
     /// - [`VmapAllocError::EmptyInput`] — `frames` is empty.
-    /// - [`VmapAllocError::DuplicateMapping`] — a physical frame is already mapped.
     /// - [`VmapAllocError::VaSpaceExhausted`] — no contiguous VA range is available.
     pub fn allocate_va_and_register_map(
         &self,
@@ -165,25 +161,9 @@ impl VmapRegionAllocator {
 
         let mut inner = self.inner.lock();
 
-        // Check for duplicate PA mappings before allocating
-        for frame in frames {
-            if inner.pa_to_va_map.contains_key(frame) {
-                return Err(VmapAllocError::DuplicateMapping);
-            }
-        }
-
         let base_va = inner
             .allocate_va_range(frames.len())
             .ok_or(VmapAllocError::VaSpaceExhausted)?;
-        let end_va = base_va + (frames.len() as u64) * (PAGE_SIZE as u64);
-
-        for (va, &frame) in (base_va.as_u64()..end_va.as_u64())
-            .step_by(PAGE_SIZE)
-            .map(VirtAddr::new)
-            .zip(frames.iter())
-        {
-            inner.pa_to_va_map.insert(frame, va);
-        }
 
         inner.allocations.insert(
             base_va,
@@ -195,8 +175,8 @@ impl VmapRegionAllocator {
         Ok(base_va)
     }
 
-    /// Unregisters all mappings for an allocation starting at the given virtual address
-    /// and returns its VA range to the free list.
+    /// Unregisters the allocation starting at the given virtual address and returns its VA range to
+    /// the free list.
     ///
     /// This is used both for normal `vunmap` teardown and to roll back a failed
     /// page-table mapping after `allocate_va_and_register_map` succeeds.
@@ -205,13 +185,11 @@ impl VmapRegionAllocator {
     pub fn unregister_allocation(&self, base_va: VirtAddr) -> Option<usize> {
         let mut inner = self.inner.lock();
         let allocation = inner.allocations.remove(&base_va)?;
-        for frame in &allocation.frames {
-            inner.pa_to_va_map.remove(frame);
-        }
+        let num_pages = allocation.frames.len();
 
-        inner.free_va_range(base_va, allocation.frames.len());
+        inner.free_va_range(base_va, num_pages);
 
-        Some(allocation.frames.len())
+        Some(num_pages)
     }
 }
 
@@ -282,11 +260,6 @@ mod tests {
         assert!(base_va.is_ok());
         let base_va = base_va.unwrap();
         assert_eq!(base_va.as_u64(), VMAP_START as u64);
-
-        // Duplicate PA should fail with DuplicateMapping
-        let duplicate = allocator
-            .allocate_va_and_register_map(&[PhysFrame::containing_address(PhysAddr::new(0x1000))]);
-        assert!(matches!(duplicate, Err(VmapAllocError::DuplicateMapping)));
 
         // Empty input should fail with EmptyInput
         assert!(matches!(
