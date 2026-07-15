@@ -22,7 +22,7 @@ use litebox::{
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{errno::Errno, vmap::GlobalVmapManager};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, vmap::GlobalVmapManager};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
@@ -269,6 +269,7 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                stack_guard_page_addr: Cell::new(0),
             },
         };
         if let Some(ta_bin) = ta_bin
@@ -781,8 +782,11 @@ impl Task {
             let ta_entry_point = self.get_ta_entry_point();
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
+            self.allocate_stack_guard_page()?;
             self.ta_prepared.set(true);
         }
+
+        self.restore_stack_guard_fs_base();
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
@@ -791,18 +795,6 @@ impl Task {
         ta_stack
             .init(self.global.platform, params)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
-
-        // Point the FS base at the TA stack canary so the compiler's
-        // stack-guard reads resolve to it. Must run after
-        // `ta_stack.init` (which pushes the canary) and on every entry,
-        // because the guest FS base does not persist across shim<->guest
-        // transitions (see `set_guest_stack_guard_fs_base`).
-        #[cfg(target_arch = "x86_64")]
-        Self::set_guest_stack_guard_fs_base(
-            ta_stack
-                .canary_addr()
-                .ok_or(ElfLoaderError::InvalidStackAddr)?,
-        )?;
 
         Ok(ThreadInitState::Ta {
             cmd_id: cmd_id.unwrap_or(0) as usize,
@@ -843,31 +835,40 @@ impl Task {
         }
     }
 
-    /// Point the guest FS base at the TA stack canary so the compiler's stack
-    /// guard read resolves onto it.
-    ///
-    /// OP-TEE TAs are single-threaded and have no TLS block, but the x86-64
-    /// toolchain still emits stack-protector reads of `%fs:0x28`. To satisfy
-    /// those reads without allocating a TLS area, we set the FS base to
-    /// `canary_addr - ABI_STACK_GUARD_FS_OFFSET` (shared by GCC, Clang, glibc,
-    /// and musl), so the compiler's guard read lands on the TA stack canary.
-    ///
-    /// This must be called on every TA entry: the guest FS base is not
-    /// guaranteed to persist across a shim<->guest transition. Re-establishing
-    /// it here keeps the shim platform-agnostic.
-    ///
-    /// Returns [`ElfLoaderError::InvalidStackAddr`] if `canary_addr` is below
-    /// `ABI_STACK_GUARD_FS_OFFSET`.
-    #[cfg(target_arch = "x86_64")]
-    fn set_guest_stack_guard_fs_base(canary_addr: usize) -> Result<(), ElfLoaderError> {
-        use litebox::platform::ArchSpecificProvider as _;
-        let fs_base = canary_addr
-            .checked_sub(crate::loader::ta_stack::ABI_STACK_GUARD_FS_OFFSET)
+    /// Allocate and initialize the page backing the x86-64 stack-guard slot.
+    fn allocate_stack_guard_page(&self) -> Result<(), ElfLoaderError> {
+        use litebox::platform::CrngProvider as _;
+
+        let page = self
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_POPULATE,
+                -1,
+                0,
+            )
+            .map_err(|_| {
+                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+            })?;
+        let mut guard = [0u8; core::mem::size_of::<usize>()];
+        self.global.platform.fill_bytes_crng(&mut guard);
+        page.copy_from_slice(loader::ta_stack::ABI_STACK_GUARD_FS_OFFSET, &guard)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
+        self.sys_mprotect(page, PAGE_SIZE, ProtFlags::PROT_READ)
+            .map_err(ElfLoaderError::ProtectError)?;
+        self.stack_guard_page_addr.set(page.as_usize());
+        Ok(())
+    }
+
+    /// Restore the guest FS base so `%fs:0x28` reads the stack guard page.
+    fn restore_stack_guard_fs_base(&self) {
+        use litebox::platform::ArchSpecificProvider as _;
+        let fs_base = self.stack_guard_page_addr.get();
+        debug_assert_ne!(fs_base, 0);
         litebox_platform_multiplex::platform()
             .set_arch_specific_register(&litebox::platform::ArchSpecificRegister::FsBase, fs_base)
             .expect("requires guaranteed platform support for FsBase");
-        Ok(())
     }
 
     /// Retrieve the result of the `ldelf` execution.
@@ -1346,6 +1347,8 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
+    /// Base address of the read-only page containing the stack guard.
+    stack_guard_page_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
 
@@ -1510,6 +1513,7 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                stack_guard_page_addr: Cell::new(0),
             }
         }
     }

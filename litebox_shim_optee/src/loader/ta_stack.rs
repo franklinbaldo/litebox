@@ -24,9 +24,8 @@ use crate::{Platform, UserMutPtr};
 /// The guard itself is a single pointer-sized word, i.e., **8 bytes** on x86-64.
 /// The read therefore spans `[%fs:0x28 .. %fs:0x30)`.
 ///
-/// OP-TEE TAs have no TLS block, so the shim sets the guest FS base to
-/// `canary_addr - ABI_STACK_GUARD_FS_OFFSET`, making that read resolve onto the
-/// CRNG canary pushed by [`TaStack::init`].
+/// OP-TEE TAs have no TLS block, so the shim provides a dedicated stack-guard
+/// page whose guard word is stored at this offset.
 #[cfg(target_arch = "x86_64")]
 pub(crate) const ABI_STACK_GUARD_FS_OFFSET: usize = 0x28;
 
@@ -126,6 +125,7 @@ impl TaStack {
     /// Get the address of the TA stack canary pushed by [`Self::init`].
     /// Returns `None` if no canary has been pushed yet.
     #[cfg(target_arch = "x86_64")]
+    #[expect(dead_code, reason = "retained with the existing stack canary")]
     pub(crate) fn canary_addr(&self) -> Option<usize> {
         self.canary_pos.map(|pos| self.stack_top.as_usize() + pos)
     }
