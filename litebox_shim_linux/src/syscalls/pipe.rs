@@ -58,7 +58,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             pipe_flags,
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
             NonZero::new(4096),
-        );
+        )?;
 
         let initial_status = OFlags::from(pipe_flags);
         {

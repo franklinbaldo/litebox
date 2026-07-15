@@ -29,8 +29,22 @@ impl Encoder {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
+    pub(super) fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
     pub(super) fn u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub(super) fn bytes(&mut self, value: &[u8]) {
+        self.u64(
+            value
+                .len()
+                .try_into()
+                .expect("broker byte payload length exceeds u64"),
+        );
+        self.bytes.extend_from_slice(value);
     }
 
     pub(super) fn protocol_version(&mut self, version: ProtocolVersion) {
@@ -78,11 +92,21 @@ impl<'a> Decoder<'a> {
         Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
+    pub(super) fn u32(&mut self) -> Result<u32, WireError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
     pub(super) fn u64(&mut self) -> Result<u64, WireError> {
         let bytes = self.take(8)?;
         Ok(u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
+    }
+
+    pub(super) fn bytes(&mut self) -> Result<Vec<u8>, WireError> {
+        let len = usize::try_from(self.u64()?).map_err(|_| WireError::OffsetOverflow)?;
+        Ok(self.take(len)?.to_vec())
     }
 
     pub(super) fn protocol_version(&mut self) -> Result<ProtocolVersion, WireError> {

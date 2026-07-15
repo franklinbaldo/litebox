@@ -12,6 +12,11 @@ use core::{
 };
 
 use alloc::sync::{Arc, Weak};
+use either::Either;
+use litebox_broker_protocol::{
+    ObjectHandle,
+    pipe::{MAX_PIPE_TRANSFER_SIZE, PipeEndpoint, PipeReadinessState},
+};
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
     traits::{Consumer as _, Observer as _, Producer as _, Split as _},
@@ -20,6 +25,10 @@ use thiserror::Error;
 
 use crate::{
     LiteBox,
+    broker::{
+        BrokerControl, BrokerHandleRegistry,
+        error::{BrokerControlError, BrokerObjectError},
+    },
     event::{
         Events, IOPollable,
         observer::Observer,
@@ -65,15 +74,31 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         capacity: usize,
         flags: Flags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
-    ) -> (PipeFd<Platform>, PipeFd<Platform>) {
-        let (sender, receiver) =
-            new_pipe::<Platform, u8>(capacity, OFlags::from(flags), atomic_slice_guarantee_size);
-        let sender = PipeEnd::Sender(sender);
-        let receiver = PipeEnd::Receiver(receiver);
+    ) -> Result<(PipeFd<Platform>, PipeFd<Platform>), errors::CreateError> {
+        let (sender, receiver) = if let Some(broker) = self.litebox.broker_control() {
+            let (sender, receiver) = new_broker_pipe(
+                broker,
+                self.litebox.broker_handle_registry(),
+                capacity,
+                OFlags::from(flags),
+                atomic_slice_guarantee_size,
+            )?;
+            (
+                PipeEnd::BrokerSender(sender),
+                PipeEnd::BrokerReceiver(receiver),
+            )
+        } else {
+            let (sender, receiver) = new_pipe::<Platform, u8>(
+                capacity,
+                OFlags::from(flags),
+                atomic_slice_guarantee_size,
+            );
+            (PipeEnd::Sender(sender), PipeEnd::Receiver(receiver))
+        };
         let mut dt = self.litebox.descriptor_table_mut();
         let sender = dt.insert(sender);
         let receiver = dt.insert(receiver);
-        (sender, receiver)
+        Ok((sender, receiver))
     }
 
     /// Close the pipe at `fd`.
@@ -99,11 +124,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) => Arc::clone(p),
-            PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
+            PipeEnd::Receiver(p) => Either::Left(Arc::clone(p)),
+            PipeEnd::BrokerReceiver(p) => Either::Right(Arc::clone(p)),
+            PipeEnd::Sender(_) | PipeEnd::BrokerSender(_) => {
+                return Err(errors::ReadError::NotForReading);
+            }
         };
         drop(dt);
-        p.read(cx, buf).map_err(From::from)
+        match p {
+            Either::Left(p) => p.read(cx, buf).map_err(From::from),
+            Either::Right(p) => p.read(cx, buf).map_err(From::from),
+        }
     }
 
     /// Write the values in `buf` into the pipe, returning the number of elements written.
@@ -117,11 +148,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ) -> Result<usize, errors::WriteError> {
         let dt = self.litebox.descriptor_table();
         let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
-            PipeEnd::Sender(p) => Arc::clone(p),
-            PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
+            PipeEnd::Sender(p) => Either::Left(Arc::clone(p)),
+            PipeEnd::BrokerSender(p) => Either::Right(Arc::clone(p)),
+            PipeEnd::Receiver(_) | PipeEnd::BrokerReceiver(_) => {
+                return Err(errors::WriteError::NotForWriting);
+            }
         };
         drop(dt);
-        p.write(cx, buf).map_err(From::from)
+        match p {
+            Either::Left(p) => p.write(cx, buf).map_err(From::from),
+            Either::Right(p) => p.write(cx, buf).map_err(From::from),
+        }
     }
 
     /// Whether the provided FD points to a reader or a writer end.
@@ -131,8 +168,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ) -> Result<HalfPipeType, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
         match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
-            PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
+            PipeEnd::Sender(_) | PipeEnd::BrokerSender(_) => Ok(HalfPipeType::SenderHalf),
+            PipeEnd::Receiver(_) | PipeEnd::BrokerReceiver(_) => Ok(HalfPipeType::ReceiverHalf),
         }
     }
 
@@ -142,6 +179,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.get_status(),
             PipeEnd::Sender(p) => p.get_status(),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => p.get_status(),
         };
         Ok(Flags::from_oflags_truncate(oflags))
     }
@@ -159,6 +197,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => p.set_status(OFlags::from(mask), on),
             PipeEnd::Sender(p) => p.set_status(OFlags::from(mask), on),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => {
+                p.set_status(OFlags::from(mask), on);
+            }
         }
         Ok(())
     }
@@ -173,6 +214,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
             PipeEnd::Receiver(p) => Ok(f(p)),
             PipeEnd::Sender(p) => Ok(f(p)),
+            PipeEnd::BrokerReceiver(p) | PipeEnd::BrokerSender(p) => Ok(f(p)),
         }
     }
 }
@@ -187,6 +229,8 @@ pub enum HalfPipeType {
 enum PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Receiver(Arc<ReadEnd<Platform, u8>>),
     Sender(Arc<WriteEnd<Platform, u8>>),
+    BrokerReceiver(Arc<BrokerPipeEnd<Platform>>),
+    BrokerSender(Arc<BrokerPipeEnd<Platform>>),
 }
 
 bitflags::bitflags! {
@@ -226,6 +270,18 @@ pub mod errors {
 
     use thiserror::Error;
 
+    /// Possible errors from [`Pipes::create_pipe`].
+    #[non_exhaustive]
+    #[derive(Error, Debug)]
+    pub enum CreateError {
+        #[error("pipe resource exhausted")]
+        ResourceExhausted,
+        #[error("pipe permission denied")]
+        PermissionDenied,
+        #[error("pipe broker I/O failed")]
+        Io,
+    }
+
     /// Possible errors from [`Pipes::close`]
     #[non_exhaustive]
     #[derive(Error, Debug)]
@@ -243,6 +299,8 @@ pub mod errors {
         WouldBlock,
         #[error("wait error")]
         WaitError(WaitError),
+        #[error("pipe I/O failed")]
+        Io,
     }
 
     /// Possible errors from [`Pipes::write`]
@@ -259,6 +317,8 @@ pub mod errors {
         WouldBlock,
         #[error("wait error")]
         WaitError(WaitError),
+        #[error("pipe I/O failed")]
+        Io,
     }
 
     /// Possible errors from functions that always succeed unless the descriptor is closed.
@@ -266,6 +326,236 @@ pub mod errors {
     pub enum ClosedError {
         #[error("not an open file descriptor")]
         ClosedFd,
+    }
+}
+
+struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    broker: Arc<dyn BrokerControl>,
+    handle: ObjectHandle,
+    registry: Arc<BrokerHandleRegistry<Platform>>,
+    pollee: Arc<Pollee<Platform>>,
+    peer: Weak<Self>,
+    endpoint_type: HalfPipeType,
+    status: AtomicU32,
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "a type alias would not make the two pipe endpoint result clearer"
+)]
+fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
+    broker: Arc<dyn BrokerControl>,
+    registry: Arc<BrokerHandleRegistry<Platform>>,
+    capacity: usize,
+    flags: OFlags,
+    atomic_slice_guarantee_size: Option<NonZeroUsize>,
+) -> Result<(Arc<BrokerPipeEnd<Platform>>, Arc<BrokerPipeEnd<Platform>>), errors::CreateError> {
+    let atomic_write_size = atomic_slice_guarantee_size
+        .map(NonZeroUsize::get)
+        .unwrap_or_default();
+    if atomic_write_size > MAX_PIPE_TRANSFER_SIZE as usize {
+        return Err(errors::CreateError::ResourceExhausted);
+    }
+    let response = broker
+        .create_pipe(
+            capacity
+                .try_into()
+                .map_err(|_| errors::CreateError::ResourceExhausted)?,
+            atomic_write_size
+                .try_into()
+                .map_err(|_| errors::CreateError::ResourceExhausted)?,
+        )
+        .map_err(BrokerObjectError::from)
+        .map_err(errors::CreateError::from)?;
+
+    let mut writer = Arc::new(BrokerPipeEnd {
+        broker: Arc::clone(&broker),
+        handle: response.write_handle,
+        registry: Arc::clone(&registry),
+        pollee: Arc::new(Pollee::new()),
+        peer: Weak::new(),
+        endpoint_type: HalfPipeType::SenderHalf,
+        status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
+    });
+    let reader = Arc::new_cyclic(|weak_reader| {
+        Arc::get_mut(&mut writer)
+            .expect("new pipe writer must be uniquely owned")
+            .peer = weak_reader.clone();
+        BrokerPipeEnd {
+            broker,
+            handle: response.read_handle,
+            registry: Arc::clone(&registry),
+            pollee: Arc::new(Pollee::new()),
+            peer: Arc::downgrade(&writer),
+            endpoint_type: HalfPipeType::ReceiverHalf,
+            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+        }
+    });
+
+    registry.register_pollable(response.write_handle, &writer.pollee);
+    registry.register_pollable(response.read_handle, &reader.pollee);
+    Ok((writer, reader))
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
+    fn get_status(&self) -> OFlags {
+        OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
+    }
+
+    fn set_status(&self, mask: OFlags, on: bool) {
+        if on {
+            self.status.fetch_or(mask.bits(), Relaxed);
+        } else {
+            self.status.fetch_and(mask.complement().bits(), Relaxed);
+        }
+    }
+
+    fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, PipeError> {
+        let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
+        if length == 0 {
+            return Ok(0);
+        }
+        let request_length = length
+            .try_into()
+            .expect("pipe transfer limit must fit in u32");
+
+        self.pollee
+            .wait(
+                cx,
+                self.get_status().contains(OFlags::NONBLOCK),
+                Events::IN,
+                || {
+                    let data = self
+                        .broker
+                        .read_pipe(self.handle, request_length)
+                        .map_err(broker_pipe_operation_error)?;
+                    if data.len() > length {
+                        return Err(TryOpError::Other(PipeError::Io));
+                    }
+                    buf[..data.len()].copy_from_slice(&data);
+                    if !data.is_empty()
+                        && let Some(peer) = self.peer.upgrade()
+                    {
+                        peer.pollee.notify_observers(Events::OUT);
+                    }
+                    Ok(data.len())
+                },
+            )
+            .map_err(PipeError::from)
+    }
+
+    fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, PipeError> {
+        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        if nonblock || buf.is_empty() {
+            let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
+            return self
+                .pollee
+                .wait(cx, nonblock, Events::OUT, || self.try_write(data))
+                .map_err(PipeError::from);
+        }
+
+        let mut total_written = 0;
+        while total_written < buf.len() {
+            let end = total_written
+                .saturating_add(MAX_PIPE_TRANSFER_SIZE as usize)
+                .min(buf.len());
+            let data = &buf[total_written..end];
+            match self
+                .pollee
+                .wait(cx, false, Events::OUT, || self.try_write(data))
+            {
+                Ok(written) => total_written += written,
+                Err(_) if total_written != 0 => return Ok(total_written),
+                Err(error) => return Err(PipeError::from(error)),
+            }
+        }
+        Ok(total_written)
+    }
+
+    fn try_write(&self, data: &[u8]) -> Result<usize, TryOpError<PipeError>> {
+        let written = self
+            .broker
+            .write_pipe(self.handle, data)
+            .map_err(broker_pipe_operation_error)?;
+        if written > data.len() || (written == 0 && !data.is_empty()) {
+            return Err(TryOpError::Other(PipeError::Io));
+        }
+        if written != 0
+            && let Some(peer) = self.peer.upgrade()
+        {
+            peer.pollee.notify_observers(Events::IN);
+        }
+        Ok(written)
+    }
+
+    fn readiness(&self) -> Result<PipeReadinessState, BrokerControlError> {
+        self.broker.check_pipe_readiness(self.handle)
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerPipeEnd<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
+        self.pollee.register_observer(observer, filter);
+    }
+
+    fn check_io_events(&self) -> Events {
+        match self.readiness() {
+            Ok(readiness) => pipe_readiness_events(readiness),
+            Err(_) => Events::ERR,
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerPipeEnd<Platform> {
+    fn drop(&mut self) {
+        self.registry.unregister_pollable(self.handle, &self.pollee);
+        let _ = self.broker.close_object(self.handle);
+        if let Some(peer) = self.peer.upgrade() {
+            let event = match self.endpoint_type {
+                HalfPipeType::SenderHalf => Events::HUP,
+                HalfPipeType::ReceiverHalf => Events::ERR,
+            };
+            peer.pollee.notify_observers(event);
+        }
+    }
+}
+
+fn broker_pipe_operation_error(error: BrokerControlError) -> TryOpError<PipeError> {
+    match BrokerObjectError::from(error) {
+        BrokerObjectError::WouldBlock => TryOpError::TryAgain,
+        BrokerObjectError::PeerClosed => TryOpError::Other(PipeError::PeerShutdown),
+        BrokerObjectError::Control
+        | BrokerObjectError::InvalidObject
+        | BrokerObjectError::ResourceExhausted
+        | BrokerObjectError::PermissionDenied => TryOpError::Other(PipeError::Io),
+    }
+}
+
+fn pipe_readiness_events(readiness: PipeReadinessState) -> Events {
+    let mut events = Events::empty();
+    match readiness.endpoint {
+        PipeEndpoint::Read => {
+            events.set(Events::IN, readiness.ready);
+            events.set(Events::HUP, readiness.peer_closed);
+        }
+        PipeEndpoint::Write => {
+            events.set(Events::OUT, readiness.ready);
+            events.set(Events::ERR, readiness.peer_closed);
+        }
+    }
+    events
+}
+
+impl From<BrokerObjectError> for errors::CreateError {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::WouldBlock
+            | BrokerObjectError::PeerClosed => Self::Io,
+        }
     }
 }
 
@@ -351,15 +641,15 @@ enum PipeError {
     WouldBlock,
     #[error("wait error")]
     WaitError(WaitError),
+    #[error("pipe I/O failed")]
+    Io,
 }
 
 impl From<PipeError> for errors::ReadError {
     fn from(err: PipeError) -> Self {
         match err {
             PipeError::ThisEndShutdown => errors::ReadError::ClosedFd,
-            PipeError::PeerShutdown => {
-                unreachable!("unreachable for now; see documentation of `read`")
-            }
+            PipeError::PeerShutdown | PipeError::Io => errors::ReadError::Io,
             PipeError::WouldBlock => errors::ReadError::WouldBlock,
             PipeError::WaitError(e) => errors::ReadError::WaitError(e),
         }
@@ -372,6 +662,7 @@ impl From<PipeError> for errors::WriteError {
             PipeError::PeerShutdown => errors::WriteError::ReadEndClosed,
             PipeError::WouldBlock => errors::WriteError::WouldBlock,
             PipeError::WaitError(e) => errors::WriteError::WaitError(e),
+            PipeError::Io => errors::WriteError::Io,
         }
     }
 }
@@ -634,7 +925,7 @@ mod tests {
         let litebox = &crate::LiteBox::new(platform);
         let pipes = &super::Pipes::new(litebox);
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None);
+        let (prod, cons) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {
@@ -672,7 +963,9 @@ mod tests {
         let litebox = &crate::LiteBox::new(platform);
         let pipes = &super::Pipes::new(litebox);
 
-        let (prod, cons) = pipes.create_pipe(2, super::Flags::NON_BLOCKING, None);
+        let (prod, cons) = pipes
+            .create_pipe(2, super::Flags::NON_BLOCKING, None)
+            .unwrap();
 
         std::thread::scope(|scope| {
             scope.spawn(move || {

@@ -6,6 +6,10 @@ use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
     CreateEventRequest, CreateEventResponse, ReadinessState, WaitEventRequest, WaitEventResponse,
 };
+use crate::pipe::{
+    CheckPipeReadinessRequest, CheckPipeReadinessResponse, CreatePipeRequest, CreatePipeResponse,
+    PipeReadinessState, ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
+};
 use crate::{ObjectHandle, ProtocolVersion};
 
 /// Broker handshake request sent before the control channel is active.
@@ -22,6 +26,8 @@ pub enum BrokerRequest {
     CloseObject(ObjectHandle),
     /// Event object request family.
     Event(EventRequest),
+    /// Pipe object request family.
+    Pipe(PipeRequest),
 }
 
 /// Broker handshake response sent before the control channel is active.
@@ -61,6 +67,19 @@ pub enum EventRequest {
     Consume(ConsumeEventRequest),
 }
 
+/// Broker-owned pipe object request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PipeRequest {
+    /// Create a broker-owned byte pipe.
+    Create(CreatePipeRequest),
+    /// Read bytes from a pipe.
+    Read(ReadPipeRequest),
+    /// Write bytes to a pipe.
+    Write(WritePipeRequest),
+    /// Query one endpoint's readiness.
+    CheckReadiness(CheckPipeReadinessRequest),
+}
+
 /// Broker response sent over an active control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResponse {
@@ -68,6 +87,8 @@ pub enum BrokerResponse {
     ObjectClosed,
     /// Event object response family.
     Event(EventResponse),
+    /// Pipe object response family.
+    Pipe(PipeResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -85,6 +106,19 @@ pub enum EventResponse {
     Consume(ConsumeEventResponse),
 }
 
+/// Broker-owned pipe object response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PipeResponse {
+    /// Create operation response.
+    Create(CreatePipeResponse),
+    /// Read operation response.
+    Read(ReadPipeResponse),
+    /// Write operation response.
+    Write(WritePipeResponse),
+    /// Readiness query response.
+    CheckReadiness(CheckPipeReadinessResponse),
+}
+
 /// Broker-initiated asynchronous notification.
 ///
 /// Notifications are level-triggered snapshots and may be coalesced or
@@ -94,6 +128,8 @@ pub enum EventResponse {
 pub enum BrokerNotification {
     /// Readiness changed or should be re-checked for a broker-owned event object.
     EventReadiness(EventReadinessNotification),
+    /// Readiness changed or should be re-checked for a broker-owned pipe endpoint.
+    PipeReadiness(PipeReadinessNotification),
 }
 
 /// Readiness notification for a broker-owned event object.
@@ -103,4 +139,13 @@ pub struct EventReadinessNotification {
     pub handle: ObjectHandle,
     /// Current broker-authoritative readiness snapshot.
     pub readiness: ReadinessState,
+}
+
+/// Readiness notification for a broker-owned pipe endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipeReadinessNotification {
+    /// Pipe endpoint handle.
+    pub handle: ObjectHandle,
+    /// Current broker-authoritative readiness snapshot.
+    pub readiness: PipeReadinessState,
 }

@@ -4,6 +4,7 @@
 use alloc::sync::Arc;
 
 use crate::event::EventObject;
+use crate::pipe::{PipeReadEnd, PipeWriteEnd};
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -43,20 +44,23 @@ pub(crate) struct ObjectReference {
     pub(crate) rights: ObjectRights,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectEntry {
     Event(EventObject),
+    PipeReader(PipeReadEnd),
+    PipeWriter(PipeWriteEnd),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ObjectKind {
     Event,
+    Pipe,
 }
 
 impl ObjectEntry {
-    fn kind(self) -> ObjectKind {
+    fn kind(&self) -> ObjectKind {
         match self {
             Self::Event(_) => ObjectKind::Event,
+            Self::PipeReader(_) | Self::PipeWriter(_) => ObjectKind::Pipe,
         }
     }
 }
@@ -187,7 +191,7 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(PrincipalRights::all()),
-            BrokerCoreLimits::new(1),
+            BrokerCoreLimits::new(2),
         )
         .unwrap();
         let session = broker
@@ -234,10 +238,12 @@ mod tests {
                 },
             })
         );
+        let second_handle = crate::event::create(&session, 0).unwrap();
         assert_eq!(
             crate::event::create(&session, 0),
             Err(BrokerError::ResourceExhausted)
         );
+        assert_eq!(session.close_object_reference(second_handle), Ok(()));
 
         assert_eq!(session.close_object_reference(handle), Ok(()));
         {
@@ -268,6 +274,65 @@ mod tests {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
+        let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
+        assert_eq!(
+            crate::pipe::check_readiness(&session, reader),
+            Ok(litebox_broker_protocol::pipe::PipeReadinessState {
+                endpoint: litebox_broker_protocol::pipe::PipeEndpoint::Read,
+                ready: false,
+                peer_closed: false,
+            })
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 1),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(crate::pipe::write(&session, writer, &[1, 2]), Ok(2));
+        assert_eq!(crate::pipe::write(&session, writer, &[3, 4, 5]), Ok(2));
+        assert_eq!(
+            crate::pipe::write(&session, writer, &[5]),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 3),
+            Ok(std::vec::Vec::from([1, 2, 3]))
+        );
+        assert_eq!(crate::pipe::write(&session, writer, &[5, 6]), Ok(2));
+        assert_eq!(session.close_object_reference(writer), Ok(()));
+        assert_eq!(
+            crate::pipe::check_readiness(&session, reader),
+            Ok(litebox_broker_protocol::pipe::PipeReadinessState {
+                endpoint: litebox_broker_protocol::pipe::PipeEndpoint::Read,
+                ready: true,
+                peer_closed: true,
+            })
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 4),
+            Ok(std::vec::Vec::from([4, 5, 6]))
+        );
+        assert_eq!(
+            crate::pipe::read(&session, reader, 1),
+            Ok(std::vec::Vec::new())
+        );
+        assert_eq!(session.close_object_reference(reader), Ok(()));
+
+        let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
+        assert_eq!(session.close_object_reference(reader), Ok(()));
+        assert_eq!(
+            crate::pipe::write(&session, writer, &[1]),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            crate::pipe::check_readiness(&session, writer),
+            Ok(litebox_broker_protocol::pipe::PipeReadinessState {
+                endpoint: litebox_broker_protocol::pipe::PipeEndpoint::Write,
+                ready: false,
+                peer_closed: true,
+            })
+        );
+        assert_eq!(session.close_object_reference(writer), Ok(()));
+
         {
             let mut next_reference_handle = broker.next_reference_handle.write();
             *next_reference_handle = u64::MAX;

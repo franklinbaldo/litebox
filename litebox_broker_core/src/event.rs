@@ -31,6 +31,7 @@ pub fn wait(session: &BrokerSession, handle: ObjectHandle) -> Result<ReadinessSt
             read_ready: event.count > 0,
             write_ready: event.count < MAX_EVENT_COUNT,
         }),
+        _ => Err(BrokerError::InvalidRights),
     })
 }
 
@@ -39,6 +40,7 @@ pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<
     let required_rights = ObjectRights::WRITE;
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.add(value),
+        _ => Err(BrokerError::InvalidRights),
     })
 }
 
@@ -51,6 +53,7 @@ pub fn consume(
     let required_rights = ObjectRights::WAIT;
     session.with_authorized_object_mut(handle, required_rights, |object| match object {
         ObjectEntry::Event(event) => event.consume(mode),
+        _ => Err(BrokerError::InvalidRights),
     })
 }
 

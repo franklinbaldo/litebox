@@ -27,6 +27,8 @@ pub enum ErrorCode {
     ResourceExhausted,
     #[error("broker operation would block")]
     WouldBlock,
+    #[error("broker object peer is closed")]
+    PeerClosed,
 }
 
 impl ErrorCode {
@@ -48,6 +50,7 @@ impl ErrorCode {
             8 => Some(Self::InvalidRights),
             9 => Some(Self::ResourceExhausted),
             10 => Some(Self::WouldBlock),
+            11 => Some(Self::PeerClosed),
             _ => None,
         }
     }
@@ -65,6 +68,7 @@ impl ErrorCode {
             Self::InvalidRights => 8,
             Self::ResourceExhausted => 9,
             Self::WouldBlock => 10,
+            Self::PeerClosed => 11,
         }
     }
 }

@@ -20,6 +20,7 @@ extern crate std;
 
 mod error;
 pub mod event;
+pub mod pipe;
 mod policy;
 mod session;
 

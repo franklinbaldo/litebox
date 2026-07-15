@@ -11,6 +11,7 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode, ReadinessState};
+use litebox_broker_protocol::pipe::{CreatePipeResponse, PipeEndpoint, PipeReadinessState};
 
 use crate::event::{Events, polling::Pollee};
 use crate::platform::TimeProvider;
@@ -51,6 +52,29 @@ pub(crate) trait BrokerControl: Send + Sync {
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
 
+    fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
+
+    fn read_pipe(
+        &self,
+        handle: ObjectHandle,
+        length: u32,
+    ) -> core::result::Result<Vec<u8>, BrokerControlError>;
+
+    fn write_pipe(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+    ) -> core::result::Result<usize, BrokerControlError>;
+
+    fn check_pipe_readiness(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<PipeReadinessState, BrokerControlError>;
+
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 }
 
@@ -87,16 +111,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
     where
         Platform: TimeProvider,
     {
-        let mut handles = self.handles.lock();
-        let Some(entry) = handles.get_mut(&handle) else {
-            return;
-        };
-        entry.prune_stale_pollables();
-        if entry.is_empty() {
-            handles.remove(&handle);
-            return;
-        }
-
         let mut events = Events::empty();
         if readiness.read_ready {
             events |= Events::IN;
@@ -104,7 +118,42 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         if readiness.write_ready {
             events |= Events::OUT;
         }
-        if !events.is_empty() {
+        self.notify_events(handle, events);
+    }
+
+    pub(crate) fn notify_pipe_readiness(&self, handle: ObjectHandle, readiness: PipeReadinessState)
+    where
+        Platform: TimeProvider,
+    {
+        let mut events = Events::empty();
+        match readiness.endpoint {
+            PipeEndpoint::Read => {
+                events.set(Events::IN, readiness.ready);
+                events.set(Events::HUP, readiness.peer_closed);
+            }
+            PipeEndpoint::Write => {
+                events.set(Events::OUT, readiness.ready);
+                events.set(Events::ERR, readiness.peer_closed);
+            }
+        }
+        self.notify_events(handle, events);
+    }
+
+    fn notify_events(&self, handle: ObjectHandle, events: Events)
+    where
+        Platform: TimeProvider,
+    {
+        if events.is_empty() {
+            return;
+        }
+        let mut handles = self.handles.lock();
+        let Some(entry) = handles.get_mut(&handle) else {
+            return;
+        };
+        entry.prune_stale_pollables();
+        if entry.is_empty() {
+            handles.remove(&handle);
+        } else {
             entry.notify_pollables(events);
         }
     }
@@ -205,6 +254,37 @@ where
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
         Ok(self.local.lock().consume_event(handle, mode)?)
+    }
+
+    fn create_pipe(
+        &self,
+        capacity: u64,
+        atomic_write_size: u64,
+    ) -> core::result::Result<CreatePipeResponse, BrokerControlError> {
+        Ok(self.local.lock().create_pipe(capacity, atomic_write_size)?)
+    }
+
+    fn read_pipe(
+        &self,
+        handle: ObjectHandle,
+        length: u32,
+    ) -> core::result::Result<Vec<u8>, BrokerControlError> {
+        Ok(self.local.lock().read_pipe(handle, length)?)
+    }
+
+    fn write_pipe(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+    ) -> core::result::Result<usize, BrokerControlError> {
+        Ok(self.local.lock().write_pipe(handle, data)?)
+    }
+
+    fn check_pipe_readiness(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<PipeReadinessState, BrokerControlError> {
+        Ok(self.local.lock().check_pipe_readiness(handle)?)
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

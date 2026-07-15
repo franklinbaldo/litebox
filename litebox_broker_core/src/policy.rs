@@ -23,6 +23,8 @@ pub enum PolicyProfile {
 pub struct PrincipalRights {
     /// Rights for event objects.
     pub event: ObjectRights,
+    /// Rights for pipe objects.
+    pub pipe: ObjectRights,
 }
 
 impl PrincipalRights {
@@ -30,12 +32,14 @@ impl PrincipalRights {
     pub const fn all() -> Self {
         Self {
             event: ObjectRights::WAIT.union(ObjectRights::WRITE),
+            pipe: ObjectRights::WAIT.union(ObjectRights::WRITE),
         }
     }
 
     fn object_rights(self, object_kind: ObjectKind) -> ObjectRights {
         match object_kind {
             ObjectKind::Event => self.event,
+            ObjectKind::Pipe => self.pipe,
         }
     }
 }
@@ -109,6 +113,7 @@ mod tests {
     fn static_policy_returns_configured_principal_rights() {
         let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
             event: ObjectRights::WAIT,
+            pipe: ObjectRights::empty(),
         });
 
         assert_eq!(
@@ -121,6 +126,7 @@ mod tests {
     fn empty_principal_rights_deny_object_authorization() {
         let policy = PolicyEngine::with_unauthenticated_rights(PrincipalRights {
             event: ObjectRights::empty(),
+            pipe: ObjectRights::empty(),
         });
 
         assert_eq!(
