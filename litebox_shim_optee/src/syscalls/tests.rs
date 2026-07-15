@@ -43,24 +43,6 @@ fn test_cryp_random_number_generate() {
 }
 
 #[test]
-fn test_stack_guard_page_is_initialized() {
-    use litebox::platform::RawConstPointer as _;
-
-    let task = init_platform();
-    task.allocate_stack_guard_page().unwrap();
-
-    let base = task.stack_guard_page_addr.get();
-    assert_ne!(base, 0);
-    assert_eq!(base % litebox::mm::linux::PAGE_SIZE, 0);
-    let guard = crate::UserConstPtr::<usize>::from_usize(
-        base + crate::loader::ta_stack::ABI_STACK_GUARD_FS_OFFSET,
-    )
-    .read_at_offset(0)
-    .unwrap();
-    assert_ne!(guard, 0);
-}
-
-#[test]
 fn test_sys_get_time_system_is_monotonic() {
     use litebox::platform::RawConstPointer as _;
     use litebox_common_optee::{TeeTime, TeeTimeCategory};

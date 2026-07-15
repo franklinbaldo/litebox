@@ -269,6 +269,7 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                #[cfg(target_arch = "x86_64")]
                 stack_guard_page_addr: Cell::new(0),
             },
         };
@@ -836,6 +837,11 @@ impl Task {
     }
 
     /// Allocate and initialize the page backing the x86-64 stack-guard slot.
+    ///
+    /// The x86-64 toolchain emits stack-protector accesses to `%fs:0x28`.
+    /// Normally glibc or musl initializes that ABI slot before application code
+    /// runs. OP-TEE TAs use neither runtime, so the shim must provide and
+    /// initialize the slot before entering a protected TA.
     fn allocate_stack_guard_page(&self) -> Result<(), ElfLoaderError> {
         use litebox::platform::CrngProvider as _;
 
@@ -853,6 +859,9 @@ impl Task {
             })?;
         let mut guard = [0u8; core::mem::size_of::<usize>()];
         self.global.platform.fill_bytes_crng(&mut guard);
+        // Terminator-canary convention (matches glibc `_dl_setup_stack_chk_guard`):
+        // zero the lowest-addressed byte of the guard to stop the overflow by C string func.
+        guard[0] = 0;
         page.copy_from_slice(loader::ta_stack::ABI_STACK_GUARD_FS_OFFSET, &guard)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
         self.sys_mprotect(page, PAGE_SIZE, ProtFlags::PROT_READ)
@@ -1348,6 +1357,7 @@ struct Task {
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
     /// Base address of the read-only page containing the stack guard.
+    #[cfg(target_arch = "x86_64")]
     stack_guard_page_addr: Cell<usize>,
     // TODO: OP-TEE supports global, persistent objects across sessions. Add these maps if needed.
 }
@@ -1513,6 +1523,7 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                #[cfg(target_arch = "x86_64")]
                 stack_guard_page_addr: Cell::new(0),
             }
         }
