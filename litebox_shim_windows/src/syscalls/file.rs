@@ -745,14 +745,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         ea_buffer: Option<ConstPtr<Platform, u8>>,
         ea_length: u32,
     ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
-        let object = if object == CondrvObject::Connect {
+        if object == CondrvObject::Connect {
             condrv::validate_connect_server_ea::<Platform>(ea_buffer, ea_length)?;
-            CondrvObject::Connected
         } else if ea_buffer.is_some() || ea_length != 0 {
             return Err(NtStatus::EAS_NOT_SUPPORTED);
-        } else {
-            object
-        };
+        }
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
             return Err(NtStatus::NOT_A_DIRECTORY);
         }
@@ -775,10 +772,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 )?;
                 (FileObjectBacking::CondrvStream { object, fd }, information)
             }
-            CondrvObject::Server
-            | CondrvObject::Reference
-            | CondrvObject::Connect
-            | CondrvObject::Connected => (
+            CondrvObject::Server | CondrvObject::Reference | CondrvObject::Connect => (
                 FileObjectBacking::CondrvControl(object),
                 FileCreateInformation::Opened,
             ),
@@ -1327,6 +1321,24 @@ mod tests {
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_OPEN,
                 FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                None,
+                0,
+            ),
+            NtStatus::EAS_NOT_SUPPORTED
+        );
+        assert!(connect_handle.is_null());
+
+        assert_eq!(
+            task.sys_nt_create_file(
+                mut_ptr(&mut connect_handle),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                Some(const_ptr(&connect_attributes)),
+                mut_ptr(&mut io_status),
+                None,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
                 Some(const_ptr(&ea[0])),
                 u32::try_from(ea.len()).unwrap(),
             ),
@@ -1357,7 +1369,7 @@ mod tests {
             task.file_entry(connect_handle)
                 .unwrap()
                 .with_entry(FileObject::condrv_object),
-            Some(CondrvObject::Connected)
+            Some(CondrvObject::Connect)
         );
 
         assert_eq!(connect_handle, server_handle);
@@ -1365,9 +1377,21 @@ mod tests {
             open_condrv_child(&task, connect_handle, r"\Input", FILE_GENERIC_READ);
         let (output_status, output_handle) =
             open_condrv_child(&task, connect_handle, r"\Output", FILE_GENERIC_WRITE);
+        let (current_input_status, current_input_handle) =
+            open_condrv_child(&task, connect_handle, r"\CurrentIn", FILE_GENERIC_READ);
+        let (current_output_status, current_output_handle) =
+            open_condrv_child(&task, connect_handle, r"\CurrentOut", FILE_GENERIC_WRITE);
+        let (screen_buffer_status, screen_buffer_handle) =
+            open_condrv_child(&task, connect_handle, r"\ScreenBuffer", FILE_GENERIC_WRITE);
         assert_eq!(input_status, NtStatus::SUCCESS);
         assert_eq!(output_status, NtStatus::SUCCESS);
+        assert_eq!(current_input_status, NtStatus::SUCCESS);
+        assert_eq!(current_output_status, NtStatus::SUCCESS);
+        assert_eq!(screen_buffer_status, NtStatus::SUCCESS);
 
+        assert_eq!(task.sys_nt_close(screen_buffer_handle), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(current_output_handle), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(current_input_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(output_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(input_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(connect_handle), NtStatus::SUCCESS);
@@ -2197,6 +2221,9 @@ mod tests {
             for (name, expected) in [
                 (r"\Input", NtStatus::SUCCESS),
                 (r"\Output", NtStatus::SUCCESS),
+                (r"\CurrentIn", NtStatus::SUCCESS),
+                (r"\CurrentOut", NtStatus::SUCCESS),
+                (r"\ScreenBuffer", NtStatus::SUCCESS),
                 (r"\Server", NtStatus::SUCCESS),
                 (r"\Reference", NtStatus::SUCCESS),
                 (r"\Connect", NtStatus::INVALID_HANDLE),

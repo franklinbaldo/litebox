@@ -24,7 +24,6 @@ pub(crate) enum CondrvObject {
     Server = 2,
     Reference = 3,
     Connect = 4,
-    Connected = 5,
 }
 
 impl CondrvObject {
@@ -33,7 +32,6 @@ impl CondrvObject {
             Some(object @ (Self::Input | Self::Output | Self::Server)) => Ok(object),
             Some(Self::Reference) => Err(NtStatus::INVALID_HANDLE),
             Some(Self::Connect) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
-            Some(Self::Connected) => unreachable!("Connected is not a named ConDrv endpoint"),
             None => Err(NtStatus::OBJECT_NAME_NOT_FOUND),
         }
     }
@@ -56,22 +54,34 @@ impl CondrvObject {
 
     pub(crate) fn relative_child(self, name: &str) -> Result<Self, NtStatus> {
         let name = name.strip_prefix('\\').ok_or(NtStatus::NOT_FOUND)?;
-        let child = Self::from_component(name).ok_or(NtStatus::NOT_FOUND)?;
+        let child = if self == Self::Connect {
+            if name.eq_ignore_ascii_case("CurrentIn") {
+                Self::Input
+            } else if name.eq_ignore_ascii_case("CurrentOut")
+                || name.eq_ignore_ascii_case("ScreenBuffer")
+            {
+                Self::Output
+            } else {
+                Self::from_component(name).ok_or(NtStatus::NOT_FOUND)?
+            }
+        } else {
+            Self::from_component(name).ok_or(NtStatus::NOT_FOUND)?
+        };
 
         match (self, child) {
             (Self::Server, Self::Server | Self::Reference)
             | (Self::Reference, Self::Server | Self::Connect | Self::Input | Self::Output)
             | (Self::Input | Self::Output, Self::Server | Self::Input | Self::Output)
-            | (Self::Connected, Self::Server | Self::Reference | Self::Input | Self::Output) => {
+            | (Self::Connect, Self::Server | Self::Reference | Self::Input | Self::Output) => {
                 Ok(child)
             }
             (Self::Server, Self::Input | Self::Output) => Err(NtStatus::INVALID_DEVICE_STATE),
             (Self::Reference | Self::Input | Self::Output, Self::Reference) => {
                 Err(NtStatus::OBJECT_TYPE_MISMATCH)
             }
-            (Self::Server | Self::Input | Self::Output | Self::Connected, Self::Connect)
-            | (Self::Connect, _) => Err(NtStatus::INVALID_HANDLE),
-            (_, Self::Connected) => Err(NtStatus::NOT_FOUND),
+            (Self::Server | Self::Input | Self::Output | Self::Connect, Self::Connect) => {
+                Err(NtStatus::INVALID_HANDLE)
+            }
         }
     }
 
@@ -81,7 +91,7 @@ impl CondrvObject {
             Self::Output => "/dev/stdout",
             Self::Server => r"\Device\ConDrv\Server",
             Self::Reference => r"\Device\ConDrv\Reference",
-            Self::Connect | Self::Connected => r"\Device\ConDrv\Connect",
+            Self::Connect => r"\Device\ConDrv\Connect",
         }
     }
 }
@@ -184,7 +194,8 @@ pub(crate) fn validate_connect_server_ea<Platform: crate::ShimPlatform>(
     };
     // Windows rejects a structurally valid but zeroed server handshake with
     // STATUS_PIPE_DISCONNECTED.
-    // TODO(condrv-handshake): decode the undocumented server payload once its layout is known.
+    // TODO(condrv-handshake): fully decode the undocumented server payload; the current subset
+    // only pins the native all-zero rejection and validates its readable extent.
     let Some(value) =
         ConstPtr::<Platform, u8>::from_usize(value_address).to_owned_slice(value_length)
     else {
@@ -277,7 +288,7 @@ mod tests {
 
     #[test]
     fn relative_children_match_host_parse_contexts() {
-        use CondrvObject::{Connect, Connected, Input, Output, Reference, Server};
+        use CondrvObject::{Connect, Input, Output, Reference, Server};
 
         for (parent, name, expected) in [
             (Server, r"\Server", Ok(Server)),
@@ -304,13 +315,14 @@ mod tests {
             (Output, r"\Output", Ok(Output)),
             (Output, r"\Reference", Err(NtStatus::OBJECT_TYPE_MISMATCH)),
             (Output, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
-            (Connect, r"\Input", Err(NtStatus::INVALID_HANDLE)),
-            (Connect, r"\Output", Err(NtStatus::INVALID_HANDLE)),
-            (Connected, r"\Input", Ok(Input)),
-            (Connected, r"\Output", Ok(Output)),
-            (Connected, r"\Server", Ok(Server)),
-            (Connected, r"\Reference", Ok(Reference)),
-            (Connected, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
+            (Connect, r"\Input", Ok(Input)),
+            (Connect, r"\Output", Ok(Output)),
+            (Connect, r"\CurrentIn", Ok(Input)),
+            (Connect, r"\CurrentOut", Ok(Output)),
+            (Connect, r"\ScreenBuffer", Ok(Output)),
+            (Connect, r"\Server", Ok(Server)),
+            (Connect, r"\Reference", Ok(Reference)),
+            (Connect, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
         ] {
             assert_eq!(parent.relative_child(name), expected, "{parent:?} + {name}");
         }
