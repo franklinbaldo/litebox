@@ -323,6 +323,7 @@ mod tests {
             (Connect, r"\Server", Ok(Server)),
             (Connect, r"\Reference", Ok(Reference)),
             (Connect, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
+            (Connect, r"\Bogus", Err(NtStatus::NOT_FOUND)),
         ] {
             assert_eq!(parent.relative_child(name), expected, "{parent:?} + {name}");
         }

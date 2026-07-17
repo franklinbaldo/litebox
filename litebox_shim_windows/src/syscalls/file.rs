@@ -2227,6 +2227,7 @@ mod tests {
                 (r"\Server", NtStatus::SUCCESS),
                 (r"\Reference", NtStatus::SUCCESS),
                 (r"\Connect", NtStatus::INVALID_HANDLE),
+                (r"\Bogus", NtStatus::NOT_FOUND),
             ] {
                 let (status, handle) = host_create_file(console_handle, name);
                 assert_eq!(status, expected, "{name:?}");
