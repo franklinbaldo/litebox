@@ -11,7 +11,8 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode, ReadinessState};
-use litebox_broker_protocol::pipe::{CreatePipeResponse, PipeEndpoint, PipeReadinessState};
+use litebox_broker_protocol::message::ReadinessFlags;
+use litebox_broker_protocol::pipe::{CreatePipeResponse, PipeReadinessState};
 
 use crate::event::{Events, polling::Pollee};
 use crate::platform::TimeProvider;
@@ -107,35 +108,15 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         }
     }
 
-    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessState)
+    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags)
     where
         Platform: TimeProvider,
     {
         let mut events = Events::empty();
-        if readiness.read_ready {
-            events |= Events::IN;
-        }
-        if readiness.write_ready {
-            events |= Events::OUT;
-        }
-        self.notify_events(handle, events);
-    }
-
-    pub(crate) fn notify_pipe_readiness(&self, handle: ObjectHandle, readiness: PipeReadinessState)
-    where
-        Platform: TimeProvider,
-    {
-        let mut events = Events::empty();
-        match readiness.endpoint {
-            PipeEndpoint::Read => {
-                events.set(Events::IN, readiness.ready);
-                events.set(Events::HUP, readiness.peer_closed);
-            }
-            PipeEndpoint::Write => {
-                events.set(Events::OUT, readiness.ready);
-                events.set(Events::ERR, readiness.peer_closed);
-            }
-        }
+        events.set(Events::IN, readiness.contains(ReadinessFlags::READ));
+        events.set(Events::OUT, readiness.contains(ReadinessFlags::WRITE));
+        events.set(Events::HUP, readiness.contains(ReadinessFlags::HANGUP));
+        events.set(Events::ERR, readiness.contains(ReadinessFlags::ERROR));
         self.notify_events(handle, events);
     }
 

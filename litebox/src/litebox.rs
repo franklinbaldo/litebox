@@ -150,14 +150,10 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         Platform: TimeProvider,
     {
         match notification {
-            BrokerNotification::EventReadiness(notification) => self
+            BrokerNotification::Readiness(notification) => self
                 .x
                 .broker_handles
-                .notify_readiness(notification.handle, notification.readiness),
-            BrokerNotification::PipeReadiness(notification) => self
-                .x
-                .broker_handles
-                .notify_pipe_readiness(notification.handle, notification.readiness),
+                .notify_readiness(notification.handle, notification.events),
         }
     }
 

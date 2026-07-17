@@ -4,11 +4,11 @@
 use crate::error::ErrorCode;
 use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
-    CreateEventRequest, CreateEventResponse, ReadinessState, WaitEventRequest, WaitEventResponse,
+    CreateEventRequest, CreateEventResponse, WaitEventRequest, WaitEventResponse,
 };
 use crate::pipe::{
     CheckPipeReadinessRequest, CheckPipeReadinessResponse, CreatePipeRequest, CreatePipeResponse,
-    PipeReadinessState, ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
+    ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion};
 
@@ -126,26 +126,54 @@ pub enum PipeResponse {
 /// re-check authoritative state, not as ordered state transitions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerNotification {
-    /// Readiness changed or should be re-checked for a broker-owned event object.
-    EventReadiness(EventReadinessNotification),
-    /// Readiness changed or should be re-checked for a broker-owned pipe endpoint.
-    PipeReadiness(PipeReadinessNotification),
+    /// Readiness changed or should be re-checked for a broker-owned object.
+    Readiness(ReadinessNotification),
 }
 
-/// Readiness notification for a broker-owned event object.
+/// Readiness notification for a broker-owned object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EventReadinessNotification {
-    /// Event object handle.
+pub struct ReadinessNotification {
+    /// Broker object handle.
     pub handle: ObjectHandle,
     /// Current broker-authoritative readiness snapshot.
-    pub readiness: ReadinessState,
+    pub events: ReadinessFlags,
 }
 
-/// Readiness notification for a broker-owned pipe endpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PipeReadinessNotification {
-    /// Pipe endpoint handle.
-    pub handle: ObjectHandle,
-    /// Current broker-authoritative readiness snapshot.
-    pub readiness: PipeReadinessState,
+/// Object-neutral readiness flags carried by broker notifications.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadinessFlags(u32);
+
+impl ReadinessFlags {
+    /// Reading can complete without blocking.
+    pub const READ: Self = Self(1 << 0);
+    /// Writing can complete without blocking.
+    pub const WRITE: Self = Self(1 << 1);
+    /// A stream or pipe write peer has closed.
+    pub const HANGUP: Self = Self(1 << 2);
+    /// An object has an error condition.
+    pub const ERROR: Self = Self(1 << 3);
+
+    /// Constructs readiness flags while retaining unknown future bits.
+    pub const fn from_bits_retain(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Returns the raw readiness bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Returns whether all bits in `other` are present.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl core::ops::BitOr for ReadinessFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
 }

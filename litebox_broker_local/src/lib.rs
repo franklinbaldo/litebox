@@ -163,7 +163,7 @@ mod tests {
     use litebox_broker_protocol::channel::LocalNotificationChannel;
     use litebox_broker_protocol::event::{CreateEventRequest, CreateEventResponse};
     use litebox_broker_protocol::message::{
-        EventReadinessNotification, EventRequest, EventResponse,
+        EventRequest, EventResponse, ReadinessFlags, ReadinessNotification,
     };
 
     #[test]
@@ -254,12 +254,9 @@ mod tests {
 
     #[test]
     fn notification_receiver_returns_broker_notifications() {
-        let notification = BrokerNotification::EventReadiness(EventReadinessNotification {
+        let notification = BrokerNotification::Readiness(ReadinessNotification {
             handle: ObjectHandle(7),
-            readiness: litebox_broker_protocol::event::ReadinessState {
-                read_ready: true,
-                write_ready: false,
-            },
+            events: ReadinessFlags::READ,
         });
         let mut receiver = BrokerNotifications::new(FakeNotificationChannel {
             notification: Some(notification.clone()),

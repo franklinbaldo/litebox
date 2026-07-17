@@ -188,7 +188,7 @@ mod tests {
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption, ReadinessState};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, EventReadinessNotification, EventRequest, EventResponse,
+        BrokerResponse, EventRequest, EventResponse, ReadinessFlags, ReadinessNotification,
     };
 
     use super::*;
@@ -234,13 +234,10 @@ mod tests {
             std::thread::yield_now();
         }
         read_ready.store(true, Ordering::SeqCst);
-        litebox.dispatch_broker_notification(BrokerNotification::EventReadiness(
-            EventReadinessNotification {
+        litebox.dispatch_broker_notification(BrokerNotification::Readiness(
+            ReadinessNotification {
                 handle,
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: true,
-                },
+                events: ReadinessFlags::READ | ReadinessFlags::WRITE,
             },
         ));
 
