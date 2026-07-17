@@ -58,19 +58,12 @@ impl BrokerCoreLimits {
         max_total_pipe_capacity: 64 * 1024 * 1024,
     };
 
-    /// Creates a broker core limit set with the default pipe-capacity limit.
-    pub const fn new(max_references: usize) -> Self {
+    /// Creates a broker core limit set.
+    pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
         Self {
             max_references,
-            ..Self::DEFAULT
+            max_total_pipe_capacity,
         }
-    }
-
-    /// Sets the maximum total capacity in bytes reserved by live pipes.
-    #[must_use]
-    pub const fn with_max_total_pipe_capacity(mut self, max_total_pipe_capacity: usize) -> Self {
-        self.max_total_pipe_capacity = max_total_pipe_capacity;
-        self
     }
 }
 

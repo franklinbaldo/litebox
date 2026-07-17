@@ -256,7 +256,7 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(2).with_max_total_pipe_capacity(4),
+            BrokerCoreLimits::new(2, 4),
         )
         .unwrap();
         let session = broker
