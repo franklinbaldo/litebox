@@ -2156,6 +2156,12 @@ mod tests {
             fn NtClose(Handle: *mut c_void) -> i32;
         }
 
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn AllocConsole() -> i32;
+            fn GetLastError() -> u32;
+        }
+
         fn host_nt_path(path: &std::path::Path) -> std::string::String {
             std::format!(r"\??\{}", path.display())
         }
@@ -2211,11 +2217,34 @@ mod tests {
         #[test]
         fn connected_console_child_matrix_matches_host() {
             // SAFETY: RtlGetCurrentPeb returns the live typed PEB for this process.
-            let peb = unsafe { &*RtlGetCurrentPeb() };
+            let mut peb = unsafe { &*RtlGetCurrentPeb() };
             // SAFETY: The current process owns a live RTL_USER_PROCESS_PARAMETERS block.
-            let process_parameters =
+            let mut process_parameters =
                 unsafe { &*(peb.process_parameters as *const RtlUserProcessParameters) };
-            assert_ne!(process_parameters.console_handle, 0);
+            let console_handle = process_parameters.console_handle;
+            // ReactOS and Wine model detached/new/no-window console states as null or
+            // the reserved pseudo-handles -1 through -4.
+            if console_handle == 0 || console_handle >= usize::MAX - 3 {
+                // SAFETY: The test process has no connected console, so AllocConsole may attach one.
+                let allocated = unsafe { AllocConsole() };
+                assert_ne!(
+                    allocated,
+                    0,
+                    "AllocConsole failed with Win32 error {}",
+                    // SAFETY: GetLastError has no preconditions.
+                    unsafe { GetLastError() }
+                );
+                // AllocConsole updates the live process parameters.
+                // SAFETY: RtlGetCurrentPeb returns the live typed PEB for this process.
+                peb = unsafe { &*RtlGetCurrentPeb() };
+                // SAFETY: The PEB owns a live RTL_USER_PROCESS_PARAMETERS block.
+                process_parameters =
+                    unsafe { &*(peb.process_parameters as *const RtlUserProcessParameters) };
+            }
+            assert_ne!(
+                process_parameters.console_handle, 0,
+                "console handle remained null after ensuring a console"
+            );
             let console_handle = Handle::from_raw(process_parameters.console_handle);
 
             for (name, expected) in [
@@ -2230,7 +2259,12 @@ mod tests {
                 (r"\Bogus", NtStatus::NOT_FOUND),
             ] {
                 let (status, handle) = host_create_file(console_handle, name);
-                assert_eq!(status, expected, "{name:?}");
+                assert_eq!(
+                    status,
+                    expected,
+                    "{name:?} under console handle {:#x}",
+                    console_handle.as_raw()
+                );
                 if status == NtStatus::SUCCESS {
                     assert!(!handle.is_null());
                     close_host_handle(handle);
