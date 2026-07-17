@@ -609,7 +609,8 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
 impl From<litebox::pipes::errors::CreateError> for Errno {
     fn from(value: litebox::pipes::errors::CreateError) -> Self {
         match value {
-            litebox::pipes::errors::CreateError::ResourceExhausted => Errno::ENOMEM,
+            litebox::pipes::errors::CreateError::ResourceExhausted => Errno::ENFILE,
+            litebox::pipes::errors::CreateError::OutOfMemory => Errno::ENOMEM,
             litebox::pipes::errors::CreateError::PermissionDenied => Errno::EACCES,
             litebox::pipes::errors::CreateError::Io => Errno::EIO,
             _ => todo!(),

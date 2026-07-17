@@ -10,8 +10,8 @@ use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
-use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode, ReadinessState};
-use litebox_broker_protocol::pipe::{CreatePipeResponse, PipeReadinessState};
+use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
+use litebox_broker_protocol::pipe::CreatePipeResponse;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
@@ -39,13 +39,13 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn wait_event(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<ReadinessState, BrokerControlError>;
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn add_event(
         &self,
         handle: ObjectHandle,
         value: u64,
-    ) -> core::result::Result<ReadinessState, BrokerControlError>;
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn consume_event(
         &self,
@@ -74,7 +74,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn check_pipe_readiness(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<PipeReadinessState, BrokerControlError>;
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 }
@@ -112,18 +112,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
     where
         Platform: TimeProvider,
     {
-        let mut events = Events::empty();
-        events.set(Events::IN, readiness.contains(ReadinessFlags::READ));
-        events.set(Events::OUT, readiness.contains(ReadinessFlags::WRITE));
-        events.set(Events::HUP, readiness.contains(ReadinessFlags::HANGUP));
-        events.set(Events::ERR, readiness.contains(ReadinessFlags::ERROR));
-        self.notify_events(handle, events);
-    }
-
-    fn notify_events(&self, handle: ObjectHandle, events: Events)
-    where
-        Platform: TimeProvider,
-    {
+        let events = readiness_events(readiness);
         if events.is_empty() {
             return;
         }
@@ -217,7 +206,7 @@ where
     fn wait_event(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<ReadinessState, BrokerControlError> {
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
         Ok(self.local.lock().wait_event(handle)?)
     }
 
@@ -225,7 +214,7 @@ where
         &self,
         handle: ObjectHandle,
         value: u64,
-    ) -> core::result::Result<ReadinessState, BrokerControlError> {
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
         Ok(self.local.lock().add_event(handle, value)?)
     }
 
@@ -264,11 +253,20 @@ where
     fn check_pipe_readiness(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<PipeReadinessState, BrokerControlError> {
+    ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
         Ok(self.local.lock().check_pipe_readiness(handle)?)
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
         Ok(self.local.lock().close_object(handle)?)
     }
+}
+
+pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
+    let mut events = Events::empty();
+    events.set(Events::IN, readiness.0 & ReadinessFlags::READ.0 != 0);
+    events.set(Events::OUT, readiness.0 & ReadinessFlags::WRITE.0 != 0);
+    events.set(Events::HUP, readiness.0 & ReadinessFlags::HANGUP.0 != 0);
+    events.set(Events::ERR, readiness.0 & ReadinessFlags::ERROR.0 != 0);
+    events
 }

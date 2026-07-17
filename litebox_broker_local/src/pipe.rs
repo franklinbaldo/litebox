@@ -7,9 +7,10 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
-    CheckPipeReadinessRequest, CreatePipeRequest, CreatePipeResponse, PipeReadinessState,
-    ReadPipeRequest, WritePipeRequest,
+    CheckPipeReadinessRequest, CreatePipeRequest, CreatePipeResponse, ReadPipeRequest,
+    WritePipeRequest,
 };
+use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
@@ -80,7 +81,7 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
     pub fn check_pipe_readiness(
         &mut self,
         handle: ObjectHandle,
-    ) -> Result<PipeReadinessState, Channel::Error> {
+    ) -> Result<ReadinessFlags, Channel::Error> {
         match self.request_pipe(PipeRequest::CheckReadiness(CheckPipeReadinessRequest {
             handle,
         }))? {

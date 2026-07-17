@@ -32,7 +32,7 @@ use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use policy::{PolicyEngine, PolicyProfile, PrincipalRights};
+pub use policy::{PolicyEngine, PolicyProfile};
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights};
 
@@ -47,17 +47,30 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 pub struct BrokerCoreLimits {
     /// Maximum live object references.
     pub max_references: usize,
+    /// Maximum total capacity in bytes reserved by live pipes.
+    pub max_total_pipe_capacity: usize,
 }
 
 impl BrokerCoreLimits {
     /// Conservative default limits for initial broker deployments.
     pub const DEFAULT: Self = Self {
         max_references: 4096,
+        max_total_pipe_capacity: 64 * 1024 * 1024,
     };
 
-    /// Creates a broker core limit set.
+    /// Creates a broker core limit set with the default pipe-capacity limit.
     pub const fn new(max_references: usize) -> Self {
-        Self { max_references }
+        Self {
+            max_references,
+            ..Self::DEFAULT
+        }
+    }
+
+    /// Sets the maximum total capacity in bytes reserved by live pipes.
+    #[must_use]
+    pub const fn with_max_total_pipe_capacity(mut self, max_total_pipe_capacity: usize) -> Self {
+        self.max_total_pipe_capacity = max_total_pipe_capacity;
+        self
     }
 }
 
@@ -79,6 +92,7 @@ pub struct BrokerCore {
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
+    pub(crate) reserved_pipe_capacity: Arc<RwLock<usize>>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -101,6 +115,7 @@ impl BrokerCore {
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
+            reserved_pipe_capacity: Arc::new(RwLock::new(0)),
         })
     }
 

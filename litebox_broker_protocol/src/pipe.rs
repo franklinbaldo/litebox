@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::ObjectHandle;
+use crate::readiness::ReadinessFlags;
 
 /// Maximum pipe payload carried by one control-path request or response.
 ///
@@ -68,29 +69,9 @@ pub struct CheckPipeReadinessRequest {
     pub handle: ObjectHandle,
 }
 
-/// Pipe endpoint kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PipeEndpoint {
-    /// Read endpoint.
-    Read,
-    /// Write endpoint.
-    Write,
-}
-
-/// Broker-authoritative readiness for one pipe endpoint.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PipeReadinessState {
-    /// Endpoint described by this snapshot.
-    pub endpoint: PipeEndpoint,
-    /// The endpoint's operation can complete without blocking.
-    pub ready: bool,
-    /// The opposite endpoint has closed.
-    pub peer_closed: bool,
-}
-
 /// Response to a pipe readiness query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckPipeReadinessResponse {
     /// Current endpoint readiness.
-    pub readiness: PipeReadinessState,
+    pub readiness: ReadinessFlags,
 }

@@ -14,8 +14,7 @@ use core::{
 use alloc::sync::{Arc, Weak};
 use either::Either;
 use litebox_broker_protocol::{
-    ObjectHandle,
-    pipe::{MAX_PIPE_TRANSFER_SIZE, PipeEndpoint, PipeReadinessState},
+    ObjectHandle, pipe::MAX_PIPE_TRANSFER_SIZE, readiness::ReadinessFlags,
 };
 use ringbuf::{
     HeapCons, HeapProd, HeapRb,
@@ -28,6 +27,7 @@ use crate::{
     broker::{
         BrokerControl, BrokerHandleRegistry,
         error::{BrokerControlError, BrokerObjectError},
+        readiness_events,
     },
     event::{
         Events, IOPollable,
@@ -276,6 +276,8 @@ pub mod errors {
     pub enum CreateError {
         #[error("pipe resource exhausted")]
         ResourceExhausted,
+        #[error("pipe memory allocation failed")]
+        OutOfMemory,
         #[error("pipe permission denied")]
         PermissionDenied,
         #[error("pipe broker I/O failed")]
@@ -428,7 +430,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
                     let data = self
                         .broker
                         .read_pipe(self.handle, request_length)
-                        .map_err(broker_pipe_operation_error)?;
+                        .map_err(|error| self.broker_request_error(error))?;
                     if data.len() > length {
                         return Err(TryOpError::Other(PipeError::Io));
                     }
@@ -476,7 +478,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         let written = self
             .broker
             .write_pipe(self.handle, data)
-            .map_err(broker_pipe_operation_error)?;
+            .map_err(|error| self.broker_request_error(error))?;
         if written > data.len() || (written == 0 && !data.is_empty()) {
             return Err(TryOpError::Other(PipeError::Io));
         }
@@ -488,7 +490,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         Ok(written)
     }
 
-    fn readiness(&self) -> Result<PipeReadinessState, BrokerControlError> {
+    fn broker_request_error(&self, error: BrokerControlError) -> BrokerObjectError {
+        let error = error.into();
+        if error != BrokerObjectError::WouldBlock {
+            self.pollee.notify_observers(Events::ERR);
+        }
+        error
+    }
+
+    fn readiness(&self) -> Result<ReadinessFlags, BrokerControlError> {
         self.broker.check_pipe_readiness(self.handle)
     }
 }
@@ -500,7 +510,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerPi
 
     fn check_io_events(&self) -> Events {
         match self.readiness() {
-            Ok(readiness) => pipe_readiness_events(readiness),
+            Ok(readiness) => readiness_events(readiness),
             Err(_) => Events::ERR,
         }
     }
@@ -520,36 +530,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerPipeEnd<
     }
 }
 
-fn broker_pipe_operation_error(error: BrokerControlError) -> TryOpError<PipeError> {
-    match BrokerObjectError::from(error) {
-        BrokerObjectError::WouldBlock => TryOpError::TryAgain,
-        BrokerObjectError::PeerClosed => TryOpError::Other(PipeError::PeerShutdown),
-        BrokerObjectError::Control
-        | BrokerObjectError::InvalidObject
-        | BrokerObjectError::ResourceExhausted
-        | BrokerObjectError::PermissionDenied => TryOpError::Other(PipeError::Io),
-    }
-}
-
-fn pipe_readiness_events(readiness: PipeReadinessState) -> Events {
-    let mut events = Events::empty();
-    match readiness.endpoint {
-        PipeEndpoint::Read => {
-            events.set(Events::IN, readiness.ready);
-            events.set(Events::HUP, readiness.peer_closed);
-        }
-        PipeEndpoint::Write => {
-            events.set(Events::OUT, readiness.ready);
-            events.set(Events::ERR, readiness.peer_closed);
+impl From<BrokerObjectError> for TryOpError<PipeError> {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::WouldBlock => TryOpError::TryAgain,
+            BrokerObjectError::PeerClosed => TryOpError::Other(PipeError::PeerShutdown),
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::ResourceExhausted
+            | BrokerObjectError::PermissionDenied
+            | BrokerObjectError::OutOfMemory => TryOpError::Other(PipeError::Io),
         }
     }
-    events
 }
 
 impl From<BrokerObjectError> for errors::CreateError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
             BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
+            BrokerObjectError::OutOfMemory => Self::OutOfMemory,
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
@@ -912,12 +911,107 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 
 #[cfg(test)]
 mod tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use alloc::sync::Arc;
+    use litebox_broker_local::BrokerLocal;
+    use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::message::{
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+        PipeRequest, PipeResponse,
+    };
+    use litebox_broker_protocol::pipe::CreatePipeResponse;
+    use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
+
     use crate::{
-        event::wait::WaitState,
+        event::{Events, observer::Observer, wait::WaitState},
         pipes::errors::{ReadError, WriteError},
     };
 
     extern crate std;
+
+    #[test]
+    fn broker_error_notifies_pipe_observers() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let local = BrokerLocal::negotiate(FailingPipeChannel { last_request: None }).unwrap();
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let pipes = super::Pipes::new(&litebox);
+        let (_writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
+        pipes
+            .with_iopollable(&reader, |pollable| {
+                pollable.register_observer(Arc::downgrade(&observer_dyn), Events::ERR);
+            })
+            .unwrap();
+
+        let mut value = 0;
+        assert!(matches!(
+            pipes.read(
+                &WaitState::new(platform).context(),
+                &reader,
+                core::slice::from_mut(&mut value),
+            ),
+            Err(ReadError::Io)
+        ));
+        assert!(observer.0.load(Ordering::SeqCst));
+    }
+
+    struct ErrorObserver(AtomicBool);
+
+    impl Observer<Events> for ErrorObserver {
+        fn on_events(&self, events: &Events) {
+            if events.contains(Events::ERR) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingPipeChannel {
+        last_request: Option<BrokerRequest>,
+    }
+
+    impl LocalControlChannel for FailingPipeChannel {
+        type Error = ();
+
+        fn send_handshake_request(
+            &mut self,
+            _request: &BrokerHandshakeRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn recv_handshake_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            }))
+        }
+
+        fn send_request(
+            &mut self,
+            request: &BrokerRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            self.last_request = Some(request.clone());
+            Ok(())
+        }
+
+        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+            match self.last_request.take().unwrap() {
+                BrokerRequest::Pipe(PipeRequest::Create(_)) => Ok(Some(BrokerResponse::Pipe(
+                    PipeResponse::Create(CreatePipeResponse {
+                        read_handle: ObjectHandle(1),
+                        write_handle: ObjectHandle(2),
+                    }),
+                ))),
+                BrokerRequest::Pipe(PipeRequest::Read(_)) => Err(()),
+                BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
+                request => panic!("unexpected broker request: {request:?}"),
+            }
+        }
+    }
 
     #[test]
     fn test_blocking_channel() {

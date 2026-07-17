@@ -4,9 +4,9 @@
 use crate::message::{PipeRequest, PipeResponse};
 use crate::pipe::{
     CheckPipeReadinessRequest, CheckPipeReadinessResponse, CreatePipeRequest, CreatePipeResponse,
-    PipeEndpoint, PipeReadinessState, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
-    WritePipeResponse,
+    ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
 };
+use crate::readiness::ReadinessFlags;
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
@@ -20,9 +20,6 @@ const PIPE_RESPONSE_TAG_CREATED: u8 = 0;
 const PIPE_RESPONSE_TAG_READ: u8 = 1;
 const PIPE_RESPONSE_TAG_WRITTEN: u8 = 2;
 const PIPE_RESPONSE_TAG_READINESS: u8 = 3;
-
-const PIPE_ENDPOINT_TAG_READ: u8 = 0;
-const PIPE_ENDPOINT_TAG_WRITE: u8 = 1;
 
 pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
     match request {
@@ -88,7 +85,7 @@ pub(super) fn encode_pipe_response(encoder: &mut Encoder, response: PipeResponse
         }
         PipeResponse::CheckReadiness(response) => {
             encoder.u8(PIPE_RESPONSE_TAG_READINESS);
-            encode_readiness(encoder, response.readiness);
+            encoder.u32(response.readiness.0);
         }
     }
 }
@@ -107,30 +104,9 @@ pub(super) fn decode_pipe_response(decoder: &mut Decoder<'_>) -> Result<PipeResp
         })),
         PIPE_RESPONSE_TAG_READINESS => {
             Ok(PipeResponse::CheckReadiness(CheckPipeReadinessResponse {
-                readiness: decode_readiness(decoder)?,
+                readiness: ReadinessFlags(decoder.u32()?),
             }))
         }
         _ => Err(WireError::InvalidTag),
     }
-}
-
-pub(super) fn encode_readiness(encoder: &mut Encoder, readiness: PipeReadinessState) {
-    encoder.u8(match readiness.endpoint {
-        PipeEndpoint::Read => PIPE_ENDPOINT_TAG_READ,
-        PipeEndpoint::Write => PIPE_ENDPOINT_TAG_WRITE,
-    });
-    encoder.bool(readiness.ready);
-    encoder.bool(readiness.peer_closed);
-}
-
-pub(super) fn decode_readiness(decoder: &mut Decoder<'_>) -> Result<PipeReadinessState, WireError> {
-    Ok(PipeReadinessState {
-        endpoint: match decoder.u8()? {
-            PIPE_ENDPOINT_TAG_READ => PipeEndpoint::Read,
-            PIPE_ENDPOINT_TAG_WRITE => PipeEndpoint::Write,
-            _ => return Err(WireError::InvalidTag),
-        },
-        ready: decoder.bool()?,
-        peer_closed: decoder.bool()?,
-    })
 }

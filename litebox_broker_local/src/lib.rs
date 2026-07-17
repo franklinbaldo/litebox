@@ -107,7 +107,8 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
                 | ErrorCode::InvalidRights
                 | ErrorCode::ResourceExhausted
                 | ErrorCode::WouldBlock
-                | ErrorCode::PeerClosed => Err(BrokerLocalError::Broker(error)),
+                | ErrorCode::PeerClosed
+                | ErrorCode::OutOfMemory => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState

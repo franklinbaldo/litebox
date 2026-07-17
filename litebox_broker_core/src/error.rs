@@ -23,6 +23,8 @@ pub enum BrokerError {
     WouldBlock,
     #[error("broker object peer is closed")]
     PeerClosed,
+    #[error("broker memory allocation failed")]
+    OutOfMemory,
     #[error("unsupported broker operation")]
     UnsupportedOperation,
 }
@@ -37,6 +39,7 @@ impl From<BrokerError> for ErrorCode {
             BrokerError::BrokerCoreAlreadyExists => Self::Internal,
             BrokerError::WouldBlock => Self::WouldBlock,
             BrokerError::PeerClosed => Self::PeerClosed,
+            BrokerError::OutOfMemory => Self::OutOfMemory,
             BrokerError::UnsupportedOperation => Self::UnsupportedOperation,
         }
     }

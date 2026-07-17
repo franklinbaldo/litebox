@@ -6,7 +6,8 @@
 use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::pipe::{MAX_PIPE_TRANSFER_SIZE, PipeEndpoint, PipeReadinessState};
+use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
 use crate::session::{ObjectEntry, ObjectRights};
@@ -17,10 +18,6 @@ pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
 
 /// Creates a broker-owned pipe and returns its read and write endpoint handles.
 ///
-/// # Panics
-///
-/// Panics if rollback of a newly-created read endpoint unexpectedly fails
-/// after write-endpoint creation fails.
 pub fn create(
     session: &BrokerSession,
     capacity: u64,
@@ -37,32 +34,23 @@ pub fn create(
         return Err(BrokerError::ResourceExhausted);
     }
 
+    let capacity_reservation = PipeCapacityReservation::new(session, capacity)?;
     let mut data = VecDeque::new();
     data.try_reserve_exact(capacity)
-        .map_err(|_| BrokerError::ResourceExhausted)?;
+        .map_err(|_| BrokerError::OutOfMemory)?;
     let state = Arc::new(RwLock::new(PipeState {
         data,
         capacity,
         atomic_write_size,
         read_open: true,
         write_open: true,
+        _capacity_reservation: capacity_reservation,
     }));
 
-    let read_handle = session.create_object_reference(ObjectEntry::PipeReader(PipeReadEnd {
-        state: Arc::clone(&state),
-    }))?;
-    let write_handle =
-        match session.create_object_reference(ObjectEntry::PipeWriter(PipeWriteEnd { state })) {
-            Ok(handle) => handle,
-            Err(error) => {
-                session
-                    .close_object_reference(read_handle)
-                    .expect("newly created pipe read handle must be valid");
-                return Err(error);
-            }
-        };
-
-    Ok((read_handle, write_handle))
+    session.create_object_reference_pair(
+        ObjectEntry::Pipe(PipeObject::reader(Arc::clone(&state))),
+        ObjectEntry::Pipe(PipeObject::writer(state)),
+    )
 }
 
 /// Reads up to `length` bytes from a broker-owned pipe.
@@ -71,8 +59,8 @@ pub fn read(session: &BrokerSession, handle: ObjectHandle, length: u32) -> Resul
         return Err(BrokerError::ResourceExhausted);
     }
     session.with_authorized_object(handle, ObjectRights::WAIT, |object| match object {
-        ObjectEntry::PipeReader(end) => end.read(length as usize),
-        ObjectEntry::Event(_) | ObjectEntry::PipeWriter(_) => Err(BrokerError::InvalidRights),
+        ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
+        ObjectEntry::Event(_) => Err(BrokerError::InvalidRights),
     })
 }
 
@@ -82,29 +70,43 @@ pub fn write(session: &BrokerSession, handle: ObjectHandle, data: &[u8]) -> Resu
         return Err(BrokerError::ResourceExhausted);
     }
     session.with_authorized_object(handle, ObjectRights::WRITE, |object| match object {
-        ObjectEntry::PipeWriter(end) => end.write(data),
-        ObjectEntry::Event(_) | ObjectEntry::PipeReader(_) => Err(BrokerError::InvalidRights),
-    })
-}
-
-/// Returns the current readiness of one pipe endpoint.
-pub fn check_readiness(
-    session: &BrokerSession,
-    handle: ObjectHandle,
-) -> Result<PipeReadinessState> {
-    session.with_authorized_object(handle, ObjectRights::WAIT, |object| match object {
-        ObjectEntry::PipeReader(end) => Ok(end.readiness()),
-        ObjectEntry::PipeWriter(end) => Ok(end.readiness()),
+        ObjectEntry::Pipe(pipe) => pipe.write(data),
         ObjectEntry::Event(_) => Err(BrokerError::InvalidRights),
     })
 }
 
-pub(crate) struct PipeReadEnd {
-    state: Arc<RwLock<PipeState>>,
+/// Returns the current readiness of one pipe endpoint.
+pub fn check_readiness(session: &BrokerSession, handle: ObjectHandle) -> Result<ReadinessFlags> {
+    session.with_authorized_object(handle, ObjectRights::WAIT, |object| match object {
+        ObjectEntry::Pipe(pipe) => Ok(pipe.readiness()),
+        ObjectEntry::Event(_) => Err(BrokerError::InvalidRights),
+    })
 }
 
-impl PipeReadEnd {
+pub(crate) struct PipeObject {
+    state: Arc<RwLock<PipeState>>,
+    endpoint: PipeEndpoint,
+}
+
+impl PipeObject {
+    fn reader(state: Arc<RwLock<PipeState>>) -> Self {
+        Self {
+            state,
+            endpoint: PipeEndpoint::Read,
+        }
+    }
+
+    fn writer(state: Arc<RwLock<PipeState>>) -> Self {
+        Self {
+            state,
+            endpoint: PipeEndpoint::Write,
+        }
+    }
+
     fn read(&self, length: usize) -> Result<Vec<u8>> {
+        if !matches!(self.endpoint, PipeEndpoint::Read) {
+            return Err(BrokerError::InvalidRights);
+        }
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -126,28 +128,10 @@ impl PipeReadEnd {
         Ok(data)
     }
 
-    fn readiness(&self) -> PipeReadinessState {
-        let state = self.state.read();
-        PipeReadinessState {
-            endpoint: PipeEndpoint::Read,
-            ready: !state.data.is_empty(),
-            peer_closed: !state.write_open,
-        }
-    }
-}
-
-impl Drop for PipeReadEnd {
-    fn drop(&mut self) {
-        self.state.write().read_open = false;
-    }
-}
-
-pub(crate) struct PipeWriteEnd {
-    state: Arc<RwLock<PipeState>>,
-}
-
-impl PipeWriteEnd {
     fn write(&self, data: &[u8]) -> Result<usize> {
+        if !matches!(self.endpoint, PipeEndpoint::Write) {
+            return Err(BrokerError::InvalidRights);
+        }
         let mut state = self.state.write();
         if !state.read_open {
             return Err(BrokerError::PeerClosed);
@@ -166,19 +150,69 @@ impl PipeWriteEnd {
         Ok(write_len)
     }
 
-    fn readiness(&self) -> PipeReadinessState {
+    fn readiness(&self) -> ReadinessFlags {
         let state = self.state.read();
-        PipeReadinessState {
-            endpoint: PipeEndpoint::Write,
-            ready: state.read_open && state.data.len() < state.capacity,
-            peer_closed: !state.read_open,
+        match self.endpoint {
+            PipeEndpoint::Read => {
+                let mut readiness = ReadinessFlags::default();
+                if !state.data.is_empty() {
+                    readiness = readiness | ReadinessFlags::READ;
+                }
+                if !state.write_open {
+                    readiness = readiness | ReadinessFlags::HANGUP;
+                }
+                readiness
+            }
+            PipeEndpoint::Write if !state.read_open => ReadinessFlags::ERROR,
+            PipeEndpoint::Write if state.data.len() < state.capacity => ReadinessFlags::WRITE,
+            PipeEndpoint::Write => ReadinessFlags::default(),
         }
     }
 }
 
-impl Drop for PipeWriteEnd {
+impl Drop for PipeObject {
     fn drop(&mut self) {
-        self.state.write().write_open = false;
+        let mut state = self.state.write();
+        match self.endpoint {
+            PipeEndpoint::Read => state.read_open = false,
+            PipeEndpoint::Write => state.write_open = false,
+        }
+    }
+}
+
+enum PipeEndpoint {
+    Read,
+    Write,
+}
+
+struct PipeCapacityReservation {
+    reserved_capacity: Arc<RwLock<usize>>,
+    capacity: usize,
+}
+
+impl PipeCapacityReservation {
+    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
+        let reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
+        {
+            let mut reserved = reserved_capacity.write();
+            *reserved = reserved
+                .checked_add(capacity)
+                .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
+                .ok_or(BrokerError::ResourceExhausted)?;
+        }
+        Ok(Self {
+            reserved_capacity,
+            capacity,
+        })
+    }
+}
+
+impl Drop for PipeCapacityReservation {
+    fn drop(&mut self) {
+        let mut reserved = self.reserved_capacity.write();
+        *reserved = reserved
+            .checked_sub(self.capacity)
+            .expect("reserved pipe capacity must include every live pipe");
     }
 }
 
@@ -188,4 +222,5 @@ struct PipeState {
     atomic_write_size: usize,
     read_open: bool,
     write_open: bool,
+    _capacity_reservation: PipeCapacityReservation,
 }

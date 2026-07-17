@@ -214,7 +214,7 @@ pub enum ConnectionTermination {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_broker_core::{PolicyEngine, PrincipalRights};
+    use litebox_broker_core::{ObjectRights, PolicyEngine};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
         WaitEventRequest,
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn host_request_handling_uses_one_broker_core() {
         let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-            PrincipalRights::all(),
+            ObjectRights::all(),
         ))
         .unwrap();
 
@@ -381,18 +381,13 @@ mod tests {
             &channel.responses[1..],
             [
                 BrokerResponse::Event(EventResponse::Add(AddEventResponse {
-                    readiness: litebox_broker_protocol::event::ReadinessState {
-                        read_ready: true,
-                        write_ready: true,
-                    },
+                    readiness: litebox_broker_protocol::readiness::ReadinessFlags::READ
+                        | litebox_broker_protocol::readiness::ReadinessFlags::WRITE,
                 })),
                 BrokerResponse::Event(EventResponse::Consume(
                     litebox_broker_protocol::event::ConsumeEventResponse {
                         value: 1,
-                        readiness: litebox_broker_protocol::event::ReadinessState {
-                            read_ready: false,
-                            write_ready: true,
-                        },
+                        readiness: litebox_broker_protocol::readiness::ReadinessFlags::WRITE,
                     }
                 )),
             ]

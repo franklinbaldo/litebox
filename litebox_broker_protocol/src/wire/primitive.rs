@@ -17,10 +17,6 @@ impl Encoder {
         self.bytes
     }
 
-    pub(super) fn bool(&mut self, value: bool) {
-        self.u8(u8::from(value));
-    }
-
     pub(super) fn u8(&mut self, value: u8) {
         self.bytes.push(value);
     }
@@ -71,14 +67,6 @@ impl<'a> Decoder<'a> {
             Ok(())
         } else {
             Err(WireError::TrailingBytes)
-        }
-    }
-
-    pub(super) fn bool(&mut self) -> Result<bool, WireError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(WireError::InvalidBoolean),
         }
     }
 

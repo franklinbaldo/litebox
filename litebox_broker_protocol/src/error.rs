@@ -29,6 +29,8 @@ pub enum ErrorCode {
     WouldBlock,
     #[error("broker object peer is closed")]
     PeerClosed,
+    #[error("broker memory allocation failed")]
+    OutOfMemory,
 }
 
 impl ErrorCode {
@@ -51,6 +53,7 @@ impl ErrorCode {
             9 => Some(Self::ResourceExhausted),
             10 => Some(Self::WouldBlock),
             11 => Some(Self::PeerClosed),
+            12 => Some(Self::OutOfMemory),
             _ => None,
         }
     }
@@ -69,6 +72,7 @@ impl ErrorCode {
             Self::ResourceExhausted => 9,
             Self::WouldBlock => 10,
             Self::PeerClosed => 11,
+            Self::OutOfMemory => 12,
         }
     }
 }

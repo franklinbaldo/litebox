@@ -34,6 +34,8 @@ pub(crate) enum BrokerObjectError {
     ResourceExhausted,
     #[error("broker object permission denied")]
     PermissionDenied,
+    #[error("broker memory allocation failed")]
+    OutOfMemory,
 }
 
 impl From<BrokerControlError> for BrokerObjectError {
@@ -53,6 +55,7 @@ impl From<ErrorCode> for BrokerObjectError {
             ErrorCode::PeerClosed => Self::PeerClosed,
             ErrorCode::ResourceExhausted => Self::ResourceExhausted,
             ErrorCode::PolicyDenied => Self::PermissionDenied,
+            ErrorCode::OutOfMemory => Self::OutOfMemory,
             ErrorCode::UnsupportedVersion
             | ErrorCode::MalformedRequest
             | ErrorCode::ProtocolState
@@ -76,7 +79,6 @@ impl From<BrokerObjectError> for TryOpError<EventCounterError> {
     fn from(error: BrokerObjectError) -> Self {
         match error {
             BrokerObjectError::WouldBlock => Self::TryAgain,
-            BrokerObjectError::PeerClosed => Self::Other(EventCounterError::Io),
             error => Self::Other(error.into()),
         }
     }
@@ -86,7 +88,9 @@ impl From<BrokerObjectError> for EventCounterError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
             BrokerObjectError::WouldBlock => Self::WouldBlock,
-            BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
+            BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
+                Self::ResourceExhausted
+            }
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject

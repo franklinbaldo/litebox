@@ -53,8 +53,6 @@ pub enum WireError {
     TruncatedFrame,
     #[error("trailing broker wire bytes")]
     TrailingBytes,
-    #[error("invalid broker wire boolean")]
-    InvalidBoolean,
     #[error("invalid broker wire tag")]
     InvalidTag,
     #[error("broker wire message is not valid in this protocol phase")]
@@ -237,7 +235,7 @@ pub fn encode_notification(notification: BrokerNotification) -> Vec<u8> {
         BrokerNotification::Readiness(notification) => {
             encoder.u8(NOTIFICATION_TAG_READINESS);
             encoder.handle(notification.handle);
-            encoder.u32(notification.events.bits());
+            encoder.u32(notification.events.0);
         }
     }
     encoder.finish()
@@ -250,7 +248,7 @@ pub fn decode_notification(frame: &[u8]) -> Result<BrokerNotification, WireError
     let notification = match tag {
         NOTIFICATION_TAG_READINESS => BrokerNotification::Readiness(ReadinessNotification {
             handle: decoder.handle()?,
-            events: ReadinessFlags::from_bits_retain(decoder.u32()?),
+            events: ReadinessFlags(decoder.u32()?),
         }),
         _ => return Err(WireError::InvalidTag),
     };
@@ -263,14 +261,13 @@ mod tests {
     use super::*;
     use crate::event::{
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
-        CreateEventResponse, EventConsumeMode, EventConsumption, ReadinessState, WaitEventRequest,
+        CreateEventResponse, EventConsumeMode, EventConsumption, WaitEventRequest,
         WaitEventResponse,
     };
     use crate::message::{EventRequest, EventResponse, PipeRequest, PipeResponse};
     use crate::pipe::{
         CheckPipeReadinessRequest, CheckPipeReadinessResponse, CreatePipeRequest,
-        CreatePipeResponse, PipeEndpoint, PipeReadinessState, ReadPipeRequest, ReadPipeResponse,
-        WritePipeRequest, WritePipeResponse,
+        CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest, WritePipeResponse,
     };
     use crate::{ObjectHandle, ProtocolVersion};
 
@@ -359,29 +356,17 @@ mod tests {
             BrokerResponse::ObjectClosed,
             BrokerResponse::Event(EventResponse::Create(CreateEventResponse { handle })),
             BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: false,
-                },
+                readiness: ReadinessFlags::READ,
             })),
             BrokerResponse::Event(EventResponse::Wait(WaitEventResponse {
-                readiness: ReadinessState {
-                    read_ready: false,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::WRITE,
             })),
             BrokerResponse::Event(EventResponse::Add(AddEventResponse {
-                readiness: ReadinessState {
-                    read_ready: true,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
             })),
             BrokerResponse::Event(EventResponse::Consume(EventConsumption {
                 value: 3,
-                readiness: ReadinessState {
-                    read_ready: false,
-                    write_ready: true,
-                },
+                readiness: ReadinessFlags::WRITE,
             })),
             BrokerResponse::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle: handle,
@@ -392,15 +377,12 @@ mod tests {
             })),
             BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResponse::Pipe(PipeResponse::CheckReadiness(CheckPipeReadinessResponse {
-                readiness: PipeReadinessState {
-                    endpoint: PipeEndpoint::Read,
-                    ready: true,
-                    peer_closed: true,
-                },
+                readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
             })),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
             BrokerResponse::Error(ErrorCode::PeerClosed),
+            BrokerResponse::Error(ErrorCode::OutOfMemory),
             BrokerResponse::Error(ErrorCode::Internal),
         ];
 
@@ -540,22 +522,21 @@ mod tests {
         );
         assert_eq!(
             decode_response(&[1, 1, 0xff]),
-            Err(WireError::InvalidBoolean)
+            Err(WireError::TruncatedFrame)
         );
         assert_eq!(
             decode_response(&[2, 0xff, 0xff]),
             Err(WireError::InvalidTag)
         );
 
-        let mut invalid_bool = [1, 2, 2, 0];
-        assert_eq!(
-            decode_response(&invalid_bool),
-            Err(WireError::InvalidBoolean)
-        );
+        let truncated = [1, 2, 2, 0];
+        assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
 
-        invalid_bool[2] = 1;
-        invalid_bool[3] = 1;
-        let mut frame = invalid_bool.to_vec();
+        let mut frame = encode_response(BrokerResponse::Event(EventResponse::Add(
+            AddEventResponse {
+                readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
+            },
+        )));
         frame.push(0xff);
         assert_eq!(decode_response(&frame), Err(WireError::TrailingBytes));
     }
@@ -599,13 +580,10 @@ mod tests {
         assert_eq!(
             encode_response(BrokerResponse::Event(EventResponse::Add(
                 AddEventResponse {
-                    readiness: ReadinessState {
-                        read_ready: true,
-                        write_ready: false,
-                    },
+                    readiness: ReadinessFlags::READ,
                 }
             ))),
-            [1, 2, 1, 0]
+            [1, 2, 1, 0, 0, 0]
         );
     }
 
