@@ -683,7 +683,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 share_access,
                 create_disposition,
                 create_options,
-                file_attributes,
                 ea_buffer,
                 ea_length,
             ),
@@ -718,7 +717,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             desired_access,
             create_disposition,
             create_options,
-            file_attributes,
+            create_mode(file_attributes),
         )?;
         Ok((
             FileObject {
@@ -743,15 +742,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         share_access: FileShareAccess,
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
-        file_attributes: u32,
         ea_buffer: Option<ConstPtr<Platform, u8>>,
         ea_length: u32,
     ) -> Result<(FileObject<FS>, FileCreateInformation), NtStatus> {
-        if object == CondrvObject::Connect {
+        let object = if object == CondrvObject::Connect {
             condrv::validate_connect_server_ea::<Platform>(ea_buffer, ea_length)?;
+            CondrvObject::Connected
         } else if ea_buffer.is_some() || ea_length != 0 {
             return Err(NtStatus::EAS_NOT_SUPPORTED);
-        }
+        } else {
+            object
+        };
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
             return Err(NtStatus::NOT_A_DIRECTORY);
         }
@@ -760,16 +761,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.check_file_sharing(&path, desired_access, share_access)?;
         let (backing, information) = match object {
             CondrvObject::Input | CondrvObject::Output => {
+                let backing_access = match object {
+                    CondrvObject::Input => FileAccess::READ_DATA,
+                    CondrvObject::Output => FileAccess::WRITE_DATA,
+                    _ => unreachable!(),
+                };
                 let (fd, _, information) = self.open_backing_fd(
                     &path,
-                    desired_access,
+                    backing_access,
                     create_disposition,
                     create_options,
-                    file_attributes,
+                    Mode::empty(),
                 )?;
                 (FileObjectBacking::CondrvStream { object, fd }, information)
             }
-            CondrvObject::Server | CondrvObject::Reference | CondrvObject::Connect => (
+            CondrvObject::Server
+            | CondrvObject::Reference
+            | CondrvObject::Connect
+            | CondrvObject::Connected => (
                 FileObjectBacking::CondrvControl(object),
                 FileCreateInformation::Opened,
             ),
@@ -792,7 +801,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         desired_access: FileAccess,
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
-        file_attributes: u32,
+        mode: Mode,
     ) -> Result<(TypedFd<FS>, bool, FileCreateInformation), NtStatus> {
         let existed_before_open = self.fs.file_status(path).is_ok();
         if create_disposition == CreateDisposition::Supersede
@@ -804,7 +813,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let flags = desired_access.open_flags(create_disposition, create_options);
         let fd = self
             .fs
-            .open(path, flags, create_mode(file_attributes))
+            .open(path, flags, mode)
             .map_err(|error| map_open_error(error, create_disposition))?;
         let file_status = match self.fs.fd_file_status(&fd) {
             Ok(file_status) => file_status,
@@ -1256,8 +1265,34 @@ mod tests {
         .0
     }
 
+    fn open_condrv_child(
+        task: &Task<TestPlatform, TestFS>,
+        root: Handle,
+        name: &str,
+        desired_access: u32,
+    ) -> (NtStatus, Handle) {
+        let (_path, _name, mut attributes) = open_object_attributes(name);
+        attributes.root_directory = root;
+        let mut handle = Handle::default();
+        let mut io_status = IoStatusBlock::default();
+        let status = task.sys_nt_create_file(
+            mut_ptr(&mut handle),
+            desired_access,
+            Some(const_ptr(&attributes)),
+            mut_ptr(&mut io_status),
+            None,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+            None,
+            0,
+        );
+        (status, handle)
+    }
+
     #[test]
-    fn nt_create_file_follows_condrv_server_reference_connect_sequence() {
+    fn nt_create_file_follows_condrv_connection_through_standard_streams() {
         let task = crate::tests::test_task();
         let server_handle = open_condrv_server(&task);
         let reference_handle = open_condrv_reference(&task, server_handle);
@@ -1280,6 +1315,28 @@ mod tests {
                 .with_entry(FileObject::condrv_object),
             Some(CondrvObject::Reference)
         );
+
+        assert_eq!(
+            task.sys_nt_create_file(
+                mut_ptr(&mut connect_handle),
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                Some(const_ptr(&connect_attributes)),
+                mut_ptr(&mut io_status),
+                None,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                Some(const_ptr(&ea[0])),
+                u32::try_from(ea.len()).unwrap(),
+            ),
+            NtStatus::PIPE_DISCONNECTED
+        );
+        assert!(connect_handle.is_null());
+
+        assert_eq!(task.sys_nt_close(server_handle), NtStatus::SUCCESS);
+        let mut ea = ea;
+        *ea.last_mut().unwrap() = 1;
         assert_eq!(
             task.sys_nt_create_file(
                 mut_ptr(&mut connect_handle),
@@ -1300,12 +1357,21 @@ mod tests {
             task.file_entry(connect_handle)
                 .unwrap()
                 .with_entry(FileObject::condrv_object),
-            Some(CondrvObject::Connect)
+            Some(CondrvObject::Connected)
         );
 
+        assert_eq!(connect_handle, server_handle);
+        let (input_status, input_handle) =
+            open_condrv_child(&task, connect_handle, r"\Input", FILE_GENERIC_READ);
+        let (output_status, output_handle) =
+            open_condrv_child(&task, connect_handle, r"\Output", FILE_GENERIC_WRITE);
+        assert_eq!(input_status, NtStatus::SUCCESS);
+        assert_eq!(output_status, NtStatus::SUCCESS);
+
+        assert_eq!(task.sys_nt_close(output_handle), NtStatus::SUCCESS);
+        assert_eq!(task.sys_nt_close(input_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(connect_handle), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(reference_handle), NtStatus::SUCCESS);
-        assert_eq!(task.sys_nt_close(server_handle), NtStatus::SUCCESS);
     }
 
     #[test]
@@ -2029,10 +2095,12 @@ mod tests {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     mod host_fidelity {
         use super::*;
+        use crate::nt_types::{ProcessEnvironmentBlock, RtlUserProcessParameters};
         use core::ffi::c_void;
 
         #[link(name = "ntdll")]
         unsafe extern "system" {
+            fn RtlGetCurrentPeb() -> *const ProcessEnvironmentBlock;
             fn NtCreateFile(
                 FileHandle: *mut *mut c_void,
                 DesiredAccess: u32,
@@ -2088,6 +2156,60 @@ mod tests {
 
         fn host_status(status: i32) -> NtStatus {
             NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
+        }
+
+        fn host_create_file(root: Handle, name: &str) -> (NtStatus, *mut c_void) {
+            let path = utf16(name);
+            let name = unicode_string(&path);
+            let mut attributes = host_object_attributes(&name);
+            attributes.root_directory = root;
+            let mut handle = core::ptr::null_mut();
+            let mut io_status = IoStatusBlock::default();
+            // SAFETY: All pointers reference live local typed values for the call.
+            let status = unsafe {
+                NtCreateFile(
+                    &raw mut handle,
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                    &raw const attributes,
+                    &raw mut io_status,
+                    core::ptr::null(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    FILE_OPEN,
+                    FileCreateOptions::SYNCHRONOUS_IO_NONALERT.bits(),
+                    core::ptr::null(),
+                    0,
+                )
+            };
+            (host_status(status), handle)
+        }
+
+        #[test]
+        fn connected_console_child_matrix_matches_host() {
+            // SAFETY: RtlGetCurrentPeb returns the live typed PEB for this process.
+            let peb = unsafe { &*RtlGetCurrentPeb() };
+            // SAFETY: The current process owns a live RTL_USER_PROCESS_PARAMETERS block.
+            let process_parameters =
+                unsafe { &*(peb.process_parameters as *const RtlUserProcessParameters) };
+            assert_ne!(process_parameters.console_handle, 0);
+            let console_handle = Handle::from_raw(process_parameters.console_handle);
+
+            for (name, expected) in [
+                (r"\Input", NtStatus::SUCCESS),
+                (r"\Output", NtStatus::SUCCESS),
+                (r"\Server", NtStatus::SUCCESS),
+                (r"\Reference", NtStatus::SUCCESS),
+                (r"\Connect", NtStatus::INVALID_HANDLE),
+            ] {
+                let (status, handle) = host_create_file(console_handle, name);
+                assert_eq!(status, expected, "{name:?}");
+                if status == NtStatus::SUCCESS {
+                    assert!(!handle.is_null());
+                    close_host_handle(handle);
+                } else {
+                    assert!(handle.is_null());
+                }
+            }
         }
 
         #[test]

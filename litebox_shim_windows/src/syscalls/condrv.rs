@@ -24,6 +24,7 @@ pub(crate) enum CondrvObject {
     Server = 2,
     Reference = 3,
     Connect = 4,
+    Connected = 5,
 }
 
 impl CondrvObject {
@@ -32,6 +33,7 @@ impl CondrvObject {
             Some(object @ (Self::Input | Self::Output | Self::Server)) => Ok(object),
             Some(Self::Reference) => Err(NtStatus::INVALID_HANDLE),
             Some(Self::Connect) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
+            Some(Self::Connected) => unreachable!("Connected is not a named ConDrv endpoint"),
             None => Err(NtStatus::OBJECT_NAME_NOT_FOUND),
         }
     }
@@ -59,14 +61,17 @@ impl CondrvObject {
         match (self, child) {
             (Self::Server, Self::Server | Self::Reference)
             | (Self::Reference, Self::Server | Self::Connect | Self::Input | Self::Output)
-            | (Self::Input | Self::Output, Self::Server | Self::Input | Self::Output) => Ok(child),
+            | (Self::Input | Self::Output, Self::Server | Self::Input | Self::Output)
+            | (Self::Connected, Self::Server | Self::Reference | Self::Input | Self::Output) => {
+                Ok(child)
+            }
             (Self::Server, Self::Input | Self::Output) => Err(NtStatus::INVALID_DEVICE_STATE),
             (Self::Reference | Self::Input | Self::Output, Self::Reference) => {
                 Err(NtStatus::OBJECT_TYPE_MISMATCH)
             }
-            (Self::Server | Self::Input | Self::Output, Self::Connect) | (Self::Connect, _) => {
-                Err(NtStatus::INVALID_HANDLE)
-            }
+            (Self::Server | Self::Input | Self::Output | Self::Connected, Self::Connect)
+            | (Self::Connect, _) => Err(NtStatus::INVALID_HANDLE),
+            (_, Self::Connected) => Err(NtStatus::NOT_FOUND),
         }
     }
 
@@ -76,7 +81,7 @@ impl CondrvObject {
             Self::Output => "/dev/stdout",
             Self::Server => r"\Device\ConDrv\Server",
             Self::Reference => r"\Device\ConDrv\Reference",
-            Self::Connect => r"\Device\ConDrv\Connect",
+            Self::Connect | Self::Connected => r"\Device\ConDrv\Connect",
         }
     }
 }
@@ -177,13 +182,16 @@ pub(crate) fn validate_connect_server_ea<Platform: crate::ShimPlatform>(
     let Some(value_address) = ea_buffer.as_usize().checked_add(value_offset) else {
         return Err(NtStatus::EAS_NOT_SUPPORTED);
     };
-    // The ConDrv "server" EA value format is undocumented; probe the declared payload without
-    // interpreting it until its semantics are understood.
-    if ConstPtr::<Platform, u8>::from_usize(value_address)
-        .to_owned_slice(value_length)
-        .is_none()
-    {
+    // Windows rejects a structurally valid but zeroed server handshake with
+    // STATUS_PIPE_DISCONNECTED.
+    // TODO(condrv-handshake): decode the undocumented server payload once its layout is known.
+    let Some(value) =
+        ConstPtr::<Platform, u8>::from_usize(value_address).to_owned_slice(value_length)
+    else {
         return Err(NtStatus::ACCESS_VIOLATION);
+    };
+    if value.iter().all(|byte| *byte == 0) {
+        return Err(NtStatus::PIPE_DISCONNECTED);
     }
 
     Ok(())
@@ -269,7 +277,7 @@ mod tests {
 
     #[test]
     fn relative_children_match_host_parse_contexts() {
-        use CondrvObject::{Connect, Input, Output, Reference, Server};
+        use CondrvObject::{Connect, Connected, Input, Output, Reference, Server};
 
         for (parent, name, expected) in [
             (Server, r"\Server", Ok(Server)),
@@ -296,6 +304,13 @@ mod tests {
             (Output, r"\Output", Ok(Output)),
             (Output, r"\Reference", Err(NtStatus::OBJECT_TYPE_MISMATCH)),
             (Output, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
+            (Connect, r"\Input", Err(NtStatus::INVALID_HANDLE)),
+            (Connect, r"\Output", Err(NtStatus::INVALID_HANDLE)),
+            (Connected, r"\Input", Ok(Input)),
+            (Connected, r"\Output", Ok(Output)),
+            (Connected, r"\Server", Ok(Server)),
+            (Connected, r"\Reference", Ok(Reference)),
+            (Connected, r"\Connect", Err(NtStatus::INVALID_HANDLE)),
         ] {
             assert_eq!(parent.relative_child(name), expected, "{parent:?} + {name}");
         }
