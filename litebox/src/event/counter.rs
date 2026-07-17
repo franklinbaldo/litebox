@@ -188,8 +188,9 @@ mod tests {
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption, ReadinessState};
     use litebox_broker_protocol::message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-        BrokerResponse, EventRequest, EventResponse, ReadinessFlags, ReadinessNotification,
+        BrokerResponse, EventRequest, EventResponse, ReadinessNotification,
     };
+    use litebox_broker_protocol::readiness::ReadinessFlags;
 
     use super::*;
     use crate::LiteBox;

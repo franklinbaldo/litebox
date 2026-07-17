@@ -21,8 +21,9 @@ use thiserror::Error;
 use crate::error::ErrorCode;
 use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse, ReadinessFlags, ReadinessNotification,
+    BrokerResponse, ReadinessNotification,
 };
+use crate::readiness::ReadinessFlags;
 
 use primitive::{Decoder, Encoder};
 

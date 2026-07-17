@@ -11,8 +11,8 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::channel::LocalControlChannel;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode, ReadinessState};
-use litebox_broker_protocol::message::ReadinessFlags;
 use litebox_broker_protocol::pipe::{CreatePipeResponse, PipeReadinessState};
+use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
 use crate::platform::TimeProvider;

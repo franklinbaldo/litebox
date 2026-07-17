@@ -162,9 +162,8 @@ mod tests {
     use litebox_broker_protocol::ProtocolVersion;
     use litebox_broker_protocol::channel::LocalNotificationChannel;
     use litebox_broker_protocol::event::{CreateEventRequest, CreateEventResponse};
-    use litebox_broker_protocol::message::{
-        EventRequest, EventResponse, ReadinessFlags, ReadinessNotification,
-    };
+    use litebox_broker_protocol::message::{EventRequest, EventResponse, ReadinessNotification};
+    use litebox_broker_protocol::readiness::ReadinessFlags;
 
     #[test]
     fn negotiate_returns_active_local_connection() {
