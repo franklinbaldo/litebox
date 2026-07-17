@@ -34,23 +34,24 @@ pub fn create(
         return Err(BrokerError::ResourceExhausted);
     }
 
-    let capacity_reservation = PipeCapacityReservation::new(session, capacity)?;
-    let mut data = VecDeque::new();
-    data.try_reserve_exact(capacity)
-        .map_err(|_| BrokerError::OutOfMemory)?;
-    let state = Arc::new(RwLock::new(PipeState {
-        data,
-        capacity,
-        atomic_write_size,
-        read_open: true,
-        write_open: true,
-        _capacity_reservation: capacity_reservation,
-    }));
-
-    session.create_object_reference_pair(
-        ObjectEntry::Pipe(PipeObject::reader(Arc::clone(&state))),
-        ObjectEntry::Pipe(PipeObject::writer(state)),
-    )
+    session.create_object_reference_pair(|| {
+        let capacity_reservation = PipeCapacityReservation::new(session, capacity)?;
+        let mut data = VecDeque::new();
+        data.try_reserve_exact(capacity)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        let state = Arc::new(RwLock::new(PipeState {
+            data,
+            capacity,
+            atomic_write_size,
+            read_open: true,
+            write_open: true,
+            _capacity_reservation: capacity_reservation,
+        }));
+        Ok((
+            ObjectEntry::Pipe(PipeObject::reader(Arc::clone(&state))),
+            ObjectEntry::Pipe(PipeObject::writer(state)),
+        ))
+    })
 }
 
 /// Reads up to `length` bytes from a broker-owned pipe.
@@ -123,7 +124,7 @@ impl PipeObject {
         let read_len = length.min(state.data.len());
         let mut data = Vec::new();
         data.try_reserve_exact(read_len)
-            .map_err(|_| BrokerError::ResourceExhausted)?;
+            .map_err(|_| BrokerError::OutOfMemory)?;
         data.extend(state.data.drain(..read_len));
         Ok(data)
     }
