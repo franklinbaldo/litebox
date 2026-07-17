@@ -82,15 +82,9 @@ impl BrokerSession {
             .policy
             .principal_object_rights(self.caller_credential)?;
         let mut references = self.core.references.write();
-        let reserved_references = self.core.reserved_references.read();
-        if references
-            .len()
-            .checked_add(*reserved_references)
-            .is_none_or(|count| count >= self.core.limits.max_references)
-        {
+        if references.len() >= self.core.limits.max_references {
             return Err(BrokerError::ResourceExhausted);
         }
-        drop(reserved_references);
         let handle = self.core.allocate_reference_handle()?;
         references.insert(
             handle,
@@ -106,19 +100,23 @@ impl BrokerSession {
 
     pub(crate) fn create_object_reference_pair(
         &self,
-        create_objects: impl FnOnce() -> Result<(ObjectEntry, ObjectEntry)>,
+        first: ObjectEntry,
+        second: ObjectEntry,
     ) -> Result<(ObjectHandle, ObjectHandle)> {
         let rights = self
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
-        let mut reservation = ObjectReferenceReservation::new(&self.core, 2)?;
-        let (first, second) = create_objects()?;
+        let mut references = self.core.references.write();
+        if references
+            .len()
+            .checked_add(2)
+            .is_none_or(|count| count > self.core.limits.max_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
         let first_handle = self.core.allocate_reference_handle()?;
         let second_handle = self.core.allocate_reference_handle()?;
-        let mut references = self.core.references.write();
-        let mut reserved_references = self.core.reserved_references.write();
-        reservation.consume(&mut reserved_references);
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
             references.insert(
                 handle,
@@ -191,52 +189,6 @@ impl BrokerSession {
     }
 }
 
-struct ObjectReferenceReservation {
-    reserved_references: Arc<RwLock<usize>>,
-    count: usize,
-    active: bool,
-}
-
-impl ObjectReferenceReservation {
-    fn new(core: &BrokerCore, count: usize) -> Result<Self> {
-        let references = core.references.read();
-        let reserved_references = Arc::clone(&core.reserved_references);
-        {
-            let mut reserved = reserved_references.write();
-            let new_total = references
-                .len()
-                .checked_add(*reserved)
-                .and_then(|total| total.checked_add(count))
-                .filter(|total| *total <= core.limits.max_references)
-                .ok_or(BrokerError::ResourceExhausted)?;
-            *reserved = new_total - references.len();
-        }
-        Ok(Self {
-            reserved_references,
-            count,
-            active: true,
-        })
-    }
-
-    fn consume(&mut self, reserved_references: &mut usize) {
-        *reserved_references = reserved_references
-            .checked_sub(self.count)
-            .expect("reserved reference count must include every active reservation");
-        self.active = false;
-    }
-}
-
-impl Drop for ObjectReferenceReservation {
-    fn drop(&mut self) {
-        if self.active {
-            let mut reserved = self.reserved_references.write();
-            *reserved = reserved
-                .checked_sub(self.count)
-                .expect("reserved reference count must include every active reservation");
-        }
-    }
-}
-
 impl Drop for BrokerSession {
     fn drop(&mut self) {
         self.core.close_session(self.session_id);
@@ -303,7 +255,6 @@ mod tests {
             crate::pipe::create(&session, 4, 2),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(*broker.reserved_references.read(), 0);
         assert_eq!(*broker.reserved_pipe_capacity.read(), 0);
         assert_eq!(session.close_object_reference(second_handle), Ok(()));
 
@@ -340,10 +291,8 @@ mod tests {
             crate::pipe::create(&session, 5, 2),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(*broker.reserved_references.read(), 0);
         assert_eq!(*broker.reserved_pipe_capacity.read(), 0);
         let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
-        assert_eq!(*broker.reserved_references.read(), 0);
         assert_eq!(*broker.reserved_pipe_capacity.read(), 4);
         assert_eq!(
             crate::pipe::check_readiness(&session, reader),
