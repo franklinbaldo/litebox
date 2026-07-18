@@ -283,6 +283,8 @@ impl<FS: ShimFS> GlobalState<FS> {
 
     #[cfg(feature = "mirai")]
     fn mirai_setsockopt_pre_fix(&self, _fd: &SocketFd) {
+        // This is intentionally non-recursive: the real bug re-enters while the callback's
+        // pre-state holds the writer, so recursive may-union convergence is not involved.
         self.mirai_with_descriptor_write(|litebox| {
             litebox::mirai_contracts::require_no_descriptor_writer(litebox);
         });

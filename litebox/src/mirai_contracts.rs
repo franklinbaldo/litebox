@@ -1,3 +1,11 @@
+//! MIRAI's feasibility rows bind `descriptor_write_held` and `descriptor_read_count` to `&LiteBox`
+//! as a proxy for the single table-level `RwLock<Platform, Descriptors<Platform>>`. This
+//! deliberately distinguishes that resource from each per-entry
+//! `Arc<RwLock<Platform, DescriptorEntry>>`.
+//!
+//! The rows consume these LiteBox-level contracts rather than the separate model annotations on
+//! `RwLock::read`, `RwLock::write`, and the guard `Drop` implementations.
+
 use mirai_annotations::{get_model_field, precondition, set_model_field};
 
 use crate::{LiteBox, sync::RawSyncPrimitivesProvider};
