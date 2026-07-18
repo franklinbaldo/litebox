@@ -106,11 +106,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
-
-    #[cfg(feature = "mirai")]
-    pub(crate) fn descriptor_lock(&self) -> &RwLock<Platform, Descriptors<Platform>> {
-        &self.x.descriptors
-    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
