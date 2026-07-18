@@ -333,13 +333,14 @@ mod tests {
         let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
         assert_eq!(*broker.reserved_pipe_capacity.read(), 4);
         assert_eq!(session.close_object_reference(reader), Ok(()));
+        assert_eq!(crate::pipe::write(&session, writer, &[]), Ok(0));
         assert_eq!(
             crate::pipe::write(&session, writer, &[1]),
             Err(BrokerError::PeerClosed)
         );
         assert_eq!(
             crate::pipe::check_readiness(&session, writer),
-            Ok(ReadinessFlags::ERROR)
+            Ok(ReadinessFlags::WRITE | ReadinessFlags::ERROR)
         );
         assert_eq!(session.close_object_reference(writer), Ok(()));
         assert_eq!(*broker.reserved_pipe_capacity.read(), 0);

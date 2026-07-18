@@ -131,12 +131,12 @@ impl PipeObject {
         if !matches!(self.endpoint, PipeEndpoint::Write) {
             return Err(BrokerError::InvalidRights);
         }
+        if data.is_empty() {
+            return Ok(0);
+        }
         let mut state = self.state.write();
         if !state.read_open {
             return Err(BrokerError::PeerClosed);
-        }
-        if data.is_empty() {
-            return Ok(0);
         }
 
         let available = state.capacity - state.data.len();
@@ -162,9 +162,16 @@ impl PipeObject {
                 }
                 readiness
             }
-            PipeEndpoint::Write if !state.read_open => ReadinessFlags::ERROR,
-            PipeEndpoint::Write if state.data.len() < state.capacity => ReadinessFlags::WRITE,
-            PipeEndpoint::Write => ReadinessFlags::default(),
+            PipeEndpoint::Write => {
+                let mut readiness = ReadinessFlags::default();
+                if state.data.len() < state.capacity {
+                    readiness = readiness | ReadinessFlags::WRITE;
+                }
+                if !state.read_open {
+                    readiness = readiness | ReadinessFlags::ERROR;
+                }
+                readiness
+            }
         }
     }
 }

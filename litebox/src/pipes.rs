@@ -447,8 +447,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
     }
 
     fn write(&self, cx: &WaitContext<'_, Platform>, buf: &[u8]) -> Result<usize, PipeError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let nonblock = self.get_status().contains(OFlags::NONBLOCK);
-        if nonblock || buf.is_empty() {
+        if nonblock {
             let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
             return self
                 .pollee
@@ -693,11 +696,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
         if self.is_shutdown() {
             return Err(TryOpError::Other(PipeError::ThisEndShutdown));
         }
-        if self.is_peer_shutdown() {
-            return Err(TryOpError::Other(PipeError::PeerShutdown));
-        }
         if buf.is_empty() {
             return Ok(0);
+        }
+        if self.is_peer_shutdown() {
+            return Err(TryOpError::Other(PipeError::PeerShutdown));
         }
 
         let write_len = {
@@ -727,15 +730,25 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> WriteEnd<Platform, T
     where
         T: Copy,
     {
-        self.endpoint
-            .pollee
-            .wait(
-                cx,
-                self.get_status().contains(OFlags::NONBLOCK),
-                Events::OUT,
-                || self.try_write(buf),
-            )
-            .map_err(PipeError::from)
+        if self.get_status().contains(OFlags::NONBLOCK) {
+            return self
+                .endpoint
+                .pollee
+                .wait(cx, true, Events::OUT, || self.try_write(buf))
+                .map_err(PipeError::from);
+        }
+
+        let mut total_written = 0;
+        while total_written < buf.len() {
+            match self.endpoint.pollee.wait(cx, false, Events::OUT, || {
+                self.try_write(&buf[total_written..])
+            }) {
+                Ok(written) => total_written += written,
+                Err(_) if total_written != 0 => return Ok(total_written),
+                Err(error) => return Err(PipeError::from(error)),
+            }
+        }
+        Ok(total_written)
     }
 
     common_functions_for_channel!();
@@ -911,16 +924,18 @@ fn new_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider, T>(
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use alloc::sync::Arc;
     use litebox_broker_local::BrokerLocal;
     use litebox_broker_protocol::channel::LocalControlChannel;
+    use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
-        PipeRequest, PipeResponse,
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+        BrokerResponse, PipeRequest, PipeResponse, ReadinessNotification,
     };
     use litebox_broker_protocol::pipe::CreatePipeResponse;
+    use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
 
     use crate::{
@@ -931,17 +946,32 @@ mod tests {
     extern crate std;
 
     #[test]
-    fn broker_error_notifies_pipe_observers() {
+    fn broker_control_failure_notifies_all_pipe_observers() {
         let platform = crate::platform::mock::MockPlatform::new();
-        let local = BrokerLocal::negotiate(FailingPipeChannel { last_request: None }).unwrap();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_transport = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FailingPipeChannel {
+            last_request: None,
+            request_count: Arc::clone(&request_count),
+            read_failure: ReadFailure::Transport,
+            force_transport,
+        })
+        .unwrap();
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let pipes = super::Pipes::new(&litebox);
-        let (_writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
-        let observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
-        let observer_dyn: Arc<dyn Observer<Events>> = observer.clone();
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
+        pipes
+            .with_iopollable(&writer, |pollable| {
+                pollable.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+        let reader_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let reader_observer_dyn: Arc<dyn Observer<Events>> = reader_observer.clone();
         pipes
             .with_iopollable(&reader, |pollable| {
-                pollable.register_observer(Arc::downgrade(&observer_dyn), Events::ERR);
+                pollable.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
             })
             .unwrap();
 
@@ -954,7 +984,155 @@ mod tests {
             ),
             Err(ReadError::Io)
         ));
-        assert!(observer.0.load(Ordering::SeqCst));
+        assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        assert!(writer_observer.0.load(Ordering::SeqCst));
+        assert!(reader_observer.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn broker_notification_failure_prevents_future_control_requests() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_transport = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FailingPipeChannel {
+            last_request: None,
+            request_count: Arc::clone(&request_count),
+            read_failure: ReadFailure::Transport,
+            force_transport,
+        })
+        .unwrap();
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
+        pipes
+            .with_iopollable(&writer, |pollable| {
+                pollable.register_observer(Arc::downgrade(&writer_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+        let reader_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
+        let reader_observer_dyn: Arc<dyn Observer<Events>> = reader_observer.clone();
+        pipes
+            .with_iopollable(&reader, |pollable| {
+                pollable.register_observer(Arc::downgrade(&reader_observer_dyn), Events::ERR);
+            })
+            .unwrap();
+
+        litebox.broker_failure_dispatcher()();
+
+        assert!(writer_observer.0.load(Ordering::SeqCst));
+        assert!(reader_observer.0.load(Ordering::SeqCst));
+        assert!(matches!(
+            litebox
+                .broker_control()
+                .unwrap()
+                .read_pipe(ObjectHandle(1), 1),
+            Err(crate::broker::error::BrokerControlError::Transport)
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn broker_failure_wakes_blocked_pipe_read() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let force_transport = Arc::new(AtomicBool::new(false));
+        let local = BrokerLocal::negotiate(FailingPipeChannel {
+            last_request: None,
+            request_count: Arc::clone(&request_count),
+            read_failure: ReadFailure::WouldBlock,
+            force_transport: Arc::clone(&force_transport),
+        })
+        .unwrap();
+        let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+
+        let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+        let read_litebox = Arc::clone(&litebox);
+        let read_thread = std::thread::spawn(move || {
+            let pipes = super::Pipes::new(&read_litebox);
+            let mut value = 0;
+            result_sender
+                .send(pipes.read(
+                    &WaitState::new(platform).context(),
+                    &reader,
+                    core::slice::from_mut(&mut value),
+                ))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut setup_completed = true;
+        while request_count.load(Ordering::SeqCst) < 3 {
+            if std::time::Instant::now() >= deadline {
+                setup_completed = false;
+                force_transport.store(true, Ordering::SeqCst);
+                let _ = pipes.close(&writer);
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        if setup_completed {
+            litebox.dispatch_broker_notification(BrokerNotification::Readiness(
+                ReadinessNotification {
+                    handle: ObjectHandle(1),
+                    events: ReadinessFlags::READ,
+                },
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while request_count.load(Ordering::SeqCst) < 4 {
+                if std::time::Instant::now() >= deadline {
+                    setup_completed = false;
+                    force_transport.store(true, Ordering::SeqCst);
+                    let _ = pipes.close(&writer);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        if setup_completed {
+            litebox.broker_failure_dispatcher()();
+        }
+
+        let initial_read_result = result_receiver.recv_timeout(std::time::Duration::from_secs(1));
+        let woke_without_cleanup = initial_read_result.is_ok();
+        let mut read_result = initial_read_result.ok();
+        if read_result.is_none() {
+            force_transport.store(true, Ordering::SeqCst);
+            let _ = pipes.close(&writer);
+            read_result = result_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .ok();
+        }
+        if read_result.is_some() {
+            read_thread.join().unwrap();
+        } else {
+            std::process::abort();
+        }
+
+        assert!(setup_completed);
+        assert!(woke_without_cleanup);
+        assert!(matches!(read_result, Some(Err(ReadError::Io))));
+        assert_eq!(request_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn local_zero_length_write_succeeds_after_reader_closes() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let litebox = crate::LiteBox::new(platform);
+        let pipes = super::Pipes::new(&litebox);
+        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+
+        pipes.close(&reader).unwrap();
+
+        assert!(matches!(
+            pipes.write(&WaitState::new(platform).context(), &writer, &[]),
+            Ok(0)
+        ));
+        pipes.close(&writer).unwrap();
     }
 
     struct ErrorObserver(AtomicBool);
@@ -970,6 +1148,15 @@ mod tests {
     #[derive(Debug)]
     struct FailingPipeChannel {
         last_request: Option<BrokerRequest>,
+        request_count: Arc<AtomicUsize>,
+        read_failure: ReadFailure,
+        force_transport: Arc<AtomicBool>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadFailure {
+        Transport,
+        WouldBlock,
     }
 
     impl LocalControlChannel for FailingPipeChannel {
@@ -995,6 +1182,7 @@ mod tests {
             request: &BrokerRequest,
         ) -> core::result::Result<(), Self::Error> {
             self.last_request = Some(request.clone());
+            self.request_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1006,7 +1194,17 @@ mod tests {
                         write_handle: ObjectHandle(2),
                     }),
                 ))),
-                BrokerRequest::Pipe(PipeRequest::Read(_)) => Err(()),
+                BrokerRequest::Pipe(PipeRequest::Read(_))
+                    if self.force_transport.load(Ordering::SeqCst) =>
+                {
+                    Err(())
+                }
+                BrokerRequest::Pipe(PipeRequest::Read(_)) => match self.read_failure {
+                    ReadFailure::Transport => Err(()),
+                    ReadFailure::WouldBlock => {
+                        Ok(Some(BrokerResponse::Error(ErrorCode::WouldBlock)))
+                    }
+                },
                 BrokerRequest::CloseObject(_) => Ok(Some(BrokerResponse::ObjectClosed)),
                 request => panic!("unexpected broker request: {request:?}"),
             }
@@ -1029,6 +1227,7 @@ mod tests {
                     let ret = pipes
                         .write(&WaitState::new(platform).context(), &prod, &data[i..])
                         .unwrap();
+                    assert_eq!(ret, data.len() - i);
                     i += ret;
                 }
                 pipes.close(&prod).unwrap();

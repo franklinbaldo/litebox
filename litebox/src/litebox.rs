@@ -12,7 +12,6 @@ use litebox_broker_protocol::message::BrokerNotification;
 use crate::{
     broker,
     fd::Descriptors,
-    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -36,7 +35,11 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// If the `enforce_singleton_litebox_instance` compilation feature has been enabled, and more
     /// than one instance is made, will panic.
     pub fn new(platform: &'static Platform) -> Self {
-        Self::new_inner(platform, None)
+        Self::new_inner(
+            platform,
+            None,
+            Arc::new(broker::BrokerHandleRegistry::new()),
+        )
     }
 
     /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
@@ -47,17 +50,18 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     where
         Channel: LocalControlChannel + Send + 'static,
     {
-        Self::new_inner(
-            platform,
-            Some(Arc::new(
-                broker::BrokerLocalControl::<Platform, Channel>::new(broker_local),
-            )),
-        )
+        let broker_handles = Arc::new(broker::BrokerHandleRegistry::new());
+        let broker_control = Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(
+            broker_local,
+            Arc::clone(&broker_handles),
+        ));
+        Self::new_inner(platform, Some(broker_control), broker_handles)
     }
 
     fn new_inner(
         platform: &'static Platform,
         broker_control: Option<Arc<dyn broker::BrokerControl>>,
+        broker_handles: Arc<broker::BrokerHandleRegistry<Platform>>,
     ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
         //
@@ -102,7 +106,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 platform,
                 descriptors,
                 broker: broker_control,
-                broker_handles: Arc::new(broker::BrokerHandleRegistry::new()),
+                broker_handles,
             }),
         }
     }
@@ -145,10 +149,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 
     /// Dispatches one broker notification to the matching local-core object.
-    pub fn dispatch_broker_notification(&self, notification: BrokerNotification)
-    where
-        Platform: TimeProvider,
-    {
+    pub fn dispatch_broker_notification(&self, notification: BrokerNotification) {
         match notification {
             BrokerNotification::Readiness(notification) => self
                 .x
@@ -160,11 +161,21 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Returns a narrow dispatcher for moving broker notification handling into deployment code.
     pub fn broker_notification_dispatcher(&self) -> impl Fn(BrokerNotification) + Send + 'static
     where
-        Platform: TimeProvider + 'static,
+        Platform: 'static,
     {
         let litebox = self.clone();
         move |notification| {
             litebox.dispatch_broker_notification(notification);
+        }
+    }
+
+    /// Returns a dispatcher that fails all broker-backed objects when the association closes.
+    pub fn broker_failure_dispatcher(&self) -> impl Fn() + Send + 'static {
+        let litebox = self.clone();
+        move || {
+            if let Some(broker) = &litebox.x.broker {
+                broker.fail_connection();
+            }
         }
     }
 }

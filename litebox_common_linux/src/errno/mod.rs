@@ -576,8 +576,8 @@ impl From<litebox::sync::futex::FutexError> for Errno {
 impl From<litebox::pipes::errors::ReadError> for Errno {
     fn from(value: litebox::pipes::errors::ReadError) -> Self {
         match value {
-            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADFD,
-            litebox::pipes::errors::ReadError::NotForReading => Errno::EINVAL,
+            litebox::pipes::errors::ReadError::ClosedFd
+            | litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
             litebox::pipes::errors::ReadError::WaitError(e) => match e {
                 litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
@@ -594,7 +594,7 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
         match value {
             litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
-            litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
+            litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
             litebox::pipes::errors::WriteError::WaitError(e) => match e {
                 litebox::event::wait::WaitError::Interrupted => Errno::EINTR,

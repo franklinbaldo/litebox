@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -15,7 +16,6 @@ use litebox_broker_protocol::pipe::CreatePipeResponse;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
 use crate::event::{Events, polling::Pollee};
-use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;
@@ -77,6 +77,8 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
+
+    fn fail_connection(&self);
 }
 
 pub(crate) struct BrokerHandleRegistry<Platform: RawSyncPrimitivesProvider> {
@@ -108,23 +110,44 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleRegistry<Platform> {
         }
     }
 
-    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags)
-    where
-        Platform: TimeProvider,
-    {
+    pub(crate) fn notify_readiness(&self, handle: ObjectHandle, readiness: ReadinessFlags) {
         let events = readiness_events(readiness);
         if events.is_empty() {
             return;
         }
-        let mut handles = self.handles.lock();
-        let Some(entry) = handles.get_mut(&handle) else {
-            return;
+        let pollables = {
+            let mut handles = self.handles.lock();
+            let Some(entry) = handles.get_mut(&handle) else {
+                return;
+            };
+            entry.prune_stale_pollables();
+            let pollables = entry
+                .pollables
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            if entry.is_empty() {
+                handles.remove(&handle);
+            }
+            pollables
         };
-        entry.prune_stale_pollables();
-        if entry.is_empty() {
-            handles.remove(&handle);
-        } else {
-            entry.notify_pollables(events);
+        for pollee in pollables {
+            pollee.notify_observers(events);
+        }
+    }
+
+    fn notify_all(&self, events: Events) {
+        let pollables = {
+            let mut pollables = Vec::new();
+            self.handles.lock().retain(|_, entry| {
+                entry.prune_stale_pollables();
+                pollables.extend(entry.pollables.iter().filter_map(Weak::upgrade));
+                !entry.is_empty()
+            });
+            pollables
+        };
+        for pollee in pollables {
+            pollee.notify_observers(events);
         }
     }
 }
@@ -157,17 +180,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerHandleEntry<Platform> {
             .retain(|registered| registered.strong_count() > 0);
     }
 
-    fn notify_pollables(&self, events: Events)
-    where
-        Platform: TimeProvider,
-    {
-        for registered in &self.pollables {
-            if let Some(pollee) = registered.upgrade() {
-                pollee.notify_observers(events);
-            }
-        }
-    }
-
     fn is_empty(&self) -> bool {
         self.pollables.is_empty()
     }
@@ -176,7 +188,9 @@ pub(crate) struct BrokerLocalControl<
     Platform: RawSyncPrimitivesProvider,
     Channel: LocalControlChannel + Send,
 > {
-    local: Mutex<Platform, BrokerLocal<Channel>>,
+    local: Mutex<Platform, Option<BrokerLocal<Channel>>>,
+    handles: Arc<BrokerHandleRegistry<Platform>>,
+    failed: AtomicBool,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -184,9 +198,53 @@ where
     Platform: RawSyncPrimitivesProvider,
     Channel: LocalControlChannel + Send,
 {
-    pub(crate) const fn new(local: BrokerLocal<Channel>) -> Self {
+    pub(crate) fn new(
+        local: BrokerLocal<Channel>,
+        handles: Arc<BrokerHandleRegistry<Platform>>,
+    ) -> Self {
         Self {
-            local: Mutex::new(local),
+            local: Mutex::new(Some(local)),
+            handles,
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn request<T>(
+        &self,
+        request: impl FnOnce(
+            &mut BrokerLocal<Channel>,
+        ) -> litebox_broker_local::Result<T, Channel::Error>,
+    ) -> core::result::Result<T, BrokerControlError> {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(BrokerControlError::Transport);
+        }
+        let (result, notify_failure) = {
+            let mut local = self.local.lock();
+            if self.failed.load(Ordering::Acquire) {
+                return Err(BrokerControlError::Transport);
+            }
+            let result = request(
+                local
+                    .as_mut()
+                    .expect("active broker connection must retain its control channel"),
+            )
+            .map_err(BrokerControlError::from);
+            let notify_failure = matches!(result.as_ref(), Err(BrokerControlError::Transport))
+                && !self.failed.swap(true, Ordering::AcqRel);
+            if matches!(result.as_ref(), Err(BrokerControlError::Transport)) {
+                local.take();
+            }
+            (result, notify_failure)
+        };
+        if notify_failure {
+            self.handles.notify_all(Events::ERR);
+        }
+        result
+    }
+
+    fn mark_failed(&self) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            self.handles.notify_all(Events::ERR);
         }
     }
 }
@@ -200,14 +258,14 @@ where
         &self,
         initial_count: u64,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        Ok(self.local.lock().create_event_with_count(initial_count)?)
+        self.request(|local| local.create_event_with_count(initial_count))
     }
 
     fn wait_event(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        Ok(self.local.lock().wait_event(handle)?)
+        self.request(|local| local.wait_event(handle))
     }
 
     fn add_event(
@@ -215,7 +273,7 @@ where
         handle: ObjectHandle,
         value: u64,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        Ok(self.local.lock().add_event(handle, value)?)
+        self.request(|local| local.add_event(handle, value))
     }
 
     fn consume_event(
@@ -223,7 +281,7 @@ where
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
-        Ok(self.local.lock().consume_event(handle, mode)?)
+        self.request(|local| local.consume_event(handle, mode))
     }
 
     fn create_pipe(
@@ -231,7 +289,7 @@ where
         capacity: u64,
         atomic_write_size: u64,
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError> {
-        Ok(self.local.lock().create_pipe(capacity, atomic_write_size)?)
+        self.request(|local| local.create_pipe(capacity, atomic_write_size))
     }
 
     fn read_pipe(
@@ -239,7 +297,7 @@ where
         handle: ObjectHandle,
         length: u32,
     ) -> core::result::Result<Vec<u8>, BrokerControlError> {
-        Ok(self.local.lock().read_pipe(handle, length)?)
+        self.request(|local| local.read_pipe(handle, length))
     }
 
     fn write_pipe(
@@ -247,18 +305,22 @@ where
         handle: ObjectHandle,
         data: &[u8],
     ) -> core::result::Result<usize, BrokerControlError> {
-        Ok(self.local.lock().write_pipe(handle, data)?)
+        self.request(|local| local.write_pipe(handle, data))
     }
 
     fn check_pipe_readiness(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
-        Ok(self.local.lock().check_pipe_readiness(handle)?)
+        self.request(|local| local.check_pipe_readiness(handle))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
-        Ok(self.local.lock().close_object(handle)?)
+        self.request(|local| local.close_object(handle))
+    }
+
+    fn fail_connection(&self) {
+        self.mark_failed();
     }
 }
 
