@@ -254,10 +254,51 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         f: impl FnOnce(&mut SocketOptions) -> R,
     ) -> R {
+        #[cfg(feature = "mirai")]
+        {
+            litebox::mirai_contracts::acquire_descriptor_write(&self.litebox);
+            let mut options = SocketOptions::default();
+            let result = f(&mut options);
+            litebox::mirai_contracts::release_descriptor_write(&self.litebox);
+            return result;
+        }
+
+        #[cfg(not(feature = "mirai"))]
         self.litebox
             .descriptor_table_mut()
             .with_metadata_mut(fd, |opt| f(opt))
             .unwrap()
+    }
+
+    #[cfg(feature = "mirai")]
+    fn mirai_with_descriptor_write<R>(
+        &self,
+        callback: impl FnOnce(&litebox::LiteBox<Platform>) -> R,
+    ) -> R {
+        litebox::mirai_contracts::acquire_descriptor_write(&self.litebox);
+        let result = callback(&self.litebox);
+        litebox::mirai_contracts::release_descriptor_write(&self.litebox);
+        result
+    }
+
+    #[cfg(feature = "mirai")]
+    fn mirai_setsockopt_pre_fix(&self, _fd: &SocketFd) {
+        self.mirai_with_descriptor_write(|litebox| {
+            litebox::mirai_contracts::require_no_descriptor_writer(litebox);
+        });
+    }
+
+    #[cfg(feature = "mirai")]
+    fn mirai_setsockopt_fixed(&self, _fd: &SocketFd) {
+        self.mirai_with_descriptor_write(|_litebox| {});
+        litebox::mirai_contracts::require_no_descriptor_writer(&self.litebox);
+    }
+
+    #[cfg(feature = "mirai")]
+    fn mirai_setsockopt_unrelated_lock(&self, _fd: &SocketFd, other: &litebox::LiteBox<Platform>) {
+        self.mirai_with_descriptor_write(|_litebox| {
+            litebox::mirai_contracts::require_no_descriptor_writer(other);
+        });
     }
 
     /// Common implementation for setsockopt for options that are stored in [`SocketOptions`]:
@@ -328,6 +369,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         optlen: usize,
     ) -> Result<(), Errno> {
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
+            #[cfg(not(feature = "mirai_buggy_setsockopt"))]
             // Collect any TCP option that needs to be applied via Network after
             // releasing the descriptor table write lock, to avoid a deadlock:
             // `with_socket_options_mut` holds a write lock on descriptors, while
@@ -355,32 +397,66 @@ impl<FS: ShimFS> GlobalState<FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        deferred_tcp_option = Some(if keep_alive {
-                            // default time interval is 2 hours
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_secs(2 * 60 * 60),
-                            ))
-                        } else {
-                            litebox::net::TcpOptionData::KEEPALIVE(None)
-                        });
+                        #[cfg(feature = "mirai_buggy_setsockopt")]
+                        {
+                            litebox::mirai_contracts::require_no_descriptor_writer(&self.litebox);
+                            if let Err(err) = self.net.lock().set_tcp_option(
+                                fd,
+                                if keep_alive {
+                                    litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                        core::time::Duration::from_secs(2 * 60 * 60),
+                                    ))
+                                } else {
+                                    litebox::net::TcpOptionData::KEEPALIVE(None)
+                                },
+                            ) {
+                                match err {
+                                    litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                        return Err(Errno::EBADF);
+                                    }
+                                    litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                        unimplemented!(
+                                            "SO_KEEPALIVE is not supported for non-TCP sockets"
+                                        )
+                                    }
+                                    _ => unimplemented!(),
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "mirai_buggy_setsockopt"))]
+                        {
+                            deferred_tcp_option = Some(if keep_alive {
+                                // default time interval is 2 hours
+                                litebox::net::TcpOptionData::KEEPALIVE(Some(
+                                    core::time::Duration::from_secs(2 * 60 * 60),
+                                ))
+                            } else {
+                                litebox::net::TcpOptionData::KEEPALIVE(None)
+                            });
+                        }
                         opt.keep_alive = keep_alive;
                     }
                     _ => unreachable!(),
                 }
                 Ok::<(), Errno>(())
             })?;
-            // Apply deferred TCP option after releasing the descriptor table write lock.
-            if let Some(tcp_data) = deferred_tcp_option
-                && let Err(err) = self.net.lock().set_tcp_option(fd, tcp_data)
+            #[cfg(not(feature = "mirai_buggy_setsockopt"))]
             {
-                match err {
-                    litebox::net::errors::SetTcpOptionError::InvalidFd => {
-                        return Err(Errno::EBADF);
+                // Apply deferred TCP option after releasing the descriptor table write lock.
+                if let Some(tcp_data) = deferred_tcp_option {
+                    #[cfg(feature = "mirai")]
+                    litebox::mirai_contracts::require_no_descriptor_writer(&self.litebox);
+                    if let Err(err) = self.net.lock().set_tcp_option(fd, tcp_data) {
+                        match err {
+                            litebox::net::errors::SetTcpOptionError::InvalidFd => {
+                                return Err(Errno::EBADF);
+                            }
+                            litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
+                                unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                            }
+                            _ => unimplemented!(),
+                        }
                     }
-                    litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
-                    }
-                    _ => unimplemented!(),
                 }
             }
 

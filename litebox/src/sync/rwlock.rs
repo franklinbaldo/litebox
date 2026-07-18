@@ -11,6 +11,9 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
+#[cfg(feature = "mirai")]
+use mirai_annotations::{get_model_field, precondition, set_model_field};
+
 use crate::platform::RawMutex;
 
 #[cfg(feature = "lock_tracing")]
@@ -437,6 +440,13 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref for RwLockReadGuar
 
 impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockReadGuard<'_, Platform, T> {
     fn drop(&mut self) {
+        #[cfg(feature = "mirai")]
+        {
+            let read_count = get_model_field!(self.rwlock, read_count, 0usize);
+            precondition!(read_count > 0, "read release requires a live reader");
+            set_model_field!(self.rwlock, read_count, read_count - 1);
+        }
+
         #[cfg(feature = "lock_tracing")]
         if let Some(witness) = &mut self.locked_witness {
             witness.mark_unlock();
@@ -468,6 +478,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
 
 impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, Platform, T> {
     fn drop(&mut self) {
+        #[cfg(feature = "mirai")]
+        set_model_field!(self.rwlock, write_held, 0usize);
+
         #[cfg(feature = "lock_tracing")]
         if let Some(witness) = &mut self.locked_witness {
             witness.mark_unlock();
@@ -614,6 +627,17 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
+        #[cfg(feature = "mirai")]
+        {
+            precondition!(
+                get_model_field!(self, write_held, 0usize) == 0,
+                "read requires no live writer"
+            );
+            let read_count = get_model_field!(self, read_count, 0usize);
+            precondition!(read_count < usize::MAX, "reader count must not overflow");
+            set_model_field!(self, read_count, read_count + 1);
+        }
+
         #[cfg(feature = "lock_tracing")]
         self.creation
             .ensure_registered(LockType::RwLock, || &raw const self.raw.state);
@@ -634,6 +658,19 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn write(&self) -> RwLockWriteGuard<'_, Platform, T> {
+        #[cfg(feature = "mirai")]
+        {
+            precondition!(
+                get_model_field!(self, write_held, 0usize) == 0,
+                "write requires no live writer"
+            );
+            precondition!(
+                get_model_field!(self, read_count, 0usize) == 0,
+                "write requires no live readers"
+            );
+            set_model_field!(self, write_held, 1usize);
+        }
+
         #[cfg(feature = "lock_tracing")]
         self.creation
             .ensure_registered(LockType::RwLock, || &raw const self.raw.state);

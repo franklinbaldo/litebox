@@ -51,7 +51,7 @@ default-members = [
 # pushing it too far; this way we get something even further than default clippy
 # but not _too_ ridiculous.
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rlock)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rlock)', 'cfg(mirai)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

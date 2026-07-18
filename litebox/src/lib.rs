@@ -19,6 +19,8 @@ extern crate alloc;
 pub mod event;
 pub mod fd;
 pub mod fs;
+#[cfg(feature = "mirai")]
+pub mod mirai_contracts;
 pub mod mm;
 pub mod net;
 pub mod path;
