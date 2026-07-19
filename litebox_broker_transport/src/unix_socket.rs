@@ -158,11 +158,10 @@ impl SharedMemory for UnixSharedMemory {
             .mapping
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let end = offset
+        offset
             .checked_add(destination.len())
             .filter(|end| *end <= mapping.length)
             .ok_or(SharedMemoryError::InvalidRange)?;
-        let _ = end;
         // SAFETY: The range was checked against the live mapping, and
         // `destination` is valid for its full length. Control-channel
         // serialization prevents the peer from reusing this staging range
@@ -182,11 +181,10 @@ impl SharedMemory for UnixSharedMemory {
             .mapping
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let end = offset
+        offset
             .checked_add(source.len())
             .filter(|end| *end <= mapping.length)
             .ok_or(SharedMemoryError::InvalidRange)?;
-        let _ = end;
         // SAFETY: The range was checked against the live mapping, and `source`
         // is valid for its full length. The mapping is byte-addressed foreign
         // memory and no Rust references into it are created.
