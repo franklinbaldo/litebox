@@ -1156,7 +1156,6 @@ mod tests {
                     PipeResponse::Create(CreatePipeResponse {
                         read_handle: ObjectHandle(1),
                         write_handle: ObjectHandle(2),
-                        shared_memory: false,
                     }),
                 ))),
                 BrokerRequest::Pipe(PipeRequest::Read(_))

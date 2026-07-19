@@ -7,9 +7,8 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::pipe::{
-    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse,
-    ReadPipeSharedRequest, ReadPipeSharedResponse, WritePipeRequest, WritePipeResponse,
-    WritePipeSharedRequest,
+    CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
+    WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
 use crate::{ObjectHandle, ProtocolVersion};
@@ -76,12 +75,8 @@ pub enum PipeRequest {
     Create(CreatePipeRequest),
     /// Read bytes from a pipe.
     Read(ReadPipeRequest),
-    /// Read bytes from a pipe into shared memory.
-    ReadShared(ReadPipeSharedRequest),
     /// Write bytes to a pipe.
     Write(WritePipeRequest),
-    /// Write bytes staged in shared memory to a pipe.
-    WriteShared(WritePipeSharedRequest),
 }
 
 /// Broker response sent over an active control channel.
@@ -117,12 +112,8 @@ pub enum PipeResponse {
     Create(CreatePipeResponse),
     /// Read operation response.
     Read(ReadPipeResponse),
-    /// Shared-memory read operation response.
-    ReadShared(ReadPipeSharedResponse),
     /// Write operation response.
     Write(WritePipeResponse),
-    /// Shared-memory write operation response.
-    WriteShared(WritePipeResponse),
 }
 
 /// Broker-initiated asynchronous notification.

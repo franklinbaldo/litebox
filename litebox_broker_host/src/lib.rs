@@ -137,7 +137,6 @@ fn handle_pipe_request(session: &BrokerSession, request: PipeRequest) -> BrokerR
                     PipeResponse::Create(CreatePipeResponse {
                         read_handle,
                         write_handle,
-                        shared_memory: false,
                     })
                 })
         }
@@ -155,9 +154,6 @@ fn handle_pipe_request(session: &BrokerSession, request: PipeRequest) -> BrokerR
                     }))
                 },
             )
-        }
-        PipeRequest::ReadShared(_) | PipeRequest::WriteShared(_) => {
-            Err(litebox_broker_core::BrokerError::UnsupportedOperation)
         }
     };
 
