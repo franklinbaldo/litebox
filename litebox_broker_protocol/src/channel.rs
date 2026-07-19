@@ -8,6 +8,10 @@ use crate::message::{
 use crate::shared_memory::SharedMemory;
 
 /// Active control response and its optional transport-provided shared memory.
+///
+/// The attachment is logically part of the response and must be delivered
+/// atomically with it. A transport may represent the attachment as a newly
+/// transferred resource or as a region of an existing shared-memory arena.
 pub struct ControlResponse<Memory> {
     /// Broker protocol response.
     pub response: BrokerResponse,
@@ -44,6 +48,9 @@ pub enum HostReceive<T> {
 }
 
 /// Local-side control channel for broker authority calls.
+///
+/// Requests are synchronous: callers send one request and receive its response
+/// before sending another request on the same channel.
 pub trait LocalControlChannel {
     /// Channel-specific error type.
     type Error;
@@ -74,6 +81,9 @@ pub trait LocalControlChannel {
 }
 
 /// Host-side control channel for broker authority calls.
+///
+/// Requests are synchronous: each received request is answered before another
+/// request is received on the same channel.
 pub trait HostControlChannel {
     /// Channel-specific error type.
     type Error;
@@ -99,6 +109,9 @@ pub trait HostControlChannel {
 
     /// Creates a shared-memory resource for an active response.
     ///
+    /// The resource may be independently allocated or may refer to a region in
+    /// shared memory already established by the transport.
+    ///
     /// Returns `Ok(None)` when this channel does not support shared-memory
     /// attachments.
     fn create_shared_memory(
@@ -108,7 +121,10 @@ pub trait HostControlChannel {
         Ok(None)
     }
 
-    /// Sends one active broker response.
+    /// Sends one active broker response and its logically associated attachment.
+    ///
+    /// A successful return means the response and attachment, when present,
+    /// will be observed together by the peer.
     fn send_response(
         &mut self,
         response: &BrokerResponse,

@@ -19,6 +19,9 @@ pub enum SharedMemoryError {
 
 /// Byte-copy access to a shared-memory resource supplied by a control channel.
 ///
+/// A value may own a distinct shared-memory object or identify a region in a
+/// larger transport-managed shared-memory arena.
+///
 /// Implementations must keep the backing resource alive for the lifetime of
 /// the value and synchronize concurrent accesses without exposing typed
 /// references into memory writable by another process.
