@@ -1119,6 +1119,7 @@ mod tests {
 
     impl LocalControlChannel for FailingPipeChannel {
         type Error = ();
+        type SharedMemory = litebox_broker_protocol::shared_memory::NoSharedMemory;
 
         fn send_handshake_request(
             &mut self,
@@ -1144,12 +1145,18 @@ mod tests {
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            match self.last_request.take().unwrap() {
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<
+            Option<litebox_broker_protocol::channel::ControlResponse<Self::SharedMemory>>,
+            Self::Error,
+        > {
+            let response = match self.last_request.take().unwrap() {
                 BrokerRequest::Pipe(PipeRequest::Create(_)) => Ok(Some(BrokerResponse::Pipe(
                     PipeResponse::Create(CreatePipeResponse {
                         read_handle: ObjectHandle(1),
                         write_handle: ObjectHandle(2),
+                        shared_memory: false,
                     }),
                 ))),
                 BrokerRequest::Pipe(PipeRequest::Read(_))
@@ -1170,7 +1177,13 @@ mod tests {
                 request @ (BrokerRequest::Pipe(_) | BrokerRequest::Event(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
-            }
+            }?;
+            Ok(response.map(
+                |response| litebox_broker_protocol::channel::ControlResponse {
+                    response,
+                    shared_memory: None,
+                },
+            ))
         }
     }
 

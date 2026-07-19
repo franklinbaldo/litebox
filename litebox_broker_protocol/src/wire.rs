@@ -283,8 +283,9 @@ mod tests {
     };
     use crate::message::{EventRequest, EventResponse, PipeRequest, PipeResponse};
     use crate::pipe::{
-        CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
-        WritePipeResponse,
+        CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse,
+        ReadPipeSharedRequest, ReadPipeSharedResponse, WritePipeRequest, WritePipeResponse,
+        WritePipeSharedRequest,
     };
     use crate::{ObjectHandle, ProtocolVersion};
 
@@ -328,9 +329,19 @@ mod tests {
                 atomic_write_size: 512,
             })),
             BrokerRequest::Pipe(PipeRequest::Read(ReadPipeRequest { handle, length: 32 })),
+            BrokerRequest::Pipe(PipeRequest::ReadShared(ReadPipeSharedRequest {
+                handle,
+                offset: 7,
+                length: 32,
+            })),
             BrokerRequest::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle,
                 data: Vec::from([1, 2, 3]),
+            })),
+            BrokerRequest::Pipe(PipeRequest::WriteShared(WritePipeSharedRequest {
+                handle,
+                offset: 9,
+                length: 3,
             })),
         ];
 
@@ -381,11 +392,14 @@ mod tests {
             BrokerResponse::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle: handle,
                 write_handle: ObjectHandle(14),
+                shared_memory: true,
             })),
             BrokerResponse::Pipe(PipeResponse::Read(ReadPipeResponse {
                 data: Vec::from([1, 2, 3]),
             })),
+            BrokerResponse::Pipe(PipeResponse::ReadShared(ReadPipeSharedResponse { read: 3 })),
             BrokerResponse::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
+            BrokerResponse::Pipe(PipeResponse::WriteShared(WritePipeResponse { written: 3 })),
             BrokerResponse::Error(ErrorCode::PolicyDenied),
             BrokerResponse::Error(ErrorCode::WouldBlock),
             BrokerResponse::Error(ErrorCode::PeerClosed),

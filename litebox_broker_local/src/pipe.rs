@@ -28,7 +28,13 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
             capacity,
             atomic_write_size,
         }))? {
-            PipeResponse::Create(response) => Ok(response),
+            PipeResponse::Create(response) => {
+                assert!(
+                    !response.shared_memory,
+                    "inline-only broker local received shared-memory pipe"
+                );
+                Ok(response)
+            }
             response => panic!("broker returned unexpected pipe response: {response:?}"),
         }
     }

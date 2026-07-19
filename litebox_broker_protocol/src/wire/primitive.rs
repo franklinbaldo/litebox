@@ -21,6 +21,10 @@ impl Encoder {
         self.bytes.push(value);
     }
 
+    pub(super) fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
     pub(super) fn u16(&mut self, value: u16) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -73,6 +77,14 @@ impl<'a> Decoder<'a> {
     pub(super) fn u8(&mut self) -> Result<u8, WireError> {
         let bytes = self.take(1)?;
         Ok(bytes[0])
+    }
+
+    pub(super) fn bool(&mut self) -> Result<bool, WireError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(WireError::InvalidTag),
+        }
     }
 
     pub(super) fn u16(&mut self) -> Result<u16, WireError> {

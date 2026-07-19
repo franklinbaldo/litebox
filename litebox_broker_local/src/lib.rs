@@ -20,7 +20,9 @@ mod error;
 mod event;
 mod pipe;
 
-use litebox_broker_protocol::channel::{LocalControlChannel, LocalNotificationChannel};
+use litebox_broker_protocol::channel::{
+    ControlResponse, LocalControlChannel, LocalNotificationChannel,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
@@ -96,12 +98,19 @@ impl<Channel: LocalControlChannel> BrokerLocal<Channel> {
         self.channel
             .send_request(&request)
             .map_err(BrokerLocalError::Channel)?;
-        match self
+        let ControlResponse {
+            response,
+            shared_memory,
+        } = self
             .channel
             .recv_response()
             .map_err(BrokerLocalError::Channel)?
-            .ok_or(BrokerLocalError::ChannelClosed)?
-        {
+            .ok_or(BrokerLocalError::ChannelClosed)?;
+        assert!(
+            shared_memory.is_none(),
+            "broker attached unexpected shared memory to response"
+        );
+        match response {
             BrokerResponse::Error(error) => match error {
                 ErrorCode::PolicyDenied
                 | ErrorCode::UnknownObject
@@ -337,6 +346,7 @@ mod tests {
 
     impl LocalControlChannel for FakeControlChannel {
         type Error = Infallible;
+        type SharedMemory = litebox_broker_protocol::shared_memory::NoSharedMemory;
 
         fn send_handshake_request(
             &mut self,
@@ -360,8 +370,14 @@ mod tests {
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
-            Ok(self.response.take())
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<Option<ControlResponse<Self::SharedMemory>>, Self::Error>
+        {
+            Ok(self.response.take().map(|response| ControlResponse {
+                response,
+                shared_memory: None,
+            }))
         }
     }
 

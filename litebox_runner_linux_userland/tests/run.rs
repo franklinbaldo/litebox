@@ -407,6 +407,7 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
     litebox_broker_protocol::channel::HostControlChannel for CountingHostControlChannel<Channel>
 {
     type Error = Channel::Error;
+    type SharedMemory = Channel::SharedMemory;
 
     fn peer_credential(
         &self,
@@ -452,11 +453,19 @@ impl<Channel: litebox_broker_protocol::channel::HostControlChannel>
         Ok(request)
     }
 
+    fn create_shared_memory(
+        &mut self,
+        length: usize,
+    ) -> Result<Option<Self::SharedMemory>, Self::Error> {
+        self.inner.create_shared_memory(length)
+    }
+
     fn send_response(
         &mut self,
         response: &litebox_broker_protocol::message::BrokerResponse,
+        shared_memory: Option<&Self::SharedMemory>,
     ) -> Result<(), Self::Error> {
-        self.inner.send_response(response)
+        self.inner.send_response(response, shared_memory)
     }
 }
 

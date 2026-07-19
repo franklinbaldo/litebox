@@ -98,7 +98,7 @@ where
             HostReceive::Message(request) => request,
             HostReceive::ProtocolViolation => {
                 control_channel
-                    .send_response(&BrokerResponse::Error(ErrorCode::ProtocolState))
+                    .send_response(&BrokerResponse::Error(ErrorCode::ProtocolState), None)
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(ConnectionTermination::ProtocolViolation);
             }
@@ -107,7 +107,7 @@ where
 
         let response = handle_request(&session, request);
         control_channel
-            .send_response(&response)
+            .send_response(&response, None)
             .map_err(BrokerHostError::Channel)?;
     }
 
@@ -137,6 +137,7 @@ fn handle_pipe_request(session: &BrokerSession, request: PipeRequest) -> BrokerR
                     PipeResponse::Create(CreatePipeResponse {
                         read_handle,
                         write_handle,
+                        shared_memory: false,
                     })
                 })
         }
@@ -154,6 +155,9 @@ fn handle_pipe_request(session: &BrokerSession, request: PipeRequest) -> BrokerR
                     }))
                 },
             )
+        }
+        PipeRequest::ReadShared(_) | PipeRequest::WriteShared(_) => {
+            Err(litebox_broker_core::BrokerError::UnsupportedOperation)
         }
     };
 
@@ -444,6 +448,7 @@ mod tests {
 
     impl HostControlChannel for FakeHostControlChannel {
         type Error = ();
+        type SharedMemory = litebox_broker_protocol::shared_memory::NoSharedMemory;
 
         fn peer_credential(&self) -> core::result::Result<PeerCredential, Self::Error> {
             Ok(PeerCredential::Unauthenticated)
@@ -483,7 +488,9 @@ mod tests {
         fn send_response(
             &mut self,
             response: &BrokerResponse,
+            shared_memory: Option<&Self::SharedMemory>,
         ) -> core::result::Result<(), Self::Error> {
+            assert!(shared_memory.is_none());
             if self.send_error {
                 return Err(());
             }

@@ -14,13 +14,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use litebox_broker_protocol::channel::{
-    HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
+    ControlResponse, HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
     LocalNotificationChannel, PeerCredential,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };
+use litebox_broker_protocol::shared_memory::NoSharedMemory;
 use litebox_broker_protocol::wire::{
     WireError, decode_handshake_request, decode_handshake_response, decode_notification,
     decode_request, decode_response, encode_handshake_request, encode_handshake_response,
@@ -136,6 +137,7 @@ impl UnixStreamHostNotificationChannel {
 
 impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = Error;
+    type SharedMemory = NoSharedMemory;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
         let frame = encode_handshake_request(request.clone());
@@ -161,9 +163,16 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
         write_frame_with_deadline(&mut self.stream, &frame, None)
     }
 
-    fn recv_response(&mut self) -> IoResult<Option<BrokerResponse>> {
+    fn recv_response(&mut self) -> IoResult<Option<ControlResponse<Self::SharedMemory>>> {
         match read_frame_with_deadline(&mut self.stream, None)? {
-            Some(frame) => decode_response(&frame).map(Some).map_err(wire_error),
+            Some(frame) => decode_response(&frame)
+                .map(|response| {
+                    Some(ControlResponse {
+                        response,
+                        shared_memory: None,
+                    })
+                })
+                .map_err(wire_error),
             None => Ok(None),
         }
     }
@@ -171,6 +180,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
 impl HostControlChannel for UnixStreamHostControlChannel {
     type Error = Error;
+    type SharedMemory = NoSharedMemory;
 
     fn peer_credential(&self) -> IoResult<PeerCredential> {
         // TODO(broker): replace the PoC placeholder with Unix peer credential extraction
@@ -208,7 +218,16 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         }
     }
 
-    fn send_response(&mut self, response: &BrokerResponse) -> IoResult<()> {
+    fn send_response(
+        &mut self,
+        response: &BrokerResponse,
+        shared_memory: Option<&Self::SharedMemory>,
+    ) -> IoResult<()> {
+        if shared_memory.is_some() {
+            return Err(invalid_data(
+                "Unix transport does not support shared memory yet",
+            ));
+        }
         write_frame_with_deadline(&mut self.stream, &encode_response(response.clone()), None)
     }
 }
