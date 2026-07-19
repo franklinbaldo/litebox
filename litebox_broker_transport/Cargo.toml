@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-unix = ["dep:libc"]
+std = []
+unix = ["std", "dep:libc"]
 
 [dependencies]
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
