@@ -2,8 +2,8 @@ $ErrorActionPreference = "Stop"
 
 # These opt-in XFAIL rows are deliberately excluded from run_mirai_double_lock.ps1. They isolate
 # two independent summary limits: incomplete nested-HOF summaries and model-field writes through a
-# returned reference losing their parameter root. An XPASS means MIRAI gained a capability and this
-# quarantine should be removed or tightened.
+# returned reference losing their parameter root. An XPASS/FAIL means either MIRAI gained a
+# capability or its internal log format changed; investigate before removing or tightening this.
 
 $repositoryRoot = $PSScriptRoot
 $miraiRoot = (Resolve-Path (Join-Path $repositoryRoot "..\..\MIRAI")).Path
