@@ -254,7 +254,7 @@ impl<FS: ShimFS> GlobalState<FS> {
         fd: &SocketFd,
         f: impl FnOnce(&mut SocketOptions) -> R,
     ) -> R {
-        #[cfg(feature = "mirai")]
+        #[cfg(all(feature = "mirai", not(feature = "mirai_real_path_tripwire")))]
         {
             litebox::mirai_contracts::acquire_descriptor_write(&self.litebox);
             let mut options = SocketOptions::default();
@@ -263,7 +263,7 @@ impl<FS: ShimFS> GlobalState<FS> {
             return result;
         }
 
-        #[cfg(not(feature = "mirai"))]
+        #[cfg(any(not(feature = "mirai"), feature = "mirai_real_path_tripwire"))]
         self.litebox
             .descriptor_table_mut()
             .with_metadata_mut(fd, |opt| f(opt))
@@ -300,6 +300,24 @@ impl<FS: ShimFS> GlobalState<FS> {
     fn mirai_setsockopt_unrelated_lock(&self, _fd: &SocketFd, other: &litebox::LiteBox<Platform>) {
         self.mirai_with_descriptor_write(|_litebox| {
             litebox::mirai_contracts::require_no_descriptor_writer(other);
+        });
+    }
+
+    /// Known limitation: the real nested guard/HOF path currently yields an incomplete summary,
+    /// so its callback cannot be resolved from persisted summaries.
+    #[cfg(feature = "mirai_real_path_tripwire")]
+    fn mirai_real_path_tripwire(&self, fd: &SocketFd) {
+        self.with_socket_options_mut(fd, |_options| {
+            litebox::mirai_contracts::require_no_descriptor_writer(&self.litebox);
+        });
+    }
+
+    /// Known limitation: a returned `&RwLock` does not keep its model-field write parameter-rooted,
+    /// so the persisted callback pre-state is empty and this violation is silently missed.
+    #[cfg(feature = "mirai_descriptor_rekey_tripwire")]
+    fn mirai_descriptor_rekey_tripwire(&self, _fd: &SocketFd) {
+        self.mirai_with_descriptor_write(|litebox| {
+            litebox::mirai_contracts::require_no_descriptor_writer(litebox);
         });
     }
 

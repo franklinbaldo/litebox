@@ -35,6 +35,7 @@ lock_tracing = ["dep:arrayvec", "spin/mutex"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
 mirai = ["dep:mirai-annotations"]
+mirai_descriptor_rekey_tripwire = ["mirai"]
 
 [lints]
 workspace = true

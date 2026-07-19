@@ -24,6 +24,8 @@ platform_windows_userland = ["litebox_platform_multiplex/platform_windows_userla
 platform_linux_snp = ["litebox_platform_multiplex/platform_linux_snp"]
 mirai = ["litebox/mirai"]
 mirai_buggy_setsockopt = ["mirai"]
+mirai_descriptor_rekey_tripwire = ["mirai", "litebox/mirai_descriptor_rekey_tripwire"]
+mirai_real_path_tripwire = ["mirai"]
 
 [dev-dependencies]
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
