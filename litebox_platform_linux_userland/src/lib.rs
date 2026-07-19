@@ -508,6 +508,39 @@ impl LinuxUserland {
                     .unwrap(),
                 ],
             ),
+            // Broker shared-memory responses receive one descriptor with
+            // close-on-exec and validate that its memfd size is sealed.
+            (
+                libc::SYS_recvmsg,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            2,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::MSG_CMSG_CLOEXEC.cast_unsigned().into(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+            (libc::SYS_fstat, vec![]),
+            (
+                libc::SYS_fcntl,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::F_GET_SEALS.cast_unsigned().into(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
             (libc::SYS_close, vec![]),
         ];
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
