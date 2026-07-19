@@ -11,6 +11,12 @@ use crate::ObjectHandle;
 /// smallest currently supported transport frame.
 pub const MAX_PIPE_TRANSFER_SIZE: u32 = 32 * 1024;
 
+/// Size of each directional shared-memory staging ring.
+pub const PIPE_SHARED_MEMORY_REGION_SIZE: usize = MAX_PIPE_TRANSFER_SIZE as usize;
+
+/// Total size of one pipe's read and write staging rings.
+pub const PIPE_SHARED_MEMORY_SIZE: usize = PIPE_SHARED_MEMORY_REGION_SIZE * 2;
+
 /// Request to create a broker-owned byte pipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreatePipeRequest {
@@ -27,6 +33,8 @@ pub struct CreatePipeResponse {
     pub read_handle: ObjectHandle,
     /// Handle for the write endpoint.
     pub write_handle: ObjectHandle,
+    /// Whether the control response includes the pipe's shared-memory resource.
+    pub shared_memory: bool,
 }
 
 /// Request to read bytes from a pipe endpoint.
@@ -45,6 +53,24 @@ pub struct ReadPipeResponse {
     pub data: Vec<u8>,
 }
 
+/// Request to read pipe bytes into the shared-memory read ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadPipeSharedRequest {
+    /// Read endpoint handle.
+    pub handle: ObjectHandle,
+    /// Byte offset within the read ring.
+    pub offset: u32,
+    /// Maximum number of bytes to read.
+    pub length: u32,
+}
+
+/// Response describing bytes placed in the shared-memory read ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadPipeSharedResponse {
+    /// Number of bytes placed in the ring.
+    pub read: u32,
+}
+
 /// Request to write bytes to a pipe endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WritePipeRequest {
@@ -52,6 +78,17 @@ pub struct WritePipeRequest {
     pub handle: ObjectHandle,
     /// Bytes to append to the pipe.
     pub data: Vec<u8>,
+}
+
+/// Request to write bytes staged in the shared-memory write ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePipeSharedRequest {
+    /// Write endpoint handle.
+    pub handle: ObjectHandle,
+    /// Byte offset within the write ring.
+    pub offset: u32,
+    /// Number of staged bytes to write.
+    pub length: u32,
 }
 
 /// Response describing a completed pipe write.

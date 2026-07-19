@@ -402,6 +402,7 @@ mod tests {
 
     impl LocalControlChannel for FakeLocalControlChannel {
         type Error = ();
+        type SharedMemory = litebox_broker_protocol::shared_memory::NoSharedMemory;
 
         fn send_handshake_request(
             &mut self,
@@ -427,7 +428,12 @@ mod tests {
             Ok(())
         }
 
-        fn recv_response(&mut self) -> core::result::Result<Option<BrokerResponse>, Self::Error> {
+        fn recv_response(
+            &mut self,
+        ) -> core::result::Result<
+            Option<litebox_broker_protocol::channel::ControlResponse<Self::SharedMemory>>,
+            Self::Error,
+        > {
             if self.fail_requests.load(Ordering::SeqCst) {
                 self.last_request.take();
                 return Err(());
@@ -457,7 +463,10 @@ mod tests {
                     panic!("unexpected broker request: {request:?}")
                 }
             };
-            Ok(Some(response))
+            Ok(Some(litebox_broker_protocol::channel::ControlResponse {
+                response,
+                shared_memory: None,
+            }))
         }
     }
 }

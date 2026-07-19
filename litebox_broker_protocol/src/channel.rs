@@ -5,6 +5,15 @@ use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };
+use crate::shared_memory::SharedMemory;
+
+/// Active control response and its optional transport-provided shared memory.
+pub struct ControlResponse<Memory> {
+    /// Broker protocol response.
+    pub response: BrokerResponse,
+    /// Shared-memory resource attached to this response.
+    pub shared_memory: Option<Memory>,
+}
 
 /// Peer identity information supplied by the channel or host layer.
 ///
@@ -38,6 +47,8 @@ pub enum HostReceive<T> {
 pub trait LocalControlChannel {
     /// Channel-specific error type.
     type Error;
+    /// Shared-memory resource received from this channel.
+    type SharedMemory: SharedMemory;
 
     /// Sends one broker handshake request.
     fn send_handshake_request(
@@ -58,13 +69,16 @@ pub trait LocalControlChannel {
     ///
     /// Returns `Ok(None)` when the broker closed the channel cleanly before
     /// starting another response frame.
-    fn recv_response(&mut self) -> Result<Option<BrokerResponse>, Self::Error>;
+    fn recv_response(&mut self)
+    -> Result<Option<ControlResponse<Self::SharedMemory>>, Self::Error>;
 }
 
 /// Host-side control channel for broker authority calls.
 pub trait HostControlChannel {
     /// Channel-specific error type.
     type Error;
+    /// Shared-memory resource created and transferred by this channel.
+    type SharedMemory: SharedMemory;
 
     /// Returns the peer credential authenticated for this channel endpoint.
     fn peer_credential(&self) -> Result<PeerCredential, Self::Error>;
@@ -83,8 +97,23 @@ pub trait HostControlChannel {
     /// Receives one active broker request.
     fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
 
+    /// Creates a shared-memory resource for an active response.
+    ///
+    /// Returns `Ok(None)` when this channel does not support shared-memory
+    /// attachments.
+    fn create_shared_memory(
+        &mut self,
+        _length: usize,
+    ) -> Result<Option<Self::SharedMemory>, Self::Error> {
+        Ok(None)
+    }
+
     /// Sends one active broker response.
-    fn send_response(&mut self, response: &BrokerResponse) -> Result<(), Self::Error>;
+    fn send_response(
+        &mut self,
+        response: &BrokerResponse,
+        shared_memory: Option<&Self::SharedMemory>,
+    ) -> Result<(), Self::Error>;
 }
 
 /// Local-side receive channel for broker-initiated asynchronous notifications.
