@@ -69,7 +69,7 @@ impl UnixSharedMemory {
         if length == 0 {
             return Err(invalid_data("shared memory cannot be empty"));
         }
-        let name = c"litebox-broker-pipe";
+        let name = c"litebox-broker-shm";
         // SAFETY: `name` is a valid NUL-terminated C string and the flags are
         // accepted by `memfd_create`.
         let raw_fd = unsafe {
