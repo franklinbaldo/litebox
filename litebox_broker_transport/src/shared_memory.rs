@@ -72,6 +72,11 @@ impl MemfdSharedMemory {
     }
 
     fn map(fd: OwnedFd, length: usize) -> IoResult<Self> {
+        if length > isize::MAX as usize {
+            return Err(invalid_data(
+                "shared-memory length exceeds pointer offset range",
+            ));
+        }
         // SAFETY: `fd` refers to a file at least `length` bytes long. The
         // returned mapping is checked against `MAP_FAILED` and owned by
         // `MappedRegion`.
@@ -168,4 +173,19 @@ impl Drop for MappedRegion {
 
 fn invalid_data(message: &'static str) -> Error {
     Error::new(std::io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_mapping_larger_than_pointer_offset_range() {
+        let fd = memfd_create("litebox-broker-shm-test", MemfdFlags::CLOEXEC).unwrap();
+        let error = MemfdSharedMemory::map(fd, isize::MAX as usize + 1)
+            .err()
+            .expect("oversized mapping should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
