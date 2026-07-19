@@ -94,6 +94,16 @@ impl UnixSharedMemory {
     }
 
     fn from_received_fd(fd: OwnedFd) -> IoResult<Self> {
+        // Verify the size seals before reading the size so it cannot change
+        // between validation and mapping.
+        // SAFETY: `fd` is valid and `F_GET_SEALS` does not modify memory.
+        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
+        if seals < 0 {
+            return Err(Error::last_os_error());
+        }
+        if seals & REQUIRED_MEMFD_SEALS != REQUIRED_MEMFD_SEALS {
+            return Err(invalid_data("shared-memory size is not sealed"));
+        }
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: `stat` points to writable storage and `fd` is valid.
         if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
@@ -105,14 +115,6 @@ impl UnixSharedMemory {
             .map_err(|_| invalid_data("invalid shared-memory length"))?;
         if length == 0 {
             return Err(invalid_data("shared memory cannot be empty"));
-        }
-        // SAFETY: `fd` is valid and `F_GET_SEALS` does not modify memory.
-        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
-        if seals < 0 {
-            return Err(Error::last_os_error());
-        }
-        if seals & REQUIRED_MEMFD_SEALS != REQUIRED_MEMFD_SEALS {
-            return Err(invalid_data("shared-memory size is not sealed"));
         }
         Self::map(fd, length)
     }
