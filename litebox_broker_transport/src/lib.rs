@@ -9,5 +9,8 @@
 //! protocol messages, local-side adapters, host-side request handling, and core
 //! authority state live in separate crates.
 
+#[cfg(all(feature = "linux-shared-memory", target_os = "linux"))]
+pub mod shared_memory;
+
 #[cfg(all(feature = "unix", target_os = "linux"))]
 pub mod unix_socket;

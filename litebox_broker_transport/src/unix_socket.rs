@@ -9,7 +9,7 @@
 
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Read, Result as IoResult, Write};
 use std::net::Shutdown;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use rustix::net::{
     SendAncillaryMessage, SendFlags,
 };
 
+use crate::shared_memory::MemfdSharedMemory;
 use litebox_broker_protocol::channel::{
     ControlResponse, HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
     LocalNotificationChannel, PeerCredential,
@@ -38,10 +39,6 @@ const MAX_FRAME_LEN: usize = 64 * 1024;
 const RESPONSE_ATTACHMENT_NONE: u8 = 0;
 const RESPONSE_ATTACHMENT_SHARED_MEMORY: u8 = 1;
 const SHARED_MEMORY_MARKER: u8 = 0xa5;
-mod shared_memory;
-
-pub use shared_memory::UnixSharedMemory;
-
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
     stream: UnixStream,
@@ -149,7 +146,7 @@ impl UnixStreamHostNotificationChannel {
 
 impl LocalControlChannel for UnixStreamLocalControlChannel {
     type Error = Error;
-    type SharedMemory = UnixSharedMemory;
+    type SharedMemory = MemfdSharedMemory;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
         let frame = encode_handshake_request(request.clone());
@@ -184,7 +181,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
                 let response = decode_response(response_frame).map_err(wire_error)?;
                 let shared_memory = match attachment {
                     RESPONSE_ATTACHMENT_NONE => None,
-                    RESPONSE_ATTACHMENT_SHARED_MEMORY => Some(UnixSharedMemory::from_received_fd(
+                    RESPONSE_ATTACHMENT_SHARED_MEMORY => Some(MemfdSharedMemory::from_received_fd(
                         receive_fd(&self.stream)?,
                     )?),
                     _ => return Err(invalid_data("invalid broker response attachment tag")),
@@ -201,7 +198,7 @@ impl LocalControlChannel for UnixStreamLocalControlChannel {
 
 impl HostControlChannel for UnixStreamHostControlChannel {
     type Error = Error;
-    type SharedMemory = UnixSharedMemory;
+    type SharedMemory = MemfdSharedMemory;
 
     fn peer_credential(&self) -> IoResult<PeerCredential> {
         // TODO(broker): replace the PoC placeholder with Unix peer credential extraction
@@ -240,7 +237,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
     }
 
     fn create_shared_memory(&mut self, length: usize) -> IoResult<Option<Self::SharedMemory>> {
-        UnixSharedMemory::create(length).map(Some)
+        MemfdSharedMemory::create(length).map(Some)
     }
 
     fn send_response(

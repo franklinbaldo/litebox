@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Linux memfd-backed shared memory for the Unix socket transport.
+//! Reusable Linux memfd-backed shared memory.
 
 use std::io::{Error, Result as IoResult};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
@@ -14,14 +14,12 @@ use rustix::fs::{
 
 use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
 
-use super::invalid_data;
-
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
 
-/// Memfd-backed shared memory transferred over a Unix control channel.
-pub struct UnixSharedMemory {
+/// Linux memfd-backed shared memory usable by broker transports.
+pub struct MemfdSharedMemory {
     fd: OwnedFd,
     mapping: Mutex<MappedRegion>,
 }
@@ -35,8 +33,9 @@ struct MappedRegion {
 // serialized by the enclosing `Mutex`.
 unsafe impl Send for MappedRegion {}
 
-impl UnixSharedMemory {
-    pub(super) fn create(length: usize) -> IoResult<Self> {
+impl MemfdSharedMemory {
+    /// Creates and maps a sealed memfd with `length` bytes.
+    pub fn create(length: usize) -> IoResult<Self> {
         if length == 0 {
             return Err(invalid_data("shared memory cannot be empty"));
         }
@@ -54,7 +53,10 @@ impl UnixSharedMemory {
         Self::map(fd, length)
     }
 
-    pub(super) fn from_received_fd(fd: OwnedFd) -> IoResult<Self> {
+    /// Validates and maps a received memfd.
+    ///
+    /// The descriptor must have a nonzero size sealed against changes.
+    pub fn from_received_fd(fd: OwnedFd) -> IoResult<Self> {
         // Verify the size seals before reading the size so it cannot change
         // between validation and mapping.
         let seals = fcntl_get_seals(&fd)?;
@@ -67,10 +69,6 @@ impl UnixSharedMemory {
             return Err(invalid_data("shared memory cannot be empty"));
         }
         Self::map(fd, length)
-    }
-
-    pub(super) fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
     }
 
     fn map(fd: OwnedFd, length: usize) -> IoResult<Self> {
@@ -99,7 +97,13 @@ impl UnixSharedMemory {
     }
 }
 
-impl SharedMemory for UnixSharedMemory {
+impl AsFd for MemfdSharedMemory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+impl SharedMemory for MemfdSharedMemory {
     fn len(&self) -> usize {
         self.mapping
             .lock()
@@ -160,4 +164,8 @@ impl Drop for MappedRegion {
         let result = unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
         debug_assert_eq!(result, 0, "failed to unmap broker shared memory");
     }
+}
+
+fn invalid_data(message: &'static str) -> Error {
+    Error::new(std::io::ErrorKind::InvalidData, message)
 }
