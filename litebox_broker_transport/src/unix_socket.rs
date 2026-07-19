@@ -7,14 +7,18 @@
 //! framing are hosted userland concerns. Portable broker interfaces live in the
 //! no_std protocol, local, core, and host crates.
 
-use std::io::{Error, ErrorKind, Read, Result as IoResult, Write};
+use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Read, Result as IoResult, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::ptr::NonNull;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use rustix::io::Errno;
+use rustix::net::{
+    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
+    SendAncillaryMessage, SendFlags,
+};
 
 use litebox_broker_protocol::channel::{
     ControlResponse, HostControlChannel, HostNotificationChannel, HostReceive, LocalControlChannel,
@@ -24,7 +28,6 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
     BrokerResponse,
 };
-use litebox_broker_protocol::shared_memory::{SharedMemory, SharedMemoryError};
 use litebox_broker_protocol::wire::{
     WireError, decode_handshake_request, decode_handshake_response, decode_notification,
     decode_request, decode_response, encode_handshake_request, encode_handshake_response,
@@ -35,8 +38,9 @@ const MAX_FRAME_LEN: usize = 64 * 1024;
 const RESPONSE_ATTACHMENT_NONE: u8 = 0;
 const RESPONSE_ATTACHMENT_SHARED_MEMORY: u8 = 1;
 const SHARED_MEMORY_MARKER: u8 = 0xa5;
-const REQUIRED_MEMFD_SEALS: libc::c_int =
-    libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+mod shared_memory;
+
+pub use shared_memory::UnixSharedMemory;
 
 /// Local-side Unix-domain-socket control channel for the hosted userland POC.
 pub struct UnixStreamLocalControlChannel {
@@ -47,165 +51,6 @@ pub struct UnixStreamLocalControlChannel {
 /// Independently owned handle for interrupting local control-channel I/O.
 pub struct UnixStreamLocalControlCancellation {
     stream: UnixStream,
-}
-
-/// Memfd-backed shared memory transferred over a Unix control channel.
-pub struct UnixSharedMemory {
-    fd: OwnedFd,
-    mapping: Mutex<MappedRegion>,
-}
-
-struct MappedRegion {
-    address: NonNull<u8>,
-    length: usize,
-}
-
-// SAFETY: `MappedRegion` exclusively owns its mapping, and all byte access is
-// serialized by the enclosing `Mutex`.
-unsafe impl Send for MappedRegion {}
-
-impl UnixSharedMemory {
-    fn create(length: usize) -> IoResult<Self> {
-        if length == 0 {
-            return Err(invalid_data("shared memory cannot be empty"));
-        }
-        let name = c"litebox-broker-shm";
-        // SAFETY: `name` is a valid NUL-terminated C string and the flags are
-        // accepted by `memfd_create`.
-        let raw_fd = unsafe {
-            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
-        };
-        if raw_fd < 0 {
-            return Err(Error::last_os_error());
-        }
-        // SAFETY: `memfd_create` returned a new owned file descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        let length_off_t = libc::off_t::try_from(length)
-            .map_err(|_| invalid_data("shared-memory length exceeds off_t"))?;
-        // SAFETY: `fd` is valid and `length_off_t` is nonnegative.
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), length_off_t) } != 0 {
-            return Err(Error::last_os_error());
-        }
-        // SAFETY: `fd` is a sealable memfd and the seal mask is valid.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, REQUIRED_MEMFD_SEALS) } != 0 {
-            return Err(Error::last_os_error());
-        }
-        Self::map(fd, length)
-    }
-
-    fn from_received_fd(fd: OwnedFd) -> IoResult<Self> {
-        // Verify the size seals before reading the size so it cannot change
-        // between validation and mapping.
-        // SAFETY: `fd` is valid and `F_GET_SEALS` does not modify memory.
-        let seals = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS) };
-        if seals < 0 {
-            return Err(Error::last_os_error());
-        }
-        if seals & REQUIRED_MEMFD_SEALS != REQUIRED_MEMFD_SEALS {
-            return Err(invalid_data("shared-memory size is not sealed"));
-        }
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: `stat` points to writable storage and `fd` is valid.
-        if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(Error::last_os_error());
-        }
-        // SAFETY: `fstat` initialized `stat` after returning success.
-        let stat = unsafe { stat.assume_init() };
-        let length = usize::try_from(stat.st_size)
-            .map_err(|_| invalid_data("invalid shared-memory length"))?;
-        if length == 0 {
-            return Err(invalid_data("shared memory cannot be empty"));
-        }
-        Self::map(fd, length)
-    }
-
-    fn map(fd: OwnedFd, length: usize) -> IoResult<Self> {
-        // SAFETY: `fd` refers to a file at least `length` bytes long. The
-        // returned mapping is checked against `MAP_FAILED` and owned by
-        // `MappedRegion`.
-        let address = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(Error::last_os_error());
-        }
-        let address =
-            NonNull::new(address.cast()).ok_or_else(|| invalid_data("mmap returned null"))?;
-        Ok(Self {
-            fd,
-            mapping: Mutex::new(MappedRegion { address, length }),
-        })
-    }
-}
-
-impl SharedMemory for UnixSharedMemory {
-    fn len(&self) -> usize {
-        self.mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .length
-    }
-
-    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        offset
-            .checked_add(destination.len())
-            .filter(|end| *end <= mapping.length)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        // SAFETY: The range was checked against the live mapping, and
-        // `destination` is valid for its full length. Control-channel
-        // serialization prevents the peer from reusing this staging range
-        // until the operation completes.
-        unsafe {
-            libc::memcpy(
-                destination.as_mut_ptr().cast(),
-                mapping.address.as_ptr().add(offset).cast(),
-                destination.len(),
-            );
-        }
-        Ok(())
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        let mapping = self
-            .mapping
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        offset
-            .checked_add(source.len())
-            .filter(|end| *end <= mapping.length)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        // SAFETY: The range was checked against the live mapping, and `source`
-        // is valid for its full length. The mapping is byte-addressed foreign
-        // memory and no Rust references into it are created.
-        unsafe {
-            libc::memcpy(
-                mapping.address.as_ptr().add(offset).cast(),
-                source.as_ptr().cast(),
-                source.len(),
-            );
-        }
-        Ok(())
-    }
-}
-
-impl Drop for MappedRegion {
-    fn drop(&mut self) {
-        // SAFETY: `address` and `length` describe the mapping exclusively owned
-        // by this value, and it is unmapped exactly once here.
-        let result = unsafe { libc::munmap(self.address.as_ptr().cast(), self.length) };
-        debug_assert_eq!(result, 0, "failed to unmap broker shared memory");
-    }
 }
 
 impl UnixStreamLocalControlChannel {
@@ -413,7 +258,7 @@ impl HostControlChannel for UnixStreamHostControlChannel {
         frame.extend_from_slice(&encoded_response);
         write_frame_with_deadline(&mut self.stream, &frame, None)?;
         if let Some(shared_memory) = shared_memory {
-            send_fd(&self.stream, shared_memory.fd.as_raw_fd())?;
+            send_fd(&self.stream, shared_memory.as_fd())?;
         }
         Ok(())
     }
@@ -513,123 +358,68 @@ fn write_all_with_deadline(
     Ok(())
 }
 
-#[repr(C)]
-struct FdControlMessage {
-    header: libc::cmsghdr,
-    fds: [RawFd; 4],
-}
-
-fn send_fd(stream: &UnixStream, fd: RawFd) -> IoResult<()> {
-    let fd_size: libc::c_uint = std::mem::size_of::<RawFd>()
-        .try_into()
-        .expect("file descriptor size must fit in c_uint");
+fn send_fd(stream: &UnixStream, fd: BorrowedFd<'_>) -> IoResult<()> {
     let marker = [SHARED_MEMORY_MARKER];
-    let mut io = libc::iovec {
-        iov_base: marker.as_ptr().cast_mut().cast(),
-        iov_len: marker.len(),
-    };
-    // SAFETY: A zeroed cmsghdr/iovec message is a valid starting state.
-    let mut control: FdControlMessage = unsafe { std::mem::zeroed() };
-    control.header.cmsg_level = libc::SOL_SOCKET;
-    control.header.cmsg_type = libc::SCM_RIGHTS;
-    // SAFETY: The requested control-message size contains exactly one RawFd.
-    control.header.cmsg_len = unsafe { libc::CMSG_LEN(fd_size) } as usize;
-    control.fds[0] = fd;
-    // SAFETY: A zeroed msghdr is valid before assigning all used fields.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &raw mut io;
-    message.msg_iovlen = 1;
-    message.msg_control = std::ptr::addr_of_mut!(control).cast();
-    // SAFETY: The requested space is backed by `control`.
-    message.msg_controllen = unsafe { libc::CMSG_SPACE(fd_size) } as usize;
+    let io = [IoSlice::new(&marker)];
+    let fds = [fd];
+    let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut control_space);
+    assert!(
+        control.push(SendAncillaryMessage::ScmRights(&fds)),
+        "SCM_RIGHTS control buffer is correctly sized"
+    );
 
     loop {
-        // SAFETY: `message` points to live marker and control buffers for the
-        // duration of the call.
-        let sent = unsafe { libc::sendmsg(stream.as_raw_fd(), &raw const message, 0) };
-        if sent == 1 {
-            return Ok(());
-        }
-        if sent == 0 {
-            return Err(Error::new(
-                ErrorKind::WriteZero,
-                "failed to send shared-memory descriptor",
-            ));
-        }
-        let error = Error::last_os_error();
-        if error.kind() != ErrorKind::Interrupted {
-            return Err(error);
+        match rustix::net::sendmsg(stream, &io, &mut control, SendFlags::empty()) {
+            Ok(1) => return Ok(()),
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to send shared-memory descriptor",
+                ));
+            }
+            Ok(_) => {
+                return Err(invalid_data(
+                    "shared-memory descriptor marker was oversized",
+                ));
+            }
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
         }
     }
 }
 
 fn receive_fd(stream: &UnixStream) -> IoResult<OwnedFd> {
     let mut marker = [0];
-    let mut io = libc::iovec {
-        iov_base: marker.as_mut_ptr().cast(),
-        iov_len: marker.len(),
-    };
-    // SAFETY: A zeroed control buffer and msghdr are valid starting states.
-    let mut control: FdControlMessage = unsafe { std::mem::zeroed() };
-    // SAFETY: A zeroed msghdr is valid before assigning all used fields.
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &raw mut io;
-    message.msg_iovlen = 1;
-    message.msg_control = std::ptr::addr_of_mut!(control).cast();
-    message.msg_controllen = std::mem::size_of::<FdControlMessage>();
+    let mut io = [IoSliceMut::new(&mut marker)];
+    let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
+    let mut control = RecvAncillaryBuffer::new(&mut control_space);
 
     let received = loop {
-        // SAFETY: `message` points to live marker and control buffers for the
-        // duration of the call.
-        let received =
-            unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut message, libc::MSG_CMSG_CLOEXEC) };
-        if received >= 0 {
-            break received;
-        }
-        let error = Error::last_os_error();
-        if error.kind() != ErrorKind::Interrupted {
-            return Err(error);
+        match rustix::net::recvmsg(stream, &mut io, &mut control, RecvFlags::CMSG_CLOEXEC) {
+            Ok(received) => break received,
+            Err(Errno::INTR) => {}
+            Err(error) => return Err(error.into()),
         }
     };
-    if received == 0 {
+    if received.bytes == 0 {
         return Err(Error::new(
             ErrorKind::UnexpectedEof,
             "broker closed before shared-memory descriptor",
         ));
     }
     let mut received_fds = Vec::new();
-    // SAFETY: `message` contains the kernel-initialized control buffer from
-    // `recvmsg`; CMSG iteration stays within `msg_controllen`.
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&raw const message);
-        while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let header_length = libc::CMSG_LEN(0) as usize;
-                let data_length = (*header).cmsg_len.saturating_sub(header_length);
-                if !data_length.is_multiple_of(std::mem::size_of::<RawFd>()) {
-                    return Err(invalid_data("invalid SCM_RIGHTS payload length"));
-                }
-                let count = data_length / std::mem::size_of::<RawFd>();
-                let data = libc::CMSG_DATA(header);
-                for index in 0..count {
-                    let mut fd = std::mem::MaybeUninit::<RawFd>::uninit();
-                    std::ptr::copy_nonoverlapping(
-                        data.add(index * std::mem::size_of::<RawFd>()),
-                        fd.as_mut_ptr().cast::<u8>(),
-                        std::mem::size_of::<RawFd>(),
-                    );
-                    received_fds.push(OwnedFd::from_raw_fd(fd.assume_init()));
-                }
-            }
-            header = libc::CMSG_NXTHDR(&raw const message, header);
+    for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(fds) = message {
+            received_fds.extend(fds);
         }
     }
-    if message.msg_flags & libc::MSG_CTRUNC != 0 || received_fds.len() != 1 {
+    if received.flags.contains(ReturnFlags::CTRUNC) || received_fds.len() != 1 {
         return Err(invalid_data(
             "shared-memory response must contain exactly one descriptor",
         ));
     }
-    if received != 1 || marker[0] != SHARED_MEMORY_MARKER {
+    if received.bytes != 1 || marker[0] != SHARED_MEMORY_MARKER {
         return Err(invalid_data("invalid shared-memory descriptor marker"));
     }
     Ok(received_fds
@@ -670,6 +460,8 @@ mod tests {
     use super::*;
     use litebox_broker_protocol::message::PipeResponse;
     use litebox_broker_protocol::pipe::CreatePipeResponse;
+    use litebox_broker_protocol::shared_memory::SharedMemory;
+    use rustix::io::FdFlags;
 
     const TEST_SHARED_MEMORY_REGION_SIZE: usize = 32 * 1024;
     const TEST_SHARED_MEMORY_SIZE: usize = TEST_SHARED_MEMORY_REGION_SIZE * 2;
@@ -717,9 +509,8 @@ mod tests {
             .read(TEST_SHARED_MEMORY_REGION_SIZE, &mut data)
             .unwrap();
         assert_eq!(data, [4, 5, 6]);
-        // SAFETY: `F_GETFD` reads descriptor flags from a valid owned fd.
-        let descriptor_flags = unsafe { libc::fcntl(local_memory.fd.as_raw_fd(), libc::F_GETFD) };
-        assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+        let descriptor_flags = rustix::io::fcntl_getfd(local_memory.as_fd()).unwrap();
+        assert!(descriptor_flags.contains(FdFlags::CLOEXEC));
     }
 
     #[test]
