@@ -3,8 +3,11 @@ name = "litebox_broker_transport"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+unix = ["dep:libc"]
+
 [dependencies]
-libc = { version = "0.2.177", default-features = false }
+libc = { version = "0.2.177", default-features = false, optional = true }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 
 [lints]
