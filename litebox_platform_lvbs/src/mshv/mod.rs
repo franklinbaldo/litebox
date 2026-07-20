@@ -87,11 +87,13 @@ type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
 /// is deliberately kept private so it cannot be repurposed into arbitrary
 /// confused-deputy writes to VTL0 memory.
 ///
-/// # Safety
+/// # Caller contract
 ///
 /// The caller must have validated the destination and `bytes` against VTL1's
-/// precomputed HEKI patch data. Writing unvalidated data can corrupt VTL0 memory.
-pub unsafe fn write_validated_vtl0_patch_contiguous(
+/// precomputed HEKI patch data before calling. This is a security precondition,
+/// not a memory-safety one: writing unvalidated data does not cause undefined
+/// behavior, but it defeats the HEKI integrity guarantee for VTL0 memory.
+pub fn write_validated_vtl0_patch_contiguous(
     base_pa: usize,
     bytes: &[u8],
 ) -> Result<(), PhysPointerError> {
@@ -101,12 +103,9 @@ pub unsafe fn write_validated_vtl0_patch_contiguous(
 
 /// Writes already-validated HEKI text-patch bytes across the given VTL0 physical
 /// `pages` at `offset`, through the privileged (protected-frame-bypassing) mapping.
-/// See [`write_validated_vtl0_patch_contiguous`] for the security rationale.
-///
-/// # Safety
-///
-/// Same contract as [`write_validated_vtl0_patch_contiguous`].
-pub unsafe fn write_validated_vtl0_patch_pages(
+/// See [`write_validated_vtl0_patch_contiguous`] for the security rationale and the
+/// caller contract.
+pub fn write_validated_vtl0_patch_pages(
     pages: &[litebox_common_linux::vmap::PhysPageAddr<PAGE_SIZE>],
     offset: usize,
     bytes: &[u8],

@@ -794,16 +794,13 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
                     <= heki_patch_pa_0.align_down(Size4KiB::SIZE).as_u64() + Size4KiB::SIZE,
             "patch crosses page boundary but pa_1 is null"
         );
-        // The patch was validated against VTL1's precomputed HEKI patch data.
-        // SAFETY: `HekiPatch::is_valid` validated the destination and `patch`
-        // against VTL1's precomputed HEKI patch data.
-        unsafe {
-            litebox_platform_lvbs::mshv::write_validated_vtl0_patch_contiguous(
-                heki_patch_pa_0.as_u64().trunc(),
-                patch,
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        }
+        // The patch was validated against VTL1's precomputed HEKI patch data
+        // (`HekiPatch::is_valid`), satisfying the writer's caller contract.
+        litebox_platform_lvbs::mshv::write_validated_vtl0_patch_contiguous(
+            heki_patch_pa_0.as_u64().trunc(),
+            patch,
+        )
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
     } else {
         let pages = [
             PhysPageAddr::<PAGE_SIZE>::new(
@@ -813,17 +810,14 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
             PhysPageAddr::<PAGE_SIZE>::new(heki_patch_pa_1.as_u64().trunc())
                 .ok_or(VsmError::Vtl0CopyFailed)?,
         ];
-        // The patch was validated against VTL1's precomputed HEKI patch data.
-        // SAFETY: `HekiPatch::is_valid` validated the destination and `patch`
-        // against VTL1's precomputed HEKI patch data.
-        unsafe {
-            litebox_platform_lvbs::mshv::write_validated_vtl0_patch_pages(
-                &pages,
-                (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
-                patch,
-            )
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        }
+        // The patch was validated against VTL1's precomputed HEKI patch data
+        // (`HekiPatch::is_valid`), satisfying the writer's caller contract.
+        litebox_platform_lvbs::mshv::write_validated_vtl0_patch_pages(
+            &pages,
+            (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
+            patch,
+        )
+        .map_err(|_| VsmError::Vtl0CopyFailed)?;
     }
     Ok(())
 }
