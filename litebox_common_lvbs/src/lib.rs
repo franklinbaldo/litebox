@@ -249,6 +249,10 @@ pub enum VsmError {
     #[error("{0} is not supported")]
     OperationNotSupported(&'static str),
 
+    // One-time Initialization Errors
+    #[error("{0} is already initialized")]
+    AlreadyInitialized(&'static str),
+
     // VTL0 Memory Copy Errors
     #[error("failed to copy data from/to VTL0")]
     Vtl0CopyFailed,
@@ -328,6 +332,9 @@ impl From<VsmError> for Errno {
 
             // Unsupported operation
             VsmError::OperationNotSupported(_) => Errno::ENOTSUP,
+
+            // One-time security resource already initialized
+            VsmError::AlreadyInitialized(_) => Errno::EEXIST,
 
             // Security/verification failures - access denied
             VsmError::TextPatchSuspicious

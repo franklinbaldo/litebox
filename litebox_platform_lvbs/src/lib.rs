@@ -40,6 +40,7 @@ use crate::mm::vmap::vmap_allocator;
 extern crate alloc;
 
 pub mod arch;
+pub mod heki_enforcer;
 pub mod host;
 pub mod mm;
 pub mod mshv;

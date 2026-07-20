@@ -186,17 +186,26 @@ static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 /// Sets the Platform Root Key (PRK) for this platform.
 ///
 /// This should be called once during platform initialization with a key derived
-/// from hardware or a boot nonce.
+/// from hardware or a boot nonce. Returns `true` if this call installed the key,
+/// or `false` if the PRK was already initialized by an earlier call (in which
+/// case the existing key is left unchanged).
 ///
 /// # Panics
 /// Panics if `key` length does not match `PRK_LEN`.
-pub fn set_platform_root_key(key: &[u8]) {
+pub fn set_platform_root_key(key: &[u8]) -> bool {
     assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
+    // `newly_set` is flipped only inside the `call_once` closure, which runs at
+    // most once for the lifetime of `PRK_ONCE`. Reading it after the call is
+    // TOCTOU-safe: a concurrent caller either ran the closure (so only one of
+    // them observes `true`) or observed the already-completed `Once`.
+    let mut newly_set = false;
     PRK_ONCE.call_once(|| {
+        newly_set = true;
         let mut prk = Zeroizing::new([0u8; PRK_LEN]);
         prk.copy_from_slice(key);
         *prk
     });
+    newly_set
 }
 
 impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {

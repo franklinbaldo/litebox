@@ -1569,6 +1569,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_lvbs",
+ "litebox_heki",
  "litebox_util_log",
  "modular-bitfield",
  "num_enum",
