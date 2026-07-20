@@ -5,7 +5,6 @@
 
 extern crate alloc;
 
-mod mem_integrity;
 mod vsm;
 
 use alloc::{boxed::Box, vec};

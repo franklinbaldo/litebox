@@ -18,6 +18,16 @@
 
 extern crate alloc;
 
+pub mod mem_integrity;
+pub mod vsm;
+
+pub use vsm::{
+    HekiState, mshv_vsm_allocate_ringbuffer_memory, mshv_vsm_copy_secondary_key,
+    mshv_vsm_end_of_boot, mshv_vsm_free_guest_module_init, mshv_vsm_kexec_validate,
+    mshv_vsm_load_kdata, mshv_vsm_patch_text, mshv_vsm_protect_memory,
+    mshv_vsm_set_platform_root_key, mshv_vsm_unload_guest_module, mshv_vsm_validate_guest_module,
+};
+
 use alloc::vec::Vec;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{HekiPatch, MemAttr, PAGE_SIZE, VsmError};
@@ -92,6 +102,10 @@ pub trait HekiEnforcer {
         initial: &[PhysFrameRange<Size4KiB>],
         f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
     ) -> Result<(), VsmError>;
+
+    /// Unprotect (release) a previously protected/committed physical frame range,
+    /// returning it to VTL0's control. Standalone — not part of any transaction.
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError>;
 
     /// Apply a HEKI text patch that the caller has already validated against
     /// VTL1's precomputed patch data, via the privileged VTL0 writer.

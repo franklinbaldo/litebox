@@ -120,6 +120,10 @@ impl HekiEnforcer for PlatformHekiEnforcer {
         result
     }
 
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
+        crate::mshv::vsm::unprotect_physical_memory_range(range)
+    }
+
     fn apply_text_patch(&self, patch: &HekiPatch) -> Result<(), VsmError> {
         // Moved verbatim from `litebox_runner_lvbs::vsm::apply_vtl0_text_patch`.
         // `HekiPatch::is_valid` already validated both physical addresses.
