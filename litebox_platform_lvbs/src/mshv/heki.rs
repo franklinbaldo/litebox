@@ -3,10 +3,7 @@
 
 use crate::mshv::HvPageProtFlags;
 
-pub use litebox_common_lvbs::{
-    HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
-    HekiPatchInfo, HekiRange, MemAttr, ModMemType, POKE_MAX_OPCODE_SIZE,
-};
+pub use litebox_common_lvbs::{MemAttr, ModMemType};
 
 pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     let mut flags = HvPageProtFlags::empty();
