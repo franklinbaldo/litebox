@@ -20,6 +20,8 @@ Run after every change set. All must pass with zero warnings/errors:
 
 ```bash
 TOOLCHAIN=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
+# Workspace-level clippy on the new common crate (CI runs --workspace -Dwarnings)
+cargo +$TOOLCHAIN clippy -p litebox_common_lvbs --all-targets --all-features
 # Platform host-target unit tests
 cargo +$TOOLCHAIN test --manifest-path=litebox_platform_lvbs/Cargo.toml
 # build-std clippy + build for platform and runner
