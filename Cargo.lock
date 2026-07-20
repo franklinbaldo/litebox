@@ -1493,6 +1493,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_heki"
+version = "0.1.0"
+dependencies = [
+ "litebox_common_linux",
+ "litebox_common_lvbs",
+ "x86_64",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
