@@ -151,6 +151,10 @@ jobs:
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
       - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_lvbs
+      - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_heki --all-features
+        # `litebox_heki` holds the HEKI/HVCI algorithms and their host-run unit
+        # tests (via MockEnforcer). Run them explicitly so the coverage does not
+        # depend on `litebox_heki` remaining in `default-members`.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -258,8 +262,10 @@ jobs:
           #   (RSA/sha2/authenticode, i.e. `libm`) that require SSE and thus a
           #   custom target built with `-Z build-std`; on the soft-float
           #   `x86_64-unknown-none` target they fail to compile (same reason as
-          #   `litebox_platform_lvbs`/`litebox_runner_lvbs`). It is exercised by
-          #   the `build_and_test` and `build_and_test_lvbs` jobs instead.
+          #   `litebox_platform_lvbs`/`litebox_runner_lvbs`). Its host build and
+          #   unit tests run in the `build_and_test` job (workspace clippy/build)
+          #   and its tests run explicitly via `nextest -p litebox_heki` in the
+          #   `build_and_test_lvbs` job.
           #
           # - `litebox_platform_multiplex` is allowed to have `std` access (in
           #   its default feature set) because `litebox_platform_linux_userland`

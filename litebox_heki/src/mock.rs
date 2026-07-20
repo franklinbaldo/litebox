@@ -194,8 +194,23 @@ impl FrameTxn for MockFrameTxn<'_> {
         ranges: &[PhysFrameRange<Size4KiB>],
     ) -> Result<Vec<ReservationStatus>, VsmError> {
         let mut statuses = Vec::with_capacity(ranges.len());
+        // Mirror `FrameReservation::reserve`: on a mid-batch rejection, roll back
+        // only the claims this call added (its `rollback_from` slice), leaving
+        // reservations from earlier calls in the same transaction intact.
+        let rollback_from = self.added_reservations.len();
         for &range in ranges {
-            let status = self.classify(range)?;
+            let status = match self.classify(range) {
+                Ok(status) => status,
+                Err(e) => {
+                    for undo in self.added_reservations.drain(rollback_from..) {
+                        self.enforcer
+                            .reserved
+                            .borrow_mut()
+                            .retain(|r| !ranges_equal(*r, undo));
+                    }
+                    return Err(e);
+                }
+            };
             if status == ReservationStatus::New {
                 // Claim immediately so subsequent classify calls (this txn or
                 // later) observe the reservation, like the live registry.
@@ -270,26 +285,20 @@ impl HekiEnforcer for MockEnforcer {
 
         let result = f(&mut txn);
         if result.is_err() {
-            // Roll back like `FrameReservation`'s Drop: unprotect only the ranges
-            // this transaction reserved (its `owned_ranges`), releasing their
-            // reservations too. Protections on non-reserved ranges are left as-is
-            // (production applies those outside the guard and never rolls them back).
+            // Roll back like `FrameReservation`'s Drop: unprotect *every* range
+            // this transaction reserved (its `owned_ranges`) — whether or not it
+            // was frozen — and release their reservations. The live Drop calls
+            // `unprotect_physical_memory_range` on all owned ranges unconditionally,
+            // so each reserved range is recorded as unprotected even if no matching
+            // protection was applied. Protections on non-reserved ranges are left
+            // as-is (production applies those outside the guard and never rolls
+            // them back).
             let reserved = txn.added_reservations;
             for range in &reserved {
-                let mut protections = self.protections.borrow_mut();
-                let mut released = false;
-                protections.retain(|(r, _)| {
-                    if ranges_equal(*r, *range) {
-                        released = true;
-                        false
-                    } else {
-                        true
-                    }
-                });
-                drop(protections);
-                if released {
-                    self.unprotected.borrow_mut().push(*range);
-                }
+                self.protections
+                    .borrow_mut()
+                    .retain(|(r, _)| !ranges_equal(*r, *range));
+                self.unprotected.borrow_mut().push(*range);
             }
             self.reserved
                 .borrow_mut()

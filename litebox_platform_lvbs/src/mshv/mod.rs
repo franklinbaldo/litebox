@@ -6,7 +6,7 @@
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
-pub mod ringbuffer;
+pub(crate) mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;
 pub mod vtl1_mem_layout;

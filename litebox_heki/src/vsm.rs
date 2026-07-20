@@ -92,7 +92,6 @@ pub fn mshv_vsm_protect_memory(
                 return Err(VsmError::AddressNotPageAligned);
             }
 
-            #[cfg(debug_assertions)]
             let va = heki_range.va;
             log::debug!(
                 "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
@@ -2010,6 +2009,55 @@ mod enforcer_tests {
         assert!(
             matches!(result, Err(VsmError::ProtectedFrameOverlap)),
             "expected ProtectedFrameOverlap, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn transaction_reserve_batch_rolls_back_intra_batch_on_reject() {
+        // A batch `[A_new, B_overlapping]` must leave nothing reserved, mirroring
+        // `FrameReservation::reserve`'s `rollback_from` intra-call rollback.
+        let mock = MockEnforcer::new();
+        let a = frame_range(0x2000, 0x3000);
+        let existing = frame_range(0x8000, 0x9000);
+        // Pre-commit `existing` so `b` (overlapping it) is rejected mid-batch.
+        mock.protect_frames_transactionally(&[existing], &mut |_txn| Ok(()))
+            .expect("seed reservation should commit");
+
+        let b = frame_range(0x8000, 0xA000); // overlaps `existing`
+        let result = mock.protect_frames_transactionally(&[], &mut |txn| {
+            let _ = txn.reserve(&[a, b])?;
+            Ok(())
+        });
+        assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
+        // `a` must NOT remain reserved after the mid-batch rejection.
+        assert!(
+            !mock
+                .reservations()
+                .iter()
+                .any(|r| r.start.start_address() == a.start.start_address()),
+            "range A must be rolled back when a later range in the batch is rejected"
+        );
+    }
+
+    #[test]
+    fn transaction_rolls_back_reserved_but_unfrozen_ranges() {
+        // A range that is reserved but never `protect`ed must still be recorded as
+        // unprotected on rollback, matching `FrameReservation`'s Drop which
+        // unprotects every owned range unconditionally.
+        let mock = MockEnforcer::new();
+        let range = frame_range(0x2000, 0x3000);
+        let result = mock.protect_frames_transactionally(&[range], &mut |_txn| {
+            // Reserved via `initial`, deliberately not protected.
+            Err(VsmError::TextPatchSuspicious)
+        });
+        assert!(result.is_err());
+        assert!(mock.reservations().is_empty());
+        assert!(
+            mock.unprotected()
+                .iter()
+                .any(|r| r.start.start_address() == range.start.start_address()
+                    && r.end.start_address() == range.end.start_address()),
+            "reserved-but-unfrozen range must be recorded as unprotected on rollback"
         );
     }
 

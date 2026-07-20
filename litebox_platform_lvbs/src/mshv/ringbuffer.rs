@@ -11,7 +11,7 @@ use litebox_common_linux::vmap::PhysPageAddr;
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 
-pub struct RingBuffer {
+pub(crate) struct RingBuffer {
     rb_pa: PhysAddr,
     write_offset: usize,
     size: usize,
@@ -23,7 +23,7 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
-    pub fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
+    pub(crate) fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
         let pa: usize = phys_addr.as_u64().trunc();
         let fast_path_eligible = requested_size > 0
             && requested_size.is_multiple_of(PAGE_SIZE)
@@ -36,7 +36,7 @@ impl RingBuffer {
         }
     }
 
-    pub fn write(&mut self, buf: &[u8]) {
+    pub(crate) fn write(&mut self, buf: &[u8]) {
         if self.size == 0 || buf.is_empty() {
             return;
         }
