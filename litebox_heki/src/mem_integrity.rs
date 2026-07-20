@@ -4,7 +4,6 @@
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 use crate::vsm::ModuleMemory;
-use litebox_common_lvbs::{HekiPatch, ModuleSignature, POKE_MAX_OPCODE_SIZE};
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -20,6 +19,7 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
+use litebox_common_lvbs::{HekiPatch, ModuleSignature, POKE_MAX_OPCODE_SIZE};
 use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};

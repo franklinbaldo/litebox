@@ -173,7 +173,10 @@ impl MockFrameTxn<'_> {
         }
 
         let committed = self.enforcer.reserved.borrow();
-        let existing = committed.iter().copied().chain(self.added_reservations.iter().copied());
+        let existing = committed
+            .iter()
+            .copied()
+            .chain(self.added_reservations.iter().copied());
         for other in existing {
             if ranges_equal(other, range) {
                 return Ok(ReservationStatus::AlreadyOwned);
@@ -228,7 +231,9 @@ impl HekiEnforcer for MockEnforcer {
     }
 
     fn read_vtl0_bytes(&self, pa: usize, out: &mut [u8]) -> Result<(), EnforceError> {
-        let buf = self.read_flat(pa, out.len()).ok_or(EnforceError::Vtl0ReadFailed)?;
+        let buf = self
+            .read_flat(pa, out.len())
+            .ok_or(EnforceError::Vtl0ReadFailed)?;
         out.copy_from_slice(&buf);
         Ok(())
     }
@@ -275,7 +280,9 @@ impl HekiEnforcer for MockEnforcer {
         self.protections
             .borrow_mut()
             .retain(|(r, _)| !ranges_equal(*r, range));
-        self.reserved.borrow_mut().retain(|r| !ranges_equal(*r, range));
+        self.reserved
+            .borrow_mut()
+            .retain(|r| !ranges_equal(*r, range));
         self.unprotected.borrow_mut().push(range);
         Ok(())
     }

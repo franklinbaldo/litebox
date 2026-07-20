@@ -254,6 +254,13 @@ jobs:
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
+          # - `litebox_heki` is `no_std` but pulls in crypto/parse dependencies
+          #   (RSA/sha2/authenticode, i.e. `libm`) that require SSE and thus a
+          #   custom target built with `-Z build-std`; on the soft-float
+          #   `x86_64-unknown-none` target they fail to compile (same reason as
+          #   `litebox_platform_lvbs`/`litebox_runner_lvbs`). It is exercised by
+          #   the `build_and_test` and `build_and_test_lvbs` jobs instead.
+          #
           # - `litebox_platform_multiplex` is allowed to have `std` access (in
           #   its default feature set) because `litebox_platform_linux_userland`
           #   has access, and this is just a multiplexer. Ideally, we'd do a
@@ -303,6 +310,7 @@ jobs:
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
+            -not -path './litebox_heki/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \

@@ -97,7 +97,8 @@ pub(crate) fn write_validated_vtl0_patch_contiguous(
     base_pa: usize,
     bytes: &[u8],
 ) -> Result<(), PhysPointerError> {
-    let ptr = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(base_pa, bytes.len())?;
+    let ptr =
+        PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(base_pa, bytes.len())?;
     ptr.write_slice_at_offset(0, bytes)
 }
 
@@ -120,8 +121,8 @@ use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-pub use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmFunction};
 pub(crate) use litebox_common_lvbs::{MemAttr, VsmError};
+pub use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmFunction};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;

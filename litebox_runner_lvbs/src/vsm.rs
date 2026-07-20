@@ -41,7 +41,9 @@ pub(crate) fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
             // The end-of-boot guard lives here because `HekiState` is owned by the runner.
             // Behavior is byte-for-byte identical: same condition, same error, same mapping.
             if state.check_end_of_boot() {
-                Err(VsmError::OperationAfterEndOfBoot("control register locking"))
+                Err(VsmError::OperationAfterEndOfBoot(
+                    "control register locking",
+                ))
             } else {
                 mshv_vsm_lock_regs()
             }

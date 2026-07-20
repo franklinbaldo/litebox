@@ -316,9 +316,7 @@ pub fn mshv_vsm_validate_guest_module(
         return Err(VsmError::InvalidInputAddress);
     }
 
-    log::debug!(
-        "VSM: Validate kernel module: pa {pa:#x} nranges {nranges}",
-    );
+    log::debug!("VSM: Validate kernel module: pa {pa:#x} nranges {nranges}",);
 
     let certs = state
         .get_system_certificates()
@@ -374,7 +372,8 @@ pub fn mshv_vsm_validate_guest_module(
     enforcer.protect_frames_transactionally(&initial, &mut |txn| {
         // Freeze frames that require immutable copy/validation to avoid TOCTOU.
         for mod_mem_range in &module_memory_metadata {
-            if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type).contains(MemAttr::MEM_ATTR_WRITE)
+            if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type)
+                .contains(MemAttr::MEM_ATTR_WRITE)
             {
                 txn.protect(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
             }
@@ -543,9 +542,7 @@ pub fn mshv_vsm_kexec_validate(
     nranges: u64,
     crash: u64,
 ) -> Result<i64, VsmError> {
-    log::debug!(
-        "VSM: Validate kexec pa {pa:#x} nranges {nranges} crash {crash}"
-    );
+    log::debug!("VSM: Validate kexec pa {pa:#x} nranges {nranges} crash {crash}");
 
     let certs = state
         .get_system_certificates()
@@ -764,10 +761,9 @@ pub fn mshv_vsm_allocate_ringbuffer_memory(
         PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
     );
     // Forward protect with no reservation: empty-initial transaction (rollback no-op).
-    enforcer
-        .protect_frames_transactionally(&[], &mut |txn| {
-            txn.protect(frame_range, MemAttr::MEM_ATTR_READ)
-        })?;
+    enforcer.protect_frames_transactionally(&[], &mut |txn| {
+        txn.protect(frame_range, MemAttr::MEM_ATTR_READ)
+    })?;
     enforcer.install_ringbuffer(phys_addr.as_u64(), size)?;
     log::debug!("VSM: Ring buffer allocated");
     Ok(0)

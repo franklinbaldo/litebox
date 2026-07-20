@@ -136,7 +136,8 @@ impl HekiEnforcer for PlatformHekiEnforcer {
         }
 
         if heki_patch_pa_1.is_null()
-            || (heki_patch_pa_0.align_up(Size4KiB::SIZE) == heki_patch_pa_1.align_down(Size4KiB::SIZE))
+            || (heki_patch_pa_0.align_up(Size4KiB::SIZE)
+                == heki_patch_pa_1.align_down(Size4KiB::SIZE))
         {
             // Single contiguous span: either fits in one page (pa_1 null) or pa_1 is the
             // adjacent next page. `HekiPatch::is_valid` enforces this; assert in debug builds.
