@@ -21,6 +21,9 @@ extern crate alloc;
 pub mod mem_integrity;
 pub mod vsm;
 
+#[cfg(test)]
+mod mock;
+
 pub use vsm::{
     HekiState, mshv_vsm_allocate_ringbuffer_memory, mshv_vsm_copy_secondary_key,
     mshv_vsm_end_of_boot, mshv_vsm_free_guest_module_init, mshv_vsm_kexec_validate,
