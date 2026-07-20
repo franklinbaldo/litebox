@@ -18,7 +18,7 @@ use litebox_common_linux::vmap::{
 };
 
 /// Provider for MSHV operations authorized to modify protected VTL0 frames.
-pub struct PrivilegedVmap;
+struct PrivilegedVmap;
 
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for PrivilegedVmap {
     type Manager = PrivilegedVmap;
@@ -77,6 +77,43 @@ type Vtl0PhysConstPtr<T, const ALIGN: usize> =
 /// VTL0 destinations that could enable confused-deputy writes.
 type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
+
+/// Writes already-validated HEKI text-patch bytes into a contiguous span of VTL0
+/// physical memory starting at `base_pa`, through the privileged mapping that
+/// bypasses ordinary protected-frame access checks.
+///
+/// This (and [`write_validated_vtl0_patch_pages`]) is the *only* cross-crate entry
+/// point to the privileged VTL0 writer. The underlying [`PrivilegedVmap`] provider
+/// is deliberately kept private so it cannot be repurposed into arbitrary
+/// confused-deputy writes to VTL0 memory.
+///
+/// # Safety
+///
+/// The caller must have validated the destination and `bytes` against VTL1's
+/// precomputed HEKI patch data. Writing unvalidated data can corrupt VTL0 memory.
+pub unsafe fn write_validated_vtl0_patch_contiguous(
+    base_pa: usize,
+    bytes: &[u8],
+) -> Result<(), PhysPointerError> {
+    let ptr = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(base_pa, bytes.len())?;
+    ptr.write_slice_at_offset(0, bytes)
+}
+
+/// Writes already-validated HEKI text-patch bytes across the given VTL0 physical
+/// `pages` at `offset`, through the privileged (protected-frame-bypassing) mapping.
+/// See [`write_validated_vtl0_patch_contiguous`] for the security rationale.
+///
+/// # Safety
+///
+/// Same contract as [`write_validated_vtl0_patch_contiguous`].
+pub unsafe fn write_validated_vtl0_patch_pages(
+    pages: &[litebox_common_linux::vmap::PhysPageAddr<PAGE_SIZE>],
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), PhysPointerError> {
+    let ptr = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::new(pages, offset)?;
+    ptr.write_slice_at_offset(0, bytes)
+}
 
 use crate::arch::MAX_CORES;
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;

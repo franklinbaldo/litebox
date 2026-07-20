@@ -17,7 +17,6 @@ use litebox_platform_lvbs::{
         set_platform_root_key,
     },
     mshv::{
-        PrivilegedVmap,
         heki::mod_mem_type_to_mem_attr,
         ringbuffer::set_ringbuffer,
         vsm::{
@@ -53,12 +52,6 @@ use zeroize::Zeroizing;
 
 type Vtl0PhysConstPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, litebox_platform_lvbs::Vmap>;
-
-/// Mutable VTL0 pointer reserved for validated HEKI text patching. It bypasses ordinary
-/// protected-frame access checks and synchronization. Do not use it for other VTL0 destinations
-/// that could enable confused-deputy writes.
-type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
 
 const PAGE_SIZE: usize = litebox::mm::linux::PAGE_SIZE;
 
@@ -802,13 +795,15 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
             "patch crosses page boundary but pa_1 is null"
         );
         // The patch was validated against VTL1's precomputed HEKI patch data.
-        let ptr = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
-            heki_patch_pa_0.as_u64().trunc(),
-            patch.len(),
-        )
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        ptr.write_slice_at_offset(0, patch)
+        // SAFETY: `HekiPatch::is_valid` validated the destination and `patch`
+        // against VTL1's precomputed HEKI patch data.
+        unsafe {
+            litebox_platform_lvbs::mshv::write_validated_vtl0_patch_contiguous(
+                heki_patch_pa_0.as_u64().trunc(),
+                patch,
+            )
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        }
     } else {
         let pages = [
             PhysPageAddr::<PAGE_SIZE>::new(
@@ -819,13 +814,16 @@ fn apply_vtl0_text_patch(heki_patch: HekiPatch) -> Result<(), VsmError> {
                 .ok_or(VsmError::Vtl0CopyFailed)?,
         ];
         // The patch was validated against VTL1's precomputed HEKI patch data.
-        let ptr = PrivilegedVtl0PhysMutPtr::<u8, PAGE_SIZE>::new(
-            &pages,
-            (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
-        )
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        ptr.write_slice_at_offset(0, patch)
+        // SAFETY: `HekiPatch::is_valid` validated the destination and `patch`
+        // against VTL1's precomputed HEKI patch data.
+        unsafe {
+            litebox_platform_lvbs::mshv::write_validated_vtl0_patch_pages(
+                &pages,
+                (heki_patch_pa_0 - heki_patch_pa_0.align_down(Size4KiB::SIZE)).trunc(),
+                patch,
+            )
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        }
     }
     Ok(())
 }
