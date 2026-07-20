@@ -25,7 +25,6 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
-use litebox_common_linux::errno::Errno;
 use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
@@ -767,32 +766,4 @@ pub enum KernelElfError {
     UnsupportedRelocation,
 }
 
-/// Errors for module signature verification.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum VerificationError {
-    #[error("signature not found in module")]
-    SignatureNotFound,
-    #[error("invalid signature format")]
-    InvalidSignature,
-    #[error("invalid certificate")]
-    InvalidCertificate,
-    #[error("signature authentication failed")]
-    AuthenticationFailed,
-    #[error("failed to parse signature data")]
-    ParseFailed,
-    #[error("unsupported signature algorithm")]
-    Unsupported,
-}
-
-impl From<VerificationError> for Errno {
-    fn from(e: VerificationError) -> Self {
-        match e {
-            VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
-            VerificationError::SignatureNotFound => Errno::ENODATA,
-            VerificationError::Unsupported => Errno::ENOPKG,
-            VerificationError::InvalidCertificate => Errno::ENOKEY,
-            VerificationError::InvalidSignature | VerificationError::ParseFailed => Errno::ELIBBAD,
-        }
-    }
-}
+pub use litebox_common_lvbs::VerificationError;

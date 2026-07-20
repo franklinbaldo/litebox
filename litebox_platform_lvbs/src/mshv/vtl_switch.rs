@@ -10,7 +10,7 @@ use crate::host::{
 use crate::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
     NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-    VTL_ENTRY_REASON_RESERVED, error::VsmError, hvcall_vp::hvcall_get_vp_registers,
+    VTL_ENTRY_REASON_RESERVED, VsmError, hvcall_vp::hvcall_get_vp_registers,
     vsm_intercept::vsm_handle_intercept,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
