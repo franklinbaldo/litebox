@@ -175,7 +175,7 @@ impl LvbsCrng {
 }
 
 /// Length of the Platform Root Key in bytes.
-pub const PRK_LEN: usize = 32;
+const PRK_LEN: usize = 32;
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 
@@ -192,7 +192,7 @@ static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 ///
 /// # Panics
 /// Panics if `key` length does not match `PRK_LEN`.
-pub fn set_platform_root_key(key: &[u8]) -> bool {
+pub(crate) fn set_platform_root_key(key: &[u8]) -> bool {
     assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
     // `newly_set` is flipped only inside the `call_once` closure, which runs at
     // most once for the lifetime of `PRK_ONCE`. Reading it after the call is

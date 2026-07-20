@@ -81,8 +81,9 @@ type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
 /// physical memory starting at `base_pa`, through the privileged mapping that
 /// bypasses ordinary protected-frame access checks.
 ///
-/// This (and [`write_validated_vtl0_patch_pages`]) is the *only* cross-crate entry
-/// point to the privileged VTL0 writer. The underlying [`PrivilegedVmap`] provider
+/// This (and [`write_validated_vtl0_patch_pages`]) is the *only* entry point to
+/// the privileged VTL0 writer, reachable in-crate solely by the platform's
+/// `HekiEnforcer` adapter. The underlying [`PrivilegedVmap`] provider
 /// is deliberately kept private so it cannot be repurposed into arbitrary
 /// confused-deputy writes to VTL0 memory.
 ///
@@ -92,7 +93,7 @@ type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
 /// precomputed HEKI patch data before calling. This is a security precondition,
 /// not a memory-safety one: writing unvalidated data does not cause undefined
 /// behavior, but it defeats the HEKI integrity guarantee for VTL0 memory.
-pub fn write_validated_vtl0_patch_contiguous(
+pub(crate) fn write_validated_vtl0_patch_contiguous(
     base_pa: usize,
     bytes: &[u8],
 ) -> Result<(), PhysPointerError> {
@@ -104,7 +105,7 @@ pub fn write_validated_vtl0_patch_contiguous(
 /// `pages` at `offset`, through the privileged (protected-frame-bypassing) mapping.
 /// See [`write_validated_vtl0_patch_contiguous`] for the security rationale and the
 /// caller contract.
-pub fn write_validated_vtl0_patch_pages(
+pub(crate) fn write_validated_vtl0_patch_pages(
     pages: &[litebox_common_linux::vmap::PhysPageAddr<PAGE_SIZE>],
     offset: usize,
     bytes: &[u8],
@@ -119,7 +120,8 @@ use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-pub use litebox_common_lvbs::{MemAttr, NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
+pub use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmFunction};
+pub(crate) use litebox_common_lvbs::{MemAttr, VsmError};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;

@@ -287,14 +287,14 @@ fn save_vtl0_locked_regs() -> Result<u64, HypervCallError> {
 /// RAII reservation over VTL0 physical frames, shared by module load and kexec validation.
 /// On drop without `commit`, every newly reserved range is restored to VTL0 read/write,
 /// non-executable access.
-pub struct FrameReservation {
+pub(crate) struct FrameReservation {
     owned_ranges: Vec<PhysFrameRange<Size4KiB>>,
     owned_frames: RangeSet<u64>,
     committed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum ReservationStatus {
+pub(crate) enum ReservationStatus {
     New,
     AlreadyOwned,
 }
@@ -306,7 +306,7 @@ impl Default for FrameReservation {
 }
 
 impl FrameReservation {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             owned_ranges: Vec::new(),
             owned_frames: RangeSet::new(),
@@ -335,7 +335,7 @@ impl FrameReservation {
     ///
     /// Validation and insertion are atomic under exclusive registry access. On rejection, only
     /// claims added by this call are rolled back.
-    pub fn reserve(
+    pub(crate) fn reserve(
         &mut self,
         frames: impl IntoIterator<Item = PhysFrameRange<Size4KiB>>,
     ) -> Result<Vec<ReservationStatus>, VsmError> {
@@ -393,7 +393,7 @@ impl FrameReservation {
     }
 
     /// Mark the reserved frames as committed; drop becomes a no-op.
-    pub fn commit(&mut self) {
+    pub(crate) fn commit(&mut self) {
         self.committed = true;
     }
 }
@@ -515,7 +515,7 @@ pub(crate) fn protected_frame_registry() -> &'static ProtectedFrameRegistry {
 /// `phys_frame_range` specifies the range whose VTL0 permissions are updated; VTL1 working-memory
 /// portions are ignored.
 /// `mem_attr` specifies the memory attributes (VTL0's allowed access) to be applied.
-pub fn protect_physical_memory_range(
+pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     mem_attr: MemAttr,
 ) -> Result<(), VsmError> {
@@ -569,7 +569,7 @@ pub fn protect_physical_memory_range(
 }
 
 /// Restore VTL0 read/write access while leaving execution disabled, and removes the registry entry.
-pub fn unprotect_physical_memory_range(
+pub(crate) fn unprotect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
 ) -> Result<(), VsmError> {
     protect_physical_memory_range(
