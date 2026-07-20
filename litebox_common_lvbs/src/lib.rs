@@ -431,6 +431,28 @@ pub enum ModMemType {
     Unknown = 0xffff_ffff_ffff_ffff,
 }
 
+/// Maps a module memory-type to the corresponding [`MemAttr`] permission set.
+pub fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
+    let mut mem_attr = MemAttr::empty();
+
+    match mod_mem_type {
+        ModMemType::Text | ModMemType::InitText => {
+            mem_attr.set(MemAttr::MEM_ATTR_READ, true);
+            mem_attr.set(MemAttr::MEM_ATTR_EXEC, true);
+        }
+        ModMemType::Data | ModMemType::RoAfterInit | ModMemType::InitData => {
+            mem_attr.set(MemAttr::MEM_ATTR_READ, true);
+            mem_attr.set(MemAttr::MEM_ATTR_WRITE, true);
+        }
+        ModMemType::RoData | ModMemType::InitRoData => {
+            mem_attr.set(MemAttr::MEM_ATTR_READ, true);
+        }
+        _ => {}
+    }
+
+    mem_attr
+}
+
 /// `HekiRange` is a generic container for various types of memory ranges.
 /// It has an `attributes` field which can be interpreted differently based on the context like
 /// `MemAttr`, `KdataType`, `ModMemType`, or `KexecType`.

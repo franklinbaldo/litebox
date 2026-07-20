@@ -3,7 +3,6 @@
 
 //! Hyper-V-specific code
 
-pub mod heki;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
@@ -120,7 +119,7 @@ use modular_bitfield::prelude::*;
 use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-pub use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
+pub use litebox_common_lvbs::{MemAttr, NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;
@@ -244,6 +243,29 @@ bitflags::bitflags! {
             | Self::HV_PAGE_WRITABLE.bits()
             | Self::HV_PAGE_EXECUTABLE.bits();
     }
+}
+
+/// Maps a HEKI [`MemAttr`](litebox_common_lvbs::MemAttr) permission set to the
+/// corresponding Hyper-V page-protection flags.
+pub(crate) fn mem_attr_to_hv_page_prot_flags(
+    attr: litebox_common_lvbs::MemAttr,
+) -> HvPageProtFlags {
+    use litebox_common_lvbs::MemAttr;
+
+    let mut flags = HvPageProtFlags::empty();
+
+    if attr.contains(MemAttr::MEM_ATTR_READ) {
+        flags.set(HvPageProtFlags::HV_PAGE_READABLE, true);
+        flags.set(HvPageProtFlags::HV_PAGE_USER_EXECUTABLE, true);
+    }
+    if attr.contains(MemAttr::MEM_ATTR_WRITE) {
+        flags.set(HvPageProtFlags::HV_PAGE_WRITABLE, true);
+    }
+    if attr.contains(MemAttr::MEM_ATTR_EXEC) {
+        flags.set(HvPageProtFlags::HV_PAGE_EXECUTABLE, true);
+    }
+
+    flags
 }
 
 bitflags::bitflags! {

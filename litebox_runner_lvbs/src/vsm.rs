@@ -17,7 +17,6 @@ use litebox_platform_lvbs::{
         set_platform_root_key,
     },
     mshv::{
-        heki::mod_mem_type_to_mem_attr,
         ringbuffer::set_ringbuffer,
         vsm::{
             FrameReservation, ReservationStatus, mshv_vsm_boot_aps, mshv_vsm_enable_aps,
@@ -38,7 +37,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_linux::{errno::Errno, vmap::PhysPageAddr};
 use litebox_common_lvbs::{
     HekiKdataType, HekiKernelInfo, HekiKernelSymbol, HekiKexecType, HekiPage, HekiPatch,
-    HekiPatchInfo, HekiRange, MemAttr, ModMemType, VsmError, VsmFunction,
+    HekiPatchInfo, HekiRange, MemAttr, ModMemType, VsmError, VsmFunction, mod_mem_type_to_mem_attr,
 };
 use spin::Once;
 use thiserror::Error;

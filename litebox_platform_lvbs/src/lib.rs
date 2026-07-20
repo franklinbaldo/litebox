@@ -1282,13 +1282,13 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 needs writable access, so deny VTL0 all access.
-            crate::mshv::heki::MemAttr::empty()
+            crate::mshv::MemAttr::empty()
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            crate::mshv::heki::MemAttr::MEM_ATTR_READ | crate::mshv::heki::MemAttr::MEM_ATTR_EXEC
+            crate::mshv::MemAttr::MEM_ATTR_READ | crate::mshv::MemAttr::MEM_ATTR_EXEC
         } else {
             // VTL1 no longer protects the pages.
-            crate::mshv::heki::MemAttr::all()
+            crate::mshv::MemAttr::all()
         };
 
         for range in range_set.iter() {
