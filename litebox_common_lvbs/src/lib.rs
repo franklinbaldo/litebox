@@ -6,6 +6,7 @@
 //! These types are moved verbatim from `litebox_platform_lvbs` so that both the
 //! platform and the runner can depend on the same shared surface.
 
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 use core::mem;
