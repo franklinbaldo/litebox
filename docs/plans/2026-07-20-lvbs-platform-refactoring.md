@@ -76,23 +76,20 @@ done
 
 ---
 
-## Task 2: Move `ringbuffer.rs` to the runner
+## Task 2: (REMOVED) Ringbuffer stays in the platform
 
-**Files:**
-- Create: `litebox_runner_lvbs/src/ringbuffer.rs`
-- Modify: `litebox_platform_lvbs/src/mshv/mod.rs` (drop `ringbuffer` module + its `PrivilegedVmap` usage if now unused there)
-- Modify: `litebox_runner_lvbs/src/lib.rs` (add `mod ringbuffer;`)
-- Delete: `litebox_platform_lvbs/src/mshv/ringbuffer.rs`
+**Decision (2026-07-20):** `ringbuffer.rs` is consumed by the platform's own
+print path (`arch/x86/ioport.rs::print` calls `ringbuffer()`). Moving it to the
+runner would force a platform→runner function-pointer callback hook — an
+architectural/indirection change, not a mechanical move, and it changes
+semantics. Ringbuffer is normal-world debug-log infrastructure, not
+OP-TEE/HEKI/HVCI policy, so it **stays in the platform**.
 
-**Step 1:** Read `mshv/ringbuffer.rs` and list its cross-refs (`set_ringbuffer` is called from `vsm.rs`; it uses `PrivilegedVtl0PhysMutPtr`/`PrivilegedVmap`). Since `vsm` policy moves in Task 3, ringbuffer and its `set_ringbuffer` caller land together in the runner. If Task 3 ordering makes this awkward, do Task 2 and Task 3 as one combined commit.
-
-**Step 2:** Copy `ringbuffer.rs` to the runner verbatim; adjust imports (`litebox_common_lvbs`, platform-exposed vmap primitives). The `PrivilegedVmap`/`vmap_privileged` path must be reachable: expose the minimal platform primitive as `pub` (see Task 3, Step 4).
-
-**Step 3:** Remove `pub(crate) mod ringbuffer;` from `mshv/mod.rs`; delete the platform file.
-
-**Step 4:** `VERIFY`. (May not fully build until Task 3 if `set_ringbuffer` has no caller yet — acceptable to fold Task 2+3 into one commit if so.)
-
-**Step 5:** Commit: `git commit -m "Move ringbuffer from platform to runner"`
+The only policy piece — the `AllocateRingbufferMemory` VSM dispatch arm
+(`mshv_vsm_allocate_ringbuffer_memory`, which calls `set_ringbuffer`) — moves to
+the runner as part of Task 3. To support that, `set_ringbuffer` becomes a `pub`
+platform primitive (folded into Task 3, Step 4). No file move, no separate
+commit.
 
 ---
 
@@ -111,7 +108,7 @@ done
 
 **Step 3 — Vtl0KernelInfo global.** In the runner, add `static VTL0_KERNEL_INFO: spin::Once<Vtl0KernelInfo>` + `fn vtl0_kernel_info() -> &'static Vtl0KernelInfo` (init on first use). Replace every `crate::platform_low().vtl0_kernel_info` with `vtl0_kernel_info()`. Remove the `vtl0_kernel_info` field from `LinuxKernel` (`lib.rs:392,625`) and the `use ...vsm::Vtl0KernelInfo` at `lib.rs:9`.
 
-**Step 4 — expose platform primitives `pub`.** Make `pub` (crate-external): `protect_physical_memory_range`, `unprotect_physical_memory_range`, `protected_frame_registry`/needed guard types, and a `pub` privileged-vmap entry the runner's ringbuffer/patch code needs (currently `PrivilegedVmap`/`vmap_privileged` in `mshv/mod.rs`). Expose the smallest surface that lets runner policy call them. `ControlRegMap` stays `pub` in platform (used by `per_cpu_variables`).
+**Step 4 — expose platform primitives `pub`.** Make `pub` (crate-external): `protect_physical_memory_range`, `unprotect_physical_memory_range`, `protected_frame_registry`/needed guard types, and a `pub` privileged-vmap entry the runner's patch code needs (currently `PrivilegedVmap`/`vmap_privileged` in `mshv/mod.rs`). Also expose `mshv::ringbuffer::set_ringbuffer` as `pub` so the runner's moved `mshv_vsm_allocate_ringbuffer_memory` can install the ring buffer (ringbuffer.rs itself stays in the platform — see Task 2 decision). Expose the smallest surface that lets runner policy call these. `ControlRegMap` stays `pub` in platform (used by `per_cpu_variables`).
 
 **Step 5 — dispatch.** Delete platform `vsm_dispatch`. In runner `lib.rs`, extend `vtlcall_dispatch` (already routes `OpteeMessage`): route `EnableAPsVtl`/`BootAPs`/`LockRegs`/`SignalEndOfBoot` to the appropriate handlers (platform `pub` fns for AP/lock; runner `end_of_boot`), and all policy IDs to runner `vsm::` handlers. Preserve exact error mapping (`Errno::from(VsmError)`).
 
