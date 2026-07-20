@@ -91,9 +91,3 @@ impl CpuMask {
         }
     }
 }
-
-// `ModuleSignature`, `Kimage`, `KexecSegment`, and `KEXEC_SEGMENT_MAX` are pure
-// `zerocopy` data types shared with the HEKI algorithms; they now live in
-// `litebox_common_lvbs` (which `litebox_heki` can depend on) and are re-exported
-// here so existing platform-side paths keep compiling.
-pub use litebox_common_lvbs::{KEXEC_SEGMENT_MAX, KexecSegment, Kimage, ListHead, ModuleSignature};
