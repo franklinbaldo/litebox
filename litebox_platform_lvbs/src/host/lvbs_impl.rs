@@ -175,7 +175,7 @@ impl LvbsCrng {
 }
 
 /// Length of the Platform Root Key in bytes.
-pub(crate) const PRK_LEN: usize = 32;
+pub const PRK_LEN: usize = 32;
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 
@@ -190,7 +190,7 @@ static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 ///
 /// # Panics
 /// Panics if `key` length does not match `PRK_LEN`.
-pub(crate) fn set_platform_root_key(key: &[u8]) {
+pub fn set_platform_root_key(key: &[u8]) {
     assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
     PRK_ONCE.call_once(|| {
         let mut prk = Zeroizing::new([0u8; PRK_LEN]);

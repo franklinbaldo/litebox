@@ -3,13 +3,9 @@
 
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-use crate::{
-    host::linux::ModuleSignature,
-    mshv::{
-        heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
-        vsm::ModuleMemory,
-    },
-};
+use crate::vsm::ModuleMemory;
+use litebox_common_lvbs::{HekiPatch, POKE_MAX_OPCODE_SIZE};
+use litebox_platform_lvbs::host::linux::ModuleSignature;
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -38,7 +34,7 @@ use x509_cert::{
 use zerocopy::FromBytes;
 
 #[cfg(debug_assertions)]
-use crate::debug_serial_println;
+use litebox_platform_lvbs::debug_serial_println;
 
 /// This function validates the memory content of a loaded kernel module against the original ELF file.
 /// In particular, it checks whether the non-relocatable/patchable bytes of certain sections
@@ -135,7 +131,7 @@ pub fn validate_kernel_module_against_elf(
                 section_from_elf[reloc.clone()].copy_from_slice(&section_in_memory[reloc.clone()]);
             }
             if section_from_elf != section_in_memory {
-                crate::serial_println!(
+                litebox_platform_lvbs::serial_println!(
                     "Found {} mismatches in {target_section_name}",
                     target_section_name
                 );
@@ -215,7 +211,7 @@ fn identify_direct_relocations(
                         todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            litebox_platform_lvbs::serial_println!("Unsupported relocation type {:?}", rela.r_type);
                             return Err(KernelElfError::UnsupportedRelocation);
                         }
                     }
@@ -309,7 +305,7 @@ fn identify_indirect_relocations(
                         todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            litebox_platform_lvbs::serial_println!("Unsupported relocation type {:?}", rela.r_type);
                             return Err(KernelElfError::UnsupportedRelocation);
                         }
                     }
@@ -407,7 +403,7 @@ pub fn verify_kernel_module_signature(
         );
         #[cfg(not(debug_assertions))]
         {
-            crate::serial_println!(
+            litebox_platform_lvbs::serial_println!(
                 "Unsupported digest or signature algorithm: {:?}, {:?}",
                 digest_alg,
                 signature_alg
@@ -558,7 +554,7 @@ pub fn verify_kernel_pe_signature(
         todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
         #[cfg(not(debug_assertions))]
         {
-            crate::serial_println!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+            litebox_platform_lvbs::serial_println!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
             return Err(VerificationError::Unsupported);
         }
     }

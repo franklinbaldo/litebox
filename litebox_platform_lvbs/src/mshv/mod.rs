@@ -3,12 +3,11 @@
 
 //! Hyper-V-specific code
 
-pub(crate) mod heki;
+pub mod heki;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
-mod mem_integrity;
-pub(crate) mod ringbuffer;
+pub mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
@@ -19,7 +18,7 @@ use litebox_common_linux::vmap::{
 };
 
 /// Provider for MSHV operations authorized to modify protected VTL0 frames.
-struct PrivilegedVmap;
+pub struct PrivilegedVmap;
 
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for PrivilegedVmap {
     type Manager = PrivilegedVmap;

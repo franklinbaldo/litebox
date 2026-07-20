@@ -5,6 +5,9 @@
 
 extern crate alloc;
 
+mod mem_integrity;
+mod vsm;
+
 use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
@@ -24,7 +27,6 @@ use litebox_platform_lvbs::{
     mm::MemoryProvider,
     mshv::{
         NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
-        vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
@@ -255,7 +257,7 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             let smc_args_pfn = params[1];
             optee_smc_handler_entry(smc_args_pfn)
         }
-        _ => vsm_dispatch(func_id, &params[1..]),
+        _ => crate::vsm::vsm_dispatch(func_id, &params[1..]),
     }
 }
 

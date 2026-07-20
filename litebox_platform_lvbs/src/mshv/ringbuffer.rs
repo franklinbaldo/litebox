@@ -135,11 +135,11 @@ fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
 }
 
 static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-pub(crate) fn set_ringbuffer(pa: PhysAddr, size: usize) -> &'static Mutex<RingBuffer> {
+pub fn set_ringbuffer(pa: PhysAddr, size: usize) {
     RINGBUFFER_ONCE.call_once(|| {
         let ring_buffer = RingBuffer::new(pa, size);
         Mutex::new(ring_buffer)
-    })
+    });
 }
 
 pub(crate) fn ringbuffer() -> Option<&'static Mutex<RingBuffer>> {

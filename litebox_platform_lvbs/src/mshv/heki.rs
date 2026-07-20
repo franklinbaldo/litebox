@@ -25,7 +25,7 @@ pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     flags
 }
 
-pub(crate) fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
+pub fn mod_mem_type_to_mem_attr(mod_mem_type: ModMemType) -> MemAttr {
     let mut mem_attr = MemAttr::empty();
 
     match mod_mem_type {
