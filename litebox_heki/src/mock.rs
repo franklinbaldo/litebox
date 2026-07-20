@@ -9,12 +9,13 @@
 //! text patches, and the one-time ring buffer / platform root key installs are
 //! captured so tests can assert exactly what the algorithms would have enforced.
 //!
-//! Transaction semantics mirror the real adapter's intent for testability:
-//! `protect_frames_transactionally` reserves `initial` (rejecting overlap with an
-//! already-reserved range with the same [`VsmError::ProtectedFrameOverlap`] the
-//! live adapter returns), runs the closure against a [`MockFrameTxn`], and either
-//! commits every reserve/protect it recorded (closure `Ok`) or discards them all
-//! (closure `Err`) so rollback is observable.
+//! Transaction semantics mirror the real adapter: `protect_frames_transactionally`
+//! reserves `initial` (rejecting overlap with an already-reserved range with the
+//! same [`VsmError::ProtectedFrameOverlap`] the live adapter returns), runs the
+//! closure against a [`MockFrameTxn`] that reserves and protects eagerly, and on
+//! closure `Err` rolls back exactly the ranges the transaction reserved (matching
+//! `FrameReservation`'s Drop unprotecting its `owned_ranges`). `protect_frame`
+//! records a non-transactional protection that is never rolled back.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -152,13 +153,15 @@ fn ranges_equal(a: PhysFrameRange<Size4KiB>, b: PhysFrameRange<Size4KiB>) -> boo
         && a.end.start_address() == b.end.start_address()
 }
 
-/// Restricted transaction handle. Reserves/protects are held here until the
-/// enclosing `protect_frames_transactionally` commits (closure `Ok`) or discards
-/// them (closure `Err`).
+/// Restricted transaction handle. Mirrors the live adapter: `reserve` claims
+/// frames immediately and `protect` applies protections immediately to the
+/// committed state. On closure `Err`, the enclosing
+/// `protect_frames_transactionally` rolls back exactly the ranges this
+/// transaction reserved (matching `FrameReservation`'s Drop, which unprotects
+/// its `owned_ranges`).
 pub struct MockFrameTxn<'a> {
     enforcer: &'a MockEnforcer,
     added_reservations: Vec<PhysFrameRange<Size4KiB>>,
-    added_protections: Vec<(PhysFrameRange<Size4KiB>, MemAttr)>,
 }
 
 impl MockFrameTxn<'_> {
@@ -173,11 +176,7 @@ impl MockFrameTxn<'_> {
         }
 
         let committed = self.enforcer.reserved.borrow();
-        let existing = committed
-            .iter()
-            .copied()
-            .chain(self.added_reservations.iter().copied());
-        for other in existing {
+        for other in committed.iter().copied() {
             if ranges_equal(other, range) {
                 return Ok(ReservationStatus::AlreadyOwned);
             }
@@ -198,6 +197,9 @@ impl FrameTxn for MockFrameTxn<'_> {
         for &range in ranges {
             let status = self.classify(range)?;
             if status == ReservationStatus::New {
+                // Claim immediately so subsequent classify calls (this txn or
+                // later) observe the reservation, like the live registry.
+                self.enforcer.reserved.borrow_mut().push(range);
                 self.added_reservations.push(range);
             }
             statuses.push(status);
@@ -206,7 +208,9 @@ impl FrameTxn for MockFrameTxn<'_> {
     }
 
     fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
-        self.added_protections.push((range, attr));
+        // Apply immediately to the committed protections, mirroring production's
+        // eager `protect_physical_memory_range`.
+        self.enforcer.protections.borrow_mut().push((range, attr));
         Ok(())
     }
 }
@@ -259,21 +263,50 @@ impl HekiEnforcer for MockEnforcer {
         let mut txn = MockFrameTxn {
             enforcer: self,
             added_reservations: Vec::new(),
-            added_protections: Vec::new(),
         };
         // Reserve the initial set; overlap with an already-reserved range is
-        // rejected before the closure runs (nothing committed).
+        // rejected before the closure runs (nothing to roll back).
         txn.reserve(initial)?;
 
         let result = f(&mut txn);
-        if result.is_ok() {
-            // Commit everything the transaction recorded.
-            self.reserved.borrow_mut().extend(txn.added_reservations);
-            self.protections.borrow_mut().extend(txn.added_protections);
+        if result.is_err() {
+            // Roll back like `FrameReservation`'s Drop: unprotect only the ranges
+            // this transaction reserved (its `owned_ranges`), releasing their
+            // reservations too. Protections on non-reserved ranges are left as-is
+            // (production applies those outside the guard and never rolls them back).
+            let reserved = txn.added_reservations;
+            for range in &reserved {
+                let mut protections = self.protections.borrow_mut();
+                let mut released = false;
+                protections.retain(|(r, _)| {
+                    if ranges_equal(*r, *range) {
+                        released = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                drop(protections);
+                if released {
+                    self.unprotected.borrow_mut().push(*range);
+                }
+            }
+            self.reserved
+                .borrow_mut()
+                .retain(|r| !reserved.iter().any(|res| ranges_equal(*res, *r)));
         }
-        // On `Err`, `txn` is dropped without committing: reserves and protects
-        // added during the transaction roll back, leaving no trace.
+        // On `Ok`, everything reserved/protected during the transaction stays.
         result
+    }
+
+    fn protect_frame(
+        &self,
+        range: PhysFrameRange<Size4KiB>,
+        attr: MemAttr,
+    ) -> Result<(), VsmError> {
+        // Non-transactional forward protect: record immediately, never rolled back.
+        self.protections.borrow_mut().push((range, attr));
+        Ok(())
     }
 
     fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
@@ -294,19 +327,19 @@ impl HekiEnforcer for MockEnforcer {
 
     fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError> {
         let mut rb = self.ringbuffer.borrow_mut();
-        if rb.is_some() {
-            return Err(VsmError::AlreadyInitialized("ring buffer"));
+        // Idempotent: first install wins, later installs are ignored (like `Once`).
+        if rb.is_none() {
+            *rb = Some((pa, size));
         }
-        *rb = Some((pa, size));
         Ok(())
     }
 
     fn set_platform_root_key(&self, key: &[u8]) -> Result<(), VsmError> {
         let mut prk = self.prk.borrow_mut();
-        if prk.is_some() {
-            return Err(VsmError::AlreadyInitialized("platform root key"));
+        // Idempotent: first install wins, later installs are ignored (like `Once`).
+        if prk.is_none() {
+            *prk = Some(key.to_vec());
         }
-        *prk = Some(key.to_vec());
         Ok(())
     }
 }

@@ -175,19 +175,21 @@ impl HekiEnforcer for PlatformHekiEnforcer {
         Ok(())
     }
 
+    fn protect_frame(
+        &self,
+        range: PhysFrameRange<Size4KiB>,
+        attr: MemAttr,
+    ) -> Result<(), VsmError> {
+        crate::mshv::vsm::protect_physical_memory_range(range, attr)
+    }
+
     fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError> {
-        if crate::mshv::ringbuffer::ringbuffer().is_some() {
-            return Err(VsmError::AlreadyInitialized("ring buffer"));
-        }
         crate::mshv::ringbuffer::set_ringbuffer(PhysAddr::new(pa), size);
         Ok(())
     }
 
     fn set_platform_root_key(&self, key: &[u8]) -> Result<(), VsmError> {
-        if crate::host::set_platform_root_key(key) {
-            Ok(())
-        } else {
-            Err(VsmError::AlreadyInitialized("platform root key"))
-        }
+        crate::host::set_platform_root_key(key);
+        Ok(())
     }
 }

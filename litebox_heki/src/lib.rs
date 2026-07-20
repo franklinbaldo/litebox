@@ -42,8 +42,6 @@ use zerocopy::FromBytes;
 pub enum EnforceError {
     /// A VTL0 physical read failed (bad address, unmapped, etc.).
     Vtl0ReadFailed,
-    /// A one-time security resource was already initialized.
-    AlreadyInitialized,
 }
 
 /// Outcome of reserving a physical frame range within a transaction.
@@ -106,6 +104,11 @@ pub trait HekiEnforcer {
         f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
     ) -> Result<(), VsmError>;
 
+    /// Protect a single physical frame range with `attr`, outside any transaction
+    /// (no rollback). For forward protects on frames not part of a reserve/commit flow.
+    fn protect_frame(&self, range: PhysFrameRange<Size4KiB>, attr: MemAttr)
+    -> Result<(), VsmError>;
+
     /// Unprotect (release) a previously protected/committed physical frame range,
     /// returning it to VTL0's control. Standalone — not part of any transaction.
     fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError>;
@@ -114,9 +117,9 @@ pub trait HekiEnforcer {
     /// VTL1's precomputed patch data, via the privileged VTL0 writer.
     fn apply_text_patch(&self, patch: &HekiPatch) -> Result<(), VsmError>;
 
-    /// Install the debug ring buffer. Returns `Err` if already installed.
+    /// Install the debug ring buffer. Succeeds idempotently (first install wins).
     fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError>;
 
-    /// Install the platform root key. Returns `Err` if already installed.
+    /// Install the platform root key. Succeeds idempotently (first install wins).
     fn set_platform_root_key(&self, key: &[u8]) -> Result<(), VsmError>;
 }

@@ -77,49 +77,46 @@ pub fn mshv_vsm_protect_memory(
     let heki_pages =
         copy_heki_pages_from_vtl0(enforcer, pa, nranges).ok_or(VsmError::HekiPagesCopyFailed)?;
 
-    // Forward protects on ranges with no reservation: model as a transaction with an
-    // empty initial reservation (rollback is a no-op), which is behavior-identical to
-    // the original direct `protect_physical_memory_range` loop.
-    enforcer.protect_frames_transactionally(&[], &mut |txn| {
-        for heki_page in &heki_pages {
-            for heki_range in heki_page {
-                let pa = heki_range.pa;
-                let epa = heki_range.epa;
-                let mem_attr = heki_range
-                    .mem_attr()
-                    .ok_or(VsmError::MemoryAttributeInvalid)?;
+    // Forward protects on ranges with no reservation: apply each range directly
+    // (non-transactional), which is behavior-identical to the original direct
+    // `protect_physical_memory_range` loop (no rollback on partial failure).
+    for heki_page in &heki_pages {
+        for heki_range in heki_page {
+            let pa = heki_range.pa;
+            let epa = heki_range.epa;
+            let mem_attr = heki_range
+                .mem_attr()
+                .ok_or(VsmError::MemoryAttributeInvalid)?;
 
-                if !heki_range.is_aligned(Size4KiB::SIZE) {
-                    return Err(VsmError::AddressNotPageAligned);
-                }
-
-                #[cfg(debug_assertions)]
-                let va = heki_range.va;
-                log::debug!(
-                    "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
-                    va,
-                    pa,
-                    epa,
-                    mem_attr,
-                    epa - pa
-                );
-
-                if pa == epa {
-                    continue;
-                }
-
-                txn.protect(
-                    PhysFrame::range(
-                        // `HekiRange::is_valid` already validated both physical addresses.
-                        PhysFrame::containing_address(PhysAddr::new(pa)),
-                        PhysFrame::containing_address(PhysAddr::new(epa)),
-                    ),
-                    mem_attr,
-                )?;
+            if !heki_range.is_aligned(Size4KiB::SIZE) {
+                return Err(VsmError::AddressNotPageAligned);
             }
+
+            #[cfg(debug_assertions)]
+            let va = heki_range.va;
+            log::debug!(
+                "VSM: Protect memory: va {:#x} pa {:#x} epa {:#x} {:?} (size: {})",
+                va,
+                pa,
+                epa,
+                mem_attr,
+                epa - pa
+            );
+
+            if pa == epa {
+                continue;
+            }
+
+            enforcer.protect_frame(
+                PhysFrame::range(
+                    // `HekiRange::is_valid` already validated both physical addresses.
+                    PhysFrame::containing_address(PhysAddr::new(pa)),
+                    PhysFrame::containing_address(PhysAddr::new(epa)),
+                ),
+                mem_attr,
+            )?;
         }
-        Ok(())
-    })?;
+    }
     Ok(0)
 }
 
@@ -248,16 +245,13 @@ pub fn mshv_vsm_load_kdata(
     // The current solution is to skip protecting kexec trampoline metadata if its insert_heki_range
     // fails, letting kdata load proceed so that heki is not broken.
     if !kexec_trampoline_insert_failed {
-        // Forward protects with no reservation: empty-initial transaction (rollback no-op).
-        enforcer.protect_frames_transactionally(&[], &mut |txn| {
-            for kexec_trampoline_range in &kexec_trampoline_metadata {
-                txn.protect(
-                    kexec_trampoline_range.phys_frame_range,
-                    MemAttr::MEM_ATTR_READ,
-                )?;
-            }
-            Ok(())
-        })?;
+        // Forward protects with no reservation: apply each range directly (non-transactional).
+        for kexec_trampoline_range in &kexec_trampoline_metadata {
+            enforcer.protect_frame(
+                kexec_trampoline_range.phys_frame_range,
+                MemAttr::MEM_ATTR_READ,
+            )?;
+        }
     }
 
     // pre-computed patch data for the kernel text
@@ -467,11 +461,9 @@ pub fn mshv_vsm_free_guest_module_init(
                 }
                 ModMemType::RoAfterInit => {
                     // make this memory range read-only after initialization (forward protect on an
-                    // already-committed frame: empty-initial transaction, rollback no-op).
+                    // already-committed frame: non-transactional, no rollback).
                     let range = mod_mem_range.phys_frame_range;
-                    enforcer.protect_frames_transactionally(&[], &mut |txn| {
-                        txn.protect(range, MemAttr::MEM_ATTR_READ)
-                    })
+                    enforcer.protect_frame(range, MemAttr::MEM_ATTR_READ)
                 }
                 _ => Ok(()),
             };
@@ -760,10 +752,8 @@ pub fn mshv_vsm_allocate_ringbuffer_memory(
         PhysFrame::from_start_address(phys_addr).map_err(|_| VsmError::AddressNotPageAligned)?,
         PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
     );
-    // Forward protect with no reservation: empty-initial transaction (rollback no-op).
-    enforcer.protect_frames_transactionally(&[], &mut |txn| {
-        txn.protect(frame_range, MemAttr::MEM_ATTR_READ)
-    })?;
+    // Forward protect with no reservation: apply directly (non-transactional).
+    enforcer.protect_frame(frame_range, MemAttr::MEM_ATTR_READ)?;
     enforcer.install_ringbuffer(phys_addr.as_u64(), size)?;
     log::debug!("VSM: Ring buffer allocated");
     Ok(0)
@@ -1957,18 +1947,55 @@ mod enforcer_tests {
         let range = frame_range(0x2000, 0x3000);
         let result = mock.protect_frames_transactionally(&[range], &mut |txn| {
             txn.protect(range, MemAttr::MEM_ATTR_READ)?;
-            // Fail partway: everything reserved/protected in this txn must roll back.
+            // Fail partway: the reserved range protected in this txn must roll back.
             Err(VsmError::TextPatchSuspicious)
         });
         assert!(result.is_err());
         assert!(
             mock.reservations().is_empty(),
-            "reservations must roll back on error"
+            "reserved ranges must roll back on error"
         );
         assert!(
             mock.protections().is_empty(),
-            "protections must roll back on error"
+            "protections on reserved ranges must roll back on error"
         );
+        assert!(
+            mock.unprotected()
+                .iter()
+                .any(|r| r.start.start_address() == range.start.start_address()
+                    && r.end.start_address() == range.end.start_address()),
+            "rolled-back reserved range must be recorded as unprotected"
+        );
+    }
+
+    #[test]
+    fn protect_frame_is_not_rolled_back_by_later_failure() {
+        let mock = MockEnforcer::new();
+        // Non-transactional forward protect: recorded immediately.
+        let forward = frame_range(0x9000, 0xA000);
+        mock.protect_frame(forward, MemAttr::MEM_ATTR_READ)
+            .expect("protect_frame should record");
+        assert_eq!(mock.protections().len(), 1);
+
+        // A subsequent failing transaction on a different reserved range must not
+        // disturb the earlier non-transactional protection.
+        let reserved = frame_range(0x2000, 0x3000);
+        let result = mock.protect_frames_transactionally(&[reserved], &mut |txn| {
+            txn.protect(reserved, MemAttr::MEM_ATTR_READ)?;
+            Err(VsmError::TextPatchSuspicious)
+        });
+        assert!(result.is_err());
+
+        let protections = mock.protections();
+        assert_eq!(
+            protections.len(),
+            1,
+            "non-transactional protection must survive the failed transaction"
+        );
+        let (r, attr) = protections[0];
+        assert_eq!(r.start.start_address().as_u64(), 0x9000);
+        assert_eq!(r.end.start_address().as_u64(), 0xA000);
+        assert_eq!(attr, MemAttr::MEM_ATTR_READ);
     }
 
     #[test]
@@ -2017,10 +2044,10 @@ mod enforcer_tests {
         assert_eq!(remaining, 0, "kexec metadata must be cleared");
     }
 
-    // --- one-time init hardening ---
+    // --- one-time inits are first-in-first-served (idempotent) ---
 
     #[test]
-    fn ringbuffer_install_is_one_time() {
+    fn ringbuffer_install_is_first_in_first_served() {
         let mock = MockEnforcer::new();
         let state = HekiState::new();
 
@@ -2028,15 +2055,18 @@ mod enforcer_tests {
         assert!(first.is_ok(), "first ring buffer install should succeed");
         assert_eq!(mock.ringbuffer(), Some((0x10_0000, 0x1000)));
 
-        let second = mshv_vsm_allocate_ringbuffer_memory(&mock, &state, 0x10_0000, 0x1000);
-        assert!(
-            matches!(second, Err(VsmError::AlreadyInitialized("ring buffer"))),
-            "second install should be rejected, got {second:?}"
+        // A second install succeeds idempotently and keeps the first value.
+        let second = mshv_vsm_allocate_ringbuffer_memory(&mock, &state, 0x20_0000, 0x2000);
+        assert!(second.is_ok(), "second install should succeed idempotently");
+        assert_eq!(
+            mock.ringbuffer(),
+            Some((0x10_0000, 0x1000)),
+            "first ring buffer value must be preserved"
         );
     }
 
     #[test]
-    fn platform_root_key_install_is_one_time() {
+    fn platform_root_key_install_is_first_in_first_served() {
         let mock = MockEnforcer::new();
         let state = HekiState::new();
 
@@ -2047,13 +2077,18 @@ mod enforcer_tests {
         assert!(first.is_ok(), "first PRK install should succeed: {first:?}");
         assert_eq!(mock.prk(), Some(alloc::vec![0x11u8; PRK_LEN]));
 
-        let second = mshv_vsm_set_platform_root_key(&mock, &state, key_pa as u64);
+        // A second install succeeds idempotently and keeps the first key.
+        let key_pa2 = 0x30_0000usize;
+        mock.write_vtl0(key_pa2, &[0x22u8; PRK_LEN]);
+        let second = mshv_vsm_set_platform_root_key(&mock, &state, key_pa2 as u64);
         assert!(
-            matches!(
-                second,
-                Err(VsmError::AlreadyInitialized("platform root key"))
-            ),
-            "second PRK install should be rejected, got {second:?}"
+            second.is_ok(),
+            "second PRK install should succeed idempotently"
+        );
+        assert_eq!(
+            mock.prk(),
+            Some(alloc::vec![0x11u8; PRK_LEN]),
+            "first PRK value must be preserved"
         );
     }
 
