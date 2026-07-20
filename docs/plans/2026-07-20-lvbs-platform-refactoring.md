@@ -93,7 +93,15 @@ commit.
 
 ---
 
-## Task 3: Split `vsm.rs` — policy to runner, core stays in platform
+## Task 3: Split `vsm.rs` (policy) + move `mem_integrity.rs` — one combined move
+
+**Sequencing note (2026-07-20):** Task 3 and the former Task 4 are executed as a
+**single commit**. `vsm.rs` policy imports `mem_integrity`'s verify functions
+(`parse_modinfo`, `validate_kernel_module_against_elf`, `validate_text_patch`,
+`verify_kernel_module_signature`, `verify_kernel_pe_signature`), while
+`mem_integrity.rs` imports `vsm::ModuleMemory`. `mem_integrity` is used nowhere
+else. Moving one without the other creates a platform→runner dependency cycle,
+so both move to the runner together.
 
 **Files:**
 - Create: `litebox_runner_lvbs/src/vsm.rs` (policy)
@@ -112,28 +120,18 @@ commit.
 
 **Step 5 — dispatch.** Delete platform `vsm_dispatch`. In runner `lib.rs`, extend `vtlcall_dispatch` (already routes `OpteeMessage`): route `EnableAPsVtl`/`BootAPs`/`LockRegs`/`SignalEndOfBoot` to the appropriate handlers (platform `pub` fns for AP/lock; runner `end_of_boot`), and all policy IDs to runner `vsm::` handlers. Preserve exact error mapping (`Errno::from(VsmError)`).
 
-**Step 6 — init wiring.** `vsm::init` stays in platform and is still called from `mshv/hvcall.rs:163`. Confirm it no longer references moved policy. `mem_integrity::parse_modinfo` reference inside moved code now resolves within the runner (Task 4).
+**Step 6 — move mem_integrity + init wiring.** Also move `litebox_platform_lvbs/src/mshv/mem_integrity.rs` → `litebox_runner_lvbs/src/mem_integrity.rs` (verbatim; fix imports: `crate::debug_serial_println`/`serial_println` → runner logging macros; `vsm::ModuleMemory` → `crate::vsm::ModuleMemory`; shared types → `litebox_common_lvbs`). Remove `mod mem_integrity;` from `mshv/mod.rs`; add `mod mem_integrity;` to the runner. `vsm::init` stays in platform and is still called from `mshv/hvcall.rs:163`; confirm it no longer references moved policy. Any platform items the moved code still needs (e.g. `host::linux::{CpuMask, Kimage, KEXEC_SEGMENT_MAX}`, `host::{set_platform_root_key, PRK_LEN}`, `host::bootparam::get_vtl1_memory_info`, HV register-name consts, `HvCrInterceptControlFlags`, `hvcall_mm::hv_modify_vtl_protection_mask`, `hvcall_vp::*`, `heki::{mem_attr_to_hv_page_prot_flags, mod_mem_type_to_mem_attr}`, `set_ringbuffer`) must be exposed `pub` from the platform — expose the minimal surface.
 
 **Step 7:** `VERIFY`. Fold in Task 2 if ordering requires.
 
-**Step 8:** Commit: `git commit -m "Split vsm.rs: move VSM/HEKI policy to runner, keep VSM core in platform"`
+**Step 8:** Commit: `git commit -m "Split vsm.rs and move VSM/HEKI policy + mem_integrity to runner"`
 
 ---
 
-## Task 4: Move `mem_integrity.rs` to the runner
+## Task 4: (MERGED into Task 3)
 
-**Files:**
-- Create: `litebox_runner_lvbs/src/mem_integrity.rs`
-- Delete: `litebox_platform_lvbs/src/mshv/mem_integrity.rs`
-- Modify: `mshv/mod.rs` (drop `mod mem_integrity;`), runner `lib.rs` (add `mod mem_integrity;`)
-
-**Step 1:** Copy `mem_integrity.rs` to the runner verbatim. Fix imports: `crate::debug_serial_println`/`serial_println` → the runner's logging macros; `vsm::ModuleMemory` → `crate::vsm::ModuleMemory` (now runner-local); shared types → `litebox_common_lvbs`.
-
-**Step 2:** Remove `mod mem_integrity;` from `mshv/mod.rs`; delete the platform file. Ensure `parse_modinfo` (used by runner `vsm`) is reachable.
-
-**Step 3:** `VERIFY`.
-
-**Step 4:** Commit: `git commit -m "Move mem_integrity from platform to runner"`
+`mem_integrity.rs` moves together with the `vsm.rs` policy split — see the
+sequencing note in Task 3. No separate commit.
 
 ---
 
