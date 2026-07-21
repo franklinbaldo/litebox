@@ -1858,3 +1858,297 @@ impl SymbolTable {
         Ok(0)
     }
 }
+
+#[cfg(test)]
+mod enforcer_tests {
+    use super::*;
+    use crate::mock::MockEnforcer;
+
+    fn make_patch(pa: [u64; 2], size: u8, first_code: u8) -> HekiPatch {
+        let mut patch = HekiPatch::default();
+        patch.pa = pa;
+        patch.size = size;
+        patch.code[0] = first_code;
+        patch
+    }
+
+    /// Serialize a `HekiPage` (a `#[repr(C, align(4096))]` POD with no padding)
+    /// to raw bytes so it can be staged into mock VTL0 memory. `HekiPage` derives
+    /// `FromBytes` but not `IntoBytes`, so read its bytes directly.
+    fn heki_page_bytes(page: &HekiPage) -> Vec<u8> {
+        // SAFETY: `HekiPage` is a `#[repr(C)]` plain-old-data aggregate of `u64`s
+        // and `HekiRange` (itself POD), fully initialized, with no padding bytes.
+        unsafe {
+            core::slice::from_raw_parts(
+                core::ptr::from_ref::<HekiPage>(page).cast::<u8>(),
+                core::mem::size_of::<HekiPage>(),
+            )
+        }
+        .to_vec()
+    }
+
+    fn one_range_page(range: HekiRange) -> HekiPage {
+        let mut page = HekiPage::new();
+        page.nranges = 1;
+        page.next_pa = 0;
+        page.ranges[0] = range;
+        page
+    }
+
+    // --- apply_text_patch (mshv_vsm_patch_text) ---
+
+    #[test]
+    fn patch_text_applies_matching_precomputed_patch() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+
+        // Precomputed patch for target 0x8000: step-1 breakpoint (INT3).
+        let precomputed = make_patch([0x8000, 0], 1, 0xcc);
+        state
+            .precomputed_patches
+            .inner
+            .write()
+            .insert(PhysAddr::new(0x8000), precomputed);
+
+        // The applied HekiPatch structure is staged in VTL0 at a page-aligned
+        // location; it patches target 0x8000 with the same INT3 (a valid step 1).
+        let applied = make_patch([0x8000, 0], 1, 0xcc);
+        let struct_pa = 0x10_000usize;
+        mock.write_vtl0(struct_pa, applied.as_bytes());
+
+        let result = mshv_vsm_patch_text(&mock, &state, struct_pa as u64, 0);
+        assert!(result.is_ok(), "expected patch to apply: {result:?}");
+
+        let writes = mock.writes();
+        assert_eq!(
+            writes.len(),
+            1,
+            "exactly one privileged write should be recorded"
+        );
+        assert_eq!(writes[0], (0x8000, alloc::vec![0xcc]));
+    }
+
+    #[test]
+    fn patch_text_rejects_patch_not_matching_precomputed() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+
+        // Precomputed patch expects INT3 at target 0x8000.
+        let precomputed = make_patch([0x8000, 0], 1, 0xcc);
+        state
+            .precomputed_patches
+            .inner
+            .write()
+            .insert(PhysAddr::new(0x8000), precomputed);
+
+        // The applied patch writes a different single byte (0x90) — not a valid
+        // step of `text_poke_bp_batch` for this precomputed data.
+        let applied = make_patch([0x8000, 0], 1, 0x90);
+        let struct_pa = 0x10_000usize;
+        mock.write_vtl0(struct_pa, applied.as_bytes());
+
+        let result = mshv_vsm_patch_text(&mock, &state, struct_pa as u64, 0);
+        assert!(
+            matches!(result, Err(VsmError::TextPatchSuspicious)),
+            "expected TextPatchSuspicious, got {result:?}"
+        );
+        assert!(
+            mock.writes().is_empty(),
+            "rejected patch must not be written"
+        );
+    }
+
+    // --- protect_memory (frame transaction, real algorithm) ---
+
+    #[test]
+    fn protect_memory_records_expected_protection() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+
+        let range = HekiRange {
+            va: 0x1000,
+            pa: 0x2000,
+            epa: 0x3000,
+            attributes: MemAttr::MEM_ATTR_READ.bits(),
+        };
+        let page = one_range_page(range);
+        let page_pa = 0x4000usize;
+        mock.write_vtl0(page_pa, &heki_page_bytes(&page));
+
+        let result = mshv_vsm_protect_memory(&mock, &state, page_pa as u64, 1);
+        assert!(result.is_ok(), "expected protect to succeed: {result:?}");
+
+        let protections = mock.protections();
+        assert_eq!(protections.len(), 1);
+        let (protected_range, attr) = protections[0];
+        assert_eq!(protected_range.start.start_address().as_u64(), 0x2000);
+        assert_eq!(protected_range.end.start_address().as_u64(), 0x3000);
+        assert_eq!(attr, MemAttr::MEM_ATTR_READ);
+    }
+
+    #[test]
+    fn protect_memory_rejects_after_end_of_boot() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        state.set_end_of_boot();
+
+        let result = mshv_vsm_protect_memory(&mock, &state, 0x4000, 1);
+        assert!(
+            matches!(result, Err(VsmError::OperationAfterEndOfBoot(_))),
+            "expected OperationAfterEndOfBoot, got {result:?}"
+        );
+        assert!(mock.protections().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_zero_nranges() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        let result = mshv_vsm_protect_memory(&mock, &state, 0x4000, 0);
+        assert!(matches!(result, Err(VsmError::InvalidInputAddress)));
+    }
+    #[test]
+    fn kexec_validate_invalidation_only_unprotects_and_clears() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        // `get_system_certificates` only needs to be `Some`; the pa == 0 path
+        // never inspects the certificates further.
+        state.set_system_certificates(Vec::new());
+
+        // Pre-seed the (non-crash) kexec metadata with one protected range.
+        let mut meta = KexecMemoryMetadata::new();
+        meta.insert_memory_range(KexecMemoryRange::new_checked(0x1000, 0x5000, 0x6000));
+        state.kexec_metadata.register_memory(meta);
+
+        let result = mshv_vsm_kexec_validate(&mock, &state, 0, 1, 0);
+        assert!(result.is_ok(), "invalidation should succeed: {result:?}");
+
+        let unprotected = mock.unprotected();
+        assert_eq!(unprotected.len(), 1, "the seeded range should be released");
+        assert_eq!(unprotected[0].start.start_address().as_u64(), 0x5000);
+        assert_eq!(unprotected[0].end.start_address().as_u64(), 0x6000);
+
+        let remaining = state
+            .kexec_metadata
+            .iter_guarded()
+            .iter_mem_ranges()
+            .count();
+        assert_eq!(remaining, 0, "kexec metadata must be cleared");
+    }
+
+    // --- one-time inits are first-in-first-served (idempotent) ---
+
+    #[test]
+    fn ringbuffer_install_is_first_in_first_served() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+
+        let first = mshv_vsm_allocate_ringbuffer_memory(&mock, &state, 0x10_0000, 0x1000);
+        assert!(first.is_ok(), "first ring buffer install should succeed");
+        assert_eq!(mock.ringbuffer(), Some((0x10_0000, 0x1000)));
+
+        // A second install succeeds idempotently and keeps the first value.
+        let second = mshv_vsm_allocate_ringbuffer_memory(&mock, &state, 0x20_0000, 0x2000);
+        assert!(second.is_ok(), "second install should succeed idempotently");
+        assert_eq!(
+            mock.ringbuffer(),
+            Some((0x10_0000, 0x1000)),
+            "first ring buffer value must be preserved"
+        );
+    }
+
+    #[test]
+    fn platform_root_key_install_is_first_in_first_served() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+
+        let key_pa = 0x20_0000usize;
+        mock.write_vtl0(key_pa, &[0x11u8; PRK_LEN]);
+
+        let first = mshv_vsm_set_platform_root_key(&mock, &state, key_pa as u64);
+        assert!(first.is_ok(), "first PRK install should succeed: {first:?}");
+        assert_eq!(mock.prk(), Some(alloc::vec![0x11u8; PRK_LEN]));
+
+        // A second install succeeds idempotently and keeps the first key.
+        let key_pa2 = 0x30_0000usize;
+        mock.write_vtl0(key_pa2, &[0x22u8; PRK_LEN]);
+        let second = mshv_vsm_set_platform_root_key(&mock, &state, key_pa2 as u64);
+        assert!(
+            second.is_ok(),
+            "second PRK install should succeed idempotently"
+        );
+        assert_eq!(
+            mock.prk(),
+            Some(alloc::vec![0x11u8; PRK_LEN]),
+            "first PRK value must be preserved"
+        );
+    }
+
+    // --- lock control registers (mshv_vsm_lock_regs) ---
+
+    #[test]
+    fn lock_regs_locks_before_end_of_boot() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        let result = mshv_vsm_lock_regs(&mock, &state);
+        assert!(result.is_ok(), "lock_regs should succeed: {result:?}");
+        assert!(mock.regs_locked(), "control registers must be locked");
+    }
+
+    #[test]
+    fn lock_regs_rejects_after_end_of_boot() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        state.set_end_of_boot();
+        let result = mshv_vsm_lock_regs(&mock, &state);
+        assert!(
+            matches!(result, Err(VsmError::OperationAfterEndOfBoot(_))),
+            "expected OperationAfterEndOfBoot, got {result:?}"
+        );
+        assert!(
+            !mock.regs_locked(),
+            "registers must not be locked after end of boot"
+        );
+    }
+
+    // --- malformed-input rejections ---
+
+    #[test]
+    fn validate_guest_module_rejects_zero_nranges() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        let result = mshv_vsm_validate_guest_module(&mock, &state, 0x1000, 0, 0);
+        assert!(matches!(result, Err(VsmError::InvalidInputAddress)));
+    }
+
+    #[test]
+    fn validate_guest_module_rejects_unaligned_pa() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        let result = mshv_vsm_validate_guest_module(&mock, &state, 0x1001, 1, 0);
+        assert!(matches!(result, Err(VsmError::InvalidInputAddress)));
+    }
+
+    #[test]
+    fn validate_guest_module_requires_certificates() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        // Valid pa/nranges, but no system certificates loaded.
+        let result = mshv_vsm_validate_guest_module(&mock, &state, 0x1000, 1, 0);
+        assert!(
+            matches!(result, Err(VsmError::SystemCertificatesNotLoaded)),
+            "expected SystemCertificatesNotLoaded, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn kexec_validate_requires_certificates() {
+        let mock = MockEnforcer::new();
+        let state = HekiState::new();
+        let result = mshv_vsm_kexec_validate(&mock, &state, 0x1000, 1, 0);
+        assert!(
+            matches!(result, Err(VsmError::SystemCertificatesNotLoaded)),
+            "expected SystemCertificatesNotLoaded, got {result:?}"
+        );
+    }
+}

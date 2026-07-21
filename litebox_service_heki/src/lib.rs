@@ -16,6 +16,9 @@ extern crate alloc;
 pub mod mem_integrity;
 pub mod vsm;
 
+#[cfg(test)]
+mod mock;
+
 pub use vsm::{
     HekiState, ValidatedTextPatch, mshv_vsm_allocate_ringbuffer_memory,
     mshv_vsm_copy_secondary_key, mshv_vsm_end_of_boot, mshv_vsm_free_guest_module_init,
@@ -63,7 +66,8 @@ pub trait FrameTxn {
 }
 
 /// The platform-enforcement port. HEKI/HVCI algorithms are generic over this.
-// TODO: add a mock implementation to enable host testing without a real LVBS platform.
+///
+/// The `#[cfg(test)]` `mock::MockEnforcer` enables host testing without a real LVBS platform.
 pub trait HekiEnforcer {
     /// Read a `FromBytes` value from the given VTL0 physical address (guarded).
     fn read_vtl0<T: FromBytes>(&self, pa: usize) -> Result<T, EnforceError>;
