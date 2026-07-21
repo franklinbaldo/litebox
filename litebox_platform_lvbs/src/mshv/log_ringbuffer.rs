@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! RingBuffer implementation and functions
+//! LogRingBuffer implementation and functions
 
 use super::PrivilegedVtl0PhysMutPtr;
 use core::fmt;
@@ -11,7 +11,7 @@ use litebox_common_linux::vmap::PhysPageAddr;
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 
-pub struct RingBuffer {
+pub(crate) struct LogRingBuffer {
     rb_pa: PhysAddr,
     write_offset: usize,
     size: usize,
@@ -22,13 +22,13 @@ pub struct RingBuffer {
     fast_path_eligible: bool,
 }
 
-impl RingBuffer {
-    pub fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
+impl LogRingBuffer {
+    pub(crate) fn new(phys_addr: PhysAddr, requested_size: usize) -> Self {
         let pa: usize = phys_addr.as_u64().trunc();
         let fast_path_eligible = requested_size > 0
             && requested_size.is_multiple_of(PAGE_SIZE)
             && pa.is_multiple_of(PAGE_SIZE);
-        RingBuffer {
+        LogRingBuffer {
             rb_pa: phys_addr,
             write_offset: 0,
             size: requested_size,
@@ -36,7 +36,7 @@ impl RingBuffer {
         }
     }
 
-    pub fn write(&mut self, buf: &[u8]) {
+    pub(crate) fn write(&mut self, buf: &[u8]) {
         if self.size == 0 || buf.is_empty() {
             return;
         }
@@ -134,19 +134,19 @@ fn write_slow(rb_pa: PhysAddr, size: usize, write_offset: usize, buf: &[u8]) -> 
     advance_offset(size, write_offset, buf.len())
 }
 
-static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
-pub(crate) fn set_ringbuffer(pa: PhysAddr, size: usize) -> &'static Mutex<RingBuffer> {
-    RINGBUFFER_ONCE.call_once(|| {
-        let ring_buffer = RingBuffer::new(pa, size);
+static LOG_RINGBUFFER_ONCE: Once<Mutex<LogRingBuffer>> = Once::new();
+pub(crate) fn set_log_ringbuffer(pa: PhysAddr, size: usize) {
+    LOG_RINGBUFFER_ONCE.call_once(|| {
+        let ring_buffer = LogRingBuffer::new(pa, size);
         Mutex::new(ring_buffer)
-    })
+    });
 }
 
-pub(crate) fn ringbuffer() -> Option<&'static Mutex<RingBuffer>> {
-    RINGBUFFER_ONCE.get()
+pub(crate) fn log_ringbuffer() -> Option<&'static Mutex<LogRingBuffer>> {
+    LOG_RINGBUFFER_ONCE.get()
 }
 
-impl fmt::Write for RingBuffer {
+impl fmt::Write for LogRingBuffer {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write(s.as_bytes());
         Ok(())

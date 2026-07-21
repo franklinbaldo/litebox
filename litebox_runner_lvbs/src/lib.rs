@@ -20,11 +20,11 @@ use litebox_common_optee::{
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop, interrupts, timer},
     debug_serial_println,
+    heki_adapter::vsm_dispatch,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
-        vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{

@@ -3,13 +3,7 @@
 
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-use crate::{
-    host::linux::ModuleSignature,
-    mshv::{
-        heki::{HekiPatch, POKE_MAX_OPCODE_SIZE},
-        vsm::ModuleMemory,
-    },
-};
+use crate::vsm::ModuleMemory;
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -25,7 +19,7 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::{HekiPatch, ModuleSignature, POKE_MAX_OPCODE_SIZE};
 use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
@@ -37,9 +31,6 @@ use x509_cert::{
     der::{Decode, Encode, oid::ObjectIdentifier},
 };
 use zerocopy::FromBytes;
-
-#[cfg(debug_assertions)]
-use crate::debug_serial_println;
 
 /// This function validates the memory content of a loaded kernel module against the original ELF file.
 /// In particular, it checks whether the non-relocatable/patchable bytes of certain sections
@@ -136,7 +127,7 @@ pub fn validate_kernel_module_against_elf(
                 section_from_elf[reloc.clone()].copy_from_slice(&section_in_memory[reloc.clone()]);
             }
             if section_from_elf != section_in_memory {
-                crate::serial_println!(
+                log::warn!(
                     "Found {} mismatches in {target_section_name}",
                     target_section_name
                 );
@@ -154,7 +145,7 @@ pub fn validate_kernel_module_against_elf(
                 }
             }
             if !diffs.is_empty() {
-                debug_serial_println!(
+                log::debug!(
                     "Found {} mismatches in {target_section_name} at {:?}",
                     diffs.len(),
                     diffs
@@ -216,7 +207,7 @@ fn identify_direct_relocations(
                         todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            log::warn!("Unsupported relocation type {:?}", rela.r_type);
                             return Err(KernelElfError::UnsupportedRelocation);
                         }
                     }
@@ -310,7 +301,7 @@ fn identify_indirect_relocations(
                         todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            log::warn!("Unsupported relocation type {:?}", rela.r_type);
                             return Err(KernelElfError::UnsupportedRelocation);
                         }
                     }
@@ -376,7 +367,7 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
                 && let Some((k, v)) = s.split_once('=')
                 && k == "name"
             {
-                debug_serial_println!("Modinfo: {} = {}", k, v);
+                log::debug!("Modinfo: {k} = {v}");
             }
         }
     }
@@ -408,7 +399,7 @@ pub fn verify_kernel_module_signature(
         );
         #[cfg(not(debug_assertions))]
         {
-            crate::serial_println!(
+            log::warn!(
                 "Unsupported digest or signature algorithm: {:?}, {:?}",
                 digest_alg,
                 signature_alg
@@ -559,7 +550,7 @@ pub fn verify_kernel_pe_signature(
         todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
         #[cfg(not(debug_assertions))]
         {
-            crate::serial_println!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+            log::warn!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
             return Err(VerificationError::Unsupported);
         }
     }
@@ -689,7 +680,7 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
             return false;
         }
 
-        // step 2. `apply_vtl0_text_patch` uses `patch_data.pa[1]` only when
+        // step 2. `ValidatedTextPatch` uses `patch_data.pa[1]` only when
         // `patch_data.pa[0]` leaves the remainder of the patch on the next page.
         // For a legitimate step 2, that next page is the precomputed patch's pa[1].
         if !precomputed_patch_second_byte_pa_aligned && patch_data.pa[1] != precomputed_patch.pa[1]
@@ -767,32 +758,4 @@ pub enum KernelElfError {
     UnsupportedRelocation,
 }
 
-/// Errors for module signature verification.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum VerificationError {
-    #[error("signature not found in module")]
-    SignatureNotFound,
-    #[error("invalid signature format")]
-    InvalidSignature,
-    #[error("invalid certificate")]
-    InvalidCertificate,
-    #[error("signature authentication failed")]
-    AuthenticationFailed,
-    #[error("failed to parse signature data")]
-    ParseFailed,
-    #[error("unsupported signature algorithm")]
-    Unsupported,
-}
-
-impl From<VerificationError> for Errno {
-    fn from(e: VerificationError) -> Self {
-        match e {
-            VerificationError::AuthenticationFailed => Errno::EKEYREJECTED,
-            VerificationError::SignatureNotFound => Errno::ENODATA,
-            VerificationError::Unsupported => Errno::ENOPKG,
-            VerificationError::InvalidCertificate => Errno::ENOKEY,
-            VerificationError::InvalidSignature | VerificationError::ParseFailed => Errno::ELIBBAD,
-        }
-    }
-}
+pub use litebox_common_lvbs::VerificationError;

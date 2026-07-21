@@ -175,7 +175,7 @@ impl LvbsCrng {
 }
 
 /// Length of the Platform Root Key in bytes.
-pub(crate) const PRK_LEN: usize = 32;
+const PRK_LEN: usize = 32;
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
 

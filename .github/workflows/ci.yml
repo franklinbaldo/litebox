@@ -151,6 +151,7 @@ jobs:
           ./.github/tools/github_actions_run_cargo build
           ./.github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
       - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_lvbs
+      - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_service_heki --all-features
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -254,6 +255,9 @@ jobs:
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
+          # - `litebox_service_heki` can't build on `x86_64-unknown-none` due to
+          #   its crypto deps (`libm`), like `litebox_platform_lvbs`.
+          #
           # - `litebox_platform_multiplex` is allowed to have `std` access (in
           #   its default feature set) because `litebox_platform_linux_userland`
           #   has access, and this is just a multiplexer. Ideally, we'd do a
@@ -303,6 +307,7 @@ jobs:
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
+            -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
