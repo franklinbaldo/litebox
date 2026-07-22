@@ -3,7 +3,7 @@
 
 //! Linux Structs
 
-use crate::arch::MAX_CORES;
+use litebox_common_lvbs::MAX_CORES;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Context saved when entering the kernel
