@@ -1168,6 +1168,9 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
             Err(VsmError::OperationNotSupported("Identity key generation"))
         }
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+        VsmFunction::IdentitySigningKeyTest => {
+            Err(VsmError::OperationNotSupported("Identity signing key test"))
+        }
     };
     match result {
         Ok(value) => value,

@@ -215,6 +215,9 @@ pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY: u32 = 0x1_ffed;
 // This VSM function ID for generating the identity signing key is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY: u32 = 0x1_ffee;
 
+// This VSM function ID for testing signing with the identity signing key is subject to change
+pub const VSM_VTL_CALL_FUNC_ID_IDENTITY_SIGNING_KEY_TEST: u32 = 0x1_ffef;
+
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
@@ -239,6 +242,7 @@ pub enum VsmFunction {
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     SetPlatformRootKey = VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY,
     GenerateIdentitySigningKey = VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY,
+    IdentitySigningKeyTest = VSM_VTL_CALL_FUNC_ID_IDENTITY_SIGNING_KEY_TEST,
 }
 
 pub const MSR_EFER: u32 = 0xc000_0080;
