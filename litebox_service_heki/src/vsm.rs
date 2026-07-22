@@ -94,7 +94,8 @@ pub fn mshv_vsm_boot_aps<P: VsmPlatform>(
         }
         for bit in 0..8u32 {
             if byte & (1 << bit) != 0 {
-                let cpu_id: u32 = (byte_index as u32) * 8 + bit;
+                let byte_index: u32 = byte_index.trunc();
+                let cpu_id: u32 = byte_index * 8 + bit;
                 platform
                     .init_vtl_ap(cpu_id)
                     .map_err(VsmError::ApInitFailed)?;

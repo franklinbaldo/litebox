@@ -292,6 +292,11 @@ jobs:
           #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           #
+          # - `litebox_service_heki` is `no_std` but pulls in cryptographic
+          #   dependencies (sha2, rsa, cms, ...) whose soft-float/asm code fails to
+          #   compile for the generic `x86_64-unknown-none` target used here. It is
+          #   built for real via the LVBS custom target instead.
+          #
           # - `dev_tests` is meant to only be used for tests, and thus can
           #   safely use std.
           #
@@ -312,6 +317,7 @@ jobs:
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
+            -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -print0 | \
