@@ -845,8 +845,7 @@ impl HekiKernelInfo {
 
 /// The hypervisor and platform primitives the VSM/HEKI service runs on.
 ///
-/// Implemented by the platform (Hyper-V today; a KVM implementation is
-/// theoretically possible). The VSM layer expresses secure-mode operations —
+/// Implemented by the platform. The VSM layer expresses secure-mode operations —
 /// AP boot, VTL0 frame protection, control-register locking — in terms of these
 /// primitives, and HEKI verification/policy sits on top of VSM
 /// (`hypercall → vsm → heki`).
