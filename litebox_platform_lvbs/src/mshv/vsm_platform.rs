@@ -50,13 +50,6 @@ pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     flags
 }
 
-/// Convert a platform-internal hypercall error into the common wire error type
-/// exposed by the [`VsmPlatform`] trait. Both enums are identical `#[repr(u32)]`
-/// copies, so the numeric hypervisor status is preserved.
-pub(crate) fn to_common_hvcall_err(e: crate::mshv::hvcall::HypervCallError) -> HypervCallError {
-    HypervCallError::try_from(u32::from(e)).unwrap_or(HypervCallError::Unknown)
-}
-
 /// Restricted transaction handle handed to a `protect_frames_transactionally`
 /// closure. Wraps the private platform [`FrameReservation`] guard so the service
 /// can never hold or leak a reservation across the trait boundary.
@@ -140,7 +133,7 @@ impl VsmPlatform for LvbsVsmPlatform {
     }
 
     fn init_vtl_ap(&self, core: u32) -> Result<u64, HypervCallError> {
-        crate::mshv::hvcall_vp::init_vtl_ap(core).map_err(to_common_hvcall_err)
+        crate::mshv::hvcall_vp::init_vtl_ap(core)
     }
 
     fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError> {

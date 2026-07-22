@@ -21,7 +21,6 @@ use crate::{
         HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP, HvCrInterceptControlFlags,
         HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, X86Cr0Flags,
         X86Cr4Flags,
-        hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers},
         vtl_switch::mshv_vsm_get_code_page_offsets,
@@ -88,7 +87,7 @@ pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
     config.set_tlb_locked(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
-        .map_err(common_hypercall_failed)?;
+        .map_err(VsmError::HypercallFailed)?;
 
     Ok(0)
 }
@@ -102,7 +101,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
     config.set_enable_vtl_protection(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
-        .map_err(common_hypercall_failed)?;
+        .map_err(VsmError::HypercallFailed)?;
 
     Ok(0)
 }
@@ -133,22 +132,22 @@ pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
         | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
         | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
 
-    save_vtl0_locked_regs().map_err(common_hypercall_failed)?;
+    save_vtl0_locked_regs().map_err(VsmError::HypercallFailed)?;
 
     hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag)
-        .map_err(common_hypercall_failed)?;
+        .map_err(VsmError::HypercallFailed)?;
 
     hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR4_MASK,
         X86Cr4Flags::CR4_PIN_MASK.bits().into(),
     )
-    .map_err(common_hypercall_failed)?;
+    .map_err(VsmError::HypercallFailed)?;
 
     hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         X86Cr0Flags::CR0_PIN_MASK.bits().into(),
     )
-    .map_err(common_hypercall_failed)?;
+    .map_err(VsmError::HypercallFailed)?;
 
     Ok(0)
 }
@@ -247,7 +246,7 @@ pub(crate) fn protect_vtl1_physical_memory_range(
     let num_pages = phys_frame_range.count() as u64;
     if num_pages > 0 {
         hv_modify_vtl_protection_mask(pa, num_pages, HvPageProtFlags::HV_PAGE_ACCESS_NONE)
-            .map_err(common_hypercall_failed)?;
+            .map_err(VsmError::HypercallFailed)?;
     }
     Ok(())
 }
@@ -263,12 +262,7 @@ pub(crate) fn protect_vtl1_physical_memory_range(
 // The registry is driven by the VSM/HEKI service through the `VsmPlatform` trait,
 // so its public surface speaks the common wire error type `VsmError`.
 
-use litebox_common_lvbs::VsmError;
-
-/// Convert a platform hypercall error into a common `VsmError::HypercallFailed`.
-pub(crate) fn common_hypercall_failed(e: crate::mshv::hvcall::HypervCallError) -> VsmError {
-    VsmError::HypercallFailed(crate::mshv::vsm_platform::to_common_hvcall_err(e))
-}
+use litebox_common_lvbs::{HypervCallError, VsmError};
 
 /// RAII reservation over VTL0 physical frames, shared by module load and kexec validation.
 /// On drop without `commit`, every newly reserved range is restored to VTL0 read/write,
@@ -528,7 +522,7 @@ pub(crate) fn protect_physical_memory_range(
             let pa = phys_frame_range.start.start_address().as_u64();
             let num_pages = phys_frame_range.count() as u64;
             hv_modify_vtl_protection_mask(pa, num_pages, page_prot)
-                .map_err(common_hypercall_failed)?;
+                .map_err(VsmError::HypercallFailed)?;
             protected.record_protection(phys_frame_range, protect);
             return Ok(());
         }
@@ -553,7 +547,7 @@ pub(crate) fn protect_physical_memory_range(
             let pa = sub_range.start.start_address().as_u64();
             let num_pages = sub_range.count() as u64;
             hv_modify_vtl_protection_mask(pa, num_pages, page_prot)
-                .map_err(common_hypercall_failed)?;
+                .map_err(VsmError::HypercallFailed)?;
             protected.record_protection(sub_range, protect);
         }
         Ok(())
