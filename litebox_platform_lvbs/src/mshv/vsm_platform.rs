@@ -6,14 +6,21 @@
 //! the platform's enforcement primitives (VTL0 physical-memory access,
 //! frame protection hypercalls, AP bring-up, ring buffer, root key).
 
+use alloc::vec::Vec;
 use litebox_common_linux::vmap::PhysPageAddr;
-use litebox_common_lvbs::{HypervCallError, MemAttr, PAGE_SIZE, VsmError, VsmPlatform};
+use litebox_common_lvbs::{
+    FrameTxn, HypervCallError, MemAttr, PAGE_SIZE, PRK_LEN, ReservationStatus, VsmError,
+    VsmPlatform,
+};
 use x86_64::{
     PhysAddr,
-    structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
+    structures::paging::{Size4KiB, frame::PhysFrameRange},
 };
 
-use crate::mshv::{HvPageProtFlags, hvcall_mm::hv_modify_vtl_protection_mask};
+use crate::mshv::HvPageProtFlags;
+use crate::mshv::vsm::{
+    FrameReservation, protect_physical_memory_range, unprotect_physical_memory_range,
+};
 
 /// A guarded, read-only physical pointer into foreign (VTL0) physical memory.
 type Vtl0PhysConstPtr<T, const ALIGN: usize> = super::Vtl0PhysConstPtr<T, ALIGN>;
@@ -50,58 +57,33 @@ pub(crate) fn to_common_hvcall_err(e: crate::mshv::hvcall::HypervCallError) -> H
     HypervCallError::try_from(u32::from(e)).unwrap_or(HypervCallError::Unknown)
 }
 
-/// Set VTL0's allowed access mask on a physical frame range, skipping any
-/// portion that falls within VTL1's own physical memory (VTL1 self-protection).
-///
-/// If the requested range overlaps VTL1 working memory, the VTL1 portion is
-/// silently skipped and only the remaining VTL0 portions are protected. If the
-/// range falls entirely within VTL1, no hypercall is issued.
-pub(crate) fn modify_vtl0_protection(
-    phys_frame_range: PhysFrameRange<Size4KiB>,
-    attr: MemAttr,
-) -> Result<(), HypervCallError> {
-    let vtl1_range = crate::platform_low().vtl1_phys_frame_range();
+/// Restricted transaction handle handed to a `protect_frames_transactionally`
+/// closure. Wraps the private platform [`FrameReservation`] guard so the service
+/// can never hold or leak a reservation across the trait boundary.
+struct PlatformFrameTxn<'a> {
+    guard: &'a mut FrameReservation,
+}
 
-    // Range fully within VTL1 — nothing to protect for VTL0.
-    if phys_frame_range.start >= vtl1_range.start && phys_frame_range.end <= vtl1_range.end {
-        return Ok(());
+/// Map a platform-internal reservation status to the common status enum.
+fn map_status(status: crate::mshv::vsm::ReservationStatus) -> ReservationStatus {
+    match status {
+        crate::mshv::vsm::ReservationStatus::New => ReservationStatus::New,
+        crate::mshv::vsm::ReservationStatus::AlreadyOwned => ReservationStatus::AlreadyOwned,
+    }
+}
+
+impl FrameTxn for PlatformFrameTxn<'_> {
+    fn reserve(
+        &mut self,
+        ranges: &[PhysFrameRange<Size4KiB>],
+    ) -> Result<Vec<ReservationStatus>, VsmError> {
+        let statuses = self.guard.reserve(ranges.iter().copied())?;
+        Ok(statuses.into_iter().map(map_status).collect())
     }
 
-    // Fast path: no overlap with VTL1 — protect the entire range directly.
-    let overlaps_vtl1 =
-        phys_frame_range.start < vtl1_range.end && vtl1_range.start < phys_frame_range.end;
-
-    if !overlaps_vtl1 {
-        let pa = phys_frame_range.start.start_address().as_u64();
-        let num_pages = phys_frame_range.count() as u64;
-        hv_modify_vtl_protection_mask(pa, num_pages, heki_mem_attr_to_hv_page_prot_flags(attr))
-            .map_err(to_common_hvcall_err)?;
-        return Ok(());
+    fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
+        protect_physical_memory_range(range, heki_mem_attr_to_hv_page_prot_flags(attr))
     }
-    // Partial overlap: split into the portions before and after VTL1, skipping
-    // VTL1 pages.
-    let sub_ranges: [PhysFrameRange<Size4KiB>; 2] = {
-        let before = PhysFrame::range(
-            phys_frame_range.start,
-            core::cmp::min(phys_frame_range.end, vtl1_range.start),
-        );
-        let after = PhysFrame::range(
-            core::cmp::max(phys_frame_range.start, vtl1_range.end),
-            phys_frame_range.end,
-        );
-        [before, after]
-    };
-
-    for sub_range in sub_ranges {
-        if sub_range.start >= sub_range.end {
-            continue;
-        }
-        let pa = sub_range.start.start_address().as_u64();
-        let num_pages = sub_range.count() as u64;
-        hv_modify_vtl_protection_mask(pa, num_pages, heki_mem_attr_to_hv_page_prot_flags(attr))
-            .map_err(to_common_hvcall_err)?;
-    }
-    Ok(())
 }
 
 impl VsmPlatform for LvbsVsmPlatform {
@@ -129,12 +111,32 @@ impl VsmPlatform for LvbsVsmPlatform {
             .map_err(|_| VsmError::Vtl0CopyFailed)
     }
 
-    fn modify_vtl0_protection(
+    fn protect_frame(
         &self,
         range: PhysFrameRange<Size4KiB>,
         attr: MemAttr,
-    ) -> Result<(), HypervCallError> {
-        modify_vtl0_protection(range, attr)
+    ) -> Result<(), VsmError> {
+        protect_physical_memory_range(range, heki_mem_attr_to_hv_page_prot_flags(attr))
+    }
+
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
+        unprotect_physical_memory_range(range)
+    }
+
+    fn protect_frames_transactionally(
+        &self,
+        initial: &[PhysFrameRange<Size4KiB>],
+        f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
+    ) -> Result<(), VsmError> {
+        let mut guard = FrameReservation::new();
+        guard.reserve(initial.iter().copied())?;
+        let mut txn = PlatformFrameTxn { guard: &mut guard };
+        let result = f(&mut txn);
+        if result.is_ok() {
+            txn.guard.commit();
+        }
+        // On `Err`, `guard` drops uncommitted, rolling back every reserved range.
+        result
     }
 
     fn init_vtl_ap(&self, core: u32) -> Result<u64, HypervCallError> {
@@ -146,7 +148,7 @@ impl VsmPlatform for LvbsVsmPlatform {
         Ok(())
     }
 
-    fn set_platform_root_key(&self, key: &[u8]) {
+    fn set_platform_root_key(&self, key: &[u8; PRK_LEN]) {
         crate::host::set_platform_root_key(key);
     }
 }

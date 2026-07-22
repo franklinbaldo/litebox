@@ -13,10 +13,6 @@ use crate::mem_integrity::{
     validate_kernel_module_against_elf, validate_text_patch, verify_kernel_module_signature,
     verify_kernel_pe_signature,
 };
-use crate::registry::{
-    FrameReservation, ReservationStatus, protect_physical_memory_range,
-    unprotect_physical_memory_range,
-};
 use crate::state::{
     HekiState, KexecMemoryMetadata, KexecMemoryRange, MemoryContainer, ModuleMemory,
     ModuleMemoryMetadata, read_vtl0_contiguous,
@@ -29,18 +25,16 @@ use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
     HekiKdataType, HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, KEXEC_SEGMENT_MAX, Kimage,
-    MemAttr, ModMemType, PAGE_SHIFT, PAGE_SIZE, VsmError, VsmPlatform, mod_mem_type_to_mem_attr,
+    MAX_CORES, MemAttr, ModMemType, PAGE_SHIFT, PAGE_SIZE, PRK_LEN, ReservationStatus, VsmError,
+    VsmPlatform, mod_mem_type_to_mem_attr,
 };
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, PhysFrame, Size4KiB},
+    structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use x509_cert::{Certificate, der::Decode};
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 use zeroize::Zeroizing;
-
-/// Length of the Platform Root Key in bytes (matches the platform's `PRK_LEN`).
-const PRK_LEN: usize = 32;
 
 // For now, we do not validate large kernel modules due to the VTL1's memory size limitation.
 const MODULE_VALIDATION_MAX_SIZE: usize = 64 * 1024 * 1024;
@@ -75,11 +69,10 @@ pub fn mshv_vsm_boot_aps<P: VsmPlatform>(
         .and_then(|pa| PhysAddr::try_new(pa).ok())
         .ok_or(VsmError::InvalidPhysicalAddress)?;
 
-    // Read the whole page holding the VTL0 cpu_online_mask and iterate its set bits.
-    // PHASE2-TODO(lock-regs): the original stored the parsed `CpuMask` in a `CPU_ONLINE_MASK`
-    // static for later per-CPU use; that state is platform-owned and deferred, so it is not
-    // retained here.
-    let mut mask_bytes = vec![0u8; PAGE_SIZE];
+    // Read the fixed-size VTL0 cpu_online_mask (MAX_CORES bits) and iterate its
+    // set bits. Only the mask's own bytes are honored; bits beyond MAX_CORES are
+    // outside the ABI and must not drive AP-boot hypercalls.
+    let mut mask_bytes = [0u8; MAX_CORES.div_ceil(8)];
     read_vtl0_contiguous(
         platform,
         cpu_online_mask_page_addr.as_u64(),
@@ -165,8 +158,7 @@ pub fn mshv_vsm_protect_memory<P: VsmPlatform>(
                 continue;
             }
 
-            protect_physical_memory_range(
-                platform,
+            platform.protect_frame(
                 PhysFrame::range(
                     // `HekiRange::is_valid` already validated both physical addresses.
                     PhysFrame::containing_address(PhysAddr::new(pa)),
@@ -305,8 +297,7 @@ pub fn mshv_vsm_load_kdata<P: VsmPlatform>(
     // fails, letting kdata load proceed so that heki is not broken.
     if !kexec_trampoline_insert_failed {
         for kexec_trampoline_range in &kexec_trampoline_metadata {
-            protect_physical_memory_range(
-                platform,
+            platform.protect_frame(
                 kexec_trampoline_range.phys_frame_range,
                 MemAttr::MEM_ATTR_READ,
             )?;
@@ -415,77 +406,80 @@ pub fn mshv_vsm_validate_guest_module<P: VsmPlatform>(
     }
 
     // Reject overlap and reserve this module's frames. Legitimate module frames are never shared.
-    let mut frame_guard = FrameReservation::new(platform);
-    let _ = frame_guard.reserve(module_memory_metadata.iter().map(|r| r.phys_frame_range))?;
-
-    // Freeze frames that require immutable copy/validation to avoid TOCTOU.
-    for mod_mem_range in &module_memory_metadata {
-        if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type).contains(MemAttr::MEM_ATTR_WRITE) {
-            protect_physical_memory_range(
-                platform,
-                mod_mem_range.phys_frame_range,
-                MemAttr::MEM_ATTR_READ,
-            )?;
+    // The reserve + freeze + validate + promote + patch-commit sequence runs transactionally: the
+    // platform reserves `initial`, commits on `Ok`, and rolls back (unprotecting every newly
+    // reserved range) on `Err` — preserving the original `FrameReservation`/`commit`/drop semantics.
+    let initial: Vec<PhysFrameRange<Size4KiB>> = module_memory_metadata
+        .iter()
+        .map(|r| r.phys_frame_range)
+        .collect();
+    platform.protect_frames_transactionally(&initial, &mut |txn| {
+        // Freeze frames that require immutable copy/validation to avoid TOCTOU.
+        for mod_mem_range in &module_memory_metadata {
+            if !mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type)
+                .contains(MemAttr::MEM_ATTR_WRITE)
+            {
+                txn.protect(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+            }
         }
-    }
 
-    module_as_elf
-        .write_bytes_from_heki_range(platform)
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-    patch_info_for_module
-        .write_bytes_from_heki_range(platform)
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-    module_in_memory
-        .write_bytes_from_heki_range(platform)
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-    let elf_size = (module_as_elf[..]).len();
-    if elf_size > MODULE_VALIDATION_MAX_SIZE {
-        return Err(VsmError::ModuleElfSizeExceeded {
-            size: elf_size,
-            max: MODULE_VALIDATION_MAX_SIZE,
-        });
-    }
-
-    let original_elf_data = &module_as_elf[..];
-
-    #[cfg(debug_assertions)]
-    parse_modinfo(original_elf_data).map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-    verify_kernel_module_signature(original_elf_data, certs)?;
-
-    if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)
-        .map_err(|_| VsmError::Vtl0CopyFailed)?
-    {
-        return Err(VsmError::ModuleRelocationInvalid);
-    }
-
-    // Both read-only and executable frames have been frozen above.
-    // Thus, only promote executable frames to RX.
-    for mod_mem_range in &module_memory_metadata {
-        if matches!(
-            mod_mem_range.mod_mem_type,
-            ModMemType::Text | ModMemType::InitText
-        ) {
-            protect_physical_memory_range(
-                platform,
-                mod_mem_range.phys_frame_range,
-                mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
-            )?;
-        }
-    }
-
-    // Commit the module's pre-computed patch data (transactional).
-    if !patch_info_for_module.is_empty() {
-        let patch_info_buf = &patch_info_for_module[..];
-        state
-            .precomputed_patches
-            .insert_patch_data_from_bytes(patch_info_buf, Some(&mut module_memory_metadata))
+        module_as_elf
+            .write_bytes_from_heki_range(platform)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
-    }
+        patch_info_for_module
+            .write_bytes_from_heki_range(platform)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        module_in_memory
+            .write_bytes_from_heki_range(platform)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
 
-    // Fully validated and committed: disarm the guard and register the module.
-    frame_guard.commit();
+        let elf_size = (module_as_elf[..]).len();
+        if elf_size > MODULE_VALIDATION_MAX_SIZE {
+            return Err(VsmError::ModuleElfSizeExceeded {
+                size: elf_size,
+                max: MODULE_VALIDATION_MAX_SIZE,
+            });
+        }
+
+        let original_elf_data = &module_as_elf[..];
+
+        #[cfg(debug_assertions)]
+        parse_modinfo(original_elf_data).map_err(|_| VsmError::Vtl0CopyFailed)?;
+
+        verify_kernel_module_signature(original_elf_data, certs)?;
+
+        if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?
+        {
+            return Err(VsmError::ModuleRelocationInvalid);
+        }
+
+        // Both read-only and executable frames have been frozen above.
+        // Thus, only promote executable frames to RX.
+        for mod_mem_range in &module_memory_metadata {
+            if matches!(
+                mod_mem_range.mod_mem_type,
+                ModMemType::Text | ModMemType::InitText
+            ) {
+                txn.protect(
+                    mod_mem_range.phys_frame_range,
+                    mod_mem_type_to_mem_attr(mod_mem_range.mod_mem_type),
+                )?;
+            }
+        }
+
+        // Commit the module's pre-computed patch data (transactional).
+        if !patch_info_for_module.is_empty() {
+            let patch_info_buf = &patch_info_for_module[..];
+            state
+                .precomputed_patches
+                .insert_patch_data_from_bytes(patch_info_buf, Some(&mut module_memory_metadata))
+                .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        }
+        Ok(())
+    })?;
+
+    // Fully validated and committed: register the module.
     // register the module memory in the global map and obtain a unique token for it
     let token = state
         .module_memory_metadata
@@ -513,15 +507,11 @@ pub fn mshv_vsm_free_guest_module_init<P: VsmPlatform>(
         for mod_mem_range in entry.iter_mem_ranges() {
             let range_result = match mod_mem_range.mod_mem_type {
                 ModMemType::InitText | ModMemType::InitData | ModMemType::InitRoData => {
-                    unprotect_physical_memory_range(platform, mod_mem_range.phys_frame_range)
+                    platform.unprotect_frames(mod_mem_range.phys_frame_range)
                 }
                 ModMemType::RoAfterInit => {
                     // make this memory range read-only after initialization
-                    protect_physical_memory_range(
-                        platform,
-                        mod_mem_range.phys_frame_range,
-                        MemAttr::MEM_ATTR_READ,
-                    )
+                    platform.protect_frame(mod_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)
                 }
                 _ => Ok(()),
             };
@@ -561,7 +551,7 @@ pub fn mshv_vsm_unload_guest_module<P: VsmPlatform>(
 
     if let Some(entry) = state.module_memory_metadata.iter_entry(token) {
         for mod_mem_range in entry.iter_mem_ranges() {
-            unprotect_physical_memory_range(platform, mod_mem_range.phys_frame_range)?;
+            platform.unprotect_frames(mod_mem_range.phys_frame_range)?;
         }
     }
 
@@ -607,7 +597,7 @@ pub fn mshv_vsm_kexec_validate<P: VsmPlatform>(
 
     // invalidate (i.e., remove protection and clear) the kexec memory ranges which were loaded in the past
     for old_kexec_mem_range in kexec_metadata_ref.iter_guarded().iter_mem_ranges() {
-        unprotect_physical_memory_range(platform, old_kexec_mem_range.phys_frame_range)?;
+        platform.unprotect_frames(old_kexec_mem_range.phys_frame_range)?;
     }
     kexec_metadata_ref.clear_memory();
 
@@ -648,61 +638,60 @@ pub fn mshv_vsm_kexec_validate<P: VsmPlatform>(
         }
     }
 
-    // Reserve then freeze the protected kexec frames, rejecting overlap with other protected frames.
-    let mut frame_guard = FrameReservation::new(platform);
-    let _ = frame_guard.reserve(kexec_memory_metadata.iter().map(|r| r.phys_frame_range))?;
-    for kexec_mem_range in &kexec_memory_metadata {
-        protect_physical_memory_range(
-            platform,
-            kexec_mem_range.phys_frame_range,
-            MemAttr::MEM_ATTR_READ,
-        )?;
-    }
-
-    kexec_image
-        .write_bytes_from_heki_range(platform)
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-    kexec_kernel_blob
-        .write_bytes_from_heki_range(platform)
-        .map_err(|_| VsmError::Vtl0CopyFailed)?;
-
-    // If this function is called for crash kexec, we protect its kimage segments as well.
-    if is_crash {
-        let kimage = Kimage::read_from_bytes(&kexec_image[..core::mem::size_of::<Kimage>()])
-            .map_err(|_| VsmError::KexecImageSegmentsInvalid)?;
-        if kimage.nr_segments > KEXEC_SEGMENT_MAX as u64 {
-            return Err(VsmError::KexecImageSegmentsInvalid);
+    // Reserve then freeze the protected kexec frames, rejecting overlap with VTL1 or other
+    // protected frames. The reserve/protect (incl. the mid-flow segment reserve for crash kexec),
+    // blob copy, and signature check run transactionally: commit on `Ok`, rollback on `Err`.
+    let initial: Vec<PhysFrameRange<Size4KiB>> = kexec_memory_metadata
+        .iter()
+        .map(|r| r.phys_frame_range)
+        .collect();
+    platform.protect_frames_transactionally(&initial, &mut |txn| {
+        for kexec_mem_range in &kexec_memory_metadata {
+            txn.protect(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
         }
-        let mut segment_ranges = Vec::new();
-        for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
-            let va = kimage.segment[i].buf;
-            let pa = kimage.segment[i].mem;
-            if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
-                segment_ranges.push(KexecMemoryRange::new(va, pa, epa)?);
-            } else {
-                return Err(VsmError::KexecSegmentRangeInvalid);
+
+        kexec_image
+            .write_bytes_from_heki_range(platform)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        kexec_kernel_blob
+            .write_bytes_from_heki_range(platform)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+
+        // If this function is called for crash kexec, we protect its kimage segments as well.
+        if is_crash {
+            let kimage = Kimage::read_from_bytes(&kexec_image[..core::mem::size_of::<Kimage>()])
+                .map_err(|_| VsmError::KexecImageSegmentsInvalid)?;
+            if kimage.nr_segments > KEXEC_SEGMENT_MAX as u64 {
+                return Err(VsmError::KexecImageSegmentsInvalid);
+            }
+            let mut segment_ranges = Vec::new();
+            for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
+                let va = kimage.segment[i].buf;
+                let pa = kimage.segment[i].mem;
+                if let Some(epa) = pa.checked_add(kimage.segment[i].memsz) {
+                    segment_ranges.push(KexecMemoryRange::new(va, pa, epa)?);
+                } else {
+                    return Err(VsmError::KexecSegmentRangeInvalid);
+                }
+            }
+            let segment_frame_ranges: Vec<PhysFrameRange<Size4KiB>> =
+                segment_ranges.iter().map(|r| r.phys_frame_range).collect();
+            let reservation_statuses = txn.reserve(&segment_frame_ranges)?;
+            for (segment_range, status) in segment_ranges.into_iter().zip(reservation_statuses) {
+                if status == ReservationStatus::New {
+                    txn.protect(segment_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
+                    kexec_memory_metadata.insert_memory_range(segment_range);
+                }
             }
         }
-        let reservation_statuses =
-            frame_guard.reserve(segment_ranges.iter().map(|r| r.phys_frame_range))?;
-        for (segment_range, status) in segment_ranges.into_iter().zip(reservation_statuses) {
-            if status == ReservationStatus::New {
-                protect_physical_memory_range(
-                    platform,
-                    segment_range.phys_frame_range,
-                    MemAttr::MEM_ATTR_READ,
-                )?;
-                kexec_memory_metadata.insert_memory_range(segment_range);
-            }
+
+        // verify the signature of the kexec blob
+        if let Err(result) = verify_kernel_pe_signature(&kexec_kernel_blob[..], certs) {
+            return Err(VsmError::SignatureVerificationFailed(result));
         }
-    }
+        Ok(())
+    })?;
 
-    // verify the signature of the kexec blob
-    if let Err(result) = verify_kernel_pe_signature(&kexec_kernel_blob[..], certs) {
-        return Err(VsmError::SignatureVerificationFailed(result));
-    }
-
-    frame_guard.commit();
     // register the protected kexec memory ranges to support possible invalidation in the future
     kexec_metadata_ref.register_memory(kexec_memory_metadata);
 
@@ -882,7 +871,7 @@ pub fn mshv_vsm_allocate_ringbuffer_memory<P: VsmPlatform>(
         PhysFrame::from_start_address(phys_addr).map_err(|_| VsmError::AddressNotPageAligned)?,
         PhysFrame::from_start_address(end).map_err(|_| VsmError::AddressNotPageAligned)?,
     );
-    protect_physical_memory_range(platform, frame_range, MemAttr::MEM_ATTR_READ)?;
+    platform.protect_frame(frame_range, MemAttr::MEM_ATTR_READ)?;
     platform.install_ringbuffer(phys_addr.as_u64(), size)?;
     log::debug!("VSM: Ring buffer allocated");
     Ok(0)
@@ -908,7 +897,7 @@ pub fn mshv_vsm_set_platform_root_key<P: VsmPlatform>(
     let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
     read_vtl0_contiguous(platform, key_pa.as_u64(), &mut *keybuf)
         .map_err(|_| VsmError::Vtl0CopyFailed)?;
-    platform.set_platform_root_key(&*keybuf);
+    platform.set_platform_root_key(&keybuf);
     Ok(0)
 }
 

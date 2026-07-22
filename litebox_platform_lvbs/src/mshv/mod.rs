@@ -249,7 +249,7 @@ pub const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
 pub const DEFAULT_REG_PIN_MASK: u64 = u64::MAX;
 
 bitflags::bitflags! {
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone, Copy)]
     pub struct HvPageProtFlags: u8 {
         const HV_PAGE_ACCESS_NONE = 0x0;
         const HV_PAGE_READABLE = 0x1;

@@ -10,6 +10,9 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
@@ -24,6 +27,13 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const PAGE_SHIFT: usize = 12;
+
+/// Length of the Platform Root Key in bytes.
+pub const PRK_LEN: usize = 32;
+
+/// Maximum number of CPU cores addressable through the VTL0 `cpu_online_mask`
+/// ABI. Bounds how many bits of the mask VTL1 will honor when booting APs.
+pub const MAX_CORES: usize = 128;
 
 /// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
@@ -875,16 +885,29 @@ pub trait VsmPlatform {
         bytes: &[u8],
     ) -> Result<(), VsmError>;
 
-    // --- Hypercalls --------------------------------------------------------
+    // --- Frame protection --------------------------------------------------
+    // The platform owns the protected-frame registry (mutual exclusion against
+    // writable VTL0 mappings) and VTL1 self-protection. The service drives VTL0
+    // frame protection through these trait methods.
 
-    /// Set VTL0's allowed access mask on a physical frame range
-    /// (`HVCALL_MODIFY_VTL_PROTECTION_MASK`). The platform converts `attr` to
-    /// its hypervisor page-protection flags and flushes VTL1 TLBs as needed.
-    fn modify_vtl0_protection(
+    /// Protect a single VTL0 physical frame range with `attr`, outside any
+    /// transaction (no rollback). For forward protects on frames that are not
+    /// part of a reserve/commit flow.
+    fn protect_frame(&self, range: PhysFrameRange<Size4KiB>, attr: MemAttr)
+    -> Result<(), VsmError>;
+
+    /// Unprotect (release) a previously protected/committed VTL0 physical frame
+    /// range, returning it to VTL0's control. Standalone — not part of any
+    /// transaction.
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError>;
+
+    /// Reserve `initial` frames, run `f` (which may reserve/protect more via the
+    /// [`FrameTxn`] handle), then commit on `Ok` or roll back on `Err`.
+    fn protect_frames_transactionally(
         &self,
-        range: PhysFrameRange<Size4KiB>,
-        attr: MemAttr,
-    ) -> Result<(), HypervCallError>;
+        initial: &[PhysFrameRange<Size4KiB>],
+        f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
+    ) -> Result<(), VsmError>;
 
     /// Enable VTL1 for an application processor and boot it into the VTL1 entry
     /// point (`HVCALL_ENABLE_VP_VTL`).
@@ -896,5 +919,31 @@ pub trait VsmPlatform {
     fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError>;
 
     /// Store the platform root key.
-    fn set_platform_root_key(&self, key: &[u8]);
+    fn set_platform_root_key(&self, key: &[u8; PRK_LEN]);
+}
+
+/// Outcome of reserving a physical frame range within a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationStatus {
+    /// The range was newly reserved by this transaction.
+    New,
+    /// The range was already owned by the protected-frame registry.
+    AlreadyOwned,
+}
+
+/// Restricted handle handed to a [`VsmPlatform::protect_frames_transactionally`]
+/// closure.
+///
+/// The only way to reserve/protect frames within a transaction; the concrete
+/// reservation guard stays private in the platform.
+pub trait FrameTxn {
+    /// Reserve the given physical frame ranges within this transaction,
+    /// returning the reservation status of each range.
+    fn reserve(
+        &mut self,
+        ranges: &[PhysFrameRange<Size4KiB>],
+    ) -> Result<Vec<ReservationStatus>, VsmError>;
+
+    /// Apply the given memory attributes to a reserved physical frame range.
+    fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError>;
 }

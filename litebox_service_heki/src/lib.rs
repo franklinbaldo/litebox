@@ -14,11 +14,10 @@
 extern crate alloc;
 
 pub mod mem_integrity;
-pub mod registry;
 pub mod state;
 pub mod vsm;
 
-pub use registry::ReservationStatus;
+pub use litebox_common_lvbs::ReservationStatus;
 pub use state::HekiState;
 pub use vsm::{
     ValidatedTextPatch, mshv_vsm_allocate_ringbuffer_memory, mshv_vsm_boot_aps,
