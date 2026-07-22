@@ -6,7 +6,7 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use crate::host::per_cpu_variables::PerCpuVariablesAsm;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -46,21 +46,15 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
-/// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
-/// the mapping's lifetime.
+/// Mapping metadata.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    protected_frame_access: Option<crate::mshv::vsm::ProtectedFrameAccessGuard<'static>>,
 }
 
 impl LvbsPhysPageMapInfo {
     fn new(base: *mut u8, size: usize) -> Self {
-        Self {
-            base,
-            size,
-            protected_frame_access: None,
-        }
+        Self { base, size }
     }
 }
 
@@ -389,7 +383,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_kernel_info: Vtl0KernelInfo,
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -622,7 +615,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(base_pt),
             vtl1_phys_frame_range: vtl1_range,
-            vtl0_kernel_info: Vtl0KernelInfo::new(),
         }))
     }
 
@@ -1115,18 +1107,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
-        let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
-            // but does not support re-entry into a VTL protection change.
-            Some(crate::mshv::vsm::protected_frame_registry().acquire_access_guard(pages)?)
-        } else {
-            None
-        };
-        // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
-        // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
-        // shared raw mapping implementation.
-        let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
-        map_info.protected_frame_access = protected_frame_access;
+        // SAFETY: `vmap_privileged` provides the shared raw mapping implementation;
+        // `validate_unowned` (invoked below) rejects VTL1-owned frames.
+        let map_info = unsafe { self.vmap_privileged(pages, perms)? };
         Ok(map_info)
     }
 
@@ -1284,13 +1267,14 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
 
         let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 needs writable access, so deny VTL0 all access.
-            crate::mshv::heki::MemAttr::empty()
+            litebox_common_lvbs::MemAttr::empty()
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            crate::mshv::heki::MemAttr::MEM_ATTR_READ | crate::mshv::heki::MemAttr::MEM_ATTR_EXEC
+            litebox_common_lvbs::MemAttr::MEM_ATTR_READ
+                | litebox_common_lvbs::MemAttr::MEM_ATTR_EXEC
         } else {
             // VTL1 no longer protects the pages.
-            crate::mshv::heki::MemAttr::all()
+            litebox_common_lvbs::MemAttr::all()
         };
 
         for range in range_set.iter() {
@@ -1298,7 +1282,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
             );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            crate::mshv::vsm_platform::modify_vtl0_protection(frame_range, mem_attr)
                 .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }
 

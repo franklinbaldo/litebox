@@ -3,8 +3,9 @@
 
 //! Error types for VSM operations
 
-use crate::mshv::{hvcall::HypervCallError, mem_integrity::VerificationError};
+use crate::mshv::hvcall::HypervCallError;
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::VerificationError;
 use thiserror::Error;
 
 /// Errors for Virtual Secure Mode (VSM) operations.

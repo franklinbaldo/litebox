@@ -24,7 +24,6 @@ use litebox_platform_lvbs::{
     mm::MemoryProvider,
     mshv::{
         NUM_VTLCALL_PARAMS, VsmFunction, hvcall,
-        vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
@@ -256,6 +255,86 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             optee_smc_handler_entry(smc_args_pfn)
         }
         _ => vsm_dispatch(func_id, &params[1..]),
+    }
+}
+
+/// The single long-lived HEKI/VSM service state, owned by the runner (the VSM
+/// composition root). Initialized on first use.
+static HEKI_STATE: spin::Once<litebox_service_heki::HekiState> = spin::Once::new();
+
+/// Returns the process-wide [`litebox_service_heki::HekiState`], initializing it
+/// on first access.
+fn heki_state() -> &'static litebox_service_heki::HekiState {
+    HEKI_STATE.call_once(litebox_service_heki::HekiState::new)
+}
+
+/// Dispatch a VSM function to its handler and return the result.
+///
+/// HEKI/VSM policy is delegated to `litebox_service_heki` over the
+/// [`litebox_common_lvbs::VsmPlatform`] adapter (`LvbsVsmPlatform`); the
+/// platform-owned control-register lock stays in `litebox_platform_lvbs`. The
+/// end-of-boot policy is enforced here against the runner-owned `HekiState`.
+fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
+    use litebox_common_lvbs::VsmError;
+    use litebox_platform_lvbs::mshv::vsm_platform::LvbsVsmPlatform;
+
+    let platform = LvbsVsmPlatform;
+    let state = heki_state();
+    let result: Result<i64, VsmError> = match func_id {
+        VsmFunction::EnableAPsVtl => litebox_service_heki::mshv_vsm_enable_aps(params[0]),
+        VsmFunction::BootAPs => litebox_service_heki::mshv_vsm_boot_aps(&platform, params[0]),
+        VsmFunction::LockRegs => {
+            if state.check_end_of_boot() {
+                Err(VsmError::OperationAfterEndOfBoot(
+                    "control register locking",
+                ))
+            } else {
+                litebox_platform_lvbs::mshv::vsm::mshv_vsm_lock_regs()
+            }
+        }
+        VsmFunction::SignalEndOfBoot => Ok(litebox_service_heki::mshv_vsm_end_of_boot(state)),
+        VsmFunction::ProtectMemory => {
+            litebox_service_heki::mshv_vsm_protect_memory(&platform, state, params[0], params[1])
+        }
+        VsmFunction::LoadKData => {
+            litebox_service_heki::mshv_vsm_load_kdata(&platform, state, params[0], params[1])
+        }
+        VsmFunction::ValidateModule => litebox_service_heki::mshv_vsm_validate_guest_module(
+            &platform, state, params[0], params[1], params[2],
+        ),
+        #[allow(clippy::cast_possible_wrap)]
+        VsmFunction::FreeModuleInit => litebox_service_heki::mshv_vsm_free_guest_module_init(
+            &platform,
+            state,
+            params[0] as i64,
+        ),
+        #[allow(clippy::cast_possible_wrap)]
+        VsmFunction::UnloadModule => {
+            litebox_service_heki::mshv_vsm_unload_guest_module(&platform, state, params[0] as i64)
+        }
+        VsmFunction::CopySecondaryKey => {
+            litebox_service_heki::mshv_vsm_copy_secondary_key(params[0], params[1])
+        }
+        VsmFunction::KexecValidate => litebox_service_heki::mshv_vsm_kexec_validate(
+            &platform, state, params[0], params[1], params[2],
+        ),
+        VsmFunction::PatchText => {
+            litebox_service_heki::mshv_vsm_patch_text(&platform, state, params[0], params[1])
+        }
+        VsmFunction::AllocateRingbufferMemory => {
+            let size: usize = params[1].trunc();
+            litebox_service_heki::mshv_vsm_allocate_ringbuffer_memory(
+                &platform, state, params[0], size,
+            )
+        }
+        VsmFunction::SetPlatformRootKey => {
+            litebox_service_heki::mshv_vsm_set_platform_root_key(&platform, state, params[0])
+        }
+        VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+    };
+    match result {
+        Ok(value) => value,
+        Err(e) => Errno::from(e).as_neg().into(),
     }
 }
 

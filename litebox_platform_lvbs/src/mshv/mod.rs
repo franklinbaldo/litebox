@@ -4,14 +4,13 @@
 //! Hyper-V-specific code
 
 pub mod error;
-pub(crate) mod heki;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
-mod mem_integrity;
 pub(crate) mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;
+pub mod vsm_platform;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
