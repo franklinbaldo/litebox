@@ -408,7 +408,7 @@ pub fn mshv_vsm_validate_guest_module<P: VsmPlatform>(
     // Reject overlap and reserve this module's frames. Legitimate module frames are never shared.
     // The reserve + freeze + validate + promote + patch-commit sequence runs transactionally: the
     // platform reserves `initial`, commits on `Ok`, and rolls back (unprotecting every newly
-    // reserved range) on `Err` — preserving the original `FrameReservation`/`commit`/drop semantics.
+    // reserved range) on `Err`.
     let initial: Vec<PhysFrameRange<Size4KiB>> = module_memory_metadata
         .iter()
         .map(|r| r.phys_frame_range)

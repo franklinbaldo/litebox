@@ -31,8 +31,7 @@ use x509_cert::Certificate;
 
 /// Read `out.len()` bytes from a contiguous VTL0 physical-memory span starting
 /// at `phys_addr`, into `out`. The span may cross page boundaries; the covered
-/// pages are assumed to be physically contiguous (as the original
-/// `with_contiguous_pages` mapping required).
+/// pages are required to be physically contiguous.
 pub(crate) fn read_vtl0_contiguous<P: VsmPlatform>(
     platform: &P,
     phys_addr: u64,

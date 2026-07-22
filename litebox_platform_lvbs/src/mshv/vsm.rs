@@ -3,11 +3,11 @@
 
 //! Platform-side VSM bring-up and control-register locking.
 //!
-//! The VSM/HEKI policy and handlers now live in `litebox_service_heki` over the
-//! [`litebox_common_lvbs::VsmPlatform`] trait. What remains here is the
-//! platform-only bring-up (partition/VTL0 secure configuration, VTL1
-//! self-protection) and the control-register lock code, which reach hardware
-//! state that is unavoidably platform-owned.
+//! Holds the platform-only VSM operations: partition and VTL0 secure
+//! configuration, VTL1 self-protection, and the control-register lock code.
+//! These reach hardware state that is platform-owned. VSM/HEKI policy and
+//! handlers live in `litebox_service_heki` and drive the platform through the
+//! [`litebox_common_lvbs::VsmPlatform`] trait.
 
 use crate::{
     debug_serial_println,
@@ -258,11 +258,10 @@ pub(crate) fn protect_vtl1_physical_memory_range(
 // authority over which VTL0 frames are non-writable or reserved by in-flight
 // module/kexec validation. Ordinary writable foreign mappings acquire a shared
 // access guard (see `LvbsPhysPageMapInfo` and `vmap`) so a concurrent VTL
-// protection change cannot alias a writable VTL0 mapping (CR-01 TOCTOU fix).
+// protection change cannot alias a writable VTL0 mapping.
 //
 // The registry is driven by the VSM/HEKI service through the `VsmPlatform` trait,
-// so its public surface speaks the common wire error type
-// (`VsmError`) rather than the platform-internal one.
+// so its public surface speaks the common wire error type `VsmError`.
 
 use litebox_common_lvbs::VsmError;
 
