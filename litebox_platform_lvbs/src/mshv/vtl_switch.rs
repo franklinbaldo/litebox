@@ -10,11 +10,12 @@ use crate::host::{
 use crate::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
     NUM_VTLCALL_PARAMS, VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL,
-    VTL_ENTRY_REASON_RESERVED, error::VsmError, hvcall_vp::hvcall_get_vp_registers,
+    VTL_ENTRY_REASON_RESERVED, hvcall_vp::hvcall_get_vp_registers, vsm::common_hypercall_failed,
     vsm_intercept::vsm_handle_intercept,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
+use litebox_common_lvbs::VsmError;
 use num_enum::TryFromPrimitive;
 
 /// Bitmask of VPs currently executing VTL1 code.
@@ -395,7 +396,7 @@ enum VtlEntryReason {
 
 pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
     let value = hvcall_get_vp_registers(HV_REGISTER_VSM_CODEPAGE_OFFSETS)
-        .map_err(VsmError::HypercallFailed)?;
+        .map_err(common_hypercall_failed)?;
     let code_page_offsets = HvRegisterVsmCodePageOffsets::from_u64(value);
     let hvcall_page: usize = hv_hypercall_page_address().trunc();
     let vtl_return_address = hvcall_page

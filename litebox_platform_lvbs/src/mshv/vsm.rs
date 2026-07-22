@@ -21,7 +21,6 @@ use crate::{
         HV_X64_REGISTER_SYSENTER_EIP, HV_X64_REGISTER_SYSENTER_ESP, HvCrInterceptControlFlags,
         HvPageProtFlags, HvRegisterVsmPartitionConfig, HvRegisterVsmVpSecureVtlConfig, X86Cr0Flags,
         X86Cr4Flags,
-        error::VsmError,
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers},
@@ -89,7 +88,7 @@ pub fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
     config.set_tlb_locked(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, config.as_u64())
-        .map_err(VsmError::HypercallFailed)?;
+        .map_err(common_hypercall_failed)?;
 
     Ok(0)
 }
@@ -103,7 +102,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
     config.set_enable_vtl_protection(true);
 
     hvcall_set_vp_registers(HV_REGISTER_VSM_PARTITION_CONFIG, config.as_u64())
-        .map_err(VsmError::HypercallFailed)?;
+        .map_err(common_hypercall_failed)?;
 
     Ok(0)
 }
@@ -115,10 +114,7 @@ pub fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 ///
 /// Returns the common wire error type so the runner can uniformly combine this
 /// platform-owned operation with the `litebox_service_heki` handlers.
-pub fn mshv_vsm_lock_regs() -> Result<i64, litebox_common_lvbs::VsmError> {
-    use crate::mshv::vsm_platform::to_common_hvcall_err;
-    let hvcall_failed = |e| litebox_common_lvbs::VsmError::HypercallFailed(to_common_hvcall_err(e));
-
+pub fn mshv_vsm_lock_regs() -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
 
     let flag = HvCrInterceptControlFlags::CR0_WRITE.bits()
@@ -137,21 +133,22 @@ pub fn mshv_vsm_lock_regs() -> Result<i64, litebox_common_lvbs::VsmError> {
         | HvCrInterceptControlFlags::MSR_SYSENTER_EIP_WRITE.bits()
         | HvCrInterceptControlFlags::MSR_SFMASK_WRITE.bits();
 
-    save_vtl0_locked_regs().map_err(hvcall_failed)?;
+    save_vtl0_locked_regs().map_err(common_hypercall_failed)?;
 
-    hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag).map_err(hvcall_failed)?;
+    hvcall_set_vp_registers(HV_REGISTER_CR_INTERCEPT_CONTROL, flag)
+        .map_err(common_hypercall_failed)?;
 
     hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR4_MASK,
         X86Cr4Flags::CR4_PIN_MASK.bits().into(),
     )
-    .map_err(hvcall_failed)?;
+    .map_err(common_hypercall_failed)?;
 
     hvcall_set_vp_registers(
         HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         X86Cr0Flags::CR0_PIN_MASK.bits().into(),
     )
-    .map_err(hvcall_failed)?;
+    .map_err(common_hypercall_failed)?;
 
     Ok(0)
 }
@@ -250,7 +247,7 @@ pub(crate) fn protect_vtl1_physical_memory_range(
     let num_pages = phys_frame_range.count() as u64;
     if num_pages > 0 {
         hv_modify_vtl_protection_mask(pa, num_pages, HvPageProtFlags::HV_PAGE_ACCESS_NONE)
-            .map_err(VsmError::HypercallFailed)?;
+            .map_err(common_hypercall_failed)?;
     }
     Ok(())
 }
@@ -265,13 +262,13 @@ pub(crate) fn protect_vtl1_physical_memory_range(
 //
 // The registry is driven by the VSM/HEKI service through the `VsmPlatform` trait,
 // so its public surface speaks the common wire error type
-// (`litebox_common_lvbs::VsmError`) rather than the platform-internal one.
+// (`VsmError`) rather than the platform-internal one.
 
-use litebox_common_lvbs::VsmError as CommonVsmError;
+use litebox_common_lvbs::VsmError;
 
 /// Convert a platform hypercall error into a common `VsmError::HypercallFailed`.
-fn common_hypercall_failed(e: crate::mshv::hvcall::HypervCallError) -> CommonVsmError {
-    CommonVsmError::HypercallFailed(crate::mshv::vsm_platform::to_common_hvcall_err(e))
+pub(crate) fn common_hypercall_failed(e: crate::mshv::hvcall::HypervCallError) -> VsmError {
+    VsmError::HypercallFailed(crate::mshv::vsm_platform::to_common_hvcall_err(e))
 }
 
 /// RAII reservation over VTL0 physical frames, shared by module load and kexec validation.
@@ -308,12 +305,12 @@ impl FrameReservation {
         owned: &RangeSet<u64>,
         registry: &ProtectedFrameUpdateGuard<'_>,
         range: Range<u64>,
-    ) -> Result<ReservationStatus, CommonVsmError> {
+    ) -> Result<ReservationStatus, VsmError> {
         if owned.gaps(&range).next().is_none() {
             return Ok(ReservationStatus::AlreadyOwned);
         }
         if owned.overlaps(&range) || registry.overlaps(&range) {
-            Err(CommonVsmError::ProtectedFrameOverlap)
+            Err(VsmError::ProtectedFrameOverlap)
         } else {
             Ok(ReservationStatus::New)
         }
@@ -328,7 +325,7 @@ impl FrameReservation {
     pub(crate) fn reserve(
         &mut self,
         frames: impl IntoIterator<Item = PhysFrameRange<Size4KiB>>,
-    ) -> Result<Vec<ReservationStatus>, CommonVsmError> {
+    ) -> Result<Vec<ReservationStatus>, VsmError> {
         let vtl1 = crate::platform_low().vtl1_phys_frame_range();
         let vtl1_start = vtl1.start.start_address().as_u64();
         let vtl1_end = vtl1.end.start_address().as_u64();
@@ -357,7 +354,7 @@ impl FrameReservation {
                 // claims, and any other concurrent reservation's in-flight claims.
                 let range = start..end;
                 let status = if seen.overlaps(&range) || (start < vtl1_end && vtl1_start < end) {
-                    Err(CommonVsmError::ProtectedFrameOverlap)
+                    Err(VsmError::ProtectedFrameOverlap)
                 } else {
                     Self::classify(&owned_before, protected, range.clone())
                 };
@@ -514,7 +511,7 @@ pub(crate) fn protected_frame_registry() -> &'static ProtectedFrameRegistry {
 pub(crate) fn protect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
     page_prot: HvPageProtFlags,
-) -> Result<(), CommonVsmError> {
+) -> Result<(), VsmError> {
     let protect = !page_prot.contains(HvPageProtFlags::HV_PAGE_WRITABLE);
     let vtl1_range = crate::platform_low().vtl1_phys_frame_range();
 
@@ -567,7 +564,7 @@ pub(crate) fn protect_physical_memory_range(
 /// Restore VTL0 read/write access while leaving execution disabled, and removes the registry entry.
 pub(crate) fn unprotect_physical_memory_range(
     phys_frame_range: PhysFrameRange<Size4KiB>,
-) -> Result<(), CommonVsmError> {
+) -> Result<(), VsmError> {
     protect_physical_memory_range(
         phys_frame_range,
         HvPageProtFlags::HV_PAGE_READABLE

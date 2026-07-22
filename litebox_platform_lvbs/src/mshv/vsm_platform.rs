@@ -33,9 +33,9 @@ type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> = super::PrivilegedVtl0Phys
 /// enforcement primitives. Constructed by the runner's VSM dispatcher.
 pub struct LvbsVsmPlatform;
 
-/// Maps a HEKI [`MemAttr`] permission set to the corresponding Hyper-V
-/// page-protection flags.
-pub(crate) fn heki_mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
+/// Maps a [`MemAttr`] permission set (the VsmPlatform permission type) to the
+/// corresponding Hyper-V page-protection flags.
+pub(crate) fn mem_attr_to_hv_page_prot_flags(attr: MemAttr) -> HvPageProtFlags {
     let mut flags = HvPageProtFlags::empty();
     if attr.contains(MemAttr::MEM_ATTR_READ) {
         flags.set(HvPageProtFlags::HV_PAGE_READABLE, true);
@@ -82,7 +82,7 @@ impl FrameTxn for PlatformFrameTxn<'_> {
     }
 
     fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
-        protect_physical_memory_range(range, heki_mem_attr_to_hv_page_prot_flags(attr))
+        protect_physical_memory_range(range, mem_attr_to_hv_page_prot_flags(attr))
     }
 }
 
@@ -116,7 +116,7 @@ impl VsmPlatform for LvbsVsmPlatform {
         range: PhysFrameRange<Size4KiB>,
         attr: MemAttr,
     ) -> Result<(), VsmError> {
-        protect_physical_memory_range(range, heki_mem_attr_to_hv_page_prot_flags(attr))
+        protect_physical_memory_range(range, mem_attr_to_hv_page_prot_flags(attr))
     }
 
     fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
