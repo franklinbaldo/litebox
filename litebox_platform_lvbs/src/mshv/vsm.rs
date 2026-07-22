@@ -340,6 +340,12 @@ impl FrameReservation {
         let vtl1_start = vtl1.start.start_address().as_u64();
         let vtl1_end = vtl1.end.start_address().as_u64();
 
+        // The hypercall is issued *inside* the exclusive registry section on purpose:
+        // applying the VTL0 protection change and recording it in the registry must be
+        // atomic relative to `acquire_access_guard` (which takes the shared lock when
+        // handing out a writable VTL0 mapping). Splitting the hypercall out of the lock
+        // to shorten the spin window would reopen the writable-mapping-vs-protection
+        // TOCTOU. Keep them together.
         protected_frame_registry().with_exclusive(|protected| {
             // Idempotence applies only to ranges owned before this call.
             let owned_before = self.owned_frames.clone();
