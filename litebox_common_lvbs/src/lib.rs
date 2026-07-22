@@ -865,16 +865,8 @@ pub trait VsmPlatform {
     ) -> Result<(), VsmError>;
 
     /// Copy `bytes` into VTL0 physical memory, starting at `offset` within the
-    /// first page of `pages`, honoring VTL0 protection masks.
-    fn write_vtl0_bytes(
-        &self,
-        pages: &[PhysPageAddr<PAGE_SIZE>],
-        offset: usize,
-        bytes: &[u8],
-    ) -> Result<(), VsmError>;
-
-    /// Privileged VTL0 write that bypasses VTL0 protection masks, for HEKI text
-    /// patching and ring-buffer setup where the destination is validated by
+    /// first page of `pages`, bypassing VTL0 protection masks. Used for HEKI
+    /// text patching and ring-buffer setup where the destination is validated by
     /// HEKI policy before the call.
     fn write_vtl0_privileged(
         &self,
@@ -893,18 +885,6 @@ pub trait VsmPlatform {
         range: PhysFrameRange<Size4KiB>,
         attr: MemAttr,
     ) -> Result<(), HypervCallError>;
-
-    /// Read a VTL0 VP register (MSR/CR).
-    fn get_vtl0_register(&self, reg_name: u32) -> Result<u64, HypervCallError>;
-
-    /// Write a VTL0 VP register (MSR/CR).
-    fn set_vtl0_register(&self, reg_name: u32, value: u64) -> Result<u64, HypervCallError>;
-
-    /// Read the current VTL (VTL1) VP register.
-    fn get_vtl1_register(&self, reg_name: u32) -> Result<u64, HypervCallError>;
-
-    /// Write the current VTL (VTL1) VP register.
-    fn set_vtl1_register(&self, reg_name: u32, value: u64) -> Result<u64, HypervCallError>;
 
     /// Enable VTL1 for an application processor and boot it into the VTL1 entry
     /// point (`HVCALL_ENABLE_VP_VTL`).
