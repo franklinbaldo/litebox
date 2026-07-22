@@ -80,7 +80,10 @@ pub fn mshv_vsm_boot_aps<P: VsmPlatform>(
     )
     .map_err(|_| VsmError::CpuOnlineMaskCopyFailed)?;
 
-    // Initialize VTL for each online CPU.
+    // Initialize VTL for each online CPU. Best-effort: attempt every online CPU
+    // and surface the last init failure after the loop, rather than stopping at
+    // the first.
+    let mut error = None;
     for (byte_index, &byte) in mask_bytes.iter().enumerate() {
         if byte == 0 {
             continue;
@@ -89,11 +92,15 @@ pub fn mshv_vsm_boot_aps<P: VsmPlatform>(
             if byte & (1 << bit) != 0 {
                 let byte_index: u32 = byte_index.trunc();
                 let cpu_id: u32 = byte_index * 8 + bit;
-                platform
-                    .init_vtl_ap(cpu_id)
-                    .map_err(VsmError::ApInitFailed)?;
+                if let Err(e) = platform.init_vtl_ap(cpu_id) {
+                    error = Some(e);
+                }
             }
         }
+    }
+
+    if let Some(e) = error {
+        return Err(VsmError::ApInitFailed(e));
     }
 
     Ok(0)
