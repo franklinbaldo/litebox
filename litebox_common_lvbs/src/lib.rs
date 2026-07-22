@@ -13,11 +13,12 @@
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::vmap::PhysPageAddr;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, Size4KiB},
+    structures::paging::{PageSize, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
@@ -834,4 +835,86 @@ impl HekiKernelInfo {
             })
         }
     }
+}
+
+/// The hypervisor and platform primitives the VSM/HEKI service runs on.
+///
+/// Implemented by the platform (Hyper-V today; a KVM implementation is
+/// theoretically possible). The VSM layer expresses secure-mode operations —
+/// AP boot, VTL0 frame protection, control-register locking — in terms of these
+/// primitives, and HEKI verification/policy sits on top of VSM
+/// (`hypercall → vsm → heki`).
+///
+/// The interface is three things: raw hypercalls, VTL0 physical-memory access,
+/// and a few platform-state hooks (log ring buffer, platform root key) that are
+/// unavoidably platform-owned. VTL1 self-protection is enforced by the platform
+/// inside the memory-access methods and is not exposed here.
+pub trait VsmPlatform {
+    // --- VTL0 physical-memory access ---------------------------------------
+    // The platform maps the VTL0 frame(s) into VTL1, copies, and unmaps, always
+    // enforcing VTL1 self-protection. The service serializes writable access
+    // against its protected-frame registry.
+
+    /// Copy `out.len()` bytes out of VTL0 physical memory, starting at `offset`
+    /// within the first page of `pages`, into `out`.
+    fn read_vtl0_bytes(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<(), VsmError>;
+
+    /// Copy `bytes` into VTL0 physical memory, starting at `offset` within the
+    /// first page of `pages`, honoring VTL0 protection masks.
+    fn write_vtl0_bytes(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VsmError>;
+
+    /// Privileged VTL0 write that bypasses VTL0 protection masks, for HEKI text
+    /// patching and ring-buffer setup where the destination is validated by
+    /// HEKI policy before the call.
+    fn write_vtl0_privileged(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VsmError>;
+
+    // --- Hypercalls --------------------------------------------------------
+
+    /// Set VTL0's allowed access mask on a physical frame range
+    /// (`HVCALL_MODIFY_VTL_PROTECTION_MASK`). The platform converts `attr` to
+    /// its hypervisor page-protection flags and flushes VTL1 TLBs as needed.
+    fn modify_vtl0_protection(
+        &self,
+        range: PhysFrameRange<Size4KiB>,
+        attr: MemAttr,
+    ) -> Result<(), HypervCallError>;
+
+    /// Read a VTL0 VP register (MSR/CR).
+    fn get_vtl0_register(&self, reg_name: u32) -> Result<u64, HypervCallError>;
+
+    /// Write a VTL0 VP register (MSR/CR).
+    fn set_vtl0_register(&self, reg_name: u32, value: u64) -> Result<u64, HypervCallError>;
+
+    /// Read the current VTL (VTL1) VP register.
+    fn get_vtl1_register(&self, reg_name: u32) -> Result<u64, HypervCallError>;
+
+    /// Write the current VTL (VTL1) VP register.
+    fn set_vtl1_register(&self, reg_name: u32, value: u64) -> Result<u64, HypervCallError>;
+
+    /// Enable VTL1 for an application processor and boot it into the VTL1 entry
+    /// point (`HVCALL_ENABLE_VP_VTL`).
+    fn init_vtl_ap(&self, core: u32) -> Result<u64, HypervCallError>;
+
+    // --- Platform-state hooks (not hypercalls, but platform-owned) ---------
+
+    /// Install a VTL0 physical buffer as the platform's log ring buffer.
+    fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError>;
+
+    /// Store the platform root key.
+    fn set_platform_root_key(&self, key: &[u8]);
 }
