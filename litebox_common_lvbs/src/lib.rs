@@ -8,14 +8,16 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::vmap::PhysPageAddr;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, Size4KiB},
+    structures::paging::{PageSize, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
@@ -839,4 +841,97 @@ impl HekiKernelInfo {
             })
         }
     }
+}
+
+/// The hypervisor and platform primitives the VSM/HEKI service runs on.
+///
+/// Implemented by the platform. The VSM layer expresses secure-mode operations
+/// in terms of these primitives and HEKI verification/policy sits on top of it.
+///
+/// It exposes raw hypercalls, VTL0 physical-memory access, and a few
+/// platform-state hooks for installing the log ring buffer and platform root key.
+///
+/// Note that the platform owns the protected-frame registry (to deal with TOCTOU
+/// and confused deputy) and enforces VTL1 self-protection. It rejects unauthorized
+/// usage of this interface against any VTL1 frames and protected VTL0 frames.
+pub trait VsmBackend {
+    /// Copy `out.len()` bytes out of VTL0 physical memory, starting at `offset`
+    /// within the first page of `pages`, into `out`.
+    fn read_vtl0_bytes(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<(), VsmError>;
+
+    /// Copy `bytes` into VTL0 physical memory, starting at `offset` within the
+    /// first page of `pages`, **bypassing** VTL0 protection masks. Used only
+    /// for HEKI text patching where the destination is validated by HEKI policy.
+    fn write_vtl0_privileged(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VsmError>;
+
+    /// Directly set VTL0 protection on a frame range — no reservation, no
+    /// rollback. Use when the caller already trusts the frame, or is re-protecting
+    /// a frame the registry already owns.
+    fn protect_frame(&self, range: PhysFrameRange<Size4KiB>, attr: MemAttr)
+    -> Result<(), VsmError>;
+
+    /// Release a frame range the registry currently protects, restoring ordinary
+    /// VTL0 access — the standalone inverse of [`Self::protect_frame`].
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError>;
+
+    /// Run a reserve-then-commit transaction: reserve `initial` (claiming the
+    /// frames so VTL0 cannot alter them while the caller inspects their contents),
+    /// run `f` — which reads/checks the frames and protects them via the
+    /// [`FrameTxn`] handle — then commit on `Ok` or roll back (release every
+    /// reserved range) on `Err`. Use when protection must be atomic with a check
+    /// of the frame contents (TOCTOU-safe).
+    fn protect_frames_transactionally(
+        &self,
+        initial: &[PhysFrameRange<Size4KiB>],
+        f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
+    ) -> Result<(), VsmError>;
+
+    /// Enable VTL1 for an AP and boot it into the VTL1 entry point.
+    fn init_vtl_ap(&self, core: u32) -> Result<u64, HypervCallError>;
+
+    /// Install a VTL0 physical buffer as the platform's log ring buffer.
+    fn install_ringbuffer(&self, pa: u64, size: usize) -> Result<(), VsmError>;
+
+    /// Store the platform root key.
+    fn set_platform_root_key(&self, key: &[u8; PRK_LEN]);
+
+    /// Lock VTL0's control registers by arming the hypervisor CR/MSR intercepts
+    /// and snapshotting their current values. The end-of-boot policy is enforced
+    /// by the caller before invoking this.
+    fn lock_control_registers(&self) -> Result<(), VsmError>;
+}
+
+/// Outcome of reserving a physical frame range within a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationStatus {
+    /// The range was newly reserved by this transaction.
+    New,
+    /// The range was already owned by the protected-frame registry.
+    AlreadyOwned,
+}
+
+/// Restricted handle for [`VsmBackend::protect_frames_transactionally`].
+///
+/// The only way to reserve/protect frames within a transaction; the concrete
+/// reservation guard stays private in the platform.
+pub trait FrameTxn {
+    /// Reserve the given physical frame ranges within this transaction,
+    /// returning the reservation status of each range.
+    fn reserve(
+        &mut self,
+        ranges: &[PhysFrameRange<Size4KiB>],
+    ) -> Result<Vec<ReservationStatus>, VsmError>;
+
+    /// Apply the given memory attributes to a reserved physical frame range.
+    fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError>;
 }

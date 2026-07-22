@@ -25,7 +25,6 @@ use litebox_platform_lvbs::{
     mm::MemoryProvider,
     mshv::{
         hvcall,
-        vsm::vsm_dispatch,
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
@@ -257,6 +256,55 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             optee_smc_handler_entry(smc_args_pfn)
         }
         _ => vsm_dispatch(func_id, &params[1..]),
+    }
+}
+
+/// Returns the process-wide [`litebox_service_heki::HekiState`], the single
+/// long-lived HEKI/VSM service state owned by the runner (the VSM composition
+/// root), initializing it on first access.
+fn heki_state() -> &'static litebox_service_heki::HekiState {
+    static HEKI_STATE: spin::Once<litebox_service_heki::HekiState> = spin::Once::new();
+    HEKI_STATE.call_once(litebox_service_heki::HekiState::new)
+}
+
+/// Dispatch a VSM function to its handler and return the result.
+///
+/// HEKI/VSM policy is delegated to `litebox_service_heki` over the
+/// [`litebox_common_lvbs::VsmBackend`] adapter (`LvbsVsmBackend`); the
+/// platform-owned control-register lock stays in `litebox_platform_lvbs`. The
+/// runner owns the `HekiState` that the service enforces end-of-boot policy
+/// against.
+fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
+    use litebox_common_lvbs::VsmError;
+    use litebox_platform_lvbs::mshv::vsm_backend::LvbsVsmBackend;
+
+    let state = heki_state();
+    let vsm = litebox_service_heki::Vsm::new(&LvbsVsmBackend, state);
+    let result: Result<i64, VsmError> = match func_id {
+        VsmFunction::EnableAPsVtl => vsm.enable_aps(params[0]),
+        VsmFunction::BootAPs => vsm.boot_aps(params[0]),
+        VsmFunction::LockRegs => vsm.lock_regs(),
+        VsmFunction::SignalEndOfBoot => Ok(vsm.end_of_boot()),
+        VsmFunction::ProtectMemory => vsm.protect_memory(params[0], params[1]),
+        VsmFunction::LoadKData => vsm.load_kdata(params[0], params[1]),
+        VsmFunction::ValidateModule => vsm.validate_guest_module(params[0], params[1], params[2]),
+        VsmFunction::FreeModuleInit => {
+            vsm.free_guest_module_init(params[0].reinterpret_as_signed())
+        }
+        VsmFunction::UnloadModule => vsm.unload_guest_module(params[0].reinterpret_as_signed()),
+        VsmFunction::CopySecondaryKey => vsm.copy_secondary_key(params[0], params[1]),
+        VsmFunction::KexecValidate => vsm.kexec_validate(params[0], params[1], params[2]),
+        VsmFunction::PatchText => vsm.patch_text(params[0], params[1]),
+        VsmFunction::AllocateRingbufferMemory => {
+            let size: usize = params[1].trunc();
+            vsm.allocate_ringbuffer_memory(params[0], size)
+        }
+        VsmFunction::SetPlatformRootKey => vsm.set_platform_root_key(params[0]),
+        VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
+    };
+    match result {
+        Ok(value) => value,
+        Err(e) => Errno::from(e).as_neg().into(),
     }
 }
 
