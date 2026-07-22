@@ -1,10 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Platform-side implementation of the [`litebox_common_lvbs::VsmPlatform`]
-//! trait: the bridge between the VSM/HEKI service (`litebox_service_heki`) and
-//! the platform's enforcement primitives (VTL0 physical-memory access,
-//! frame protection hypercalls, AP bring-up, ring buffer, root key).
+//! Platform-side implementation of the [`litebox_common_lvbs::VsmPlatform`] trait.
 
 use alloc::vec::Vec;
 use litebox_common_linux::vmap::PhysPageAddr;

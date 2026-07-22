@@ -2,12 +2,6 @@
 // Licensed under the MIT license.
 
 //! Platform-side VSM bring-up and control-register locking.
-//!
-//! Holds the platform-only VSM operations: partition and VTL0 secure
-//! configuration, VTL1 self-protection, and the control-register lock code.
-//! These reach hardware state that is platform-owned. VSM/HEKI policy and
-//! handlers live in `litebox_service_heki` and drive the platform through the
-//! [`litebox_common_lvbs::VsmPlatform`] trait.
 
 use crate::{
     debug_serial_println,

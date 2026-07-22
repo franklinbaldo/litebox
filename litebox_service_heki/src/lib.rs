@@ -3,13 +3,8 @@
 
 #![no_std]
 
-//! HEKI/HVCI + VSM service. Owns VSM dispatch and HEKI enforcement policy on
-//! top of a platform-provided hypercall trait ([`litebox_common_lvbs::VsmPlatform`]).
-//!
-//! The VSM/HEKI algorithms (module/kexec validation, text patching, kernel-data
-//! load, signature/ELF checks) live here and are generic over `VsmPlatform`: the
-//! platform provides the real implementor, and the trait is the seam that
-//! decouples the policy from any concrete platform.
+//! HEKI/HVCI + VSM service: VSM dispatch and HEKI enforcement policy, generic
+//! over the [`litebox_common_lvbs::VsmPlatform`] trait.
 
 extern crate alloc;
 

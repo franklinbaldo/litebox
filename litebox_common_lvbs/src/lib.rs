@@ -1,11 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Shared, logic-free data types and constants for the LVBS platform and runner.
-//!
-//! Defines the VSM/HEKI wire types and constants both crates depend on: VSM
-//! function IDs, error enums, HEKI page/patch/range structures, memory-attribute
-//! flags, and the page size/shift constants.
+//! Shared VSM/HEKI wire types and constants for the LVBS platform, service, and runner.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
