@@ -169,10 +169,10 @@ fn identity_signing_key_test_inner(
     let message: Box<[u8; TEST_MESSAGE_LEN]> =
         message_ptr.read_at_offset(0).map_err(|_| Errno::EFAULT)?;
 
-    let private_key = generate_identity_signing_private_key();
-    assert!(is_valid_identity_signing_private_key(&private_key));
+    let key_pair = get_identity_signing_key_pair();
 
-    let signing_key = SigningKey::from_slice(&private_key[..]).unwrap();
+    let signing_key = SigningKey::from_slice(&key_pair.private_key[..]).unwrap();
+
     let signature: Signature = signing_key.sign(&message[..]);
 
     let der = signature.to_der();
