@@ -168,7 +168,7 @@ impl Task {
             "sys_open_bin"
         );
 
-        if self.global.get_ta_bin(&ta_uuid).is_none() {
+        if ta_uuid != self.ta_app_id && self.global.get_ta_bin(&ta_uuid).is_none() {
             return Err(TeeResult::ItemNotFound);
         }
         let new_handle = self.ta_handle_map.insert(ta_uuid);
@@ -398,15 +398,11 @@ impl Task {
         offset: usize,
         count: usize,
     ) -> Option<()> {
-        if let Some(ta_uuid) = self.ta_handle_map.get(handle)
-            && let Some(ta_bin) = self.global.get_ta_bin(&ta_uuid)
-        {
+        if let Some(ta_uuid) = self.ta_handle_map.get(handle) {
             let end_offset = offset.checked_add(count)?;
-            if end_offset <= ta_bin.len() {
-                dst.copy_from_slice(0, &ta_bin[offset..end_offset])
-            } else {
-                None
-            }
+            let ta_bin = self.global.get_ta_bin(&ta_uuid)?;
+            (end_offset <= ta_bin.len())
+                .then(|| dst.copy_from_slice(0, &ta_bin[offset..end_offset]))?
         } else {
             None
         }
