@@ -25,12 +25,9 @@ use crate::{
         hvcall::HypervCallError,
         hvcall_mm::hv_modify_vtl_protection_mask,
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers},
-        vsm_platform::heki_mem_attr_to_hv_page_prot_flags,
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
 };
-
-use litebox_common_lvbs::MemAttr;
 use x86_64::{
     PhysAddr,
     structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -252,12 +249,8 @@ pub(crate) fn protect_vtl1_physical_memory_range(
     let pa = phys_frame_range.start.start_address().as_u64();
     let num_pages = phys_frame_range.count() as u64;
     if num_pages > 0 {
-        hv_modify_vtl_protection_mask(
-            pa,
-            num_pages,
-            heki_mem_attr_to_hv_page_prot_flags(MemAttr::empty()),
-        )
-        .map_err(VsmError::HypercallFailed)?;
+        hv_modify_vtl_protection_mask(pa, num_pages, HvPageProtFlags::HV_PAGE_ACCESS_NONE)
+            .map_err(VsmError::HypercallFailed)?;
     }
     Ok(())
 }
