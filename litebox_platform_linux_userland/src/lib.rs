@@ -1482,6 +1482,72 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     res
 }
 
+/// Synchronize the instruction stream with code just written to `range`, before
+/// that range becomes executable.
+///
+/// This is an AArch64 requirement, not a generic cache-flush hook: AArch64's
+/// instruction cache is not architecturally coherent with the data cache, so
+/// newly written instructions are not guaranteed to be observed by the fetch
+/// path until the D-cache is cleaned to the point of unification and the I-cache
+/// is invalidated over the range (what `__clear_cache` does).
+///
+/// x86-64 has no counterpart and no call site: its instruction cache is coherent
+/// with the data cache, so a store to code is snooped by the fetch path, and the
+/// `mprotect` making the range executable also serializes. (x86-64 does have
+/// cache maintenance such as `CLFLUSH`, but that serves data-cache and
+/// persistence purposes, not instruction-stream coherence.)
+#[cfg(target_arch = "aarch64")]
+fn sync_instruction_stream(range: core::ops::Range<usize>) {
+    if range.start >= range.end {
+        return;
+    }
+    let start = range.start;
+    let end = range.end;
+    // CTR_EL0 holds the cache line sizes: DminLine/IminLine are log2 of the
+    // line size in 4-byte words.
+    //
+    // SAFETY: only performs cache maintenance over `range` plus barriers;
+    // named registers are caller-supplied scratch.
+    unsafe {
+        core::arch::asm!(
+            "mrs    {ctr}, ctr_el0",
+            // D-cache line size (bytes) = 4 << DminLine (CTR_EL0[19:16]).
+            "ubfx   {tmp}, {ctr}, #16, #4",
+            "mov    {dline}, #4",
+            "lsl    {dline}, {dline}, {tmp}",
+            "sub    {tmp}, {dline}, #1",
+            "bic    {cur}, {start}, {tmp}",
+            "0:",
+            "dc     cvau, {cur}",
+            "add    {cur}, {cur}, {dline}",
+            "cmp    {cur}, {end}",
+            "b.lo   0b",
+            "dsb    ish",
+            // I-cache line size (bytes) = 4 << IminLine (CTR_EL0[3:0]).
+            "and    {tmp}, {ctr}, #0xf",
+            "mov    {iline}, #4",
+            "lsl    {iline}, {iline}, {tmp}",
+            "sub    {tmp}, {iline}, #1",
+            "bic    {cur}, {start}, {tmp}",
+            "1:",
+            "ic     ivau, {cur}",
+            "add    {cur}, {cur}, {iline}",
+            "cmp    {cur}, {end}",
+            "b.lo   1b",
+            "dsb    ish",
+            "isb",
+            start = in(reg) start,
+            end = in(reg) end,
+            ctr = out(reg) _,
+            dline = out(reg) _,
+            iline = out(reg) _,
+            cur = out(reg) _,
+            tmp = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
@@ -1587,6 +1653,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mprotect failed");
+        // A range becoming executable may hold code written while it was
+        // writable; on AArch64 that store is not guaranteed to be visible to the
+        // instruction fetch path until the caches are synchronized. x86-64 needs
+        // nothing here, so the check itself is AArch64-only.
+        //
+        // TODO: only a W->X transition actually requires this; `update_permissions`
+        // doesn't currently receive the old permissions, so we synchronize on
+        // every transition to X.
+        #[cfg(target_arch = "aarch64")]
+        if new_permissions.contains(MemoryRegionPermissions::EXEC) {
+            sync_instruction_stream(range);
+        }
         Ok(())
     }
 

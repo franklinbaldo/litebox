@@ -697,6 +697,21 @@ pub(crate) fn hook_syscalls_aarch64(
     }))
 }
 
+#[cfg(any(test, target_arch = "aarch64"))]
+pub(crate) fn trap_all_patch_sites(
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+) -> Result<usize> {
+    let sites = find_patch_sites(text_sections, buf)?;
+    let brk = Insn::Brk(TRAP_BRK_IMM)
+        .encode()
+        .expect("BRK always encodes");
+    for site in &sites {
+        buf[site.file_offset..site.file_offset + 4].copy_from_slice(&brk.to_le_bytes());
+    }
+    Ok(sites.len())
+}
+
 /// Emit the header slot and the shared SVC handler — the fixed-size shared
 /// prologue that per-site gates follow.
 fn emit_shared_prologue(

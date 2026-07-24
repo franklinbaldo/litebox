@@ -25,7 +25,35 @@ use object::endian::LittleEndian;
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("ELF patching code supports only x86-64 and AArch64 targets");
+
 const ENDIAN: LittleEndian = LittleEndian;
+#[cfg(target_arch = "aarch64")]
+const EXPECTED_ELF_MACHINE: u16 = object::elf::EM_AARCH64;
+#[cfg(target_arch = "x86_64")]
+const EXPECTED_ELF_MACHINE: u16 = object::elf::EM_X86_64;
+
+/// Maximum distance between the per-fd trampoline and the code segment it
+/// serves: `JMP rel32` (±2GB) on x86-64, `B imm26` (±128MB, i.e. `2^27 - 4`)
+/// on AArch64.
+#[cfg(target_arch = "aarch64")]
+const RUNTIME_TRAMPOLINE_MAX_DISTANCE: usize = 0x07FF_FFFC;
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_TRAMPOLINE_MAX_DISTANCE: usize = 0x7FFF_0000;
+
+/// Alignment applied to the per-fd trampoline cursor between consecutive stub
+/// blobs.
+///
+/// Each AArch64 blob starts with an 8-byte callback slot that its shared SVC
+/// handler reads with `LDR X16, <literal>`. Blob lengths are not always a
+/// multiple of 8 (MSR gates are 36 bytes, MRS gates 12), so without re-aligning
+/// the cursor a later blob's slot would land 4-byte aligned and the load would
+/// lose single-copy atomicity. x86-64 stubs have no such requirement.
+#[cfg(target_arch = "aarch64")]
+const RUNTIME_STUB_ALIGN: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_STUB_ALIGN: usize = 1;
 
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
@@ -55,7 +83,7 @@ pub(crate) struct ElfPatchState {
     /// Ranges that have already been patched by the runtime rewriter.
     /// This is a performance guard only — re-running the rewriter on
     /// already-patched code is safe because the second run will not see
-    /// syscall instructions. Cleared on munmap alongside file_mappings.
+    /// patch sites. Cleared on munmap alongside file_mappings.
     patched_ranges: BTreeSet<(usize, usize)>,
 }
 
@@ -128,7 +156,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
         };
 
-        // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
+        // Runtime syscall/patch-site rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0
@@ -549,7 +577,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// the segment being mapped. The `file_offset` parameter identifies which
     /// segment is being mapped so we can look up its `p_vaddr`.
     ///
-    /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
+    /// Assumes a 64-bit ELF for the current target architecture.
     fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
         if self.global.elf_patch_cache.lock().contains_key(&fd) {
@@ -574,6 +602,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
+        if ehdr.e_machine.get(ENDIAN) != EXPECTED_ELF_MACHINE {
+            return;
+        }
         let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).trunc();
         let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
@@ -641,7 +672,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // - Pre-patched: use the exact address from the trampoline header (the
         //   code already contains JMPs there, so we MUST map at this address).
         // - Unpatched: place it just past the highest PT_LOAD end (this is just
-        //   a hint — validated by the ±2GB distance check with trap fallback).
+        //   a hint — validated by the [`RUNTIME_TRAMPOLINE_MAX_DISTANCE`] check
+        //   with trap fallback).
         // For ET_DYN, virtual addresses are relative to the load base.
         let trampoline_vaddr = if pre_patched {
             if e_type == ET_DYN {
@@ -706,8 +738,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         (true, file_offset, vaddr, trampoline_size)
     }
 
-    /// Apply the trap fallback to a mapped code segment: replace all `syscall`
-    /// instructions with traps (`ICEBP;HLT`), then restore RX.
+    /// Apply the trap fallback to a mapped code segment: replace all patch sites
+    /// with traps, then restore RX.
     ///
     /// If `already_rw` is true, the segment is assumed to already be writable
     /// and the initial mprotect RW is skipped.
@@ -736,7 +768,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if count > 0 {
             litebox_util_log::warn!(
                 count:? = count, addr:? = mapped_addr.as_usize(), len:? = len;
-                "applied trap fallback to syscall instructions"
+                "applied trap fallback to patch sites"
             );
         }
         assert!(
@@ -759,8 +791,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ///
     /// For pre-patched binaries: maps the trampoline from the file and writes
     /// the syscall entry point.
-    /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
-    /// instructions and places the generated stubs in the trampoline region.
+    /// For unpatched binaries: calls `patch_code_segment()` to rewrite patch
+    /// sites and places the generated stubs in the trampoline region.
     ///
     /// Returns `true` on success or non-fatal skip. Returns `false` when a
     /// pre-patched binary's trampoline could not be set up — the caller must
@@ -870,8 +902,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
             // Try MAP_FIXED_NOREPLACE first — works when the preferred
             // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
+            // manager choose a free address and validate below that it is
+            // still reachable by the target architecture's runtime stubs.
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
@@ -894,13 +926,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
-            // Verify the trampoline is within JMP rel32 range (+-2GB) of the
-            // entire code segment, not just its start.
+            // Keep the trampoline close enough to the entire code segment, not
+            // just its start. x86-64 runtime stubs use JMP rel32; AArch64 patch
+            // sites use B imm26 to reach per-site gates.
             let far_end = addr_usize.saturating_add(len);
             let distance = actual_addr
                 .abs_diff(addr_usize)
                 .max(actual_addr.abs_diff(far_end));
-            if distance > 0x7FFF_0000 {
+            if distance > RUNTIME_TRAMPOLINE_MAX_DISTANCE {
                 litebox_util_log::warn!(
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
@@ -912,18 +945,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
             state.trampoline_addr = actual_addr;
 
-            // Write the 8-byte syscall entry point at the start.
-            let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
-            if entry_ptr
-                .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
-                .is_none()
+            // AArch64 runtime stubs carry the callback-address slot in each
+            // emitted trampoline blob, so the per-fd cursor starts at byte 0.
+            #[cfg(target_arch = "aarch64")]
             {
-                litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                self.apply_trap_fallback(mapped_addr, len, false);
-                return true;
+                state.trampoline_cursor = 0;
             }
-            state.trampoline_cursor = 8; // stubs start after the 8-byte entry
+            // x86-64 runtime stubs share one callback-address slot at the start
+            // of the per-fd trampoline allocation and reference it indirectly.
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Write the 8-byte syscall entry point at the start.
+                let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
+                if entry_ptr
+                    .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
+                    .is_none()
+                {
+                    litebox_util_log::warn!("failed to write syscall entry point to trampoline");
+                    let _ =
+                        self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                    self.apply_trap_fallback(mapped_addr, len, false);
+                    return true;
+                }
+                // Stubs start after the 8-byte entry.
+                state.trampoline_cursor = 8;
+            }
             state.trampoline_mapped = true;
             state.trampoline_mapped_len = PAGE_SIZE;
         }
@@ -984,6 +1030,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let code_vaddr = addr_usize as u64;
         let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
+        // AArch64 stubs embed the syscall entry directly; x86-64 stubs reference
+        // the shared entry slot at the start of the trampoline allocation.
+        #[cfg(target_arch = "aarch64")]
+        let syscall_entry_addr = syscall_entry as u64;
+        #[cfg(target_arch = "x86_64")]
         let syscall_entry_addr = state.trampoline_addr as u64;
 
         let patch_result = litebox_syscall_rewriter::patch_code_segment(
@@ -997,7 +1048,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if !skipped_addrs.is_empty() {
                     litebox_util_log::warn!(
                         count:? = skipped_addrs.len(), addrs:? = skipped_addrs;
-                        "syscall instruction(s) could not be patched"
+                        "patch site(s) could not be redirected"
                     );
                 }
                 Ok(stubs)
@@ -1006,7 +1057,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
-                let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
+                // Round the cursor up so the next blob starts aligned; the stubs
+                // just emitted still occupy only `cursor..cursor + stubs.len()`.
+                let Some(new_cursor) = state
+                    .trampoline_cursor
+                    .checked_add(stubs.len())
+                    .and_then(|c| c.checked_next_multiple_of(RUNTIME_STUB_ALIGN))
+                else {
                     litebox_util_log::warn!("trampoline cursor overflow");
                     self.apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);

@@ -25,6 +25,13 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+// The runtime patching entry points (`patch_code_segment`,
+// `trap_all_syscalls_in_code`) dispatch on the host architecture, and only
+// x86-64 and AArch64 are implemented. Fail loudly rather than emitting
+// confusing "unresolved name" errors from an empty `cfg` arm.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("litebox_syscall_rewriter supports only x86-64 and AArch64 targets");
+
 mod arm64;
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -1365,57 +1372,118 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 /// # Returns
 ///
 /// `(trampoline_stubs, skipped_addrs)`. The caller must copy the stubs to
-/// `trampoline_write_vaddr`. Returns empty vecs if no syscall instructions
+/// `trampoline_write_vaddr`. Returns empty vecs if no patchable instructions
 /// are found in `code`.
+///
+/// `syscall_entry_addr` is architecture-specific: on x86-64 it is the address
+/// of the shared 8-byte syscall-entry slot referenced by emitted stubs; on
+/// AArch64 it is the direct syscall-entry address stored in the emitted
+/// callback slot.
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
-    // Build control-transfer targets for this segment.
-    let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
-    let mut control_transfer_targets = BTreeSet::new();
-    for inst in &instructions {
-        let target = inst.near_branch_target();
-        if target != 0 {
-            control_transfer_targets.insert(target);
-        }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return patch_aarch64_code_segment(
+            code,
+            code_vaddr,
+            trampoline_write_vaddr,
+            syscall_entry_addr,
+        );
     }
 
-    let mut trampoline_data = Vec::new();
-    match hook_syscalls_in_section(
-        Arch::X86_64,
-        &control_transfer_targets,
-        code_vaddr,
-        code,
-        trampoline_write_vaddr,
-        syscall_entry_addr,
-        &mut trampoline_data,
-    ) {
-        Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
-        Err(InternalError::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
-        Err(InternalError::Public(e)) => Err(e),
-        Err(e) => unreachable!("unexpected internal error: {e:?}"),
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Build control-transfer targets for this segment.
+        let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
+        let mut control_transfer_targets = BTreeSet::new();
+        for inst in &instructions {
+            let target = inst.near_branch_target();
+            if target != 0 {
+                control_transfer_targets.insert(target);
+            }
+        }
+
+        let mut trampoline_data = Vec::new();
+        match hook_syscalls_in_section(
+            Arch::X86_64,
+            &control_transfer_targets,
+            code_vaddr,
+            code,
+            trampoline_write_vaddr,
+            syscall_entry_addr,
+            &mut trampoline_data,
+        ) {
+            Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
+            Err(InternalError::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
+            Err(InternalError::Public(e)) => Err(e),
+            Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        }
     }
 }
 
-/// Replace all `syscall` instructions in `code` with trap sequences (`ICEBP; HLT`).
+#[cfg(any(test, target_arch = "aarch64"))]
+fn patch_aarch64_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let section = TextSectionInfo {
+        vaddr: code_vaddr,
+        file_offset: 0,
+        size: code.len() as u64,
+    };
+    let Some(outcome) = arm64::hook_syscalls_aarch64(
+        code,
+        &[section],
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        arm64::Host::Linux,
+    )?
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    Ok((outcome.trampoline, outcome.trapped_sites))
+}
+
+/// Replace all syscall patch sites in `code` with trap instructions.
+///
+/// On x86-64 this replaces `syscall` instructions with `ICEBP; HLT`. On AArch64
+/// this replaces every patch site (`SVC`, `MSR TPIDR_EL0`, `MRS TPIDR_EL0`) with
+/// `BRK`.
 ///
 /// This is the fallback when trampoline-based patching cannot be performed
 /// (e.g. trampoline allocation failed or is too far away).
 ///
-/// Returns the number of syscall instructions that were patched.
+/// Returns the number of patch sites that were trapped.
 pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
-    let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
-    let mut count = 0;
-    for inst in &instructions {
-        if inst.code() == iced_x86::Code::Syscall {
-            replace_with_trap(code, code_vaddr, inst);
-            count += 1;
-        }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let section = TextSectionInfo {
+            vaddr: code_vaddr,
+            file_offset: 0,
+            size: code.len() as u64,
+        };
+        return arm64::trap_all_patch_sites(code, &[section]);
     }
-    Ok(count)
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
+        let mut count = 0;
+        for inst in &instructions {
+            if inst.code() == iced_x86::Code::Syscall {
+                replace_with_trap(code, code_vaddr, inst);
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
@@ -1792,6 +1860,52 @@ mod tests {
             matches!(err, Error::UnpatchableSyscalls(_)),
             "expected UnpatchableSyscalls, got {err:?}"
         );
+    }
+
+    #[test]
+    fn patch_aarch64_code_segment_rewrites_svc_to_runtime_trampoline() {
+        let mut code = 0xD400_0001u32.to_le_bytes().to_vec(); // SVC #0
+        let code_vaddr = 0x1000_0000;
+        let trampoline_vaddr = 0x1000_1000;
+        let syscall_entry_addr = 0x1000_0000_0000;
+
+        let (trampoline, skipped) =
+            patch_aarch64_code_segment(&mut code, code_vaddr, trampoline_vaddr, syscall_entry_addr)
+                .unwrap();
+
+        assert!(skipped.is_empty(), "near trampoline should patch cleanly");
+        assert!(!trampoline.is_empty(), "runtime patching emits stubs");
+        assert_eq!(
+            u64::from_le_bytes(trampoline[..8].try_into().unwrap()),
+            syscall_entry_addr,
+            "callback slot points at runtime syscall entry"
+        );
+
+        let branch = u32::from_le_bytes(code[..4].try_into().unwrap());
+        assert_eq!(branch & 0xFC00_0000, 0x1400_0000, "SVC becomes B");
+
+        let imm26 = i64::from(branch & 0x03FF_FFFF);
+        let disp = (imm26 << 38) >> 38 << 2;
+        assert_eq!(
+            code_vaddr.wrapping_add(disp.cast_unsigned()),
+            trampoline_vaddr + 16
+        );
+    }
+
+    #[test]
+    fn aarch64_trap_fallback_replaces_patch_sites_with_brk() {
+        let mut code = 0xD400_0001u32.to_le_bytes().to_vec(); // SVC #0
+        let sections = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: code.len() as u64,
+        }];
+
+        let count = arm64::trap_all_patch_sites(&mut code, &sections).unwrap();
+
+        assert_eq!(count, 1);
+        let word = u32::from_le_bytes(code[..4].try_into().unwrap());
+        assert_eq!(word & 0xFFE0_001F, 0xD420_0000, "site becomes BRK");
     }
 
     const NT_STUB_BUILD_SYSNO: u32 = 0x1234;
