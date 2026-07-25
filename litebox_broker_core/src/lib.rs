@@ -20,6 +20,7 @@ extern crate std;
 
 mod error;
 pub mod event;
+pub mod host_resource;
 pub mod pipe;
 mod policy;
 mod session;
@@ -32,6 +33,7 @@ use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
+use host_resource::HostResourceRetirement;
 pub use policy::{PolicyEngine, PolicyProfile};
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights};
@@ -140,15 +142,23 @@ impl BrokerCore {
 
     /// Allocates broker authority state for one authenticated caller session.
     pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
-        let mut next_session_id = self.next_session_id.write();
-        let session_id = *next_session_id;
-        *next_session_id = session_id
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
+        // Reserving retirement state allocates, so it happens before the
+        // session-id lock rather than under it: this is a spin lock every
+        // caller entering the broker contends for.
+        let retirement = HostResourceRetirement::with_capacity(self.limits.max_references)?;
+        let session_id = {
+            let mut next_session_id = self.next_session_id.write();
+            let session_id = *next_session_id;
+            *next_session_id = session_id
+                .checked_add(1)
+                .ok_or(BrokerError::ResourceExhausted)?;
+            session_id
+        };
         Ok(BrokerSession::new(
             self.clone(),
             session::SessionId(session_id),
             caller_credential,
+            retirement,
         ))
     }
 

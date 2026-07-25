@@ -14,8 +14,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use litebox_broker_core::host_resource::HostResourceRetirement;
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_protocol::error::ErrorCode;
@@ -60,6 +62,19 @@ struct AssociationState {
 }
 
 impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
+    /// Returns the host resources this association has finished with.
+    ///
+    /// A host that names resources clones this before serving the
+    /// association and drains it as it serves. Dropping the association drops
+    /// its session, which retires every resource the session still referenced,
+    /// so it must drain once more afterwards to release those. The
+    /// clone is what makes that possible: retirement state outlives the
+    /// association that produced it.
+    #[must_use]
+    pub fn host_resource_retirement(&self) -> &Arc<HostResourceRetirement> {
+        self.session.host_resource_retirement()
+    }
+
     /// Executes one active request and emits its response.
     ///
     /// Any fatal broker or response-channel error permanently fails this
@@ -430,6 +445,35 @@ mod tests {
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
         association_allows_out_of_order_responses(&broker);
+        association_teardown_retires_host_resources(&broker);
+    }
+
+    fn association_teardown_retires_host_resources(broker: &BrokerCore) {
+        use litebox_broker_core::host_resource::HostResourceId;
+
+        let shared_buffers = test_shared_buffers();
+        let association = test_association(broker, &shared_buffers);
+        let retirement = Arc::clone(association.host_resource_retirement());
+        let resource = HostResourceId(97);
+        let handle = association.session.adopt_host_resource(resource).unwrap();
+
+        assert_eq!(
+            handle_test_request(&association.session, BrokerOperation::CloseObject(handle)),
+            BrokerResult::ObjectClosed
+        );
+        assert_eq!(retirement.take_retired(), Some(resource));
+
+        // Naming the same identity again is only legitimate because the
+        // host took the first one back and released it above.
+        // Teardown then retires what the association still referenced, which
+        // the host only observes because retirement outlives the
+        // association that produced it.
+        let survivor = association.session.adopt_host_resource(resource).unwrap();
+        assert_ne!(survivor, handle);
+        assert_eq!(retirement.take_retired(), None);
+        drop(association);
+        assert_eq!(retirement.take_retired(), Some(resource));
+        assert_eq!(retirement.take_retired(), None);
     }
 
     fn test_channel_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {
