@@ -22,6 +22,7 @@ pub mod message;
 pub mod pipe;
 pub mod readiness;
 pub mod shared_memory;
+pub mod socket;
 pub mod wire;
 
 /// Opaque broker object reference handle.
