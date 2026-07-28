@@ -6,7 +6,7 @@
 use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::UserPtrMut};
 
-use crate::{Platform, Task, UserMutPtr};
+use crate::{Task, UserMutPtr};
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> Option<usize> {
@@ -14,7 +14,7 @@ fn align_up(addr: usize, align: usize) -> Option<usize> {
     addr.checked_next_multiple_of(align)
 }
 
-impl Task {
+impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     #[inline]
     fn do_mmap_anonymous(
         &self,
@@ -22,7 +22,7 @@ impl Task {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<UserMutPtr<u8>, MappingError> {
+    ) -> Result<UserMutPtr<Platform, u8>, MappingError> {
         let op = |_| Ok(0);
         litebox_common_linux::mm::do_mmap(
             &self.global.pm,
@@ -45,7 +45,7 @@ impl Task {
         flags: MapFlags,
         _fd: i32,
         offset: usize,
-    ) -> Result<UserMutPtr<u8>, Errno> {
+    ) -> Result<UserMutPtr<Platform, u8>, Errno> {
         // check alignment
         if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
             return Err(Errno::EINVAL);
@@ -91,7 +91,11 @@ impl Task {
     }
 
     /// Handle syscall `munmap`
-    pub(crate) fn sys_munmap(&self, addr: UserMutPtr<u8>, len: usize) -> Result<(), Errno> {
+    pub(crate) fn sys_munmap(
+        &self,
+        addr: UserMutPtr<Platform, u8>,
+        len: usize,
+    ) -> Result<(), Errno> {
         let pm = &self.global.pm;
         litebox_common_linux::mm::sys_munmap(
             pm,
@@ -104,7 +108,7 @@ impl Task {
     #[inline]
     pub(crate) fn sys_mprotect(
         &self,
-        addr: UserMutPtr<u8>,
+        addr: UserMutPtr<Platform, u8>,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {

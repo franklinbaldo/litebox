@@ -10,7 +10,7 @@ use litebox::{
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::{Platform, UserMutPtr};
+use crate::UserMutPtr;
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -49,9 +49,9 @@ fn align_down(addr: usize, align: usize) -> usize {
 /// - rcx: command ID
 ///
 /// NOTE: The above layout diagram is for 64-bit processes.
-pub struct TaStack {
+pub struct TaStack<Platform: crate::OpteeShimPlatform> {
     /// The top of the stack (base address)
-    stack_top: UserMutPtr<u8>,
+    stack_top: UserMutPtr<Platform, u8>,
     /// The length of the stack
     len: usize,
     /// The current position of the stack pointer
@@ -64,14 +64,14 @@ pub struct TaStack {
     ldelf_arg_pos: Option<usize>,
 }
 
-impl TaStack {
+impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
     /// Stack alignment required by libc ABI (not for TAs but for compatibility)
     const STACK_ALIGNMENT: usize = 16;
 
     /// Create a new stack for the user process.
     ///
     /// `stack_top` and `len` must be aligned to [`Self::STACK_ALIGNMENT`]
-    pub(super) fn new(stack_top: UserMutPtr<u8>, len: usize) -> Option<Self> {
+    pub(super) fn new(stack_top: UserMutPtr<Platform, u8>, len: usize) -> Option<Self> {
         if !stack_top.as_usize().is_multiple_of(Self::STACK_ALIGNMENT)
             || !len.is_multiple_of(Self::STACK_ALIGNMENT)
         {
@@ -289,9 +289,12 @@ impl TaStack {
 /// # Safety
 /// The caller must ensure that `sp` is a valid stack pointer and is not currently used.
 /// Normally, `sp` should be the return value of this function's previous call (with `None`).
-pub(crate) fn allocate_stack(task: &crate::Task, stack_base: Option<usize>) -> Option<TaStack> {
+pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
+    task: &crate::Task<Platform>,
+    stack_base: Option<usize>,
+) -> Option<TaStack<Platform>> {
     let sp = if let Some(stack_base) = stack_base {
-        UserMutPtr::from_usize(stack_base)
+        UserMutPtr::<Platform, _>::from_usize(stack_base)
     } else {
         let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
