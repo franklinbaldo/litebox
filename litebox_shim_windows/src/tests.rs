@@ -13,7 +13,7 @@ use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
-use crate::{ConstPtr, DefaultFS, MutPtr, Process, Task, WindowsShim};
+use crate::{ConstPtr, DefaultFS, MutPtr, Process, ShimFS, ShimPlatform, Task, WindowsShim};
 
 #[cfg(target_os = "linux")]
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
@@ -157,14 +157,21 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     let windows_shared_section =
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
+    let process = Arc::new(Process::default(None, windows_shared_section));
+    let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new());
+    assert!(process.attach_thread(crate::syscalls::process::INITIAL_THREAD_ID, &thread_object));
+
     Task {
         global,
-        process: Arc::new(Process::default(None, windows_shared_section)),
+        process,
         fs,
+        wait_state: crate::wait::WaitState::new(platform),
         entry_point: 0,
         stack_top: 0,
         context: 0,
         teb_address: 0,
+        thread_id: crate::syscalls::process::INITIAL_THREAD_ID,
+        thread_object,
     }
 }
 
@@ -172,6 +179,35 @@ const EVENT_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Returns a clone of this task representing another thread of the same
+    /// process, or `None` if the process is already exiting.
+    ///
+    /// This is what `NtCreateThreadEx` does minus the guest environment and the
+    /// spawned platform thread, so that tests can drive a sibling thread
+    /// through the shim entrypoints synchronously. The guest addresses are left
+    /// zeroed because such a task never runs guest code.
+    pub(crate) fn clone_for_test(&self) -> Option<Self> {
+        let thread_id = self.process.allocate_thread_id();
+        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new());
+        if !self.process.attach_thread(thread_id, &thread_object) {
+            return None;
+        }
+        Some(Task {
+            global: self.global.clone(),
+            process: self.process.clone(),
+            fs: self.fs.clone(),
+            wait_state: crate::wait::WaitState::new(self.global.platform),
+            entry_point: 0,
+            stack_top: 0,
+            context: 0,
+            teb_address: 0,
+            thread_id,
+            thread_object,
+        })
+    }
+}
 
 fn create_event(task: &Task<TestPlatform, TestFS>, desired_access: u32) -> Handle {
     let mut handle = Handle::default();

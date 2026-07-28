@@ -19,6 +19,8 @@ pub(crate) mod sysinfo;
 pub(crate) mod thread;
 pub(crate) mod timer;
 pub(crate) mod token;
+pub(crate) mod trace;
+pub(crate) mod wait;
 pub(crate) mod wait_completion_packet;
 pub(crate) mod wnf;
 pub(crate) mod worker_factory;
@@ -117,6 +119,11 @@ impl ThreadHandle {
     #[must_use]
     pub(crate) fn is_current(self) -> bool {
         self == Self::CURRENT
+    }
+
+    #[must_use]
+    pub(crate) fn is_null(self) -> bool {
+        self.0.is_null()
     }
 }
 
@@ -493,6 +500,31 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_information: Platform::RawConstPointer<u8>,
         thread_information_length: u32,
     },
+    NtQueryInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawMutPointer<u8>,
+        thread_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtCreateThreadEx {
+        thread_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        process_handle: ProcessHandle,
+        start_routine: usize,
+        argument: usize,
+        create_flags: u32,
+        zero_bits: usize,
+        stack_size: usize,
+        maximum_stack_size: usize,
+        attribute_list: Option<Platform::RawConstPointer<u8>>,
+    },
+    NtWaitForSingleObject {
+        handle: Handle,
+        alertable: bool,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
     NtOpenThreadToken {
         thread_handle: ThreadHandle,
         desired_access: u32,
@@ -537,6 +569,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         source: Platform::RawConstPointer<u64>,
         destination: Platform::RawMutPointer<u64>,
         conversion_error: Option<Platform::RawMutPointer<u64>>,
+    },
+    NtTraceEvent {
+        trace_handle: Handle,
+        flags: u32,
+        field_size: u32,
+        fields: Platform::RawConstPointer<trace::EventHeader>,
     },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
@@ -618,6 +656,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     },
     NtTerminateProcess {
         process_handle: ProcessHandle,
+        exit_status: i32,
+    },
+    NtTerminateThread {
+        thread_handle: ThreadHandle,
         exit_status: i32,
     },
     NtTestAlert,
@@ -1022,6 +1064,31 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 thread_information:*,
                 thread_information_length,
             })),
+            NtSysno::NtQueryInformationThread => Some(sys_req!(NtQueryInformationThread {
+                thread_handle:{ThreadHandle::from_raw},
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtCreateThreadEx => Some(sys_req!(NtCreateThreadEx {
+                thread_handle:*,
+                desired_access,
+                object_attributes:*,
+                process_handle:{ProcessHandle::from_raw},
+                start_routine,
+                argument,
+                create_flags,
+                zero_bits,
+                stack_size,
+                maximum_stack_size,
+                attribute_list:*,
+            })),
+            NtSysno::NtWaitForSingleObject => Some(sys_req!(NtWaitForSingleObject {
+                handle: { Handle::from_raw },
+                alertable: { |value: u8| value != 0 },
+                timeout:*,
+            })),
             NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
                 thread_handle: { ThreadHandle::from_raw },
                 desired_access,
@@ -1071,6 +1138,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     conversion_error:*,
                 }),
             ),
+            NtSysno::NtTraceEvent => Some(sys_req!(NtTraceEvent {
+                trace_handle: { Handle::from_raw },
+                flags,
+                field_size,
+                fields:*,
+            })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
                 base_address:*,
@@ -1150,6 +1223,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             })),
             NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
                 process_handle: { ProcessHandle::from_raw },
+                exit_status,
+            })),
+            NtSysno::NtTerminateThread => Some(sys_req!(NtTerminateThread {
+                thread_handle: { ThreadHandle::from_raw },
                 exit_status,
             })),
             NtSysno::NtTestAlert => Some(SyscallRequest::NtTestAlert),

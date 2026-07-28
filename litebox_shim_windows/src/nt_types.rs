@@ -131,7 +131,7 @@ impl X64Context {
         thread_entry_point: usize,
         application_entry_point: usize,
         stack_top: usize,
-        peb: usize,
+        thread_start_argument: usize,
     ) -> X64Context {
         X64Context {
             context_flags: ContextFlags::CONTROL
@@ -144,7 +144,7 @@ impl X64Context {
             seg_ss: USER_MODE_STACK_SELECTOR,
             e_flags: INITIAL_CONTEXT_EFLAGS,
             rcx: application_entry_point as u64,
-            rdx: peb as u64,
+            rdx: thread_start_argument as u64,
             rsp: stack_top as u64,
             rip: thread_entry_point as u64,
             ..X64Context::default()
@@ -459,8 +459,15 @@ pub struct NtTib {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
 pub struct ActivationContextStack {
-    _reserved: [u8; 0x28],
+    pub(crate) active_frame: usize,
+    pub(crate) frame_list_cache: ListEntry,
+    pub(crate) flags: u32,
+    pub(crate) next_cookie_sequence_number: u32,
+    pub(crate) stack_id: u32,
+    pub(crate) _padding: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<ActivationContextStack>() == 0x28);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
@@ -476,7 +483,7 @@ pub struct ClientId {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, Immutable)]
 pub struct ListEntry {
     pub flink: usize,
     pub blink: usize,

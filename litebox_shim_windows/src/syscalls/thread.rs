@@ -1,19 +1,233 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::boxed::Box;
+use alloc::sync::{Arc, Weak};
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
 use int_enum::IntEnum;
-use litebox::platform::RawConstPointer as _;
+use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable};
 
+use crate::loader::create_thread_environment;
+use crate::nt_types::{AccessMask, ClientId, ObjectAttributes, X64Context};
+use crate::syscalls::ProcessHandle;
 use crate::syscalls::{Handle, ThreadHandle};
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, WindowsShimEntrypoints,
+    probe_guest_output_preserving_value,
+};
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct ThreadCreateFlags: u32 {
+        const CREATE_SUSPENDED = 0x0000_0001;
+        const SKIP_THREAD_ATTACH = 0x0000_0002;
+        const HIDE_FROM_DEBUGGER = 0x0000_0004;
+        const HAS_SECURITY_DESCRIPTOR = 0x0000_0010;
+        const ACCESS_CHECK_IN_TARGET = 0x0000_0020;
+        const INITIAL_THREAD = 0x0000_0080;
+        const SKIP_LOADER_INIT = 0x0000_0100;
+        const BYPASS_PROCESS_FREEZE = 0x0000_0040;
+
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct ThreadAccess: u32 {
+        const TERMINATE = 0x0001;
+        const SUSPEND_RESUME = 0x0002;
+        const GET_CONTEXT = 0x0008;
+        const SET_CONTEXT = 0x0010;
+        const SET_INFORMATION = 0x0020;
+        const QUERY_INFORMATION = 0x0040;
+        const SET_THREAD_TOKEN = 0x0080;
+        const IMPERSONATE = 0x0100;
+        const DIRECT_IMPERSONATION = 0x0200;
+        const SET_LIMITED_INFORMATION = 0x0400;
+        const QUERY_LIMITED_INFORMATION = 0x0800;
+        const RESUME = 0x1000;
+
+        const READ = AccessMask::STANDARD_RIGHTS_READ.bits()
+            | Self::QUERY_INFORMATION.bits()
+            | Self::GET_CONTEXT.bits();
+        const WRITE = AccessMask::STANDARD_RIGHTS_WRITE.bits()
+            | Self::SET_INFORMATION.bits()
+            | Self::SET_CONTEXT.bits()
+            | Self::SET_THREAD_TOKEN.bits();
+        const EXECUTE = AccessMask::STANDARD_RIGHTS_EXECUTE.bits()
+            | AccessMask::SYNCHRONIZE.bits();
+        const ALL_ACCESS = AccessMask::STANDARD_RIGHTS_ALL.bits() | 0xffff;
+
+        const _ = !0;
+    }
+}
+
+impl ThreadAccess {
+    fn from_desired_access(desired_access: u32) -> Self {
+        Self::from_bits_retain(AccessMask::expand_generic_access(
+            desired_access,
+            Self::READ.bits(),
+            Self::WRITE.bits(),
+            Self::EXECUTE.bits(),
+            Self::ALL_ACCESS.bits(),
+        ))
+    }
+}
+
+pub(crate) struct ThreadSubsystem<Platform>(PhantomData<fn(Platform)>);
+
+impl<Platform: ShimPlatform> FdEnabledSubsystem for ThreadSubsystem<Platform> {
+    type Entry = ThreadHandleObject<Platform>;
+}
+
+impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for ThreadHandleObject<Platform> {}
+
+impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for ThreadSubsystem<Platform> {
+    fn normalize_desired_access(desired_access: u32) -> u32 {
+        ThreadAccess::from_desired_access(desired_access).bits()
+    }
+}
+
+pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
+    pub(crate) thread: Arc<ThreadObject<Platform>>,
+}
+
+pub(crate) struct ThreadObject<Platform: ShimPlatform> {
+    completion_state: AtomicU8,
+    exit_status: core::sync::atomic::AtomicI32,
+    pollee: Pollee<Platform>,
+    /// Set when the thread has been asked to exit, either by its own
+    /// termination request or by a process-wide exit.
+    is_exiting: AtomicBool,
+    /// Handle used to interrupt the thread, published once by the thread itself
+    /// when it starts running. Empty until then.
+    wait_handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+}
+
+impl<Platform: ShimPlatform> ThreadObject<Platform> {
+    const RUNNING: u8 = 0;
+    const COMPLETING: u8 = 1;
+    const COMPLETE: u8 = 2;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            completion_state: AtomicU8::new(Self::RUNNING),
+            exit_status: core::sync::atomic::AtomicI32::new(0),
+            pollee: Pollee::new(),
+            is_exiting: AtomicBool::new(false),
+            wait_handle: once_cell::race::OnceBox::new(),
+        }
+    }
+
+    /// Publishes the handle used to interrupt this thread.
+    ///
+    /// Must be called from the thread itself, because the handle captures the
+    /// current platform thread. Only the first call takes effect.
+    pub(crate) fn publish_wait_handle(&self, handle: litebox::event::wait::ThreadHandle<Platform>) {
+        self.wait_handle.set(Box::new(handle)).ok();
+    }
+
+    /// Returns true if the thread has been asked to exit and must not re-enter
+    /// guest code.
+    pub(crate) fn is_exiting(&self) -> bool {
+        self.is_exiting.load(Ordering::Acquire)
+    }
+
+    /// The exit status recorded by [`Self::exit_thread`].
+    pub(crate) fn exit_status(&self) -> i32 {
+        self.exit_status.load(Ordering::Relaxed)
+    }
+
+    /// Records `exit_status` and marks the thread as exiting.
+    pub(crate) fn exit_thread(&self, exit_status: i32) {
+        self.exit_status.store(exit_status, Ordering::Relaxed);
+        self.is_exiting.store(true, Ordering::Release);
+    }
+
+    /// Asks another thread to exit: records `exit_status`, marks the thread as
+    /// exiting, and interrupts it so that it leaves an interruptible wait or
+    /// guest execution and completes at the next return from the shim.
+    pub(crate) fn begin_exit(&self, exit_status: i32) {
+        self.exit_thread(exit_status);
+        if let Some(handle) = self.wait_handle.get() {
+            handle.interrupt();
+        }
+    }
+
+    /// Publishes the exit status recorded by [`Self::exit_thread`] and wakes
+    /// any waiters, running `before_publish` first. Only the first call takes
+    /// effect; it returns `false` if the thread has already completed.
+    pub(crate) fn complete(&self, before_publish: impl FnOnce()) -> bool {
+        if self
+            .completion_state
+            .compare_exchange(
+                Self::RUNNING,
+                Self::COMPLETING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        before_publish();
+        self.completion_state
+            .store(Self::COMPLETE, Ordering::Release);
+        self.pollee.notify_observers(Events::IN);
+        true
+    }
+}
+
+impl<Platform: ShimPlatform> IOPollable for ThreadObject<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        if self.completion_state.load(Ordering::Acquire) == Self::COMPLETE {
+            Events::IN
+        } else {
+            Events::empty()
+        }
+    }
+}
+
+struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
+    task: Task<Platform, FS>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<Platform, FS> {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+
+    fn init(
+        self: Box<Self>,
+    ) -> Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>> {
+        let Self { task } = *self;
+        Box::new(WindowsShimEntrypoints {
+            task,
+            _not_send: PhantomData,
+        })
+    }
+}
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum ThreadInformationClass {
     SchedulerSharedDataSlot = 57,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum QueryThreadInformationClass {
+    AmILastThread = 12,
 }
 
 #[repr(C)]
@@ -26,6 +240,186 @@ struct ThreadSchedulerSharedDataSlotInformation {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "NtCreateThreadEx has eleven ABI parameters whose ordering must remain explicit"
+    )]
+    pub(crate) fn sys_nt_create_thread_ex(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        thread_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        process_handle: ProcessHandle,
+        start_routine: usize,
+        argument: usize,
+        create_flags: u32,
+        zero_bits: usize,
+        stack_size: usize,
+        maximum_stack_size: usize,
+        attribute_list: Option<ConstPtr<Platform, u8>>,
+    ) -> NtStatus {
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(thread_handle) {
+            return status;
+        }
+
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+        let create_flags = ThreadCreateFlags::from_bits_retain(create_flags);
+        if !create_flags.is_empty() {
+            // TODO(thread-model): support suspended creation and the remaining native flags.
+            litebox_util_log::debug!(
+                create_flags:? = create_flags;
+                "Rejecting NtCreateThreadEx with unsupported creation flags"
+            );
+            return NtStatus::NOT_SUPPORTED;
+        }
+        // TODO(thread-object-attributes): apply object attributes to the new thread handle.
+        if object_attributes.is_some() {
+            litebox_util_log::debug!("Ignoring NtCreateThreadEx object attributes");
+        }
+        // TODO(thread-stack-model): honor ZeroBits and distinguish committed from reserved stack.
+        if zero_bits != 0 || maximum_stack_size != 0 {
+            litebox_util_log::debug!(
+                zero_bits,
+                maximum_stack_size;
+                "Ignoring unsupported NtCreateThreadEx stack constraints"
+            );
+        }
+        // TODO(thread-attributes): populate supported PS_ATTRIBUTE_LIST output attributes.
+        if attribute_list.is_some() {
+            litebox_util_log::debug!("Ignoring NtCreateThreadEx attribute list");
+        }
+
+        let Some(ntdll) = self.process.ntdll else {
+            return NtStatus::NOT_SUPPORTED;
+        };
+        let thread_id = self.process.allocate_thread_id();
+        let environment = match create_thread_environment(
+            &self.global.page_manager,
+            stack_size,
+            self.process.peb_address,
+            ClientId {
+                unique_process: self.process.id,
+                unique_thread: thread_id,
+            },
+            false,
+        ) {
+            Ok(environment) => environment,
+            Err(error) => {
+                litebox_util_log::error!(error:% = error; "Failed to create Windows thread environment");
+                return NtStatus::NO_MEMORY;
+            }
+        };
+        let initial_context = X64Context::initial_thread_context(
+            ntdll.rtl_user_thread_start,
+            start_routine,
+            environment.stack_top,
+            argument,
+        );
+        if MutPtr::<Platform, X64Context>::from_usize(environment.context)
+            .write_at_offset(0, initial_context)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let mut child_ctx = ctx.clone();
+        child_ctx.rip = ntdll.ldr_initialize_thunk;
+        child_ctx.rsp = environment.stack_top;
+        child_ctx.eflags = 0x202;
+        child_ctx.rcx = environment.context;
+        child_ctx.rdx = ntdll.mapping.base_addr;
+
+        let thread = Arc::new(ThreadObject::new());
+        if !self.process.attach_thread(thread_id, &thread) {
+            // The process is tearing down; refuse to start another thread.
+            return NtStatus::PROCESS_IS_TERMINATING;
+        }
+        let granted_access = ThreadAccess::from_desired_access(desired_access);
+        let handle = match self.insert_typed_handle::<ThreadSubsystem<Platform>>(
+            ThreadHandleObject {
+                thread: thread.clone(),
+            },
+            granted_access.bits(),
+            drop,
+        ) {
+            Ok(handle) => handle,
+            Err(status) => {
+                self.process.detach_thread(thread_id);
+                return status;
+            }
+        };
+        let task = Task {
+            global: self.global.clone(),
+            process: self.process.clone(),
+            fs: self.fs.clone(),
+            wait_state: crate::wait::WaitState::new(self.global.platform),
+            entry_point: ntdll.ldr_initialize_thunk,
+            stack_top: environment.stack_top,
+            context: environment.context,
+            teb_address: environment.teb,
+            thread_id,
+            thread_object: thread,
+        };
+        // SAFETY: `child_ctx` points at mapped guest code and stack created above, and the
+        // destination thread constructs its non-Send shim entrypoints inside `InitThread::init`.
+        if let Err(error) = unsafe {
+            self.global
+                .platform
+                .spawn_thread(&child_ctx, Box::new(NewThreadArgs { task }))
+        } {
+            litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
+            self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
+            self.process.detach_thread(thread_id);
+            return NtStatus::NO_MEMORY;
+        }
+
+        if thread_handle.write_at_offset(0, handle).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_query_information_thread(
+        &self,
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: MutPtr<Platform, u8>,
+        thread_information_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        let Ok(QueryThreadInformationClass::AmILastThread) =
+            QueryThreadInformationClass::try_from(thread_information_class)
+        else {
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if thread_information_length as usize != core::mem::size_of::<u32>() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if !thread_handle.is_current() {
+            return NtStatus::NOT_SUPPORTED;
+        }
+
+        let is_last_thread = u32::from(self.process.live_thread_count() == 1);
+        let output = MutPtr::<Platform, u32>::from_usize(thread_information.as_usize());
+        if output.write_at_offset(0, is_last_thread).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if let Some(return_length) = return_length
+            && return_length
+                .write_at_offset(0, core::mem::size_of::<u32>().trunc())
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn close_thread(thread: ThreadHandleObject<Platform>) {
+        drop(thread);
+    }
+
     pub(crate) fn sys_nt_set_information_thread(
         thread_handle: ThreadHandle,
         thread_information_class: u32,
@@ -131,8 +525,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::null_const_ptr;
+    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr};
     use litebox::platform::ThreadProvider;
+    use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
@@ -144,6 +539,64 @@ mod tests {
 
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
+    #[test]
+    fn child_exception_completes_wait_before_last_thread_is_observed() {
+        run_with_test_platform_pointers(|| {
+            let parent = crate::tests::test_task();
+            let child = parent
+                .clone_for_test()
+                .expect("a live process should accept another thread");
+            let handle = parent
+                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
+                    ThreadHandleObject {
+                        thread: Arc::clone(&child.thread_object),
+                    },
+                    AccessMask::SYNCHRONIZE.bits(),
+                    drop,
+                )
+                .expect("thread handle insertion should succeed");
+            let child = WindowsShimEntrypoints {
+                task: child,
+                _not_send: PhantomData,
+            };
+            let mut ctx = litebox_common_linux::PtRegs::default();
+            // The child must look like it is running guest code before a fault is delivered.
+            assert!(child.task.prepare_to_run_guest(&mut ctx));
+
+            assert_eq!(
+                child.exception(
+                    &mut ctx,
+                    &ExceptionInfo {
+                        exception: Exception::PAGE_FAULT,
+                        error_code: 0,
+                        cr2: 0,
+                        kernel_mode: false,
+                    },
+                ),
+                ContinueOperation::Terminate
+            );
+            assert_eq!(
+                parent.sys_nt_wait_for_single_object(handle, false, None),
+                NtStatus::SUCCESS
+            );
+            let mut is_last_thread = u32::MAX;
+            let mut return_length = 0;
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::CURRENT,
+                    12,
+                    mut_byte_ptr(&mut is_last_thread),
+                    size_of::<u32>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(is_last_thread, 1);
+            assert_eq!(return_length as usize, size_of::<u32>());
+            assert_eq!(parent.process.live_thread_count(), 1);
+        });
     }
 
     #[test]

@@ -9,7 +9,7 @@ fn run_hello_world_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import");
     let _ = std::fs::remove_dir_all(&test_dir);
     std::fs::create_dir_all(&test_dir).unwrap();
-    let pe_path = build_kernel32_import_pe(&test_dir);
+    let pe_path = build_kernel32_import_pe(&test_dir, "kernel32_import", KERNEL32_IMPORT_PE_SOURCE);
     println!(
         "Built rewritten kernel32-import PE fixture at `{}`",
         pe_path.display()
@@ -48,6 +48,62 @@ fn run_hello_world_pe() {
     );
 }
 
+/// Runs a guest PE that creates and joins a child thread.
+#[test]
+fn run_multithreaded_pe() {
+    let test_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_multithread");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let pe_path = build_kernel32_import_pe(
+        &test_dir,
+        "kernel32_multithread",
+        KERNEL32_MULTITHREAD_PE_SOURCE,
+    );
+    println!(
+        "Built rewritten multithreaded PE fixture at `{}`",
+        pe_path.display()
+    );
+    stage_system_fixtures(&test_dir);
+    let tar_path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_multithread.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/kernel32_multithread.exe",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "runner failed to run multithreaded PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    let child_one_position = stdout.find("child one\n");
+    let child_two_position = stdout.find("child two\n");
+    let joined_position = stdout.find("main joined\n");
+    assert!(
+        child_one_position.is_some() && child_two_position.is_some() && joined_position.is_some(),
+        "guest thread output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        child_one_position < joined_position && child_two_position < joined_position,
+        "main reported joining before both children ran\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// Stages the guest system DLLs and locale tables the PE fixture needs.
 fn stage_system_fixtures(test_dir: &std::path::Path) {
     for dll_name in ["ntdll.dll", "kernel32.dll", "kernelbase.dll"] {
@@ -63,11 +119,15 @@ fn stage_system_fixtures(test_dir: &std::path::Path) {
     }
 }
 
-fn build_kernel32_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
-    let source_path = test_dir.join("kernel32_import.rs");
-    let raw_exe_path = test_dir.join("kernel32_import.raw.exe");
-    let exe_path = test_dir.join("kernel32_import.exe");
-    std::fs::write(&source_path, KERNEL32_IMPORT_PE_SOURCE).unwrap();
+fn build_kernel32_import_pe(
+    test_dir: &std::path::Path,
+    fixture_name: &str,
+    source: &str,
+) -> std::path::PathBuf {
+    let source_path = test_dir.join(format!("{fixture_name}.rs"));
+    let raw_exe_path = test_dir.join(format!("{fixture_name}.raw.exe"));
+    let exe_path = test_dir.join(format!("{fixture_name}.exe"));
+    std::fs::write(&source_path, source).unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let output = std::process::Command::new(rustc)
@@ -80,6 +140,8 @@ fn build_kernel32_import_pe(test_dir: &std::path::Path) -> std::path::PathBuf {
             "opt-level=1",
             "-l",
             "dylib=kernel32",
+            "-l",
+            "dylib=ntdll",
             "-C",
             "link-arg=/ENTRY:mainCRTStartup",
             "-C",
@@ -140,6 +202,143 @@ pub unsafe extern "system" fn mainCRTStartup() -> ! {
             0,
         );
         ExitProcess(u32::from(ok == 0 || written as usize != MESSAGE.len()));
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+"#;
+
+const KERNEL32_MULTITHREAD_PE_SOURCE: &str = r#"
+#![no_std]
+#![no_main]
+
+use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+static CHILDREN_STARTED: AtomicU32 = AtomicU32::new(0);
+static CHILDREN_MAY_EXIT: AtomicBool = AtomicBool::new(false);
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(std_handle: u32) -> usize;
+    fn WriteFile(
+        file: usize,
+        buffer: *const u8,
+        length: u32,
+        written: *mut u32,
+        overlapped: usize,
+    ) -> i32;
+    fn CreateThread(
+        thread_attributes: *const u8,
+        stack_size: usize,
+        start_routine: unsafe extern "system" fn(*mut u8) -> u32,
+        parameter: *mut u8,
+        creation_flags: u32,
+        thread_id: *mut u32,
+    ) -> usize;
+    fn WaitForSingleObject(handle: usize, milliseconds: u32) -> u32;
+    fn ExitProcess(exit_code: u32) -> !;
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationThread(
+        thread_handle: usize,
+        thread_information_class: u32,
+        thread_information: *mut u32,
+        thread_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+unsafe fn write_stdout(message: &[u8]) -> bool {
+    unsafe {
+        let stdout = GetStdHandle(0xffff_fff5);
+        let mut written = 0u32;
+        WriteFile(
+            stdout,
+            message.as_ptr(),
+            message.len() as u32,
+            &raw mut written,
+            0,
+        ) != 0
+            && written as usize == message.len()
+    }
+}
+
+unsafe extern "system" fn child_thread(parameter: *mut u8) -> u32 {
+    CHILDREN_STARTED.fetch_add(1, Ordering::Release);
+    while !CHILDREN_MAY_EXIT.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let message: &[u8] = if parameter as usize == 1 {
+        b"child one\n"
+    } else {
+        b"child two\n"
+    };
+    u32::from(!unsafe { write_stdout(message) })
+}
+
+unsafe fn am_i_last_thread() -> Option<bool> {
+    let mut is_last_thread = u32::MAX;
+    let mut return_length = 0;
+    let status = unsafe {
+        NtQueryInformationThread(
+            usize::MAX - 1,
+            12,
+            &raw mut is_last_thread,
+            size_of::<u32>() as u32,
+            &raw mut return_length,
+        )
+    };
+    (status == 0 && return_length as usize == size_of::<u32>())
+        .then_some(is_last_thread != 0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn mainCRTStartup() -> ! {
+    unsafe {
+        let thread_one = CreateThread(
+            core::ptr::null(),
+            0,
+            child_thread,
+            1usize as *mut u8,
+            0,
+            core::ptr::null_mut(),
+        );
+        let thread_two = CreateThread(
+            core::ptr::null(),
+            0,
+            child_thread,
+            2usize as *mut u8,
+            0,
+            core::ptr::null_mut(),
+        );
+        if thread_one == 0 || thread_two == 0 {
+            ExitProcess(1);
+        }
+        while CHILDREN_STARTED.load(Ordering::Acquire) != 2 {
+            core::hint::spin_loop();
+        }
+        if am_i_last_thread() != Some(false)
+            || WaitForSingleObject(thread_one, 0) != 258
+            || WaitForSingleObject(thread_two, 0) != 258
+        {
+            ExitProcess(1);
+        }
+        CHILDREN_MAY_EXIT.store(true, Ordering::Release);
+        if WaitForSingleObject(thread_one, u32::MAX) != 0
+            || WaitForSingleObject(thread_two, u32::MAX) != 0
+            || am_i_last_thread() != Some(true)
+        {
+            ExitProcess(1);
+        }
+        ExitProcess(u32::from(!write_stdout(b"main joined\n")));
     }
 }
 
