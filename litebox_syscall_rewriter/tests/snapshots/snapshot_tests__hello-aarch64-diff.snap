@@ -20,10 +20,10 @@ expression: diff
 +  400128:	<trampoline-b+0x40>
    40012c:	d2801588	mov x8,#0xac
 -  400130:	d4000001	svc #0x0
-+  400130:	<trampoline-b+0x58>
++  400130:	<trampoline-b+0x6c>
    400134:	d2800ba8	mov x8,#0x5d
    400138:	d2800000	mov x0,#0x0
 -  40013c:	d4000001	svc #0x0
 \ No newline at end of file
-+  40013c:	<trampoline-b+0x70>
++  40013c:	<trampoline-b+0x98>
 \ No newline at end of file

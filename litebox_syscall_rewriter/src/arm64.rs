@@ -81,40 +81,51 @@
 //! runtime-owned scratch area would itself require first clobbering an unsaved
 //! guest register to materialize a base pointer.
 //!
-//! ## Callback register contract: `X16` is clobbered across an `SVC`
+//! ## Callback register contract: `X16` is preserved across an `SVC`
 //!
-//! The SVC gate spills the guest `X16` to `[SP, #0]` and the computed post-SVC
-//! return address to `[SP, #8]`, then enters the callback. The callback reads
-//! the return address back from `[SP, #8]`, but **does not restore `X16`**:
-//! guest code must not rely on `X16` surviving an `SVC`.
+//! The Linux AArch64 syscall ABI preserves every general-purpose register across
+//! an `SVC` except `x0`. That includes `X16`/`X17` (IP0/IP1): `SVC` is not a
+//! function call, so the AAPCS allowance that lets a linker-inserted veneer
+//! clobber IP0/IP1 does not apply, and glibc's `INTERNAL_SYSCALL` clobbers only
+//! `"memory"` — a compiler may legitimately keep a live value in `X16` across an
+//! inlined `SVC`. The gates therefore have to preserve it.
 //!
-//! This is not an oversight. AArch64 has no memory-indirect branch — there is no
-//! `BR [mem]` — so the runtime's final branch back into the guest must first
-//! materialize its target into a general-purpose register, and that register is
-//! by definition one that would otherwise hold restored guest state. Restoring
-//! all 31 GPRs *and* branching is impossible in a single pass, so exactly one
-//! register must stay clobbered. `X16` is the right victim: `X16`/`X17`
-//! (IP0/IP1) are the AAPCS intra-procedure-call scratch registers, which a
-//! linker-inserted veneer may clobber on any branch, so no conforming AArch64
-//! code can rely on them across one; and the gate has *already* clobbered `X16`
-//! before the callback runs, so the guest value is not live on the
-//! syscall-return path anyway.
-//!
-//! **Deferred fix.** The clobber can be eliminated with a per-site *outbound*
-//! stub that the runtime branches to instead of branching to `site+4` directly:
+//! `X17` is easy: no gate touches it. `X16` is not, because it is the only
+//! scratch register the SVC gate has. The gate spills the guest `X16` to
+//! `[SP, #0]`, records the post-`SVC` return address at `[SP, #8]` and the
+//! address of this site's *outbound stub* at `[SP, #16]`, then enters the
+//! callback. The runtime returns to the guest through that stub:
 //!
 //! ```text
-//! ldr x16, [sp, #0]
-//! add sp, sp, #16
-//! b   site+4          // static direct branch; needs no scratch register
+//! outbound_N:
+//!     ldr x16, [sp, #0]      // restore guest X16
+//!     add sp, sp, #32        // pop the gate frame
+//!     b   site+4             // static direct branch; needs no scratch register
 //! ```
 //!
-//! Three instructions restore `X16` fully, and because the final branch is a
-//! pure static direct branch it needs no scratch register and behaves
-//! identically on Linux, Windows and macOS hosts. Note the scope: this covers
-//! only *resume at the syscall site*. Resuming at an arbitrary PC — which real
-//! signal delivery requires — still needs an `rt_sigreturn` frame, so the stub
-//! is not on its own a complete answer for guest-visible register state.
+//! The stub exists because AArch64 has no memory-indirect branch — there is no
+//! `BR [mem]` — so a runtime-side branch back into the guest must first
+//! materialize its target into a general-purpose register, and that register is
+//! by definition one that would otherwise hold restored guest state. Restoring
+//! all 31 GPRs *and* branching is impossible **from the runtime side**. Moving
+//! the final hop into guest-adjacent code the rewriter emits removes the
+//! problem entirely: the stub's branch target is a *static* address, so it needs
+//! no register at all.
+//!
+//! The runtime does not depend on the gate frame's contents surviving its round
+//! trip through the host. Before branching to a stub, `switch_to_guest` sets
+//! `SP` to `PtRegs::sp - 32` (the stub pops the frame, so `PtRegs::sp` keeps
+//! meaning the true guest `SP` throughout) and re-writes `[SP, #0]` from
+//! `PtRegs::regs[16]`, so a shim that legitimately modifies `regs[16]` is
+//! honoured and nothing relies on guest memory below `SP` being untouched.
+//!
+//! **Scope: the stub only resumes at the original syscall site.** When the shim
+//! redirects `PtRegs::pc` — signal delivery, `execve`, and so on — the runtime
+//! detects the mismatch against the site's recorded return address and falls
+//! back to branching through `X16`, clobbering it. That is harmless there: the
+//! guest is not resuming the interrupted instruction stream, and restoring an
+//! arbitrary PC *with* full register state is what an `rt_sigreturn` frame is
+//! for.
 //!
 //! See `docs/plans/2026-07-29-aarch64-linux-userland-design.md` section 3 for
 //! the full reasoning, and `litebox_platform_linux_userland`'s
@@ -125,7 +136,8 @@
 //! ```text
 //! Offset 0:   [8 bytes]  syscall callback address (filled at load time)
 //! Offset 8:   [8 bytes]  shared SVC handler (LDR X16,<callback>; BR X16)
-//! Offset 16:  per-site gates (SVC: 24 bytes, MSR: 36 bytes, MRS: 12 bytes)
+//! Offset 16:  per-site gates (SVC: 32 bytes + a 12-byte outbound stub,
+//!                             MSR: 36 bytes, MRS: 12 bytes)
 //! ```
 //!
 //! A binary with **no** patch sites gets no trampoline at all: the rewriter
@@ -249,15 +261,45 @@ pub const GUEST_TPIDR_OFFSET: u16 = 16;
 
 // --- SVC gate stack frame ---
 //
-// The SVC gate touches only X16, so it needs a minimal 16-byte frame: one slot
-// for the saved guest X16 and one for the computed post-SVC return address.
+// The SVC gate touches only X16, so the frame holds just three words: the saved
+// guest X16, the computed post-SVC return address, and the address of this
+// site's outbound stub (which the runtime branches to in order to restore X16).
+// Rounded up to the 16-byte stack alignment that makes 32.
 
 /// SVC gate frame size (`SUB/ADD SP, SP, #SVC_FRAME_BYTES`). 16-byte aligned.
-const SVC_FRAME_BYTES: u16 = 16;
-/// Saved guest X16.
-const SVC_FRAME_OFF_X16: u16 = 0;
-/// Computed post-SVC return address.
+///
+/// Part of the rewriter/runtime ABI: `switch_to_guest` sets `SP` to
+/// `PtRegs::sp - SVC_FRAME_BYTES` before entering an outbound stub, because the
+/// stub pops this frame. Re-exported as [`crate::AARCH64_SVC_FRAME_BYTES`].
+pub const SVC_FRAME_BYTES: u16 = 32;
+/// Saved guest X16. The outbound stub reloads `X16` from here, so this offset is
+/// also ABI; re-exported as [`crate::AARCH64_SVC_FRAME_X16_OFFSET`].
+pub const SVC_FRAME_OFF_X16: u16 = 0;
+/// Computed post-SVC return address. Read by the runtime's syscall callback.
 const SVC_FRAME_OFF_RETADDR: u16 = 8;
+/// Address of this site's outbound stub. Read by the runtime's syscall callback
+/// and used as the branch target when resuming at the original syscall site, so
+/// this offset is ABI; re-exported as [`crate::AARCH64_SVC_FRAME_STUB_OFFSET`].
+pub const SVC_FRAME_OFF_STUB: u16 = 16;
+
+// The gate carves the frame out of the guest stack with `SUB SP`, so the frame
+// must keep `SP` 16-byte aligned, and it must be large enough for the three
+// words the gate writes into it.
+const _: () = assert!(
+    SVC_FRAME_BYTES.is_multiple_of(16),
+    "the SVC gate frame must keep SP 16-byte aligned"
+);
+const _: () = assert!(
+    SVC_FRAME_OFF_STUB + 8 <= SVC_FRAME_BYTES,
+    "the SVC gate frame must hold the saved X16, the return address and the stub address"
+);
+
+/// Size of the SVC gate proper, i.e. the distance from the gate's first
+/// instruction to its outbound stub. The gate is
+/// `SUB SP / STR X16 / ADRP / ADD / STR / ADR / STR / B` = 8 instructions.
+const SVC_GATE_BYTES: usize = 8 * 4;
+/// Size of the per-site outbound stub (`LDR X16 / ADD SP / B`).
+const SVC_OUTBOUND_STUB_BYTES: usize = 3 * 4;
 
 // --- MSR gate stack frame ---
 //
@@ -308,6 +350,7 @@ const IMM19_MASK: u32 = 0x0007_FFFF;
 enum Opcode {
     B = 0x1400_0000,
     LdrLiteral = 0x5800_0000,
+    Adr = 0x1000_0000,
     Adrp = 0x9000_0000,
     Br = 0xD61F_0000,
     SubImm = 0xD100_0000,
@@ -358,6 +401,20 @@ fn pcrel_imm19(op: Opcode, offset: i64, low: u32) -> Option<u32> {
         return None;
     }
     Some(op.bits() | ((imm19.cast_unsigned() & IMM19_MASK) << 5) | low)
+}
+
+/// `op | immlo<<29 | immhi<<5 | rd` — 21-bit-signed PC-relative address form
+/// (`ADR`/`ADRP`). The units of `imm` are the instruction's own: bytes for
+/// `ADR` (±1MB), 4KB pages for `ADRP` (±4GB).
+fn pcrel_imm21(op: Opcode, rd: u8, imm: i64) -> Option<u32> {
+    let imm = i32::try_from(imm).ok()?;
+    if !(-(1 << 20)..(1 << 20)).contains(&imm) {
+        return None;
+    }
+    let imm = imm.cast_unsigned();
+    let immlo = (imm & 0x3) << 29;
+    let immhi = ((imm >> 2) & IMM19_MASK) << 5;
+    Some(op.bits() | immlo | immhi | u32::from(rd))
 }
 
 /// `op | rn<<5` — instruction whose only operand is a register in the `Rn` field
@@ -419,6 +476,8 @@ fn sysreg_move(base: u32, rt: u8) -> u32 {
 enum Insn {
     /// `B` (unconditional branch), PC-relative, ±128MB, 4-byte aligned.
     B(i64),
+    /// `ADR Xd, #byte_off` — PC-relative address, ±1MB (byte granularity).
+    Adr { rd: u8, byte_off: i64 },
     /// `ADRP Xd, #page_off` — page-relative address, ±4GB (in 4KB pages).
     Adrp { rd: u8, page_off: i64 },
     /// `LDR Xt, <literal>` (PC-relative literal load), ±1MB, 4-byte aligned.
@@ -461,16 +520,8 @@ impl Insn {
     fn encode(self) -> Option<u32> {
         match self {
             Insn::B(off) => branch_imm26(Opcode::B, off),
-            Insn::Adrp { rd, page_off } => {
-                let imm = i32::try_from(page_off).ok()?;
-                if !(-(1 << 20)..(1 << 20)).contains(&imm) {
-                    return None;
-                }
-                let imm = imm.cast_unsigned();
-                let immlo = (imm & 0x3) << 29;
-                let immhi = ((imm >> 2) & IMM19_MASK) << 5;
-                Some(Opcode::Adrp.bits() | immlo | immhi | u32::from(rd))
-            }
+            Insn::Adr { rd, byte_off } => pcrel_imm21(Opcode::Adr, rd, byte_off),
+            Insn::Adrp { rd, page_off } => pcrel_imm21(Opcode::Adrp, rd, page_off),
             Insn::LdrLiteral { rt, off } => pcrel_imm19(Opcode::LdrLiteral, off, u32::from(rt)),
             Insn::Br(rn) => Some(reg_in_rn(Opcode::Br, rn)),
             Insn::SubSp(imm12) => data_imm12(Opcode::SubImm, SP, SP, imm12),
@@ -775,23 +826,44 @@ enum GateBuild {
     Unreachable,
 }
 
-/// Per-site SVC gate (6 instructions, 24 bytes, 16-byte frame).
+/// Per-site SVC gate (8 instructions, 32 bytes, 32-byte frame) plus its
+/// outbound stub (3 instructions, 12 bytes) — 44 bytes emitted per site.
 ///
-/// Saves only X16 (already a scratch register), computes the post-SVC return
-/// address into X16, records it on the frame, then branches to the shared SVC
-/// handler. Guest X17/X18/LR and NZCV are untouched; the callback finds the
-/// post-SVC return address at `[SP, #8]`.
+/// The gate saves only X16 (already a scratch register), computes the post-SVC
+/// return address into X16 and records it on the frame, records the address of
+/// this site's outbound stub alongside it, then branches to the shared SVC
+/// handler. Guest X17/X18/LR and NZCV are untouched.
 ///
-/// The saved guest X16 is left at `[SP, #0]` for the callback's benefit, but the
-/// callback **does not restore it** — `X16` is clobbered across an `SVC` and
-/// guest code must not depend on it surviving. See the module docs, "Callback
-/// register contract: `X16` is clobbered across an `SVC`", for why that is
-/// unavoidable today and for the deferred per-site outbound stub that would fix
-/// it.
-///
-/// Frame layout (relative to the decremented SP): `[0]=X16 [8]=return_addr`.
+/// Frame layout (relative to the decremented SP):
+/// `[0]=X16 [8]=return_addr [16]=outbound_stub [24]=pad`.
 /// Requires `SP` to address a valid writable stack at the site (see the module
 /// docs, "Gate scratch storage and the stack invariant").
+///
+/// ## The outbound stub
+///
+/// The stub is emitted immediately after the gate and is the runtime's normal
+/// way back into the guest:
+///
+/// ```text
+/// outbound:
+///     ldr x16, [sp, #0]     // restore guest X16
+///     add sp, sp, #32       // pop the gate frame
+///     b   site+4            // static direct branch: needs no scratch register
+/// ```
+///
+/// This is what lets `X16` be *fully restored* across an `SVC`, which the Linux
+/// syscall ABI requires — see the module docs, "Callback register contract:
+/// `X16` is preserved across an `SVC`". The runtime does not depend on the
+/// frame's contents surviving its round trip: `switch_to_guest` re-materializes
+/// `[SP, #0]` from `PtRegs::regs[16]` and sets `SP` to
+/// `PtRegs::sp - SVC_FRAME_BYTES` before branching here, so a shim that
+/// legitimately edits `regs[16]` is honoured.
+///
+/// The stub is only valid for resuming at the original syscall site. When the
+/// shim redirects `PtRegs::pc` (signal delivery, `execve`, ...) the runtime
+/// falls back to branching to the new PC through `X16`, clobbering it — which is
+/// harmless, because in that case the guest is not resuming the interrupted
+/// instruction stream anyway.
 fn emit_svc_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
@@ -801,7 +873,7 @@ fn emit_svc_gate(
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "SVC gate")?;
     let mut asm = Asm::new(gate_vaddr);
 
-    // SUB SP, SP, #16 ; STR X16, [SP] — save the guest X16.
+    // SUB SP, SP, #32 ; STR X16, [SP] — save the guest X16.
     asm.emit(Insn::SubSp(SVC_FRAME_BYTES));
     asm.emit(Insn::StrUimm {
         rt: X16,
@@ -829,6 +901,19 @@ fn emit_svc_gate(
         imm_bytes: SVC_FRAME_OFF_RETADDR,
     });
 
+    // ADR X16, <outbound stub> ; STR X16, [SP, #16] — record the stub. The stub
+    // starts right after this gate's last instruction, well within ADR's ±1MB
+    // reach, so a single ADR suffices (no ADRP/ADD pair).
+    let stub_vaddr = checked_add_u64(gate_vaddr, SVC_GATE_BYTES as u64, "SVC outbound stub")?;
+    if !asm.adr(X16, stub_vaddr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    asm.emit(Insn::StrUimm {
+        rt: X16,
+        rn: SP,
+        imm_bytes: SVC_FRAME_OFF_STUB,
+    });
+
     // B <shared SVC handler>.
     let handler_vaddr = checked_add_u64(
         trampoline_base_addr,
@@ -838,6 +923,29 @@ fn emit_svc_gate(
     if !asm.branch_to(handler_vaddr)? {
         return Ok(GateBuild::Unreachable);
     }
+
+    debug_assert_eq!(
+        asm.here()?,
+        stub_vaddr,
+        "the outbound stub must start immediately after the gate"
+    );
+
+    // The outbound stub: LDR X16, [SP] ; ADD SP, SP, #32 ; B <site+4>.
+    asm.emit(Insn::LdrUimm {
+        rt: X16,
+        rn: SP,
+        imm_bytes: SVC_FRAME_OFF_X16,
+    });
+    asm.emit(Insn::AddSp(SVC_FRAME_BYTES));
+    if !asm.branch_to(return_addr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+
+    debug_assert_eq!(
+        asm.here()?,
+        checked_add_u64(stub_vaddr, SVC_OUTBOUND_STUB_BYTES as u64, "SVC stub end")?,
+        "the outbound stub must be SVC_OUTBOUND_STUB_BYTES long"
+    );
 
     trampoline_data.extend_from_slice(&asm.finish());
     Ok(GateBuild::Emitted)
@@ -1071,6 +1179,18 @@ impl Asm {
         Ok(())
     }
 
+    /// `ADR Xd, <target>` — byte-granular PC-relative address of an absolute
+    /// target, ±1MB. Returns whether the target was in reach (see
+    /// [`Asm::branch_to`] for the out-of-range contract).
+    fn adr(&mut self, rd: u8, target_vaddr: u64) -> Result<bool> {
+        let byte_off = self.delta_to(target_vaddr)?;
+        let Some(word) = Insn::Adr { rd, byte_off }.encode() else {
+            return Ok(false);
+        };
+        self.push_word(word);
+        Ok(true)
+    }
+
     /// `ADRP Xd, <target>` — page-relative address of an absolute target.
     /// Returns whether the target's page was within ADRP's ±4GB reach (see
     /// [`Asm::branch_to`] for the out-of-range contract).
@@ -1113,8 +1233,8 @@ mod tests {
     // the tests use them to slice individual gates out of the trampoline blob and
     // to assert its total length. `GATES_START_OFFSET` is the fixed shared-prologue
     // size that the per-site gates follow.
-    const SVC_GATE_INSNS: usize = 6;
-    const SVC_GATE_SIZE: usize = SVC_GATE_INSNS * 4;
+    /// Bytes emitted per SVC site: the gate proper plus its outbound stub.
+    const SVC_GATE_SIZE: usize = SVC_GATE_BYTES + SVC_OUTBOUND_STUB_BYTES;
     const SHARED_SVC_HANDLER_INSNS: usize = 2;
     const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSNS * 4;
     const MSR_GATE_INSNS: usize = 9;
@@ -1175,6 +1295,16 @@ mod tests {
         assert_eq!(Insn::B(-4).encode().unwrap(), 0x17FF_FFFF);
         // `BR X16`.
         assert_eq!(Insn::Br(16).encode().unwrap(), 0xD61F_0200);
+        // `ADR X16, .+12` — how an SVC gate names its outbound stub.
+        assert_eq!(
+            Insn::Adr {
+                rd: 16,
+                byte_off: 12
+            }
+            .encode()
+            .unwrap(),
+            0x1000_0070
+        );
         // TPIDR_EL0 accessor.
         assert_eq!(Insn::MrsTpidrEl0(9).encode().unwrap(), 0xD53B_D049);
         // `MSR TPIDR_EL0, X9` guest word (scanned, never emitted).
@@ -1486,7 +1616,8 @@ mod tests {
         let tramp_base = 0x600000;
         let (_p, tramp) = hook_words(&[SVC_0], base, tramp_base);
         let gate = &tramp[GATES_START_OFFSET..GATES_START_OFFSET + SVC_GATE_SIZE];
-        // SUB SP,#16 ; STR X16,[SP] ; ADRP X16,.. ; ADD X16,X16,#.. ; STR X16,[SP,#8] ; B
+        // SUB SP,#32 ; STR X16,[SP] ; ADRP X16,.. ; ADD X16,X16,#.. ;
+        // STR X16,[SP,#8] ; ADR X16,stub ; STR X16,[SP,#16] ; B <handler>
         assert_eq!(
             word_at(gate, 0),
             Insn::SubSp(SVC_FRAME_BYTES).encode().unwrap()
@@ -1511,8 +1642,71 @@ mod tests {
             .encode()
             .unwrap()
         );
+        // ADR X16, <stub>. The stub starts 12 bytes past this instruction (two
+        // more gate instructions then the `B`), so the encoded displacement is
+        // +12 regardless of where the trampoline is placed.
+        assert_eq!(
+            word_at(gate, 20),
+            Insn::Adr {
+                rd: X16,
+                byte_off: 12
+            }
+            .encode()
+            .unwrap()
+        );
+        assert_eq!(
+            word_at(gate, 24),
+            Insn::StrUimm {
+                rt: X16,
+                rn: SP,
+                imm_bytes: SVC_FRAME_OFF_STUB
+            }
+            .encode()
+            .unwrap()
+        );
         // Self-contained tail branch to the shared handler (B, never BL).
-        assert_eq!(word_at(gate, 20) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        assert_eq!(word_at(gate, 28) & OPCODE_TOP6_MASK, Opcode::B.bits());
         assert_eq!(tramp.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
+    }
+
+    #[test]
+    fn svc_outbound_stub_restores_x16_pops_the_frame_and_returns_to_the_site() {
+        // The stub is what makes `X16` survive an `SVC`: it reloads the guest
+        // value the runtime staged at `[SP, #0]`, pops the gate frame so `SP`
+        // becomes the true guest `SP` again, and branches to `site + 4` with a
+        // static direct branch that needs no scratch register.
+        let base = 0x1000;
+        let tramp_base = 0x600000;
+        let (_p, tramp) = hook_words(&[SVC_0], base, tramp_base);
+        let stub_off = GATES_START_OFFSET + SVC_GATE_BYTES;
+        let stub = &tramp[stub_off..stub_off + SVC_OUTBOUND_STUB_BYTES];
+
+        assert_eq!(
+            word_at(stub, 0),
+            Insn::LdrUimm {
+                rt: X16,
+                rn: SP,
+                imm_bytes: SVC_FRAME_OFF_X16
+            }
+            .encode()
+            .unwrap()
+        );
+        assert_eq!(
+            word_at(stub, 4),
+            Insn::AddSp(SVC_FRAME_BYTES).encode().unwrap()
+        );
+
+        // The final `B` targets `site + 4`.
+        let branch = word_at(stub, 8);
+        assert_eq!(branch & OPCODE_TOP6_MASK, Opcode::B.bits());
+        let imm26 = i64::from(branch & IMM26_MASK);
+        // Sign-extend the 26-bit field, then scale by 4.
+        let disp = ((imm26 << 38) >> 38) * 4;
+        let branch_vaddr = tramp_base + (stub_off + 8) as u64;
+        assert_eq!(
+            branch_vaddr.cast_signed() + disp,
+            (base + 4).cast_signed(),
+            "outbound stub must return to site + 4"
+        );
     }
 }

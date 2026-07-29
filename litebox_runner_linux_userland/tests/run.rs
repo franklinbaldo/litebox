@@ -281,6 +281,41 @@ fn test_host_program_with_rewrite_syscalls() {
     assert!(stdout.contains("argv[0] = "), "unexpected stdout: {stdout}");
 }
 
+/// The Linux AArch64 syscall ABI preserves every general-purpose register but
+/// `x0` across an `SVC`, including `x16`/`x17` (IP0/IP1) — `svc` is not a
+/// function call, so the AAPCS allowance for veneers clobbering IP0/IP1 does
+/// not apply. The AArch64 rewriter's `SVC` gate clobbers `x16` on the way in,
+/// so the runtime has to restore it on the way out (it does, through the gate's
+/// per-site outbound stub). Getting that wrong corrupts guest state *silently*,
+/// with no fault, so it gets its own test rather than riding on the aggregate
+/// C-fixture runs.
+///
+/// On non-AArch64 hosts the fixture compiles to a trivially passing program.
+#[test]
+fn test_svc_scratch_registers_survive_rewritten_syscall() {
+    let target = common::compile(
+        "./tests/svc_scratch_regs.c",
+        "svc_scratch_regs_rewriter",
+        true,
+        false,
+    );
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let output = std::process::Command::new(binary_path)
+        .args(["--unstable", "--rewrite-syscalls"])
+        .arg(target)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+
+    assert!(
+        output.status.success(),
+        "guest scratch registers did not survive a rewritten syscall ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// Get the path of a program using `which`
 #[cfg(target_arch = "x86_64")]
 fn run_which(prog: &str) -> std::path::PathBuf {

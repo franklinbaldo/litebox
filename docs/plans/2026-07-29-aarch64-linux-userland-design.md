@@ -12,8 +12,10 @@ thread-pointer model and made most of the old machinery unnecessary.
 ## 1. Background: what the rewriter guarantees
 
 `litebox_syscall_rewriter/src/arm64.rs` rewrites each guest `SVC #imm` into a
-`B` to a 24-byte per-site gate, which branches to a shared 2-instruction handler
-that loads the callback address from trampoline offset 0 and does `BR X16`.
+`B` to a 32-byte per-site gate, which branches to a shared 2-instruction handler
+that loads the callback address from trampoline offset 0 and does `BR X16`. Each
+gate is followed by its own 12-byte *outbound stub*, the runtime's normal way
+back into the guest (see section 3).
 
 State on entry to the callback:
 
@@ -22,7 +24,8 @@ State on entry to the callback:
 | `x16` | clobbered (holds the callback address) |
 | `[sp, #0]` | saved guest `x16` |
 | `[sp, #8]` | guest resume PC (`svc_site + 4`) |
-| `sp` | guest SP minus 16 (gate frame is live) |
+| `[sp, #16]` | this site's outbound stub address |
+| `sp` | guest SP minus 32 (gate frame is live) |
 | `x0`–`x15`, `x17`–`x30`, NZCV | pristine guest values |
 | `TPIDR_EL0` | the **host** anchor |
 | `[TPIDR_EL0 + 16]` | the **guest** thread pointer (`GUEST_TPIDR_OFFSET`) |
@@ -153,9 +156,13 @@ stp  x0, x1, [x16]          // ... x2..x15 -> #16..#112
 ldp  x0, x1, [sp]           // x0 = guest x16, x1 = resume PC
 str  x0, [x16, #128]        // regs[16]
 str  x17, [x16, #136]       // x17, x18, x19..x30 -> #144..#240
-add  x0, sp, #16
-str  x0, [x16, #248]        // sp: undo the gate's 16-byte frame
+add  x0, sp, #32
+str  x0, [x16, #248]        // sp: undo the gate's frame -> true guest SP
 str  x1, [x16, #256]        // pc
+ldr  x0, [sp, #16]          // this site's outbound stub
+mrs  x17, tpidr_el0
+str  x0, [x17, #56]         // outbound_stub
+str  x1, [x17, #64]         // outbound_pc
 mrs  x0, nzcv
 str  x0, [x16, #264]        // pstate
 ldr  x0, [x16]
@@ -178,38 +185,68 @@ or restore anywhere in this path.
 Bracketed by `switch_to_guest_start:` / `switch_to_guest_end:` so
 `interrupt_signal_handler` can detect a partially restored context. Sets
 `in_guest = 1`, tests `interrupt` and branches to `interrupt_callback` if set,
-then restores NZCV, SP, `x0`–`x15` and `x17`–`x30`, finishing with:
+then chooses its exit path, and restores NZCV, SP, `x0`–`x15` and `x17`–`x30`.
+
+**Guest `x16` (IP0) is fully restored, via the rewriter's per-site outbound
+stub.** AArch64 offers no memory-indirect branch, so a branch target must occupy
+a register that would otherwise hold guest state; restoring all 31 GPRs *and*
+branching is impossible **from the runtime side**. The fix moves the final hop
+into guest-adjacent code the rewriter emits, where the branch target is a
+*static* address and therefore needs no register:
 
 ```
-ldr x16, [x0, #256]   // guest PC
-ldr x0,  [x0]         // guest x0
-br  x16
+outbound_N:
+    ldr x16, [sp, #0]     // restore guest x16
+    add sp, sp, #32       // pop the gate frame
+    b   site+4            // static direct branch: no scratch register needed
 ```
 
-**Guest `x16` (IP0) is deliberately not restored.** AArch64 offers no
-memory-indirect branch, so the branch target must occupy a register that would
-otherwise hold guest state; restoring all 31 GPRs *and* branching is impossible.
-`x16`/`x17` are AAPCS intra-procedure-call scratch registers that linker veneers
-may clobber at any branch, and the gate has already clobbered `x16` before the
-callback runs, so this is safe in practice.
-
-The rewriter's module docs originally claimed the callback "restores `X16` from
-`[SP, #0]`"; that was corrected to document the actual contract (`X16` is
-clobbered across an `SVC`; guest code must not rely on it surviving) — see
-`litebox_syscall_rewriter::arm64`, "Callback register contract: `X16` is
-clobbered across an `SVC`". The principled fix is a per-site *outbound* stub
-emitted by the rewriter:
+`syscall_callback` copied the stub's address and its resume PC into the TLS
+control block (`outbound_stub` at 56, `outbound_pc` at 64) — deliberately, so
+nothing depends on the gate frame below `sp` surviving the round trip through
+the shim. `switch_to_guest` then does:
 
 ```
-ldr x16, [sp, #0]
-add sp, sp, #16
-b   site+4          // static direct branch: no scratch register needed
+ldr x1, [x17, #56]    // outbound_stub
+ldr x2, [x17, #64]    // outbound_pc
+ldr x3, [x0, #256]    // ctx pc
+ldr x4, [x0, #248]    // ctx sp (the true guest SP)
+cmp x2, x3
+b.ne 4f               // PC redirected -> fallback
+cbz x1, 4f            // no stub recorded -> fallback
+mov x16, x1
+sub x4, x4, #32       // the stub pops the frame, so hand it SP one frame low
+mov sp, x4
+ldr x5, [x0, #128]    // ctx regs[16]
+str x5, [sp, #0]      // stage it where the stub reloads it from
+b   5f
+4:  mov x16, x3       // fallback: direct branch, guest x16 clobbered
+    mov sp, x4
+5:  ...restore x0-x15, x17-x30, NZCV...
+    br  x16
 ```
 
-That restores `x16` fully, costs three instructions, and is host-portable
-because it is a pure static branch. It is deferred; the implementation carries a
-`TODO` pointing here. Note it only covers resume-at-syscall-site; resuming at an
-arbitrary PC (real signal delivery) still needs an `rt_sigreturn` frame.
+`PtRegs::sp` therefore keeps meaning the true guest SP throughout, which is what
+the shim sees and may manipulate. `[sp, #0]` is re-materialized from
+`PtRegs::regs[16]` rather than trusted from the gate, so a shim that
+legitimately edits `regs[16]` is honoured.
+
+**Scope and the fallback.** The stub only resumes at the original syscall site.
+When the shim redirects `PtRegs::pc` — signal delivery, `execve` — the PC
+comparison fails and the runtime falls back to `br x16`, clobbering guest `x16`.
+That is correct there: the guest is not resuming the interrupted instruction
+stream, and restoring an arbitrary PC *with* full register state is what an
+`rt_sigreturn` frame is for.
+
+The recorded pair is not invalidated after use. It is always self-consistent —
+`outbound_stub` branches to `outbound_pc` by construction — so a stale record can
+only be selected when `PtRegs::pc` equals the PC that stub branches to, i.e.
+when taking it is equivalent to the fallback except that `x16` also survives.
+Clearing it would instead open a window in which an interrupt between the clear
+and the `br` silently downgrades to the clobbering path.
+
+See `litebox_syscall_rewriter::arm64`, "Callback register contract: `X16` is
+preserved across an `SVC`".
 
 Alternatives considered and rejected for now: resuming via a synthesized
 `rt_sigreturn` frame is fully general and atomically restores PSTATE, but costs
@@ -277,5 +314,5 @@ plausibly correct, but is not exercised by the hello-world target.
 
 ## 8. Out of scope
 
-Threads, dynamic linking, real signal delivery to the guest, the full
-`tests/run.rs` matrix, and the rewriter outbound stub.
+Threads, dynamic linking, real signal delivery to the guest, and the full
+`tests/run.rs` matrix.

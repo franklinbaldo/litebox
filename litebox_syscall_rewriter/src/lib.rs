@@ -38,6 +38,29 @@ mod arm64;
 /// `litebox_platform_linux_userland`'s `tls_offset::GUEST_TPIDR` does.
 pub use arm64::GUEST_TPIDR_OFFSET as AARCH64_GUEST_TPIDR_OFFSET;
 
+/// Size of the stack frame an AArch64 `SVC` gate carves out of the guest stack.
+///
+/// A rewriter/runtime ABI constant. The per-site outbound stub pops this frame
+/// (`ADD SP, SP, #AARCH64_SVC_FRAME_BYTES`) on its way back to the guest, so a
+/// runtime that branches to a stub must first set `SP` to the true guest `SP`
+/// minus this amount. `litebox_platform_linux_userland`'s `switch_to_guest`
+/// does exactly that.
+pub use arm64::SVC_FRAME_BYTES as AARCH64_SVC_FRAME_BYTES;
+
+/// Byte offset, within the AArch64 `SVC` gate frame, of the saved guest `X16`.
+///
+/// A rewriter/runtime ABI constant: the outbound stub reloads `X16` from here,
+/// so a runtime must re-materialize this slot (from `PtRegs::regs[16]`) before
+/// branching to a stub.
+pub use arm64::SVC_FRAME_OFF_X16 as AARCH64_SVC_FRAME_X16_OFFSET;
+
+/// Byte offset, within the AArch64 `SVC` gate frame, of the address of this
+/// site's outbound stub.
+///
+/// A rewriter/runtime ABI constant: the gate records the stub here so the
+/// runtime can find its way back into the guest with `X16` intact.
+pub use arm64::SVC_FRAME_OFF_STUB as AARCH64_SVC_FRAME_STUB_OFFSET;
+
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};

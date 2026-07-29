@@ -794,6 +794,17 @@ mod tls_offset {
     pub(super) const IS_GUEST_THREAD: usize = 42;
     pub(super) const PENDING_HOST_SIGNALS: usize = 44;
     pub(super) const WAIT_WAKER_ADDR: usize = 48;
+    /// Address of the rewriter's per-site *outbound stub* for the `SVC` the
+    /// guest most recently took, as recorded by `syscall_callback` from the
+    /// gate frame. `switch_to_guest` branches here — rather than straight to
+    /// the resume PC — so that guest `x16` is restored; see that function.
+    /// Zero means "no stub recorded" (e.g. the thread's first guest entry).
+    pub(super) const OUTBOUND_STUB: usize = 56;
+    /// The resume PC that [`OUTBOUND_STUB`] branches to, i.e. `svc_site + 4`.
+    /// `switch_to_guest` uses the stub only when `PtRegs::pc` still equals
+    /// this; a shim that redirected the PC (signal delivery, `execve`, ...)
+    /// gets the direct-branch fallback instead.
+    pub(super) const OUTBOUND_PC: usize = 64;
 }
 
 // The block is emitted into `.tdata` so the linker places it ahead of every
@@ -839,6 +850,12 @@ pending_host_signals:
     .align 3
 .globl wait_waker_addr
 wait_waker_addr:
+    .quad 0
+.globl outbound_stub
+outbound_stub:
+    .quad 0
+.globl outbound_pc
+outbound_pc:
     .quad 0
     "
 );
@@ -917,6 +934,8 @@ fn assert_tls_layout() {
     check!(is_guest_thread, IS_GUEST_THREAD);
     check!(pending_host_signals, PENDING_HOST_SIGNALS);
     check!(wait_waker_addr, WAIT_WAKER_ADDR);
+    check!(outbound_stub, OUTBOUND_STUB);
+    check!(outbound_pc, OUTBOUND_PC);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1356,7 +1375,8 @@ unsafe extern "C-unwind" fn run_thread_arch(
     //   | x16                      | clobbered (holds the callback address) |
     //   | [sp, #0]                 | saved guest x16                        |
     //   | [sp, #8]                 | guest resume PC (svc_site + 4)         |
-    //   | sp                       | guest SP minus 16 (gate frame is live) |
+    //   | [sp, #16]                | this site's outbound stub address      |
+    //   | sp                       | guest SP minus 32 (gate frame is live) |
     //   | x0-x15, x17-x30, NZCV    | pristine guest values                  |
     //   | TPIDR_EL0                | host anchor                            |
     .globl syscall_callback
@@ -1409,9 +1429,23 @@ syscall_callback_in_guest_cleared:
     stp  x27, x28, [x16, #216]
     stp  x29, x30, [x16, #232]
 
-    add  x0,  sp,  #16
-    str  x0,  [x16, #248]         // sp: undo the gate's 16-byte frame
+    add  x0,  sp,  #{SVC_FRAME_BYTES}
+    str  x0,  [x16, #248]         // sp: undo the gate's frame, so `PtRegs::sp`
+                                  // is the true guest SP the shim expects
     str  x1,  [x16, #256]         // pc
+
+    // Record this site's outbound stub, and the PC it branches to, in the TLS
+    // control block. `switch_to_guest` consults them to decide whether it can
+    // return through the stub (restoring guest x16) or must fall back to a
+    // direct branch. Copying them out of the gate frame here — rather than
+    // reading the frame again on the way out — is deliberate: the frame sits
+    // below the guest SP and nothing guarantees it survives the round trip
+    // through the shim. x17 is already spilled to regs[17], so it is free.
+    ldr  x0,  [sp,  #{SVC_FRAME_OFF_STUB}]
+    mrs  x17, tpidr_el0
+    str  x0,  [x17, #{OUTBOUND_STUB}]
+    str  x1,  [x17, #{OUTBOUND_PC}]
+
     mrs  x0,  nzcv
     str  x0,  [x16, #264]         // pstate
     ldr  x0,  [x16]
@@ -1492,6 +1526,10 @@ interrupt_callback:
     HOST_SP = const tls_offset::HOST_SP,
     GUEST_CONTEXT_TOP = const tls_offset::GUEST_CONTEXT_TOP,
     IN_GUEST = const tls_offset::IN_GUEST,
+    OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
+    OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
+    SVC_FRAME_BYTES = const litebox_syscall_rewriter::AARCH64_SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_STUB = const litebox_syscall_rewriter::AARCH64_SVC_FRAME_STUB_OFFSET,
     init_handler = sym init_handler,
     reenter_handler = sym reenter_handler,
     syscall_handler = sym syscall_handler,
@@ -1564,34 +1602,63 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 /// Do not call this at a point where the stack needs to be unwound to run
 /// destructors.
 ///
-/// # Guest `x16` (IP0) is deliberately not restored
+/// # Returning to the guest: the rewriter's per-site outbound stub
 ///
-/// AArch64 has no memory-indirect branch: there is no `BR [mem]`, so the
-/// branch target must first be materialized into a general-purpose register.
-/// That register is by definition one that would otherwise hold restored guest
-/// state, so restoring all 31 GPRs *and* branching is impossible in a single
-/// pass. `x16` is chosen because:
+/// AArch64 has no memory-indirect branch: there is no `BR [mem]`, so a branch
+/// target must first be materialized into a general-purpose register. That
+/// register is by definition one that would otherwise hold restored guest
+/// state, so restoring all 31 GPRs *and* branching is impossible **from here**.
 ///
-/// * `x16`/`x17` (IP0/IP1) are the AAPCS intra-procedure-call scratch
-///   registers. A linker-inserted veneer on any long branch may clobber them,
-///   so no conforming AArch64 code can rely on their values across a branch.
-/// * The rewriter's per-site SVC gate has *already* clobbered `x16` before the
-///   callback runs (it spills the guest value to `[SP, #0]` and reuses `x16`
-///   to compute the resume address), so the guest value is not live here in
-///   the syscall-return path anyway.
+/// That matters because the Linux AArch64 syscall ABI preserves every GPR but
+/// `x0` across an `SVC` — including `x16`/`x17`. `svc` is not a function call,
+/// so the AAPCS allowance for veneers clobbering IP0/IP1 does not apply, and a
+/// compiler may keep a live value in `x16` across an inlined `svc`.
 ///
-/// This matches the rewriter's documented contract: see
-/// `litebox_syscall_rewriter::arm64`, "Callback register contract: `X16` is
-/// clobbered across an `SVC`". Guest code must not rely on `x16` surviving an
-/// `SVC`.
+/// The way out is to move the final hop into guest-adjacent code the rewriter
+/// emits, where the branch target is a *static* address and so needs no
+/// register at all. Each rewritten `SVC` site has an outbound stub:
 ///
-/// TODO: have the rewriter emit a per-site *outbound* stub
-/// (`ldr x16, [sp, #0]; add sp, sp, #16; b site+4`) so `x16` is fully
-/// restored. That is a pure static branch, so it needs no scratch register and
-/// stays host-portable. It only covers resuming at the syscall site, though;
-/// resuming at an arbitrary PC (real signal delivery) still needs an
-/// `rt_sigreturn` frame. See
-/// `docs/plans/2026-07-29-aarch64-linux-userland-design.md` section 3.
+/// ```text
+/// outbound_N:
+///     ldr x16, [sp, #0]     // restore guest x16
+///     add sp, sp, #32       // pop the gate frame
+///     b   site+4            // static direct branch
+/// ```
+///
+/// `syscall_callback` copied that stub's address, and the resume PC it branches
+/// to, out of the gate frame into [`tls_offset::OUTBOUND_STUB`] /
+/// [`tls_offset::OUTBOUND_PC`]. This function stages what the stub reads:
+///
+/// * `SP` is set to `PtRegs::sp - AARCH64_SVC_FRAME_BYTES`, because the stub
+///   pops the frame. `PtRegs::sp` therefore keeps meaning the true guest `SP`
+///   throughout, which is what the shim sees and may manipulate.
+/// * `[SP, #0]` is re-written from `PtRegs::regs[16]` rather than left to
+///   whatever the gate stored. That honours a shim that legitimately modified
+///   `regs[16]`, and avoids depending on guest memory below `sp` surviving the
+///   round trip through the host.
+///
+/// ## The fallback path
+///
+/// The stub is only valid for **resuming at the original syscall site**. If the
+/// shim redirected `PtRegs::pc` — signal delivery, `execve`, and so on — the
+/// stub would branch to the wrong place, so this function compares
+/// `PtRegs::pc` against the recorded resume PC and, on a mismatch (or when no
+/// stub has been recorded, e.g. a thread's first guest entry), falls back to
+/// materializing the PC into `x16` and `br x16`. That clobbers guest `x16`,
+/// which is acceptable precisely because the guest is not resuming the
+/// interrupted instruction stream: restoring an arbitrary PC *with* full
+/// register state is what an `rt_sigreturn` frame is for.
+///
+/// The recorded pair is deliberately *not* invalidated after use. It is always
+/// consistent — `OUTBOUND_STUB` branches to `OUTBOUND_PC` by construction — so a
+/// stale record can only ever be selected when `PtRegs::pc` equals the PC that
+/// stub branches to, i.e. when taking it is equivalent to the fallback except
+/// that `x16` also survives. Clearing it would instead open a window in which an
+/// interrupt between the clear and the `br` silently downgrades to the
+/// clobbering path.
+///
+/// This matches the rewriter's contract: see `litebox_syscall_rewriter::arm64`,
+/// "Callback register contract: `X16` is preserved across an `SVC`".
 ///
 /// Note there is no thread-pointer restore here: `TPIDR_EL0` keeps holding the
 /// host anchor while the guest runs, and the rewriter redirects guest
@@ -1638,6 +1705,31 @@ switch_to_guest_start:
     b    interrupt_callback
 3:
 
+    // Pick the exit path, while x0 (`ctx`) is the only live value and every
+    // other GPR is still free scratch. `x16` carries the chosen branch target
+    // through the register restore below; nothing after this point may use it.
+    ldr  x1,  [x17, #{OUTBOUND_STUB}]   // per-site outbound stub (0 = none)
+    ldr  x2,  [x17, #{OUTBOUND_PC}]     // the PC that stub branches to
+    ldr  x3,  [x0,  #256]               // ctx pc
+    ldr  x4,  [x0,  #248]               // ctx sp (the true guest SP)
+    cmp  x2,  x3
+    b.ne 4f                             // shim redirected the PC -> fallback
+    cbz  x1,  4f                        // no stub recorded -> fallback
+    // Stub path. The stub pops the gate frame, so hand it SP one frame low,
+    // and stage the guest x16 where it reloads it from.
+    mov  x16, x1
+    sub  x4,  x4,  #{SVC_FRAME_BYTES}
+    mov  sp,  x4
+    ldr  x5,  [x0,  #128]               // ctx regs[16]
+    str  x5,  [sp,  #{SVC_FRAME_OFF_X16}]
+    b    5f
+4:
+    // Fallback: branch straight to the resume PC. Guest x16 is clobbered; see
+    // the fallback-path section of the doc comment for why that is correct.
+    mov  x16, x3
+    mov  sp,  x4
+5:
+
     // x0 holds `ctx` and stays live until the final two loads.
     //
     // `msr nzcv` writes only PSTATE 31:28. SSBS and DIT are carried in
@@ -1651,10 +1743,8 @@ switch_to_guest_start:
     // TODO: restore SSBS/DIT for guests that set them, gated on a runtime
     // feature probe (HWCAP_SSBS / HWCAP2_DIT) so the hardware floor stays at
     // ARMv8.0. Only worth doing once a guest actually depends on them.
-    ldr  x16, [x0, #264]          // pstate
-    msr  nzcv, x16
-    ldr  x16, [x0, #248]          // guest sp
-    mov  sp, x16
+    ldr  x1,  [x0, #264]          // pstate
+    msr  nzcv, x1
     ldr  x1,  [x0, #8]
     ldp  x2,  x3,  [x0, #16]
     ldp  x4,  x5,  [x0, #32]
@@ -1663,7 +1753,9 @@ switch_to_guest_start:
     ldp  x10, x11, [x0, #80]
     ldp  x12, x13, [x0, #96]
     ldp  x14, x15, [x0, #112]
-    // regs[16] is intentionally skipped; see the doc comment.
+    // regs[16] is not loaded into x16 here: x16 already holds the branch
+    // target chosen above. On the stub path the guest value was staged at
+    // `[sp, #0]` for the stub to reload; on the fallback path it is dropped.
     ldr  x17, [x0, #136]
     ldr  x18, [x0, #144]
     ldp  x19, x20, [x0, #152]
@@ -1672,7 +1764,6 @@ switch_to_guest_start:
     ldp  x25, x26, [x0, #200]
     ldp  x27, x28, [x0, #216]
     ldp  x29, x30, [x0, #232]
-    ldr  x16, [x0, #256]          // guest PC -- x16 is the branch register
     ldr  x0,  [x0, #0]            // guest x0, last use of ctx
     br   x16
 switch_to_guest_end:
@@ -1680,6 +1771,10 @@ switch_to_guest_end:
     ,
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
+    OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
+    OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
+    SVC_FRAME_BYTES = const litebox_syscall_rewriter::AARCH64_SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::AARCH64_SVC_FRAME_X16_OFFSET,
     );
 }
 
