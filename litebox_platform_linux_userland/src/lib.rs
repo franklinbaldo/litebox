@@ -3664,6 +3664,230 @@ mod tests {
         assert_eq!(offset_of!(PtRegs, syscallno), 280);
     }
 
+    /// Reads a TLS control-block slot through its *symbol*, resolving the
+    /// thread-pointer-relative offset with a `#:tprel_g1:` / `#:tprel_g0_nc:`
+    /// relocation pair.
+    ///
+    /// Deliberately not routed through `tls_offset`: the code under test
+    /// addresses these slots with the hardcoded constants, so an observer that
+    /// used the same constants could not detect a wrong one. Going through the
+    /// linker instead makes these tests an independent check of the constants
+    /// as well as of the assembly.
+    #[cfg(target_arch = "aarch64")]
+    macro_rules! read_tls_slot {
+        ($ty:ty, $sym:literal) => {{
+            let tp: usize;
+            let off: usize;
+            // SAFETY: reads the thread pointer and materializes a link-time
+            // constant; touches no memory.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {tp}, tpidr_el0",
+                    concat!("movz {off}, #:tprel_g1:", $sym),
+                    concat!("movk {off}, #:tprel_g0_nc:", $sym),
+                    tp = out(reg) tp,
+                    off = out(reg) off,
+                    options(nomem, nostack, preserves_flags)
+                );
+            }
+            // SAFETY: `tp + off` is this thread's own, naturally aligned slot.
+            unsafe { ((tp + off) as *const $ty).read_volatile() }
+        }};
+    }
+
+    /// `record_pending_signal` and `take_pending_host_signals` are the two
+    /// halves of the `pending_host_signals` protocol, and on AArch64 both are
+    /// hand-written `ldaxr`/`stlxr` loops. Neither needs a guest to run, so
+    /// exercise them directly.
+    ///
+    /// This is the load half's only real coverage: a wrong `{val:w}` operand
+    /// modifier, a wrong `tls_offset` constant, or a `2b` that branched to the
+    /// wrong label would all surface here.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_pending_host_signals_roundtrip() {
+        use litebox_common_linux::signal::{SigSet, Signal};
+
+        // Start from a known state; this thread may not have run anything yet,
+        // but do not assume it.
+        let _ = super::take_pending_host_signals();
+        assert_eq!(read_tls_slot!(u32, "pending_host_signals"), 0);
+
+        // SAFETY: on AArch64 `record_pending_signal` has no precondition
+        // beyond `TPIDR_EL0` being the host anchor, which it always is. The
+        // waker slot is null on this thread (asserted below), so no waker is
+        // dereferenced.
+        assert_eq!(read_tls_slot!(u64, "wait_waker_addr"), 0);
+        unsafe {
+            super::record_pending_signal(Signal::SIGALRM);
+            super::record_pending_signal(Signal::SIGINT);
+        }
+
+        // The bitmask is 1-based: bit `n - 1` for signal `n`.
+        let expected_bits =
+            (1u32 << (Signal::SIGALRM.as_i32() - 1)) | (1u32 << (Signal::SIGINT.as_i32() - 1));
+        assert_eq!(
+            read_tls_slot!(u32, "pending_host_signals"),
+            expected_bits,
+            "record_pending_signal must OR into the slot, not overwrite it"
+        );
+
+        // `SigSet` implements neither `PartialEq` nor `Debug`, so compare the
+        // raw bits.
+        let taken = super::take_pending_host_signals();
+        let expected = SigSet::empty().with(Signal::SIGALRM).with(Signal::SIGINT);
+        assert_eq!(taken.as_u64(), expected.as_u64());
+        assert!(taken.contains(Signal::SIGALRM));
+        assert!(taken.contains(Signal::SIGINT));
+
+        // The clear half of the exchange: a second take must come back empty,
+        // and the slot itself must be zero.
+        assert!(
+            super::take_pending_host_signals().is_empty(),
+            "take_pending_host_signals must clear the slot it read"
+        );
+        assert_eq!(read_tls_slot!(u32, "pending_host_signals"), 0);
+    }
+
+    /// `RawMutexProvider::update_waker` stores through the same hand-written
+    /// exchange on the 64-bit `wait_waker_addr` slot.
+    ///
+    /// Scope: this asserts the *store* half exactly, against a symbol-resolved
+    /// read of the slot. The *load* half is covered transitively — each call
+    /// after the first hands the value the assembly returned to
+    /// `Box::from_raw`, so a null, stale or garbage result would leak or abort
+    /// here — and directly by `test_pending_host_signals_roundtrip`, which
+    /// asserts the loaded value of the identical instruction sequence on the
+    /// sibling slot.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_update_waker_exchange() {
+        use litebox::platform::RawMutexProvider;
+
+        let platform = LinuxUserland::new(None);
+        let wait_state = litebox::event::wait::WaitState::new(platform);
+
+        assert_eq!(read_tls_slot!(u64, "wait_waker_addr"), 0);
+
+        platform.update_waker(Some(wait_state.context().waker().clone()));
+        let first = read_tls_slot!(u64, "wait_waker_addr");
+        assert_ne!(first, 0, "update_waker must publish the boxed waker");
+
+        // Replacing must overwrite with a different allocation and free the
+        // old one. If the exchange failed to read back `first`, this call
+        // would either leak it or abort inside `Box::from_raw`.
+        platform.update_waker(Some(wait_state.context().waker().clone()));
+        let second = read_tls_slot!(u64, "wait_waker_addr");
+        assert_ne!(second, 0);
+
+        // Clearing must store null and hand `second` back to be dropped.
+        platform.update_waker(None);
+        assert_eq!(
+            read_tls_slot!(u64, "wait_waker_addr"),
+            0,
+            "update_waker(None) must clear the slot"
+        );
+    }
+
+    /// Unwinds a panic out of a shim handler, through `run_thread_arch`'s
+    /// frame, and catches it on the other side.
+    ///
+    /// `run_thread_arch` is `extern "C-unwind"` and hand-written, so its CFI
+    /// is hand-written too and nothing else checks it. This exercises it for
+    /// real: to reach the `catch_unwind` below, the unwinder must resolve
+    /// `.cfi_def_cfa x29, 96` against the *host* `x29` and find the caller's
+    /// return address at `CFA - 88`.
+    ///
+    /// Note the failure mode is a process abort, not an assertion failure: a
+    /// bad CFA rule makes the unwinder read a garbage return address, and the
+    /// personality routine aborts rather than returning. A green run is the
+    /// assertion.
+    ///
+    /// This covers the `bl {init_handler}` entry. The three alternate entry
+    /// points (`syscall_callback`, `exception_callback`, `interrupt_callback`)
+    /// share the same FDE and CFA rule, and each re-establishes the host `x29`
+    /// before its `bl`, but reaching them needs real guest code — see the
+    /// end-to-end task.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_unwind_through_run_thread_arch() {
+        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+        use litebox_common_linux::PtRegs;
+
+        struct PanickingShim;
+
+        impl EnterShim for PanickingShim {
+            type ExecutionContext = PtRegs;
+            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                panic!("unwind out of init_handler");
+            }
+            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+            fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        let result = std::panic::catch_unwind(|| {
+            let mut ctx = PtRegs::default();
+            // SAFETY: the shim panics out of `init` before the context is ever
+            // used to enter the guest, so no valid guest state is required.
+            unsafe { super::run_thread(PanickingShim, &mut ctx) };
+        });
+
+        assert!(result.is_err(), "the panic must propagate to the caller");
+        assert!(
+            !super::is_guest_thread(),
+            "unwinding must run `GuestThreadMarker`'s drop"
+        );
+    }
+
+    /// `GuestThreadMarker` is what `interrupt_signal_handler`'s guest-thread
+    /// probe reads on AArch64, and it must nest and survive unwinding: a
+    /// thread that lost the marker early would re-raise signals process-wide
+    /// instead of recording them locally.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_guest_thread_marker() {
+        use super::{GuestThreadMarker, is_guest_thread};
+
+        assert!(!is_guest_thread(), "a plain test thread is not a guest");
+
+        {
+            let _outer = GuestThreadMarker::enter();
+            assert!(is_guest_thread());
+            {
+                // Nested entry, as `reenter_thread` from inside a shim
+                // callback would do.
+                let _inner = GuestThreadMarker::enter();
+                assert!(is_guest_thread());
+            }
+            assert!(
+                is_guest_thread(),
+                "dropping a nested marker must not un-mark the thread while \
+                 an outer frame is still running the guest"
+            );
+        }
+        assert!(!is_guest_thread(), "the outermost marker must restore");
+
+        // The marker must also be restored when a handler panics, since
+        // `run_thread_arch` is `extern "C-unwind"`.
+        let result = std::panic::catch_unwind(|| {
+            let _marker = GuestThreadMarker::enter();
+            assert!(is_guest_thread());
+            panic!("unwind out of guest execution");
+        });
+        assert!(result.is_err());
+        assert!(
+            !is_guest_thread(),
+            "the marker must be restored when the guest frame unwinds"
+        );
+    }
+
     #[test]
     fn test_raw_mutex() {
         let mutex = std::sync::Arc::new(super::RawMutex {
