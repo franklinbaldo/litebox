@@ -1536,7 +1536,6 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
- "litebox_syscall_rewriter",
  "syscalls",
  "thiserror",
  "zerocopy",

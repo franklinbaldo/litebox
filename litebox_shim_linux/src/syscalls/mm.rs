@@ -851,11 +851,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
 
                 // Patch the AArch64 guest thread-pointer offset into this
-                // object's gates. Every rewritten object -- the executable and
-                // each shared library -- carries its own trampoline, and this is
-                // where the ones the guest's dynamic linker maps get patched
-                // (the executable and the interpreter go through
-                // `ElfParsedFile::load_trampoline` instead). Done here on the
+                // object's gates. Every rewritten object carries its own
+                // trampoline, and every one of them is set up right here: the
+                // initial executable and the interpreter, because the ELF
+                // loader's `map_file` is `sys_mmap` and so lands in
+                // `do_mmap_file` like any other mapping, and every shared
+                // library the guest's own dynamic linker maps. Done on the
                 // staging buffer, so the gates are already correct the first
                 // time the region is written, let alone made executable.
                 if let Some(offset) = self.global.platform.guest_tpidr_offset()

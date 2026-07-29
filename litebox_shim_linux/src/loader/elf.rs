@@ -81,6 +81,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
 {
     type Error = Errno;
 
+    // The `mmap` hook owns the trampoline: `do_mmap_file` ->
+    // `maybe_patch_exec_segment` fires on this object's `PROT_EXEC` `PT_LOAD`
+    // and does the whole job -- maps the trampoline over the `PROT_NONE` range
+    // `reserve()` set aside, writes the syscall entry point, applies the
+    // architecture-specific fixups, and flips it to read+execute. It is the
+    // same path that handles every shared library the guest's own dynamic
+    // linker loads, so the executable and the interpreter are not special.
+    const POPULATES_TRAMPOLINE: bool = true;
+
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
@@ -206,12 +215,13 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         let syscall_entry_point = task.global.platform.get_syscall_entry_point();
 
         // Try to parse an embedded trampoline. For pre-patched binaries this
-        // succeeds and load_trampoline() will map it. For unpatched binaries
-        // (UnpatchedBinary error), the runtime patching during mmap will patch
-        // code segments as they are mapped.
+        // succeeds; the parsed trampoline is what makes `load()` reserve an
+        // address range covering it and start `brk` above it. Its *contents*
+        // are written by the mmap hook (see `POPULATES_TRAMPOLINE`). For
+        // unpatched binaries (UnpatchedBinary error), the runtime patching
+        // during mmap will patch code segments as they are mapped.
         if syscall_entry_point != 0 {
-            let guest_tpidr_offset = task.global.platform.guest_tpidr_offset();
-            match parsed.parse_trampoline(&mut &file, syscall_entry_point, guest_tpidr_offset) {
+            match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.

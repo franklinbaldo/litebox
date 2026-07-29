@@ -208,11 +208,7 @@ impl<'a> FileAndParsed<'a> {
         let file = ElfFileInMemory::new(task, elf_buf);
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        match parsed.parse_trampoline(
-            &mut &file,
-            task.global.platform.get_syscall_entry_point(),
-            task.global.platform.guest_tpidr_offset(),
-        ) {
+        match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
             Ok(()) | Err(ElfParseError::UnpatchedBinary) => {}
             Err(e) => return Err(e.into()),
         }
