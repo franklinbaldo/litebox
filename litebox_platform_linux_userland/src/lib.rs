@@ -32,11 +32,13 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
-/// `AT_FDCWD`: resolve relative paths against the current working directory.
+/// [`litebox_common_linux::AT_FDCWD`] in the `usize` encoding the raw
+/// `syscallN` helpers take: resolve relative paths against the current working
+/// directory.
 ///
 /// `openat` is used in place of `open` throughout this crate because AArch64
 /// has no `open` syscall; with `AT_FDCWD` the two are equivalent on x86-64.
-const AT_FDCWD: usize = (-100isize).cast_unsigned();
+const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
@@ -491,12 +493,17 @@ impl LinuxUserland {
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
+            //
+            // The condition is on argument index 2 because `openat` takes
+            // `(dirfd, path, flags, mode)` — flags are the *third* argument.
+            // Conditioning on index 1 would test the path pointer and let
+            // through `openat` with arbitrary flags.
             (
-                libc::SYS_open,
+                libc::SYS_openat,
                 vec![
                     SeccompRule::new(vec![
                         SeccompCondition::new(
-                            1,
+                            2,
                             SeccompCmpArgLen::Dword,
                             SeccompCmpOp::Eq,
                             u64::from(OFlags::RDONLY.bits()),
@@ -1710,7 +1717,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     /// 48-bit user virtual address space.
     #[cfg(target_arch = "aarch64")]
-    const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000;
+    const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // (1 << 48) - PAGE_SIZE;
 
     fn allocate_pages(
         &self,
@@ -2727,6 +2734,10 @@ mod tests {
         }
     }
 
+    /// `LinuxUserland::enable_seccomp_filter` is itself gated to x86-64 (the
+    /// rule list names syscalls such as `poll` that do not exist on AArch64),
+    /// so the test that exercises it is gated the same way.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_seccomp_filter() {
         fn test_memfd(name: &std::ffi::CStr) -> OwnedFd {
@@ -2791,34 +2802,46 @@ mod tests {
         let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
-        // `mkdir` only exists as a syscall on x86-64; AArch64 has `mkdirat`
-        // only, and the filter denies both by default, so this sub-case is
-        // inherently x86-only.
-        #[cfg(target_arch = "x86_64")]
-        {
-            let pathname = c"/tmp/test_seccomp";
-            let mkdir_res = unsafe {
-                syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
-            };
-            assert_eq!(
-                mkdir_res.unwrap_err(),
-                syscalls::Errno::EINVAL,
-                "mkdir should be blocked by seccomp filter"
-            );
-        }
+        let pathname = c"/tmp/test_seccomp";
+        let mkdir_res = unsafe {
+            syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+        };
+        assert_eq!(
+            mkdir_res.unwrap_err(),
+            syscalls::Errno::EINVAL,
+            "mkdir should be blocked by seccomp filter"
+        );
 
+        // The filter allows `openat` only when the flags argument is exactly
+        // `O_RDONLY`, so both halves of that condition need pinning: without
+        // the RDONLY case a missing/misnumbered rule would go unnoticed, and
+        // without the RDWR case the condition could be dropped entirely.
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
-        let open_res = unsafe {
-            syscalls::syscall3(
+        let open_rdonly = unsafe {
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                super::AT_FDCWD,
+                pathname.as_ptr() as usize,
+                OFlags::RDONLY.bits() as usize,
+                0,
+            )
+        };
+        let fd = open_rdonly.expect("openat with RDONLY should be allowed by seccomp filter");
+        // SAFETY: `openat` just returned this as a fresh owned descriptor.
+        drop(unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).unwrap()) });
+
+        let open_rdwr = unsafe {
+            syscalls::syscall4(
                 syscalls::Sysno::openat,
                 super::AT_FDCWD,
                 pathname.as_ptr() as usize,
                 OFlags::RDWR.bits() as usize,
+                0,
             )
         };
         assert_eq!(
-            open_res.unwrap_err(),
+            open_rdwr.unwrap_err(),
             syscalls::Errno::EINVAL,
             "openat with RDWR should be blocked by seccomp filter"
         );
