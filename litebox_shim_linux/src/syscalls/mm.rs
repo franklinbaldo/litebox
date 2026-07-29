@@ -18,7 +18,7 @@ use crate::ShimFS;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
-use litebox::utils::TruncateExt as _;
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
 
@@ -688,7 +688,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
-        let file_size = stat.st_size;
+        // `st_size` is `usize` in the x86-64 `struct stat` but `i64` in the
+        // asm-generic layout that aarch64 uses.
+        #[cfg(target_arch = "x86_64")]
+        let file_size: usize = stat.st_size;
+        #[cfg(target_arch = "aarch64")]
+        let file_size: usize = stat.st_size.reinterpret_as_unsigned().trunc();
         if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
