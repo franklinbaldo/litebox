@@ -1572,13 +1572,17 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 ///   to compute the resume address), so the guest value is not live here in
 ///   the syscall-return path anyway.
 ///
-/// This does deviate from the rewriter's documented contract, which says the
-/// callback restores `X16` from `[SP, #0]`.
+/// This matches the rewriter's documented contract: see
+/// `litebox_syscall_rewriter::arm64`, "Callback register contract: `X16` is
+/// clobbered across an `SVC`". Guest code must not rely on `x16` surviving an
+/// `SVC`.
 ///
 /// TODO: have the rewriter emit a per-site *outbound* stub
 /// (`ldr x16, [sp, #0]; add sp, sp, #16; b site+4`) so `x16` is fully
 /// restored. That is a pure static branch, so it needs no scratch register and
-/// stays host-portable. See
+/// stays host-portable. It only covers resuming at the syscall site, though;
+/// resuming at an arbitrary PC (real signal delivery) still needs an
+/// `rt_sigreturn` frame. See
 /// `docs/plans/2026-07-29-aarch64-linux-userland-design.md` section 3.
 ///
 /// Note there is no thread-pointer restore here: `TPIDR_EL0` keeps holding the

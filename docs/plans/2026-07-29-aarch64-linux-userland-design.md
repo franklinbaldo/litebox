@@ -70,8 +70,37 @@ section, 16-byte aligned, so it occupies the head of the static TLS area:
 | +32 | `guest_context_top` | `u64` |
 | +40 | `in_guest` | `u8` |
 | +41 | `interrupt` | `u8` |
+| +42 | `is_guest_thread` | `u8` (added during implementation) |
 | +44 | `pending_host_signals` | `u32` |
 | +48 | `wait_waker_addr` | `u64` |
+
+> **Amended during implementation: `.tdata` placement is necessary but NOT
+> sufficient.** The default linker script matches
+> `*(.tdata .tdata.* .gnu.linkonce.td.*)` with no sorting, so `.tdata` input
+> sections are laid out in input-object order. In the real runner link,
+> `tracing_subscriber`'s `fmt_layer::BUF` and `layer_filters::FILTERING` — two
+> 40-byte `.tdata` thread-locals — landed ahead of ours and pushed
+> `guest_tpidr` to offset 96. `assert_tls_layout()` caught it at startup and
+> reported the actual offset, which is exactly why it exists.
+>
+> The fix is `litebox_platform_linux_userland/litebox_tls.ld`, an
+> `INSERT BEFORE .tbss` fragment respelling the `.tdata` rule with
+> `*(.tdata.litebox_tls)` first, applied through each consuming binary's
+> `build.rs`. This is **opt-in per binary**: Cargo gives a dependency no way to
+> inject link arguments into its dependents, so any future binary that runs
+> guest code must add the same link argument. `assert_tls_layout()` turns
+> forgetting it into a startup panic rather than silent corruption.
+>
+> Rejected alternative: `INSERT BEFORE .tdata` with a separate output section
+> also works, but strands the section in the read-only segment and inflates
+> `PT_TLS` from 0xc8 to 0xc190 — 49 KB per thread.
+
+A second field, `is_guest_thread`, was added at offset 42 (previously alignment
+padding) during implementation. The x86-64 code it replaces tests `gsbase != 0`,
+which is a *thread-lifetime* property; `in_guest` is *momentary* and is 0
+whenever a guest thread sits in the host, including while blocked in an
+interruptible wait. Using `in_guest` for the guest-thread probe would break the
+`record_pending_signal` / `wait_waker_addr` wakeup path.
 
 Offsets are used as literal `const` operands in the transition assembly rather
 than `#:tprel_g1:` / `#:tprel_g0_nc:` relocation pairs. This is not an
@@ -164,9 +193,12 @@ otherwise hold guest state; restoring all 31 GPRs *and* branching is impossible.
 may clobber at any branch, and the gate has already clobbered `x16` before the
 callback runs, so this is safe in practice.
 
-This does deviate from the rewriter's documented contract ("the callback
-restores `X16` from `[SP, #0]`"). The principled fix is a per-site *outbound*
-stub emitted by the rewriter:
+The rewriter's module docs originally claimed the callback "restores `X16` from
+`[SP, #0]`"; that was corrected to document the actual contract (`X16` is
+clobbered across an `SVC`; guest code must not rely on it surviving) — see
+`litebox_syscall_rewriter::arm64`, "Callback register contract: `X16` is
+clobbered across an `SVC`". The principled fix is a per-site *outbound* stub
+emitted by the rewriter:
 
 ```
 ldr x16, [sp, #0]

@@ -81,6 +81,45 @@
 //! runtime-owned scratch area would itself require first clobbering an unsaved
 //! guest register to materialize a base pointer.
 //!
+//! ## Callback register contract: `X16` is clobbered across an `SVC`
+//!
+//! The SVC gate spills the guest `X16` to `[SP, #0]` and the computed post-SVC
+//! return address to `[SP, #8]`, then enters the callback. The callback reads
+//! the return address back from `[SP, #8]`, but **does not restore `X16`**:
+//! guest code must not rely on `X16` surviving an `SVC`.
+//!
+//! This is not an oversight. AArch64 has no memory-indirect branch — there is no
+//! `BR [mem]` — so the runtime's final branch back into the guest must first
+//! materialize its target into a general-purpose register, and that register is
+//! by definition one that would otherwise hold restored guest state. Restoring
+//! all 31 GPRs *and* branching is impossible in a single pass, so exactly one
+//! register must stay clobbered. `X16` is the right victim: `X16`/`X17`
+//! (IP0/IP1) are the AAPCS intra-procedure-call scratch registers, which a
+//! linker-inserted veneer may clobber on any branch, so no conforming AArch64
+//! code can rely on them across one; and the gate has *already* clobbered `X16`
+//! before the callback runs, so the guest value is not live on the
+//! syscall-return path anyway.
+//!
+//! **Deferred fix.** The clobber can be eliminated with a per-site *outbound*
+//! stub that the runtime branches to instead of branching to `site+4` directly:
+//!
+//! ```text
+//! ldr x16, [sp, #0]
+//! add sp, sp, #16
+//! b   site+4          // static direct branch; needs no scratch register
+//! ```
+//!
+//! Three instructions restore `X16` fully, and because the final branch is a
+//! pure static direct branch it needs no scratch register and behaves
+//! identically on Linux, Windows and macOS hosts. Note the scope: this covers
+//! only *resume at the syscall site*. Resuming at an arbitrary PC — which real
+//! signal delivery requires — still needs an `rt_sigreturn` frame, so the stub
+//! is not on its own a complete answer for guest-visible register state.
+//!
+//! See `docs/plans/2026-07-29-aarch64-linux-userland-design.md` section 3 for
+//! the full reasoning, and `litebox_platform_linux_userland`'s
+//! `switch_to_guest` for the runtime side of this contract.
+//!
 //! ## Trampoline layout (Linux)
 //!
 //! ```text
@@ -736,7 +775,14 @@ enum GateBuild {
 /// Saves only X16 (already a scratch register), computes the post-SVC return
 /// address into X16, records it on the frame, then branches to the shared SVC
 /// handler. Guest X17/X18/LR and NZCV are untouched; the callback finds the
-/// post-SVC return address at `[SP, #8]` and restores X16 from `[SP, #0]`.
+/// post-SVC return address at `[SP, #8]`.
+///
+/// The saved guest X16 is left at `[SP, #0]` for the callback's benefit, but the
+/// callback **does not restore it** — `X16` is clobbered across an `SVC` and
+/// guest code must not depend on it surviving. See the module docs, "Callback
+/// register contract: `X16` is clobbered across an `SVC`", for why that is
+/// unavoidable today and for the deferred per-site outbound stub that would fix
+/// it.
 ///
 /// Frame layout (relative to the decremented SP): `[0]=X16 [8]=return_addr`.
 /// Requires `SP` to address a valid writable stack at the site (see the module
