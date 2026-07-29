@@ -25,6 +25,7 @@ use crate::syscalls::event::EventObject;
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
 };
+use crate::syscalls::semaphore::SemaphoreObject;
 use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
@@ -157,6 +158,9 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     },
     Event {
         event: Weak<EventObject<Platform>>,
+    },
+    Semaphore {
+        semaphore: Weak<SemaphoreObject<Platform>>,
     },
     Section {
         section: Weak<SectionObject<Platform>>,
@@ -332,6 +336,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         new_directory() => NamedObject::Directory { children: BTreeMap::new() };
         new_symlink(target: String) => NamedObject::Symlink { target };
         new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
+        new_semaphore(semaphore: Weak<SemaphoreObject<Platform>>) => NamedObject::Semaphore { semaphore };
         new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
         new_file_device(device: FileDeviceObject) => NamedObject::FileDevice { device };
         new_port() => NamedObject::Port;
@@ -377,6 +382,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         directory_object, ObjectLeafLookup<()>, NamedObject::Directory { .. } => ObjectLeafLookup::Live(());
         pub(super) symlink_target, ObjectLeafLookup<String>, NamedObject::Symlink { target } => ObjectLeafLookup::Live(target.clone());
         event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
+        semaphore_object, ObjectLeafLookup<Arc<SemaphoreObject<Platform>>>, NamedObject::Semaphore { semaphore } => ObjectLeafLookup::from_weak(semaphore);
         section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
         file_device_object, ObjectLeafLookup<FileDeviceObject>, NamedObject::FileDevice { device } => ObjectLeafLookup::Live(device.clone());
         port_object, ObjectLeafLookup<()>, NamedObject::Port => ObjectLeafLookup::Live(());
@@ -387,6 +393,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             NamedObject::Directory { .. } => Some("Directory"),
             NamedObject::Symlink { .. } => Some("SymbolicLink"),
             NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
+            NamedObject::Semaphore { semaphore } => semaphore.upgrade().map(|_| "Semaphore"),
             NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
             NamedObject::FileDevice { .. } => Some("Device"),
             NamedObject::Port => Some("Port"),
@@ -478,6 +485,24 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
             path,
             |node| node.event_object(),
             |path, parent, name| ObjectNode::new_event(path, parent, name, event),
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            on_exists,
+            |_| on_created(),
+        )
+    }
+
+    pub(super) fn create_semaphore(
+        &self,
+        path: &str,
+        semaphore: &Arc<SemaphoreObject<Platform>>,
+        on_exists: impl FnOnce(Arc<SemaphoreObject<Platform>>) -> NtStatus,
+        on_created: impl FnOnce() -> NtStatus,
+    ) -> NtStatus {
+        let semaphore = Arc::downgrade(semaphore);
+        self.create_child(
+            path,
+            |node| node.semaphore_object(),
+            |path, parent, name| ObjectNode::new_semaphore(path, parent, name, semaphore),
             NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             |_| on_created(),
@@ -611,6 +636,13 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
 
     pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
         self.resolve_object_leaf(path, false, |node| node.event_object())
+    }
+
+    pub(super) fn resolve_semaphore(
+        &self,
+        path: &str,
+    ) -> Result<Arc<SemaphoreObject<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, false, |node| node.semaphore_object())
     }
 
     pub(super) fn resolve_section(
@@ -841,6 +873,46 @@ fn read_directory_name_string<Platform: RawPointerProvider>(
         return Err(NtStatus::ACCESS_VIOLATION);
     }
     Ok(Some(unicode_string.read_string::<Platform>()?))
+}
+
+pub(super) fn read_dispatcher_object_attributes<Platform: RawPointerProvider>(
+    object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+    require_name: bool,
+) -> Result<(Option<ObjectAttributes>, Option<String>), NtStatus> {
+    let Some(object_attributes_ptr) = object_attributes else {
+        if require_name {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        return Ok((None, None));
+    };
+    let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
+    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+        .contains(ObjectAttributesFlags::OPENLINK)
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    if object_attributes.object_name == 0 {
+        if !object_attributes.root_directory.is_null() {
+            return Err(NtStatus::OBJECT_NAME_INVALID);
+        }
+        if require_name {
+            return Err(NtStatus::OBJECT_NAME_INVALID);
+        }
+        return Ok((Some(object_attributes), None));
+    }
+    if !object_attributes.root_directory.is_null() {
+        return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
+    }
+
+    let Some(original_path) =
+        read_directory_name_string::<Platform>(object_attributes.object_name)?
+    else {
+        return Err(NtStatus::OBJECT_NAME_INVALID);
+    };
+    if original_path.is_empty() {
+        return Err(NtStatus::OBJECT_NAME_INVALID);
+    }
+    Ok((Some(object_attributes), Some(original_path)))
 }
 
 fn utf16_byte_len(value: &str) -> Result<usize, NtStatus> {
@@ -1350,7 +1422,6 @@ mod tests {
     use alloc::sync::Arc;
     use core::mem::size_of;
 
-    use litebox::platform::ThreadProvider;
     use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
@@ -1361,8 +1432,8 @@ mod tests {
         load_time_windows_shared_section,
     };
     use crate::tests::{
-        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes, test_task,
-        unicode_string, utf16_units,
+        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes,
+        run_with_test_platform_pointers, test_task, unicode_string, utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
@@ -1373,11 +1444,6 @@ mod tests {
     struct ParsedDirectoryInformation {
         name: String,
         type_name: String,
-    }
-
-    fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
-        let _ = crate::tests::test_platform();
-        <TestPlatform as ThreadProvider>::run_test_thread(f)
     }
 
     fn read_u16(buffer: &[u8], offset: usize) -> u16 {
