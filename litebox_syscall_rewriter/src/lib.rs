@@ -1452,16 +1452,71 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
     Ok(count)
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
-    // Find the highest virtual address among all PT_LOAD segments
-    let max_virtual_addr = match file {
-        object::File::Elf64(elf) => max_load_segment_end(elf),
-        _ => unreachable!(),
-    }
-    .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
+/// The guest page size assumed when laying out the appended trampoline.
+pub const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 
-    // Round up to the nearest page (assume 0x1000 page size)
-    checked_add_u64(max_virtual_addr, 0xFFF, "trampoline base").map(|addr| addr & !0xFFF)
+/// Computes the virtual address at which the appended trampoline is placed.
+///
+/// `max_load_end` is the highest `p_vaddr + p_memsz` across all `PT_LOAD`
+/// segments and `max_align` the largest `PT_LOAD` `p_align`.
+///
+/// The trampoline lives *outside* every `PT_LOAD`, so the dynamic loader knows
+/// nothing about it: the shim maps it explicitly with `MAP_FIXED` while the
+/// loader is mapping the object. The address therefore has to be one the
+/// loader neither occupies nor tears down.
+///
+/// * `max_align <= TRAMPOLINE_PAGE_SIZE` (x86-64, `p_align == 0x1000`): glibc's
+///   `_dl_map_segment` fast path maps exactly `maplength` bytes, so the first
+///   page past the last segment is free and is used.
+/// * `max_align > TRAMPOLINE_PAGE_SIZE` (aarch64, `p_align == 0x10000`): glibc
+///   takes the slow path. It reserves `maplength + p_align` bytes `PROT_NONE`,
+///   maps the segments `MAP_FIXED` at the aligned base *inside* that
+///   reservation, and only afterwards munmaps the unused head and tail. While
+///   the segments are being mapped the reservation therefore covers everything
+///   up to `base + maplength + p_align`, and its tail is subsequently unmapped.
+///   Anything placed below that would either collide with the live reservation
+///   (the shim's `MAP_FIXED` straddles a mapping boundary and fails) or be
+///   silently torn down by the trim, so a full alignment unit is skipped past
+///   the aligned end of the object.
+pub fn trampoline_addr_for(max_load_end: u64, max_align: u64) -> Result<u64> {
+    // Guard against a bogus `p_align`: the masking below requires a power of two.
+    let align = if max_align.is_power_of_two() {
+        max_align.max(TRAMPOLINE_PAGE_SIZE)
+    } else {
+        TRAMPOLINE_PAGE_SIZE
+    };
+    let aligned_end = checked_add_u64(max_load_end, align - 1, "trampoline base")? & !(align - 1);
+    if align <= TRAMPOLINE_PAGE_SIZE {
+        Ok(aligned_end)
+    } else {
+        checked_add_u64(aligned_end, align, "trampoline base")
+    }
+}
+
+fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
+    let object::File::Elf64(elf) = file else {
+        unreachable!()
+    };
+    // Find the highest virtual address among all PT_LOAD segments
+    let max_virtual_addr = max_load_segment_end(elf)
+        .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
+
+    trampoline_addr_for(max_virtual_addr, max_load_segment_align(elf))
+}
+
+/// Returns the largest `p_align` among all `PT_LOAD` segments, or
+/// [`TRAMPOLINE_PAGE_SIZE`] when there is none.
+fn max_load_segment_align<Elf: object::read::elf::FileHeader>(elf: &ElfFile<'_, Elf>) -> u64
+where
+    Elf::Word: Into<u64>,
+{
+    let endian = elf.endian();
+    elf.elf_program_headers()
+        .iter()
+        .filter(|ph| ph.p_type(endian) == object::elf::PT_LOAD)
+        .map(|ph| ph.p_align(endian).into())
+        .max()
+        .unwrap_or(TRAMPOLINE_PAGE_SIZE)
 }
 
 /// Returns the highest `p_vaddr + p_memsz` among all `PT_LOAD` segments.
@@ -1808,6 +1863,42 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With page-sized segment alignment (the x86-64 case) the trampoline goes
+    /// in the first page past the last `PT_LOAD`, unchanged from before.
+    #[test]
+    fn trampoline_addr_page_aligned_segments_use_next_page() {
+        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x1000).unwrap(), 0x20e_000);
+        assert_eq!(trampoline_addr_for(0x20e_000, 0x1000).unwrap(), 0x20e_000);
+        // A `p_align` below the page size must not pull the address down.
+        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x1).unwrap(), 0x20e_000);
+        assert_eq!(trampoline_addr_for(0x20d_fd0, 0).unwrap(), 0x20e_000);
+    }
+
+    /// With 64 KiB segment alignment (the aarch64 case) the trampoline must
+    /// clear the whole `maplength + p_align` region glibc's `_dl_map_segment`
+    /// reserves while mapping the object, otherwise the shim's `MAP_FIXED`
+    /// straddles the reservation boundary and the load fails.
+    #[test]
+    fn trampoline_addr_skips_loader_alignment_slack() {
+        // Real values from aarch64 `libc.so.6`: last PT_LOAD ends at 0x20dfd0.
+        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x10000).unwrap(), 0x220_000);
+        // Exactly on an alignment boundary still skips a full unit, because the
+        // loader's reservation runs to `end + p_align`.
+        assert_eq!(trampoline_addr_for(0x210_000, 0x10000).unwrap(), 0x220_000);
+    }
+
+    /// A non-power-of-two `p_align` is bogus; fall back to the page size rather
+    /// than corrupting the mask arithmetic.
+    #[test]
+    fn trampoline_addr_rejects_non_power_of_two_align() {
+        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x3000).unwrap(), 0x20e_000);
+    }
+
+    #[test]
+    fn trampoline_addr_reports_overflow() {
+        assert!(trampoline_addr_for(u64::MAX - 1, 0x10000).is_err());
+    }
 
     #[test]
     fn aarch64_out_of_range_site_is_rejected_as_unpatchable() {

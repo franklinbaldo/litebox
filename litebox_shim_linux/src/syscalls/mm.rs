@@ -601,6 +601,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
         // by matching the segment whose p_offset corresponds to file_offset.
         let mut max_load_end: u64 = 0;
+        let mut max_load_align: u64 = 0;
         let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
@@ -623,6 +624,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if end > max_load_end {
                 max_load_end = end;
             }
+            max_load_align = max_load_align.max(ph.p_align.get(ENDIAN));
             // Match segment by page-aligned file offset to derive base address.
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
@@ -663,8 +665,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 0
             };
-            let max_end: usize = max_load_end.trunc();
-            base + max_end.next_multiple_of(PAGE_SIZE)
+            // Use the same placement rule as the rewriter so the runtime and
+            // ahead-of-time paths agree; see `trampoline_addr_for` for why the
+            // maximum segment alignment (not the page size) governs this.
+            let Ok(offset) =
+                litebox_syscall_rewriter::trampoline_addr_for(max_load_end, max_load_align)
+            else {
+                return;
+            };
+            let offset: usize = offset.trunc();
+            base + offset
         };
 
         // Insert under lock (re-check for races).
