@@ -666,12 +666,20 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
             options(nostack)
         );
     }
-    // AArch64 has no `xchg`. The x86-64 `xchg` is an implicitly `lock`ed,
-    // fully ordered read-modify-write, so match it with the standard
-    // sequentially-consistent RMW mapping: an acquire exclusive load paired
-    // with a release exclusive store (`ldaxr`/`stlxr`). Deliberately not
-    // `swpal`, which requires LSE (ARMv8.1) and would raise the baseline this
-    // crate runs on.
+    // AArch64 has no `xchg`, so this is an `ldaxr`/`stlxr` retry loop.
+    //
+    // What is actually required here is *atomicity against signal-handler
+    // reentrancy on this same thread*, not cross-thread ordering: this slot
+    // lives in the thread's own TLS block and is touched only by the owning
+    // thread and by signal handlers running on it. Same-thread accesses are
+    // already ordered by program order, so the acquire/release semantics buy
+    // nothing on their own. `ldxr`/`stxr` would be equally correct.
+    //
+    // The barriers are kept anyway, deliberately: they cost nothing measurable
+    // on this path and they keep the memory model identical to the x86-64
+    // `xchg` (a full barrier), so the two architectures cannot diverge if this
+    // slot ever does become shared. Deliberately not `swpal`, which requires
+    // LSE (ARMv8.1) and would raise the baseline this crate runs on.
     #[cfg(target_arch = "aarch64")]
     // SAFETY: reads and clears a naturally aligned `u32` in this thread's own
     // TLS control block, whose offset from `TPIDR_EL0` is checked by
@@ -747,20 +755,7 @@ fn run_thread_inner(
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
-    // Mark this thread as a guest thread for the duration of its guest
-    // lifetime, so signal handlers can tell it apart from an ordinary host
-    // thread. x86-64 gets this for free from `gsbase != 0`; see
-    // `set_is_guest_thread`. Save and restore rather than unconditionally
-    // clearing, so a nested entry (e.g. `reenter_thread` reached from inside a
-    // shim callback) does not un-mark the thread while an outer frame is still
-    // running the guest. The guard also runs on unwind, since `run_thread_arch`
-    // is `extern "C-unwind"`.
-    #[cfg(target_arch = "aarch64")]
-    let was_guest_thread = is_guest_thread();
-    #[cfg(target_arch = "aarch64")]
-    set_is_guest_thread(true);
-    #[cfg(target_arch = "aarch64")]
-    let _guest_thread_guard = litebox::utils::defer(|| set_is_guest_thread(was_guest_thread));
+    let _guest_thread = GuestThreadMarker::enter();
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
@@ -1041,6 +1036,50 @@ fn is_guest_thread() -> bool {
     value != 0
 }
 
+/// RAII marker recording that the current thread is running guest code, for
+/// the benefit of [`interrupt_signal_handler`]'s guest-thread probe.
+///
+/// The probe asks a *thread-lifetime* question — "was this thread ever handed
+/// to `run_thread_arch`?" — so it must stay true while the thread sits in the
+/// host, including while parked in an interruptible wait.
+///
+/// On x86-64 this is free: `run_thread_arch` mirrors `fsbase` into `gsbase`,
+/// and `gsbase != 0` answers the question, so this guard does nothing there.
+/// AArch64 has no register that incidentally encodes it — `TPIDR_EL0` is valid
+/// on every thread in the process — so the marker is recorded explicitly.
+///
+/// Entering saves the previous value and restores it on drop, rather than
+/// clearing unconditionally, so a nested entry (e.g. `reenter_thread` reached
+/// from inside a shim callback) cannot un-mark the thread while an outer frame
+/// is still running the guest. Restoring on drop also covers unwinding, since
+/// `run_thread_arch` is `extern "C-unwind"`.
+struct GuestThreadMarker {
+    #[cfg(target_arch = "aarch64")]
+    previous: bool,
+}
+
+impl GuestThreadMarker {
+    fn enter() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let previous = is_guest_thread();
+            set_is_guest_thread(true);
+            Self { previous }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self {}
+        }
+    }
+}
+
+impl Drop for GuestThreadMarker {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        set_is_guest_thread(self.previous);
+    }
+}
+
 /// Reads the guest's virtualized thread pointer. See [`set_guest_tpidr`].
 #[cfg(target_arch = "aarch64")]
 fn get_guest_tpidr() -> usize {
@@ -1084,11 +1123,17 @@ unsafe extern "C-unwind" fn run_thread_arch(
     push rbp
     mov rbp, rsp
     .cfi_def_cfa rbp, 16
+    .cfi_offset rbp, -16
     push rbx
+    .cfi_offset rbx, -24
     push r12
+    .cfi_offset r12, -32
     push r13
+    .cfi_offset r13, -40
     push r14
+    .cfi_offset r14, -48
     push r15
+    .cfi_offset r15, -56
     push rdi // save thread context
 
     // Save host rsp and rbp and guest context top in TLS.
@@ -1245,12 +1290,31 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // Anchor the CFA on the frame pointer so the `sub sp, sp, #16` below (and
     // the callbacks' wholesale `mov sp, host_sp`) do not invalidate unwinding
     // through the `bl`s. This mirrors the x86-64 `.cfi_def_cfa rbp, 16`.
+    //
+    // INVARIANT: this rule is in effect for the whole FDE, including the three
+    // alternate entry points below. Each of them is reached with `x29` holding
+    // *guest* state, so each must re-establish the host `x29` before its `bl`
+    // — otherwise a panic out of a handler would make the unwinder compute
+    // `CFA = guest_x29 + 96` and read a return address from guest-controlled
+    // memory. x86-64 achieves the same thing by reloading `rbp` from the
+    // `host_bp` TLS slot; here `x29 == host_sp + 16` by construction (see the
+    // `sub sp, sp, #16` below), so no TLS slot is needed.
     .cfi_def_cfa x29, 96
     stp x19, x20, [sp, #16]
+    .cfi_offset x19, -80
+    .cfi_offset x20, -72
     stp x21, x22, [sp, #32]
+    .cfi_offset x21, -64
+    .cfi_offset x22, -56
     stp x23, x24, [sp, #48]
+    .cfi_offset x23, -48
+    .cfi_offset x24, -40
     stp x25, x26, [sp, #64]
+    .cfi_offset x25, -32
+    .cfi_offset x26, -24
     stp x27, x28, [sp, #80]
+    .cfi_offset x27, -16
+    .cfi_offset x28, -8
 
     // Reserve one 16-byte slot for `thread_ctx`. Every callback reads it back
     // from `[sp]` after restoring the host stack.
@@ -1286,11 +1350,26 @@ unsafe extern "C-unwind" fn run_thread_arch(
     //   | TPIDR_EL0                | host anchor                            |
     .globl syscall_callback
 syscall_callback:
-    // Clear `in_guest`. This must stay within the first instruction pair:
-    // `interrupt_signal_handler` case 1 recognizes this callback by comparing
-    // the faulting PC against `syscall_callback`.
+    // Clear `in_guest`.
+    //
+    // On x86-64 this is a single instruction, so `interrupt_signal_handler`
+    // case 1 can recognize the callback with `ip == syscall_callback`: either
+    // the store has not retired (pc equals the entry) or it has and
+    // `in_guest` is 0. There is no third state.
+    //
+    // AArch64 needs two instructions, which opens a state x86-64 does not
+    // have: pc == syscall_callback + 4, `in_guest` still 1. Case 1 therefore
+    // tests the half-open range
+    // `syscall_callback .. syscall_callback_in_guest_cleared` rather than an
+    // equality, and the label below is what defines the upper bound. Keep the
+    // label immediately after the `strb`: it is the assembler-enforced
+    // statement that no instruction above it has cleared `in_guest` yet, so
+    // the check can never drift out of sync with this code again.
+    // See `in_syscall_callback_prologue`.
     mrs  x16, tpidr_el0
     strb wzr, [x16, #{IN_GUEST}]
+    .globl syscall_callback_in_guest_cleared
+syscall_callback_in_guest_cleared:
 
     // x16 -> base of the guest `PtRegs`.
     ldr  x16, [x16, #{GUEST_CONTEXT_TOP}]
@@ -1335,9 +1414,16 @@ syscall_callback:
 
     // Back onto the host stack, then handle the syscall. This normally jumps
     // back to the guest and only returns when the thread is exiting.
+    //
+    // `x29` still holds the guest's frame pointer at this point (it was
+    // spilled to `regs[29]` above). Re-establish the host value before the
+    // `bl`, or the `.cfi_def_cfa x29, 96` rule would resolve against guest
+    // memory if `syscall_handler` unwinds. `host_sp` is the frame base minus
+    // the 16-byte `thread_ctx` slot, so the host `x29` is `host_sp + 16`.
     mrs  x17, tpidr_el0
     ldr  x17, [x17, #{HOST_SP}]
     mov  sp,  x17
+    add  x29, sp,  #16
     ldr  x0,  [sp]                // thread_ctx
     bl   {syscall_handler}
     b    .Ldone_aarch64
@@ -1348,10 +1434,16 @@ syscall_callback:
     // overwrites with `thread_ctx`; arguments 1-3 (trapno, error, cr2) are
     // already in x1-x3 and must not be clobbered. So the only scratch register
     // available is x9 and above.
+    //
+    // `x29` arrives holding guest state (this is a signal return out of guest
+    // execution), so it is re-established before the `bl`; see the
+    // `.cfi_def_cfa x29, 96` invariant above.
+    .globl exception_callback
 exception_callback:
     mrs x9, tpidr_el0
     ldr x9, [x9, #{HOST_SP}]
     mov sp, x9
+    add x29, sp, #16
     ldr x0, [sp]                  // thread_ctx
     bl {exception_handler}
     b .Ldone_aarch64
@@ -1360,10 +1452,15 @@ exception_callback:
     // (all four arguments are placeholders) or by a direct branch from
     // `switch_to_guest` when the `interrupt` byte was already set.
     // `interrupt_handler` takes only `thread_ctx`.
+    //
+    // Both entry paths arrive with a guest `x29`, so it is re-established
+    // before the `bl`; see the `.cfi_def_cfa x29, 96` invariant above.
+    .globl interrupt_callback
 interrupt_callback:
     mrs x9, tpidr_el0
     ldr x9, [x9, #{HOST_SP}]
     mov sp, x9
+    add x29, sp, #16
     ldr x0, [sp]                  // thread_ctx
     bl {interrupt_handler}
     b .Ldone_aarch64
@@ -1499,6 +1596,11 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
     "
+// No `.cfi_startproc`/`.cfi_endproc`, so this function gets no FDE. That is
+// deliberate: it is `-> !` and never returns, and the doc comment above
+// forbids calling it where the stack may need unwinding, so there is no
+// correct CFA to describe. Emitting a rule here would be worse than emitting
+// none, because `sp` and `x29` are switched to guest values partway through.
 switch_to_guest_start:
     // Set `in_guest` now, then check for a pending interrupt. If an interrupt
     // arrives after the check, the signal handler sees that the PC is between
@@ -1522,6 +1624,14 @@ switch_to_guest_start:
 3:
 
     // x0 holds `ctx` and stays live until the final two loads.
+    //
+    // `msr nzcv` writes only PSTATE 31:28. SSBS and DIT are carried in
+    // `PtRegs::pstate` (see `copy_signal_context`) but are knowingly NOT
+    // restored here: writing them needs `msr ssbs`/`msr dit`, which are
+    // ARMv8.0 optional / ARMv8.4 respectively, so unconditionally emitting
+    // them would raise this crate's hardware floor. A guest that sets SSBS or
+    // DIT therefore loses them across a syscall. Acceptable for now: both are
+    // hardening hints with no architectural effect on results.
     ldr  x16, [x0, #264]          // pstate
     msr  nzcv, x16
     ldr  x16, [x0, #248]          // guest sp
@@ -1542,8 +1652,7 @@ switch_to_guest_start:
     ldp  x23, x24, [x0, #184]
     ldp  x25, x26, [x0, #200]
     ldp  x27, x28, [x0, #216]
-    ldr  x29, [x0, #232]
-    ldr  x30, [x0, #240]
+    ldp  x29, x30, [x0, #232]
     ldr  x16, [x0, #256]          // guest PC -- x16 is the branch register
     ldr  x0,  [x0, #0]            // guest x0, last use of ctx
     br   x16
@@ -1707,13 +1816,9 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // guest-thread probe in `interrupt_signal_handler`. That part does
         // need an explicit equivalent, or test threads would re-raise
         // process-wide instead of recording pending signals locally, diverging
-        // from x86-64 behaviour.
-        #[cfg(target_arch = "aarch64")]
-        let was_guest_thread = is_guest_thread();
-        #[cfg(target_arch = "aarch64")]
-        set_is_guest_thread(true);
-        #[cfg(target_arch = "aarch64")]
-        let _guest_thread_guard = litebox::utils::defer(|| set_is_guest_thread(was_guest_thread));
+        // from x86-64 behaviour. `GuestThreadMarker` is that equivalent (and
+        // is a no-op on x86-64, where the mirroring above already did it).
+        let _guest_thread = GuestThreadMarker::enter();
 
         ThreadHandle::run_with_handle(f)
     }
@@ -1807,10 +1912,12 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
                 options(nostack),
             );
         }
-        // Same sequentially-consistent `ldaxr`/`stlxr` exchange as
-        // `take_pending_host_signals`, on a 64-bit slot. The interrupt signal
-        // handler reads this slot, so the ordering must match the x86-64
-        // `xchg` it replaces.
+        // Same `ldaxr`/`stlxr` exchange as `take_pending_host_signals`, on a
+        // 64-bit slot, and required for the same reason: atomicity against a
+        // signal handler on this thread (`record_pending_signal` reads this
+        // slot), not cross-thread ordering. The slot is thread-local, so
+        // program order already relates every access. The barriers are kept
+        // for parity with the x86-64 `xchg`.
         #[cfg(target_arch = "aarch64")]
         // SAFETY: exchanges a naturally aligned `u64` in this thread's own TLS
         // control block, whose offset from `TPIDR_EL0` is checked by
@@ -2468,10 +2575,41 @@ impl litebox::platform::StdioProvider for LinuxUserland {
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
+    /// First instruction of `syscall_callback` *after* the store that clears
+    /// `in_guest`. Bounds the case-1 window in
+    /// [`in_syscall_callback_prologue`]; see the comment at the label.
+    #[cfg(target_arch = "aarch64")]
+    fn syscall_callback_in_guest_cleared();
     fn exception_callback();
     fn interrupt_callback();
     fn switch_to_guest_start();
     fn switch_to_guest_end();
+}
+
+/// Whether `ip` is inside `syscall_callback`'s prologue, i.e. before the guest
+/// has been fully accounted for but after control has left the guest.
+///
+/// This is `interrupt_signal_handler` case 1. Getting the bound wrong is not a
+/// benign off-by-one: an `ip` that is past the prologue but still has
+/// `in_guest == 1` falls through to case 4, where `copy_signal_context`
+/// overwrites the guest `PtRegs` with *host* state — a runtime pc, the gate
+/// frame's shifted sp, and `syscallno = NO_SYSCALL` — silently dropping the
+/// in-flight guest syscall.
+fn in_syscall_callback_prologue(ip: usize) -> bool {
+    let start = syscall_callback as *const () as usize;
+    // x86-64 clears `in_guest` in one instruction, so the window is exactly
+    // the entry pc.
+    #[cfg(target_arch = "x86_64")]
+    {
+        ip == start
+    }
+    // AArch64 needs `mrs` + `strb`, so the window spans both. The upper bound
+    // is a label emitted immediately after the `strb` rather than a hardcoded
+    // `start + 8`, so the assembler keeps it in sync with the code.
+    #[cfg(target_arch = "aarch64")]
+    {
+        (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
+    }
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
@@ -2914,6 +3052,10 @@ fn set_signal_return(
 /// execution, so ordinary TLS addressing already works on entry.
 #[cfg(target_arch = "aarch64")]
 fn signal_handler_exit_guest(
+    // Unused on AArch64: the x86-64 counterpart needs the signal context to
+    // recover the host TLS segment, but `TPIDR_EL0` is the host anchor at all
+    // times here, so there is nothing to recover. Kept for signature parity so
+    // both call sites stay architecture-free.
     _context: &libc::ucontext_t,
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
@@ -2963,7 +3105,19 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     }
     regs.sp = m.sp.trunc();
     regs.pc = m.pc.trunc();
-    regs.pstate = m.pstate;
+    // Mask to the bits a guest may own, so this producer agrees with the other
+    // one. `syscall_callback` builds `pstate` with `mrs x0, nzcv`, which yields
+    // NZCV in 31:28 and zeros everywhere else; the raw `m.pstate` here also
+    // carries SSBS, DIT, EL/nRW/interrupt-mask bits and possibly the
+    // illegal-state bit. Without the mask the shim would see a different bit
+    // population depending on whether a context came from a syscall or from a
+    // signal, and could observe privileged bits it has no business seeing.
+    //
+    // `SAFE_USER_PSTATE` is exactly `NZCV | SSBS | DIT`, the same set
+    // `PtRegs::sanitize_for_user_return` keeps. SSBS and DIT survive into
+    // `PtRegs` but are *not* restored by `switch_to_guest` — see the note on
+    // its `msr nzcv`.
+    regs.pstate = m.pstate & litebox_common_linux::arch::SAFE_USER_PSTATE;
     // This `PtRegs` slot is reused across guest entries, so `syscallno` may
     // still hold a syscall number written by `syscall_callback` on an earlier
     // trip through the guest. Leaving it would tell the shim a syscall is in
@@ -2984,11 +3138,15 @@ const NO_SYSCALL: i32 = -1;
 /// Widens a host-pointer-sized value into an AArch64 general-purpose register
 /// slot in `mcontext_t`.
 ///
-/// AArch64 is always 64-bit, so this never fails; it exists so the conversion
-/// reads as a widening rather than a lossy `as` cast.
+/// Infallible by construction rather than by `expect`: `usize::to_ne_bytes`
+/// yields `[u8; 8]` only when `usize` is 64 bits, so the array-to-array
+/// conversion below simply fails to compile on any target where this could
+/// lose information. That matters because every caller runs inside a signal
+/// handler, where unwinding out of a panic is not async-signal-safe (the panic
+/// machinery formats and allocates).
 #[cfg(target_arch = "aarch64")]
 fn to_greg(value: usize) -> u64 {
-    u64::try_from(value).expect("aarch64 pointers are 64-bit")
+    u64::from_ne_bytes(value.to_ne_bytes())
 }
 
 /// Updates a Linux signal context to return to `f` with the given arguments.
@@ -3081,7 +3239,10 @@ unsafe extern "C" fn exception_signal_handler(
     // would put a program counter in a field named `fault_address`.
     #[cfg(target_arch = "aarch64")]
     let (trapno, err, cr2) = (
-        isize::try_from(signum).expect("signal numbers are small"),
+        // Widen infallibly: this runs in a signal handler, where a panic is
+        // not async-signal-safe. `i64::from` is a lossless widening and
+        // `trunc` to `isize` is exact on a 64-bit target.
+        TruncateExt::<isize>::trunc(i64::from(signum)),
         0isize,
         TruncateExt::<usize>::trunc(sigctx.fault_address).reinterpret_as_signed(),
     );
@@ -3183,11 +3344,25 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
         );
     }
 
-    // An `ldxr`/`stxr` retry loop rather than the LSE `stset`: `stset` is
+    // An `ldaxr`/`stlxr` retry loop rather than the LSE `stset`: `stset` is
     // ARMv8.1-A, while the `aarch64-unknown-linux-gnu` baseline is ARMv8.0-A,
     // so using it would need `+lse` and would raise this crate's hardware
-    // floor. The acquire/release pairing gives the same sequentially
-    // consistent ordering as the x86-64 `lock or`.
+    // floor.
+    //
+    // The property needed is atomicity of the read-modify-write against the
+    // interrupted code on this same thread — this handler can preempt
+    // `take_pending_host_signals` mid-exchange, and a plain load/or/store
+    // would let the two lose a bit. It is NOT a cross-thread relationship:
+    // the slot is in this thread's own TLS block. So the acquire/release
+    // pairing is stronger than strictly necessary; it is retained to keep the
+    // model identical to the x86-64 `lock or`.
+    //
+    // Consistent with that, the trailing `ldr {waker}` is deliberately left
+    // unordered with respect to the loop: `stlxr` is a store-release, which
+    // orders only *prior* accesses, so the load may be hoisted above it. That
+    // is harmless here precisely because there is no cross-thread relationship
+    // to establish — `wait_waker_addr` is only ever published by this thread's
+    // own `update_waker`.
     #[cfg(target_arch = "aarch64")]
     let waker_addr: usize;
     #[cfg(target_arch = "aarch64")]
@@ -3333,7 +3508,7 @@ unsafe fn interrupt_signal_handler(
     // FUTURE: handle trampoline code, too. This is somewhat less important
     // because it's probably fine for the shim to observe a guest context that
     // is inside the trampoline.
-    if ip == syscall_callback as *const () as usize {
+    if in_syscall_callback_prologue(ip) {
         // No need to clear `in_guest` or set interrupt; the syscall handler will
         // clear `in_guest` and call into the shim.
         return;
