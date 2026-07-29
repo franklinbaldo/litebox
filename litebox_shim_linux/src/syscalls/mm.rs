@@ -576,6 +576,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
+        let e_machine = ehdr.e_machine.get(ENDIAN);
         let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).trunc();
         let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
@@ -668,9 +669,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // Use the same placement rule as the rewriter so the runtime and
             // ahead-of-time paths agree; see `trampoline_addr_for` for why the
             // maximum segment alignment (not the page size) governs this.
-            let Ok(offset) =
-                litebox_syscall_rewriter::trampoline_addr_for(max_load_end, max_load_align)
-            else {
+            let Ok(offset) = litebox_syscall_rewriter::trampoline_addr_for(
+                max_load_end,
+                max_load_align,
+                e_machine,
+            ) else {
                 return;
             };
             let offset: usize = offset.trunc();

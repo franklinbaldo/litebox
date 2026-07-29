@@ -1538,9 +1538,26 @@ pub const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 /// range reserved instead: emit a `PT_LOAD` covering the trampoline, so the
 /// dynamic loader includes it in the object's span and places every other object
 /// clear of it -- the same guarantee every ordinary segment already gets.
-pub fn trampoline_addr_for(max_load_end: u64, max_align: u64) -> Result<u64> {
+///
+/// # Why the slow-path rule is gated on `e_machine`
+///
+/// The `max_align > TRAMPOLINE_PAGE_SIZE` rule is deliberately applied only to
+/// `EM_AARCH64` objects, even though glibc's slow path is not
+/// architecture-specific -- it triggers on any object whose `p_align` exceeds
+/// the page size, and GNU ld's default max-page-size on x86-64 is `0x200000`,
+/// so many x86-64 objects qualify.
+///
+/// This is risk management, not semantics. Because of the hazard described
+/// above, *any* change to this address changes which programs happen to
+/// collide. Applying the new rule to x86-64 would move its trampoline by up to
+/// 4 MiB and could break x86-64 programs that work today, to fix a failure only
+/// ever observed on AArch64. Once the trampoline gets its own `PT_LOAD` the
+/// hazard disappears and this gate should go with it.
+pub fn trampoline_addr_for(max_load_end: u64, max_align: u64, e_machine: u16) -> Result<u64> {
     // Guard against a bogus `p_align`: the masking below requires a power of two.
-    let align = if max_align.is_power_of_two() {
+    // Non-AArch64 objects keep the historical page-granular rule verbatim, so
+    // their placement cannot move (see "Why the slow-path rule is gated" above).
+    let align = if e_machine == object::elf::EM_AARCH64 && max_align.is_power_of_two() {
         max_align.max(TRAMPOLINE_PAGE_SIZE)
     } else {
         TRAMPOLINE_PAGE_SIZE
@@ -1561,7 +1578,11 @@ fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<u64> {
     let max_virtual_addr = max_load_segment_end(elf)
         .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
 
-    trampoline_addr_for(max_virtual_addr, max_load_segment_align(elf))
+    trampoline_addr_for(
+        max_virtual_addr,
+        max_load_segment_align(elf),
+        elf.elf_header().e_machine.get(elf.endian()),
+    )
 }
 
 /// Returns the largest `p_align` among all `PT_LOAD` segments, or
@@ -1928,11 +1949,23 @@ mod tests {
     /// in the first page past the last `PT_LOAD`, unchanged from before.
     #[test]
     fn trampoline_addr_page_aligned_segments_use_next_page() {
-        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x1000).unwrap(), 0x20e_000);
-        assert_eq!(trampoline_addr_for(0x20e_000, 0x1000).unwrap(), 0x20e_000);
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x1000, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+        assert_eq!(
+            trampoline_addr_for(0x20e_000, 0x1000, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
         // A `p_align` below the page size must not pull the address down.
-        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x1).unwrap(), 0x20e_000);
-        assert_eq!(trampoline_addr_for(0x20d_fd0, 0).unwrap(), 0x20e_000);
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x1, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
     }
 
     /// With 64 KiB segment alignment (the aarch64 case) the trampoline must
@@ -1942,22 +1975,52 @@ mod tests {
     #[test]
     fn trampoline_addr_skips_loader_alignment_slack() {
         // Real values from aarch64 `libc.so.6`: last PT_LOAD ends at 0x20dfd0.
-        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x10000).unwrap(), 0x220_000);
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x10000, object::elf::EM_AARCH64).unwrap(),
+            0x220_000
+        );
         // Exactly on an alignment boundary still skips a full unit, because the
         // loader's reservation runs to `end + p_align`.
-        assert_eq!(trampoline_addr_for(0x210_000, 0x10000).unwrap(), 0x220_000);
+        assert_eq!(
+            trampoline_addr_for(0x210_000, 0x10000, object::elf::EM_AARCH64).unwrap(),
+            0x220_000
+        );
     }
 
     /// A non-power-of-two `p_align` is bogus; fall back to the page size rather
     /// than corrupting the mask arithmetic.
     #[test]
     fn trampoline_addr_rejects_non_power_of_two_align() {
-        assert_eq!(trampoline_addr_for(0x20d_fd0, 0x3000).unwrap(), 0x20e_000);
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x3000, object::elf::EM_AARCH64).unwrap(),
+            0x20e_000
+        );
+    }
+
+    /// The slow-path rule is gated on `EM_AARCH64`. GNU ld's default
+    /// max-page-size on x86-64 is 0x200000, so x86-64 objects routinely have a
+    /// `p_align` above the page size -- but their placement must not move,
+    /// because any change to this address changes which programs collide (see
+    /// the TODO on `trampoline_addr_for`). This also covers cross-rewriting an
+    /// x86-64 binary from an aarch64 host, where `cfg(target_arch)` would be
+    /// the wrong test.
+    #[test]
+    fn trampoline_addr_slow_path_rule_is_aarch64_only() {
+        // 2 MiB alignment, the x86-64 default: keeps the old next-page rule.
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x200000, object::elf::EM_X86_64).unwrap(),
+            0x20e_000
+        );
+        // The identical object as aarch64 does skip an alignment unit.
+        assert_eq!(
+            trampoline_addr_for(0x20d_fd0, 0x200000, object::elf::EM_AARCH64).unwrap(),
+            0x600_000
+        );
     }
 
     #[test]
     fn trampoline_addr_reports_overflow() {
-        assert!(trampoline_addr_for(u64::MAX - 1, 0x10000).is_err());
+        assert!(trampoline_addr_for(u64::MAX - 1, 0x10000, object::elf::EM_AARCH64).is_err());
     }
 
     #[test]
