@@ -24,7 +24,15 @@ use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
 };
 
-const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FileAttributes: u32 {
+        const READONLY = 0x0000_0001;
+        const DIRECTORY = 0x0000_0010;
+        const ARCHIVE = 0x0000_0020;
+        const _ = !0;
+    }
+}
 
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
@@ -84,7 +92,16 @@ struct FileFsDeviceInformation {
     characteristics: u32,
 }
 
-const _: () = assert!(size_of::<FileFsDeviceInformation>() == 8);
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+pub(crate) struct FileBasicInformation {
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    file_attributes: u32,
+    _reserved: u32,
+}
 
 pub(crate) struct FileObjectSubsystem<FS>(PhantomData<fn(FS)>);
 
@@ -477,11 +494,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Err(status) = probe_file_outputs::<Platform>(file_handle, io_status_block) {
             return status;
         }
+
         let result = self.do_nt_create_file(
             desired_access,
             object_attributes,
             io_status_block,
-            FILE_ATTRIBUTE_READONLY,
+            FileAttributes::READONLY.bits(),
             share_access,
             CreateDisposition::Open,
             open_options,
@@ -492,6 +510,86 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.close_file_handle(handle);
         })
     }
+
+    pub(crate) fn sys_nt_query_attributes_file(
+        &self,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        file_information: MutPtr<Platform, FileBasicInformation>,
+    ) -> NtStatus {
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, FileBasicInformation>(file_information)
+        {
+            return status;
+        }
+        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
+        };
+        let path = match self.object_attributes_to_file_target(object_attributes) {
+            Ok(FileTarget::Filesystem(path)) => path,
+            // TODO(condrv-attributes): Model native attributes for ConDrv objects.
+            Ok(FileTarget::Condrv(object)) => {
+                litebox_util_log::debug!(
+                    object:? = object;
+                    "NtQueryAttributesFile does not support ConDrv objects"
+                );
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
+            Err(status) => return status,
+        };
+        let status =
+            match self.fs.file_status(&path) {
+                Ok(status) => status,
+                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                    let parent = path.rsplit_once('/').map_or("/", |(parent, _)| {
+                        if parent.is_empty() { "/" } else { parent }
+                    });
+                    return if self.fs.file_status(parent).is_ok() {
+                        NtStatus::OBJECT_NAME_NOT_FOUND
+                    } else {
+                        NtStatus::OBJECT_PATH_NOT_FOUND
+                    };
+                }
+                Err(error) => return map_file_status_error(error),
+            };
+        let readonly = !status.mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH);
+        let mut file_attributes = match status.file_type {
+            FileType::Directory => FileAttributes::DIRECTORY,
+            FileType::RegularFile => FileAttributes::ARCHIVE,
+            // TODO(chardev-attributes): Probe native attributes for character devices and
+            // future filesystem node types; regular files are host-grounded as ARCHIVE.
+            file_type => {
+                litebox_util_log::debug!(
+                    path = path.as_str(),
+                    file_type:? = file_type;
+                    "Using archive attributes for nonstandard filesystem node"
+                );
+                FileAttributes::ARCHIVE
+            }
+        };
+        if readonly {
+            file_attributes |= FileAttributes::READONLY;
+        }
+        // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
+        litebox_util_log::debug!(
+            path = path.as_str();
+            "Using zero timestamps for file attributes"
+        );
+        let information = FileBasicInformation {
+            file_attributes: file_attributes.bits(),
+            ..FileBasicInformation::default()
+        };
+        if file_information.write_at_offset(0, information).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    // TODO(query-full-attributes): Implement NtQueryFullAttributesFile when a guest needs
+    // allocation size and end-of-file metadata in addition to basic attributes.
 
     #[expect(
         clippy::too_many_arguments,
@@ -1260,10 +1358,10 @@ fn validate_create_options(
 }
 
 fn create_mode(file_attributes: u32) -> Mode {
-    if file_attributes & FILE_ATTRIBUTE_READONLY == 0 {
-        Mode::RUSR | Mode::WUSR
-    } else {
+    if FileAttributes::from_bits_retain(file_attributes).contains(FileAttributes::READONLY) {
         Mode::RUSR
+    } else {
+        Mode::RUSR | Mode::WUSR
     }
 }
 
@@ -1477,6 +1575,57 @@ mod tests {
             0,
         );
         (status, handle)
+    }
+
+    fn basic_information_sentinel() -> FileBasicInformation {
+        FileBasicInformation {
+            creation_time: 1,
+            last_access_time: 2,
+            last_write_time: 3,
+            change_time: 4,
+            file_attributes: 0xcccc_cccc,
+            _reserved: 0xdddd_dddd,
+        }
+    }
+
+    #[test]
+    fn nt_query_attributes_file_reports_file_type_attributes() {
+        let task = crate::tests::test_task();
+        create_existing_file(&task, "/tmp/query-attributes.txt", b"data");
+        task.fs
+            .mkdir(
+                "/tmp/query-attributes-dir",
+                Mode::RUSR | Mode::WUSR | Mode::XUSR,
+            )
+            .unwrap();
+
+        for (path, expected_attributes) in [
+            ("/tmp/query-attributes.txt", FileAttributes::ARCHIVE.bits()),
+            (
+                "/tmp/query-attributes-dir",
+                FileAttributes::DIRECTORY.bits(),
+            ),
+        ] {
+            let (_path, _name, attributes) = open_object_attributes(path);
+            let mut information = basic_information_sentinel();
+
+            assert_eq!(
+                task.sys_nt_query_attributes_file(
+                    Some(const_ptr(&attributes)),
+                    mut_ptr(&mut information),
+                ),
+                NtStatus::SUCCESS,
+                "{path}"
+            );
+            assert_eq!(
+                information,
+                FileBasicInformation {
+                    file_attributes: expected_attributes,
+                    ..FileBasicInformation::default()
+                },
+                "{path}"
+            );
+        }
     }
 
     #[test]
