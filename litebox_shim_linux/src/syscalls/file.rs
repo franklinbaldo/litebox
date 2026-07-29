@@ -1253,7 +1253,15 @@ where
         st_gid: 0,
         st_rdev: 0,
         st_size: 0,
+        // `st_blksize` is `usize` in the x86-64 `struct stat` but `i32` in the
+        // asm-generic layout that aarch64 uses.
+        #[cfg(target_arch = "x86_64")]
         st_blksize: blksize,
+        #[cfg(target_arch = "aarch64")]
+        st_blksize: {
+            let blksize: u32 = blksize.trunc();
+            blksize.reinterpret_as_signed()
+        },
         st_blocks: 0,
         ..Default::default()
     };
