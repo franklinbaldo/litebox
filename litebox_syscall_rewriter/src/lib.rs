@@ -1534,10 +1534,28 @@ pub const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 /// placement rule overlapped libperl too, by 0x8000. Adjusting the arithmetic
 /// here cannot fix it, only change which programs happen to collide.
 ///
-/// The likely fix is to stop having the runtime guess at a free gap and make the
-/// range reserved instead: emit a `PT_LOAD` covering the trampoline, so the
-/// dynamic loader includes it in the object's span and places every other object
-/// clear of it -- the same guarantee every ordinary segment already gets.
+/// The fix is to reserve the range rather than guess at a free gap -- and
+/// LiteBox already has that mechanism. `ElfParsedFile::load` extends the
+/// `MapMemory::reserve` span to cover the trampoline
+/// (`litebox_common_linux/src/loader.rs`, the `if let Some(trampoline)` arm in
+/// the `base_addr` computation), so nothing can be placed there. That is why
+/// the initial executable and the interpreter never collide.
+///
+/// The gap is that it only covers objects *our* loader maps. Every shared
+/// library is mapped by the guest's own `ld.so` through the shim's `mmap` hook
+/// (`do_mmap_file` -> `maybe_patch_exec_segment`), where the reservation is
+/// whatever `ld.so` asked for -- the `PT_LOAD` span alone. Confirmed in a live
+/// process map: `ld-linux`'s trampoline sits inside a `PROT_NONE` reservation,
+/// while `libc`'s has no slack after it and lands inside `libpython`.
+///
+/// Closing it means teaching the shim's `mmap` hook to grow the reservation the
+/// same way. That is awkward because `ld.so` reserves with an *anonymous*
+/// `mmap(NULL, span, PROT_NONE)` carrying no fd, so at reservation time the
+/// trampoline header has not been read yet; by the time the file-backed
+/// `MAP_FIXED` arrives and the trampoline size is known, another object may
+/// already own the range. TODO: associate the anonymous reservation with the
+/// file mapping that follows it so the span can be grown before any other
+/// object is placed.
 ///
 /// # Why the slow-path rule is gated on `e_machine`
 ///
