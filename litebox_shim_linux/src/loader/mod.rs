@@ -3,7 +3,8 @@
 
 //! This module contains the loader for the LiteBox shim.
 
-#![cfg(target_arch = "x86_64")]
+// This module is architecture-neutral; the ELF headers it parses are 64-bit
+// little-endian on both supported architectures.
 pub mod auxv;
 pub mod elf;
 mod stack;

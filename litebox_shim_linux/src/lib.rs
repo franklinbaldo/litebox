@@ -156,6 +156,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
         ctx: &mut Self::ExecutionContext,
         info: &litebox::shim::ExceptionInfo,
     ) -> ContinueOperation {
+        #[cfg(target_arch = "x86_64")]
         if info.kernel_mode && info.exception == litebox::shim::Exception::PAGE_FAULT {
             if unsafe {
                 self.task
@@ -169,6 +170,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
             } else {
                 return ContinueOperation::Terminate;
             }
+        }
+        // On aarch64 a kernel-mode abort would be the demand-paging path, but the
+        // page fault handler needs an access-type "error code" that on aarch64 lives
+        // in ESR_EL1's ISS field (bits 25:0). Platforms that synthesize `ExceptionInfo`
+        // from a signal (`litebox_platform_linux_userland`) leave the ISS zero, so
+        // read-vs-write and the fault status code cannot be recovered. Rather than
+        // feed the page fault handler a fabricated error code, refuse the path
+        // outright. It is unreachable today: the only aarch64 platform never sets
+        // `kernel_mode`, and its host kernel handles demand paging itself.
+        #[cfg(target_arch = "aarch64")]
+        if info.kernel_mode
+            && (info.exception == litebox::shim::Exception::DATA_ABORT_CURRENT_EL
+                || info.exception == litebox::shim::Exception::INSTRUCTION_ABORT_CURRENT_EL)
+        {
+            unimplemented!(
+                "aarch64: kernel-mode demand paging needs the ESR_EL1 ISS access bits, \
+                 which no aarch64 platform currently supplies (esr={:#x}, far={:#x})",
+                info.esr,
+                info.fault_address
+            );
         }
         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
     }
@@ -577,6 +598,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             ctx.rax = return_value;
         }
+        #[cfg(target_arch = "aarch64")]
+        {
+            ctx.regs[0] = return_value;
+        }
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
@@ -589,6 +614,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+        // The arm64 kernel keeps the syscall number in `w8`, mirrored into
+        // `pt_regs::syscallno`. The platform sets it to `NO_SYSCALL` (-1) on the
+        // exception and interrupt paths, which never reach here.
+        #[cfg(target_arch = "aarch64")]
+        let syscall_number = usize::try_from(ctx.syscallno).unwrap_or_else(|_| {
+            unreachable!(
+                "aarch64: do_syscall entered with syscallno={} (NO_SYSCALL)",
+                ctx.syscallno
+            )
+        });
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
         match request {
@@ -1078,11 +1113,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
             SyscallRequest::SetThreadArea { user_desc } => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let _ = user_desc;
-                    Err(Errno::ENOSYS) // x86_64 does not support set_thread_area
-                }
+                // `set_thread_area` is a 32-bit x86 syscall; neither x86-64 nor
+                // aarch64 implements it.
+                let _ = user_desc;
+                Err(Errno::ENOSYS)
             }
             SyscallRequest::SetTidAddress { tidptr } => {
                 Ok(self.sys_set_tid_address(tidptr).reinterpret_as_unsigned() as usize)

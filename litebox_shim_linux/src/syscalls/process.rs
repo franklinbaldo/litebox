@@ -518,9 +518,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 /// A descriptor for thread-local storage (TLS).
 ///
-/// On `x86_64`, this is represented as a `*mut u8`. The TLS pointer can point to
-/// an arbitrary-sized memory region.
-#[cfg(target_arch = "x86_64")]
+/// On `x86_64` this is the `FS` segment base, and on `aarch64` it is the guest
+/// `TPIDR_EL0` value. Both are represented as a `*mut u8`: the TLS pointer can
+/// point to an arbitrary-sized memory region.
 type ThreadLocalDescriptor = UserPtrMut<u8>;
 
 struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
@@ -641,15 +641,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
+            // Validate the user-controlled TLS base before spawning the thread.
             #[cfg(target_arch = "x86_64")]
-            {
-                // Validate the user-controlled TLS base before spawning the thread.
-                if !litebox_common_linux::arch::is_valid_user_fs_base(addr) {
-                    return Err(Errno::EPERM);
-                }
+            let valid = litebox_common_linux::arch::is_valid_user_fs_base(addr);
+            #[cfg(target_arch = "aarch64")]
+            let valid = litebox_common_linux::arch::is_valid_user_tls_base(addr);
+            if !valid {
+                return Err(Errno::EPERM);
             }
-            #[cfg(target_arch = "x86_64")]
-            let desc = UserPtrMut::from_usize(addr);
+            let desc: ThreadLocalDescriptor = UserPtrMut::from_usize(addr);
             Some(desc)
         } else {
             None
@@ -1454,19 +1454,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
-        pathname: UserPtr<i8>,
-        argv: UserPtr<UserPtr<i8>>,
-        envp: UserPtr<UserPtr<i8>>,
+        pathname: UserPtr<core::ffi::c_char>,
+        argv: UserPtr<UserPtr<core::ffi::c_char>>,
+        envp: UserPtr<UserPtr<core::ffi::c_char>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         fn copy_vector<Platform: ShimPlatform>(
-            mut base: UserPtr<UserPtr<i8>>,
+            mut base: UserPtr<UserPtr<core::ffi::c_char>>,
             _which: &str,
         ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
             let mut out = alloc::vec::Vec::new();
             let mut total = 0usize;
             for _ in 0..MAX_VEC {
-                let p: UserPtr<i8> = {
+                let p: UserPtr<core::ffi::c_char> = {
                     // read pointer-sized entries
                     match base.read_at_offset::<Platform>(0) {
                         Some(ptr) => ptr,
@@ -1537,9 +1537,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         unsafe { self.global.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
+        // The guest thread pointer does not survive `execve`.
+        #[cfg(target_arch = "x86_64")]
+        let tls_reg = ArchSpecificRegister::FsBase;
+        #[cfg(target_arch = "aarch64")]
+        let tls_reg = ArchSpecificRegister::TpidrEl0;
         self.global
             .platform
-            .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
+            .set_arch_specific_register(&tls_reg, 0)
             .expect("failed to clear guest TLS on execve");
 
         self.load_program(loader, argv_vec, envp_vec)
@@ -1609,6 +1614,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         ss: 0x2b, // __USER_DS
                     };
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // The arm64 kernel's `start_thread` zeroes every GPR and
+                    // PSTATE (EL0t, all interrupts unmasked) before entering the
+                    // new image; only PC and SP carry information.
+                    *ctx = litebox_common_linux::PtRegs {
+                        regs: [0; litebox_common_linux::AARCH64_GENERAL_REGISTER_COUNT],
+                        sp: load_info.user_stack_top,
+                        pc: load_info.entry_point,
+                        pstate: 0,
+                        orig_x0: 0,
+                        syscallno: litebox_common_linux::arch::NO_SYSCALL,
+                        unused2: 0,
+                    };
+                }
             }
             ThreadInitState::NewThread {
                 tls,
@@ -1623,6 +1643,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     }
                     ctx.rax = 0;
                 }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if let Some(stack) = stack {
+                        ctx.sp = stack;
+                    }
+                    ctx.regs[0] = 0;
+                }
 
                 // Set the TLS for the new thread.
                 if let Some(tls) = tls {
@@ -1630,6 +1657,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     {
                         self.sys_arch_prctl(ArchPrctlArg::SetFs(tls.as_usize()))
                             .unwrap();
+                    }
+                    // AArch64 has no `arch_prctl`; `CLONE_SETTLS` programs the
+                    // guest thread pointer directly. `sys_clone` already
+                    // validated the value.
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        self.global
+                            .platform
+                            .set_arch_specific_register(
+                                &ArchSpecificRegister::TpidrEl0,
+                                tls.as_usize(),
+                            )
+                            .expect("failed to set guest TLS for the new thread");
                     }
                 }
 

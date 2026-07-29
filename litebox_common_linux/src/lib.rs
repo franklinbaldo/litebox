@@ -3206,6 +3206,13 @@ pub mod arch {
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
 
+    /// The arm64 kernel's `pt_regs::syscallno` sentinel for "this context is not
+    /// in a syscall" (`NO_SYSCALL` in `arch/arm64/include/asm/ptrace.h`).
+    ///
+    /// Platforms write this on the exception and interrupt paths so the shim can
+    /// tell an in-flight syscall from one that never happened.
+    pub const NO_SYSCALL: i32 = -1;
+
     /// Returns whether `base` is a valid AArch64 Linux user thread-pointer
     /// (`TPIDR_EL0`) value.
     ///

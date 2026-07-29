@@ -3131,13 +3131,8 @@ fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::
     // Note x86-64's `copy_signal_context` deliberately differs: it sets
     // `orig_rax = rax` and has no `syscallno` field to invalidate.
     regs.orig_x0 = regs.regs[0];
-    regs.syscallno = NO_SYSCALL;
+    regs.syscallno = litebox_common_linux::arch::NO_SYSCALL;
 }
-
-/// The arm64 kernel's `syscallno` sentinel for "this context is not in a
-/// syscall" (`NO_SYSCALL` in `arch/arm64/include/asm/ptrace.h`).
-#[cfg(target_arch = "aarch64")]
-const NO_SYSCALL: i32 = -1;
 
 /// Widens a host-pointer-sized value into an AArch64 general-purpose register
 /// slot in `mcontext_t`.
