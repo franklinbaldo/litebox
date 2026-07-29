@@ -1632,6 +1632,10 @@ switch_to_guest_start:
     // them would raise this crate's hardware floor. A guest that sets SSBS or
     // DIT therefore loses them across a syscall. Acceptable for now: both are
     // hardening hints with no architectural effect on results.
+    //
+    // TODO: restore SSBS/DIT for guests that set them, gated on a runtime
+    // feature probe (HWCAP_SSBS / HWCAP2_DIT) so the hardware floor stays at
+    // ARMv8.0. Only worth doing once a guest actually depends on them.
     ldr  x16, [x0, #264]          // pstate
     msr  nzcv, x16
     ldr  x16, [x0, #248]          // guest sp
