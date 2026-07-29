@@ -3,9 +3,12 @@
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
 
-// Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
-// Linux, but we _may_ allow for more in the future, if we find it useful to do so.
-#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+// Restrict this crate to only work on Linux. For now, we are restricting this to only x86-64 and
+// aarch64 Linux, but we _may_ allow for more in the future, if we find it useful to do so.
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 
 use std::cell::Cell;
 use std::io::IsTerminal as _;
@@ -177,6 +180,9 @@ impl LinuxUserland {
     ///
     /// Panics if the tun device could not be successfully opened.
     pub fn new(tun_device_name: Option<&str>) -> &'static Self {
+        #[cfg(target_arch = "aarch64")]
+        assert_tls_layout();
+
         register_exception_handlers();
 
         let tun_socket_fd = tun_device_name
@@ -687,6 +693,124 @@ fn run_thread_inner(
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
     });
+}
+
+/// Byte offsets of the AArch64 TLS control block from `TPIDR_EL0`.
+///
+/// These are hardcoded rather than materialized through `#:tprel_g1:` /
+/// `#:tprel_g0_nc:` relocation pairs because `syscall_callback` is entered with
+/// only `x16` free and cannot spare the second scratch register a relocation
+/// pair needs. [`assert_tls_layout`] verifies them at startup.
+#[cfg(target_arch = "aarch64")]
+mod tls_offset {
+    /// Guest thread pointer. Fixed by the rewriter ABI: must equal
+    /// `litebox_syscall_rewriter`'s `arm64::GUEST_TPIDR_OFFSET`.
+    pub(super) const GUEST_TPIDR: usize = 16;
+    pub(super) const HOST_SP: usize = 24;
+    pub(super) const GUEST_CONTEXT_TOP: usize = 32;
+    pub(super) const IN_GUEST: usize = 40;
+    pub(super) const INTERRUPT: usize = 41;
+    pub(super) const PENDING_HOST_SIGNALS: usize = 44;
+    pub(super) const WAIT_WAKER_ADDR: usize = 48;
+}
+
+// The block is emitted into `.tdata` so the linker places it ahead of every
+// `.tbss` object, putting it at the head of the main executable's static TLS
+// area and therefore at a known offset from the thread pointer. A `.tbss`
+// placement measures at +48 instead of the required +16 on a stock Rust binary.
+#[cfg(target_arch = "aarch64")]
+core::arch::global_asm!(
+    "
+    .section .tdata.litebox_tls, \"awT\", @progbits
+    .align 4
+.globl guest_tpidr
+guest_tpidr:
+    .quad 0
+host_sp:
+    .quad 0
+guest_context_top:
+    .quad 0
+in_guest:
+    .byte 0
+.globl interrupt
+interrupt:
+    .byte 0
+    .align 2
+.globl pending_host_signals
+pending_host_signals:
+    .long 0
+    .align 3
+.globl wait_waker_addr
+wait_waker_addr:
+    .quad 0
+    "
+);
+
+/// Materializes the link-time thread-pointer-relative offset of a TLS symbol.
+#[cfg(target_arch = "aarch64")]
+macro_rules! tprel_offset {
+    ($var:literal) => {{
+        let offset: usize;
+        // SAFETY: reads no memory; materializes a link-time constant only.
+        unsafe {
+            core::arch::asm!(
+                concat!("movz {0}, #:tprel_g1:", $var),
+                concat!("movk {0}, #:tprel_g0_nc:", $var),
+                out(reg) offset,
+                options(pure, nomem, nostack, preserves_flags)
+            );
+        }
+        offset
+    }};
+}
+
+/// Verifies that the TLS control block landed where [`tls_offset`] says it did.
+///
+/// The transition assembly addresses the block with literal offsets rather than
+/// relocations, so a silent shift — caused by another TLS object being linked
+/// ahead of `.tdata.litebox_tls` — would corrupt host TLS or the guest thread
+/// pointer at runtime. Panicking here converts that into a legible failure.
+///
+/// # Panics
+///
+/// Panics if any symbol's actual offset differs from its expected offset.
+#[cfg(target_arch = "aarch64")]
+fn assert_tls_layout() {
+    let check = |name: &str, actual: usize, expected: usize| {
+        assert!(
+            actual == expected,
+            "TLS symbol `{name}` is at thread-pointer offset {actual}, expected {expected}; \
+             another TLS object was linked ahead of `.tdata.litebox_tls`"
+        );
+    };
+
+    check(
+        "guest_tpidr",
+        tprel_offset!("guest_tpidr"),
+        tls_offset::GUEST_TPIDR,
+    );
+    check("host_sp", tprel_offset!("host_sp"), tls_offset::HOST_SP);
+    check(
+        "guest_context_top",
+        tprel_offset!("guest_context_top"),
+        tls_offset::GUEST_CONTEXT_TOP,
+    );
+    check("in_guest", tprel_offset!("in_guest"), tls_offset::IN_GUEST);
+    check(
+        "interrupt",
+        tprel_offset!("interrupt"),
+        tls_offset::INTERRUPT,
+    );
+    check(
+        "pending_host_signals",
+        tprel_offset!("pending_host_signals"),
+        tls_offset::PENDING_HOST_SIGNALS,
+    );
+    check(
+        "wait_waker_addr",
+        tprel_offset!("wait_waker_addr"),
+        tls_offset::WAIT_WAKER_ADDR,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2520,6 +2644,12 @@ mod tests {
     use litebox::platform::PageManagementProvider;
 
     extern crate std;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_tls_layout() {
+        super::assert_tls_layout();
+    }
 
     #[test]
     fn test_raw_mutex() {
