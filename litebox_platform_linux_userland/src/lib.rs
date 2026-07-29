@@ -772,8 +772,16 @@ fn run_thread_inner(
 #[cfg(target_arch = "aarch64")]
 mod tls_offset {
     /// Guest thread pointer. Fixed by the rewriter ABI: must equal
-    /// `litebox_syscall_rewriter`'s `arm64::GUEST_TPIDR_OFFSET`.
+    /// `litebox_syscall_rewriter`'s `arm64::GUEST_TPIDR_OFFSET`, re-exported as
+    /// `litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET`. The assertion
+    /// below makes drift a compile error rather than silent guest-TLS
+    /// corruption.
     pub(super) const GUEST_TPIDR: usize = 16;
+    const _: () = assert!(
+        GUEST_TPIDR == litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET as usize,
+        "tls_offset::GUEST_TPIDR must equal litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET; \
+         rewritten guest binaries address the guest thread pointer at the rewriter's offset"
+    );
     pub(super) const HOST_SP: usize = 24;
     pub(super) const GUEST_CONTEXT_TOP: usize = 32;
     pub(super) const IN_GUEST: usize = 40;

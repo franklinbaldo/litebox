@@ -27,6 +27,17 @@ extern crate alloc;
 
 mod arm64;
 
+/// Byte offset, from the host anchor in `TPIDR_EL0`, of the guest
+/// thread-pointer slot that AArch64-rewritten binaries address.
+///
+/// This is a rewriter/runtime ABI constant: the scaled immediate is baked into
+/// every rewritten `MSR`/`MRS TPIDR_EL0` gate, so a runtime that lays its
+/// per-thread block out differently silently corrupts guest TLS. Runtimes
+/// should assert equality against their own offset at compile time rather than
+/// duplicating the value behind a comment;
+/// `litebox_platform_linux_userland`'s `tls_offset::GUEST_TPIDR` does.
+pub use arm64::GUEST_TPIDR_OFFSET as AARCH64_GUEST_TPIDR_OFFSET;
+
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};

@@ -16,6 +16,15 @@ syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 seccompiler = { version = "0.5.0" }
 
+# AArch64 only. The guest thread-pointer offset baked into rewritten binaries is
+# a rewriter/runtime ABI constant; depending on the rewriter lets
+# `tls_offset::GUEST_TPIDR` assert equality with it at compile time instead of
+# relying on a comment. Target-gated so no other target grows the edge, and
+# `default-features = false` to keep the rewriter's binary-only `std`/`anyhow`/
+# `clap` dependencies out of the graph.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+
 [features]
 default = ["linux_syscall"]
 linux_syscall = []

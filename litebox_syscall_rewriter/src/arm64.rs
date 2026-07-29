@@ -240,7 +240,12 @@ const XZR: u8 = 31;
 /// dtv slot. Because the scaled immediate is baked into statically rewritten
 /// binaries, this value is part of the rewriter/runtime ABI and must match the
 /// runtime's block layout.
-const GUEST_TPIDR_OFFSET: u16 = 16;
+///
+/// Re-exported from the crate root as [`crate::AARCH64_GUEST_TPIDR_OFFSET`] so a
+/// runtime can tie itself to it at compile time rather than by comment;
+/// `litebox_platform_linux_userland`'s `tls_offset::GUEST_TPIDR` does exactly
+/// that with a `const` assertion.
+pub const GUEST_TPIDR_OFFSET: u16 = 16;
 
 // --- SVC gate stack frame ---
 //
