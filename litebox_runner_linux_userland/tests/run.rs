@@ -316,6 +316,44 @@ fn test_svc_scratch_registers_survive_rewritten_syscall() {
     );
 }
 
+/// Delivering a signal to a guest handler is only half the contract: the
+/// handler has to *return*, through `rt_sigreturn`, with the whole interrupted
+/// context restored.
+///
+/// On AArch64 that return path is synthetic. The arm64 kernel ignores
+/// `sa_restorer` and points `x30` at the vDSO's `__kernel_rt_sigreturn`;
+/// LiteBox has no vDSO, so it installs its own trampoline in guest address
+/// space. A test that only proves the handler was *entered* would not exercise
+/// any of that, so this one asserts that execution resumes with caller-saved
+/// registers and `sp` intact and the program exits 0.
+///
+/// On non-AArch64 hosts the fixture still exercises handler entry and return,
+/// just without the register-level assertions.
+#[test]
+fn test_signal_handler_returns_through_sigreturn() {
+    let target = common::compile("./tests/sigreturn.c", "sigreturn_rewriter", true, false);
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+
+    let output = std::process::Command::new(binary_path)
+        .args(["--unstable", "--rewrite-syscalls"])
+        .arg(target)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+
+    assert!(
+        output.status.success(),
+        "signal handler did not return cleanly through rt_sigreturn ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("sigreturn ok"),
+        "guest did not reach the post-sigreturn write: {}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
 /// Get the path of a program using `which`
 #[cfg(target_arch = "x86_64")]
 fn run_which(prog: &str) -> std::path::PathBuf {

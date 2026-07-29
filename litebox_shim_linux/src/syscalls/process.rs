@@ -122,6 +122,20 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     pub(crate) limits: ResourceLimits,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
+    /// Address of this process's `rt_sigreturn` trampoline, once one has been
+    /// mapped.
+    ///
+    /// AArch64 only. The arm64 kernel ignores `sa_restorer` and always points
+    /// `x30` at the vDSO's `__kernel_rt_sigreturn`, so a guest signal handler
+    /// has no return path of its own. LiteBox exposes no vDSO, so it maps an
+    /// equivalent stub into guest address space on first signal delivery; see
+    /// [`crate::syscalls::signal::arch::sigreturn_trampoline`].
+    ///
+    /// Process-wide because it lives in the (process-wide) address space, and
+    /// behind a mutex rather than an atomic so two threads taking a signal at
+    /// once cannot each map a page.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
 }
 
 pub(crate) struct Alarm<Platform: ShimPlatform> {
@@ -182,6 +196,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 handle: None,
                 deadline: None,
             }),
+            #[cfg(target_arch = "aarch64")]
+            sigreturn_trampoline: Mutex::new(None),
         }
     }
 
@@ -1531,6 +1547,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.thread.clear_child_tid.set(None);
 
         self.signals.reset_for_exec();
+
+        // The `rt_sigreturn` trampoline lives in the address space that is
+        // about to be torn down, so drop the cached address; the next signal
+        // delivery maps a fresh one.
+        #[cfg(target_arch = "aarch64")]
+        {
+            *self.process().sigreturn_trampoline.lock() = None;
+        }
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();

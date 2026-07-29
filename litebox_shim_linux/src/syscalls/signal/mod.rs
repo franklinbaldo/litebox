@@ -347,6 +347,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
         let sp = arch::sp(ctx);
         let on_alt_stack = is_on_stack(&self.altstack.get(), sp);
@@ -366,7 +367,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             return Err(DeliverFault);
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx)?;
+        self.write_signal_frame(frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -612,9 +613,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 SIG_IGN => {}
                 _ => {
-                    if let Err(DeliverFault) =
-                        self.signals.deliver_signal(signal, &siginfo, &action, ctx)
-                    {
+                    // The `rt_sigreturn` trampoline is architecture-specific
+                    // and, on aarch64, mapped lazily into guest memory; a
+                    // failure there is as fatal to delivery as a bad stack, so
+                    // both funnel into the same `DeliverFault` handling.
+                    let delivered =
+                        arch::sigreturn_trampoline(self, &action).and_then(|trampoline| {
+                            self.signals
+                                .deliver_signal(signal, &siginfo, &action, ctx, trampoline)
+                        });
+                    if let Err(DeliverFault) = delivered {
                         // Failed to deliver signal. Inject a SIGSEGV
                         // (terminating the process if we were trying to deliver
                         // a SIGSEGV).

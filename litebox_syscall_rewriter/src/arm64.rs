@@ -308,8 +308,10 @@ pub const SVC_FRAME_BYTES: u16 = 32;
 /// Saved guest X16. The outbound stub reloads `X16` from here, so this offset is
 /// also ABI; re-exported as [`crate::AARCH64_SVC_FRAME_X16_OFFSET`].
 pub const SVC_FRAME_OFF_X16: u16 = 0;
-/// Computed post-SVC return address. Read by the runtime's syscall callback.
-const SVC_FRAME_OFF_RETADDR: u16 = 8;
+/// Computed post-SVC return address. Read by the runtime's syscall callback,
+/// which publishes it as the guest resume PC, so this offset is also ABI;
+/// re-exported as [`crate::AARCH64_SVC_FRAME_RETADDR_OFFSET`].
+pub const SVC_FRAME_OFF_RETADDR: u16 = 8;
 /// Address of this site's outbound stub. Read by the runtime's syscall callback
 /// and used as the branch target when resuming at the original syscall site, so
 /// this offset is ABI; re-exported as [`crate::AARCH64_SVC_FRAME_STUB_OFFSET`].

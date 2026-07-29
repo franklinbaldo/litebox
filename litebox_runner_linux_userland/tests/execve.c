@@ -27,9 +27,18 @@ static void die(const char *msg) {
     exit(2);
 }
 
+// Spin hint: `pause` is x86-only; AArch64 spells it `yield`.
+#if defined(__x86_64__) || defined(__i386__)
+#define SPIN_HINT() __asm__ __volatile__("pause")
+#elif defined(__aarch64__)
+#define SPIN_HINT() __asm__ __volatile__("yield")
+#else
+#define SPIN_HINT() __asm__ __volatile__("")
+#endif
+
 void* spin_thread(void* arg) {
     for (;;) {
-        __asm__ __volatile__("pause");
+        SPIN_HINT();
     }
 }
 

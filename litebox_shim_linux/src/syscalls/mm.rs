@@ -99,7 +99,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     #[inline]
-    fn do_mmap_anonymous(
+    pub(crate) fn do_mmap_anonymous(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
@@ -435,7 +435,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Raw mprotect without exec interception — used internally by the
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
     #[inline]
-    fn sys_mprotect_raw(
+    pub(crate) fn sys_mprotect_raw(
         &self,
         addr: UserPtrMut<u8>,
         len: usize,

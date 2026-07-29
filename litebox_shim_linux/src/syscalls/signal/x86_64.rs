@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::ShimPlatform;
-use crate::UserPtrMut;
 use crate::syscalls::signal::{DeliverFault, SignalState};
+use crate::{ShimFS, ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
@@ -44,6 +43,22 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     frame_addr
 }
 
+/// x86-64 needs no shim-supplied `rt_sigreturn` trampoline: the kernel honours
+/// `sa_restorer` and glibc always sets it, so the restorer is simply the
+/// guest's. A guest that sets none is rejected with `DeliverFault`, exactly as
+/// the kernel rejects it with `force_sigsegv`. The AArch64 port, where the
+/// kernel ignores `sa_restorer` and supplies the trampoline itself, is the odd
+/// one out; see the sibling module.
+pub(super) fn sigreturn_trampoline<Platform: ShimPlatform, FS: ShimFS>(
+    _task: &Task<Platform, FS>,
+    action: &SigAction,
+) -> Result<usize, DeliverFault> {
+    if !action.flags.contains(SaFlags::RESTORER) {
+        return Err(DeliverFault);
+    }
+    Ok(action.restorer)
+}
+
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
@@ -51,14 +66,11 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         siginfo: &Siginfo,
         action: &SigAction,
         ctx: &mut PtRegs,
+        sigreturn_trampoline: usize,
     ) -> Result<(), DeliverFault> {
-        if !action.flags.contains(SaFlags::RESTORER) {
-            return Err(DeliverFault);
-        }
-
         let last_exception = self.last_exception.get();
         let frame = SignalFrame {
-            return_address: action.restorer,
+            return_address: sigreturn_trampoline,
             ucontext: Ucontext {
                 flags: 0,
                 link: 0, // core::ptr::null_mut(),

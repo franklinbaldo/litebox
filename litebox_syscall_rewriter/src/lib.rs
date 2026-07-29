@@ -88,6 +88,16 @@ pub use arm64::SVC_FRAME_OFF_X16 as AARCH64_SVC_FRAME_X16_OFFSET;
 /// runtime can find its way back into the guest with `X16` intact.
 pub use arm64::SVC_FRAME_OFF_STUB as AARCH64_SVC_FRAME_STUB_OFFSET;
 
+/// Byte offset, within the AArch64 `SVC` gate frame, of the guest resume PC
+/// (the address of the instruction after the rewritten `SVC`).
+///
+/// A rewriter/runtime ABI constant: the runtime's syscall callback publishes
+/// this slot as `PtRegs::pc`. Code that synthesizes a gate frame without an
+/// originating `SVC` site — for instance the shim's AArch64 `rt_sigreturn`
+/// trampoline, which resumes at a PC restored from the signal frame rather
+/// than at any syscall site — must still initialize it deterministically.
+pub use arm64::SVC_FRAME_OFF_RETADDR as AARCH64_SVC_FRAME_RETADDR_OFFSET;
+
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
