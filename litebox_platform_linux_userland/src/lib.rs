@@ -789,9 +789,10 @@ mod tls_offset {
 }
 
 // The block is emitted into `.tdata` so the linker places it ahead of every
-// `.tbss` object, putting it at the head of the main executable's static TLS
-// area and therefore at a known offset from the thread pointer. A `.tbss`
-// placement measures at +48 instead of the required +16 on a stock Rust binary.
+// `.tbss` object. That alone is not enough to put it at the head of the static
+// TLS area: `.tdata` input sections are laid out in input-object order, so any
+// dependency's thread-local can still land in front of it. `litebox_tls.ld`
+// forces the order; see that file. `assert_tls_layout` enforces the result.
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     "
@@ -890,9 +891,11 @@ fn assert_tls_layout() {
             assert!(
                 actual == expected,
                 "TLS symbol `{}` is at thread-pointer offset {actual}, expected {expected}; \
-                 either another TLS object was linked ahead of `.tdata.litebox_tls`, or some \
-                 TLS object in the link has alignment > 16, which shifts the whole static TLS \
-                 block",
+                 either this binary was linked without \
+                 `litebox_platform_linux_userland/litebox_tls.ld` (see \
+                 `litebox_runner_linux_userland/build.rs`), so another TLS object landed ahead \
+                 of `.tdata.litebox_tls`, or some TLS object in the link has alignment > 16, \
+                 which shifts the whole static TLS block",
                 stringify!($sym),
             );
         }};
