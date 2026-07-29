@@ -1053,6 +1053,190 @@ interrupt_callback:
     );
 }
 
+/// Runs the guest thread until it terminates.
+///
+/// Parallels the x86-64 version above: it saves the callee-saved registers,
+/// publishes the host stack pointer and the top of the guest context into the
+/// TLS control block, and dispatches to `init_handler` or `reenter_handler`.
+/// When the guest issues a syscall it re-enters this function's body at
+/// `syscall_callback`, which spills the guest state into the `PtRegs` block,
+/// switches back to the host stack, and calls `syscall_handler`.
+///
+/// Unlike x86-64 there is **no thread-pointer swapping anywhere**. `TPIDR_EL0`
+/// holds the host anchor for the entire lifetime of this call stack, including
+/// while guest code runs; the rewriter redirects every guest thread-pointer
+/// access to `[TPIDR_EL0 + 16]` (see [`tls_offset::GUEST_TPIDR`]). There is
+/// therefore no `rdfsbase`/`wrgsbase` analogue to prime.
+///
+/// The `PtRegs` field offsets baked into the assembly below are pinned by
+/// `tests::test_ptregs_layout`.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C-unwind" fn run_thread_arch(
+    thread_ctx: &mut ThreadContext,
+    ctx: *mut litebox_common_linux::PtRegs,
+    reenter: u8,
+) {
+    core::arch::naked_asm!(
+    "
+    .cfi_startproc
+    // Save the frame pointer and link register, then the callee-saved GPRs.
+    // 96 bytes covers x29/x30 plus x19-x28.
+    stp x29, x30, [sp, #-96]!
+    .cfi_def_cfa_offset 96
+    .cfi_offset x29, -96
+    .cfi_offset x30, -88
+    mov x29, sp
+    // Anchor the CFA on the frame pointer so the `sub sp, sp, #16` below (and
+    // the callbacks' wholesale `mov sp, host_sp`) do not invalidate unwinding
+    // through the `bl`s. This mirrors the x86-64 `.cfi_def_cfa rbp, 16`.
+    .cfi_def_cfa x29, 96
+    stp x19, x20, [sp, #16]
+    stp x21, x22, [sp, #32]
+    stp x23, x24, [sp, #48]
+    stp x25, x26, [sp, #64]
+    stp x27, x28, [sp, #80]
+
+    // Reserve one 16-byte slot for `thread_ctx`. Every callback reads it back
+    // from `[sp]` after restoring the host stack.
+    sub sp, sp, #16
+    str x0, [sp]
+
+    // Publish the host stack pointer and the top of the guest context.
+    mrs x8, tpidr_el0
+    mov x9, sp
+    str x9, [x8, #{HOST_SP}]
+    add x9, x1, #{GUEST_CONTEXT_SIZE}
+    str x9, [x8, #{GUEST_CONTEXT_TOP}]
+
+    // Dispatch on the `reenter` flag (in w2).
+    cbnz w2, 1f
+    bl {init_handler}
+    b .Ldone_aarch64
+1:
+    bl {reenter_handler}
+    b .Ldone_aarch64
+
+    // Entered by `BR X16` from the rewriter's shared SVC handler when the
+    // guest issues a syscall. State on entry (rewriter ABI, see
+    // `litebox_syscall_rewriter::arm64` module docs):
+    //
+    //   | Item                     | Value                                  |
+    //   | ------------------------ | -------------------------------------- |
+    //   | x16                      | clobbered (holds the callback address) |
+    //   | [sp, #0]                 | saved guest x16                        |
+    //   | [sp, #8]                 | guest resume PC (svc_site + 4)         |
+    //   | sp                       | guest SP minus 16 (gate frame is live) |
+    //   | x0-x15, x17-x30, NZCV    | pristine guest values                  |
+    //   | TPIDR_EL0                | host anchor                            |
+    .globl syscall_callback
+syscall_callback:
+    // Clear `in_guest`. This must stay within the first instruction pair:
+    // `interrupt_signal_handler` case 1 recognizes this callback by comparing
+    // the faulting PC against `syscall_callback`.
+    mrs  x16, tpidr_el0
+    strb wzr, [x16, #{IN_GUEST}]
+
+    // x16 -> base of the guest `PtRegs`.
+    ldr  x16, [x16, #{GUEST_CONTEXT_TOP}]
+    sub  x16, x16, #{GUEST_CONTEXT_SIZE}
+
+    // regs[0..=15].
+    stp  x0,  x1,  [x16]
+    stp  x2,  x3,  [x16, #16]
+    stp  x4,  x5,  [x16, #32]
+    stp  x6,  x7,  [x16, #48]
+    stp  x8,  x9,  [x16, #64]
+    stp  x10, x11, [x16, #80]
+    stp  x12, x13, [x16, #96]
+    stp  x14, x15, [x16, #112]
+
+    // Guest x16 and the resume PC come off the gate frame.
+    ldp  x0,  x1,  [sp]
+    str  x0,  [x16, #128]         // regs[16] = guest x16
+    str  x17, [x16, #136]
+    str  x18, [x16, #144]
+    // regs[19..=30]. x30 must land here before the `bl` below clobbers it.
+    stp  x19, x20, [x16, #152]
+    stp  x21, x22, [x16, #168]
+    stp  x23, x24, [x16, #184]
+    stp  x25, x26, [x16, #200]
+    stp  x27, x28, [x16, #216]
+    stp  x29, x30, [x16, #232]
+
+    add  x0,  sp,  #16
+    str  x0,  [x16, #248]         // sp: undo the gate's 16-byte frame
+    str  x1,  [x16, #256]         // pc
+    mrs  x0,  nzcv
+    str  x0,  [x16, #264]         // pstate
+    ldr  x0,  [x16]
+    str  x0,  [x16, #272]         // orig_x0
+    str  w8,  [x16, #280]         // syscallno
+    // regs[0] = -ENOSYS, matching what the kernel leaves in x0 on entry.
+    // `mov x0, #-38` assembles to `MOVN X0, #37`, i.e. the 64-bit value
+    // 0xFFFF_FFFF_FFFF_FFDA, not a zero-extended 0xFFFF_FFDA.
+    mov  x0,  #-38
+    str  x0,  [x16]
+
+    // Back onto the host stack, then handle the syscall. This normally jumps
+    // back to the guest and only returns when the thread is exiting.
+    mrs  x17, tpidr_el0
+    ldr  x17, [x17, #{HOST_SP}]
+    mov  sp,  x17
+    ldr  x0,  [sp]                // thread_ctx
+    bl   {syscall_handler}
+    b    .Ldone_aarch64
+
+    // Entered from `exception_signal_handler` via `set_signal_return`, which
+    // parks the handler arguments in `regs[0..3]` -> x0-x3 on entry here.
+    // Exactly as on x86-64, argument 0 is a placeholder that this stub
+    // overwrites with `thread_ctx`; arguments 1-3 (trapno, error, cr2) are
+    // already in x1-x3 and must not be clobbered. So the only scratch register
+    // available is x9 and above.
+exception_callback:
+    mrs x9, tpidr_el0
+    ldr x9, [x9, #{HOST_SP}]
+    mov sp, x9
+    ldr x0, [sp]                  // thread_ctx
+    bl {exception_handler}
+    b .Ldone_aarch64
+
+    // Entered either from `interrupt_signal_handler` via `set_signal_return`
+    // (all four arguments are placeholders) or by a direct branch from
+    // `switch_to_guest` when the `interrupt` byte was already set.
+    // `interrupt_handler` takes only `thread_ctx`.
+interrupt_callback:
+    mrs x9, tpidr_el0
+    ldr x9, [x9, #{HOST_SP}]
+    mov sp, x9
+    ldr x0, [sp]                  // thread_ctx
+    bl {interrupt_handler}
+    b .Ldone_aarch64
+
+.Ldone_aarch64:
+    add sp, sp, #16
+    ldp x19, x20, [sp, #16]
+    ldp x21, x22, [sp, #32]
+    ldp x23, x24, [sp, #48]
+    ldp x25, x26, [sp, #64]
+    ldp x27, x28, [sp, #80]
+    ldp x29, x30, [sp], #96
+    .cfi_def_cfa sp, 0
+    ret
+    .cfi_endproc
+",
+    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
+    HOST_SP = const tls_offset::HOST_SP,
+    GUEST_CONTEXT_TOP = const tls_offset::GUEST_CONTEXT_TOP,
+    IN_GUEST = const tls_offset::IN_GUEST,
+    init_handler = sym init_handler,
+    reenter_handler = sym reenter_handler,
+    syscall_handler = sym syscall_handler,
+    exception_handler = sym exception_handler,
+    interrupt_handler = sym interrupt_handler,
+    );
+}
+
 /// Switches to the provided guest context.
 ///
 /// # Safety
@@ -2699,6 +2883,27 @@ mod tests {
     #[test]
     fn test_tls_layout() {
         super::assert_tls_layout();
+    }
+
+    /// Pins the `PtRegs` field offsets that the AArch64 transition assembly
+    /// hardcodes. A field reorder or insertion in `litebox_common_linux`
+    /// would otherwise silently corrupt the guest context.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_ptregs_layout() {
+        use core::mem::offset_of;
+        use litebox_common_linux::PtRegs;
+
+        assert_eq!(core::mem::size_of::<PtRegs>(), 288);
+        assert_eq!(core::mem::align_of::<PtRegs>(), 16);
+        // `regs[N]` lives at `8 * N`; spot-check the one the assembly names
+        // explicitly.
+        assert_eq!(offset_of!(PtRegs, regs) + 16 * 8, 128);
+        assert_eq!(offset_of!(PtRegs, sp), 248);
+        assert_eq!(offset_of!(PtRegs, pc), 256);
+        assert_eq!(offset_of!(PtRegs, pstate), 264);
+        assert_eq!(offset_of!(PtRegs, orig_x0), 272);
+        assert_eq!(offset_of!(PtRegs, syscallno), 280);
     }
 
     #[test]
