@@ -27,16 +27,43 @@ extern crate alloc;
 
 mod arm64;
 
-/// Byte offset, from the host anchor in `TPIDR_EL0`, of the guest
-/// thread-pointer slot that AArch64-rewritten binaries address.
+/// Alignment an AArch64 runtime's guest thread-pointer slot must satisfy.
 ///
-/// This is a rewriter/runtime ABI constant: the scaled immediate is baked into
-/// every rewritten `MSR`/`MRS TPIDR_EL0` gate, so a runtime that lays its
-/// per-thread block out differently silently corrupts guest TLS. Runtimes
-/// should assert equality against their own offset at compile time rather than
-/// duplicating the value behind a comment;
-/// `litebox_platform_linux_userland`'s `tls_offset::GUEST_TPIDR` does.
-pub use arm64::GUEST_TPIDR_OFFSET as AARCH64_GUEST_TPIDR_OFFSET;
+/// The gates address the slot with the 64-bit unsigned-offset `LDR`/`STR` form,
+/// whose 12-bit immediate is scaled by 8, so any offset the runtime hands to
+/// [`aarch64_patch_guest_tpidr_offset`] must be a multiple of this.
+pub use arm64::GUEST_TPIDR_OFFSET_ALIGN as AARCH64_GUEST_TPIDR_OFFSET_ALIGN;
+
+/// Largest byte offset from the host anchor at which an AArch64 runtime may
+/// place the guest thread-pointer slot — the top of the gates' scaled 12-bit
+/// immediate. Far beyond any plausible static-TLS offset.
+pub use arm64::MAX_GUEST_TPIDR_OFFSET as AARCH64_MAX_GUEST_TPIDR_OFFSET;
+
+/// Rewrites the guest thread-pointer offset into every gate of one emitted
+/// AArch64 trampoline.
+///
+/// The offset of the runtime's guest thread-pointer slot from the host anchor
+/// in `TPIDR_EL0` is a property of the *host* binary's link, not of the guest
+/// binary, so the rewriter cannot bake it in: the same rewritten binary has to
+/// run under any host build. Gates are emitted with a placeholder instead, and
+/// a loader calls this with the offset the runtime measured for itself, after
+/// reading the trampoline blob and before making it executable — so every gate
+/// is correct before any guest instruction runs.
+///
+/// `trampoline` is the whole blob, header included. Returns the number of
+/// instructions patched; zero is normal for a binary whose only patch sites are
+/// `SVC`.
+///
+/// # Errors
+///
+/// Fails if `offset` is not a multiple of
+/// [`AARCH64_GUEST_TPIDR_OFFSET_ALIGN`] or exceeds
+/// [`AARCH64_MAX_GUEST_TPIDR_OFFSET`], or if `trampoline` is not a well-formed
+/// blob this crate emitted. A loader must treat either as fatal for the binary:
+/// running an unpatched gate would dereference the placeholder.
+pub fn aarch64_patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
+    arm64::patch_guest_tpidr_offset(trampoline, offset)
+}
 
 /// Size of the stack frame an AArch64 `SVC` gate carves out of the guest stack.
 ///
@@ -89,6 +116,8 @@ pub enum Error {
     AddressOverflow(String),
     #[error("unpatchable syscall instruction(s): {0}")]
     UnpatchableSyscalls(String),
+    #[error("failed to patch trampoline: {0}")]
+    TrampolinePatchFailure(String),
 }
 
 /// Internal-only error variants used for control flow within the crate.

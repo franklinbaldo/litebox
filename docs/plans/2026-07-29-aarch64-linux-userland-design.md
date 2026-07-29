@@ -28,15 +28,17 @@ State on entry to the callback:
 | `sp` | guest SP minus 32 (gate frame is live) |
 | `x0`–`x15`, `x17`–`x30`, NZCV | pristine guest values |
 | `TPIDR_EL0` | the **host** anchor |
-| `[TPIDR_EL0 + 16]` | the **guest** thread pointer (`GUEST_TPIDR_OFFSET`) |
+| `[TPIDR_EL0 + guest_tpidr_offset]` | the **guest** thread pointer (offset patched in at load time) |
 
 The rewriter also gates guest `MSR TPIDR_EL0` and `MRS TPIDR_EL0` so that every
-guest read or write of the thread pointer is redirected to
-`[TPIDR_EL0 + GUEST_TPIDR_OFFSET]`. The hardware register therefore *always*
-holds the host anchor, even while guest code runs.
+guest read or write of the thread pointer is redirected to that slot. The
+hardware register therefore *always* holds the host anchor, even while guest
+code runs.
 
 The runtime's obligation is exactly one thing: for every thread it starts,
-reserve the slot at `[TPIDR_EL0 + 16]`.
+reserve a guest thread-pointer slot at a fixed offset from `TPIDR_EL0` — and
+report that offset to the loader, which patches it into each rewritten binary
+(see section 2).
 
 ### What this deletes relative to `shim9`
 
@@ -56,77 +58,135 @@ None of it is needed. All of it is dropped.
 
 ## 2. TLS layout and the anchor
 
-`TPIDR_EL0` is glibc's own thread pointer, so the runtime cannot simply claim
-`[TPIDR_EL0 + 16]` — on AArch64 (TLS variant 1) that address is the start of the
-main executable's static TLS block, whose contents depend on link order. Measured
-on a stock Rust binary, a `.tbss` variable lands at `+48`; the same variable
-placed in `.tdata` lands at exactly `+16`, because `.tdata` is linked ahead of
-`.tbss`.
+The platform emits its per-thread control block via `global_asm!` into `.tbss`,
+8-byte aligned. Field offsets are **relative to the block**, not to
+`TPIDR_EL0`:
 
-The platform therefore emits its control block via `global_asm!` into a `.tdata`
-section, 16-byte aligned, so it occupies the head of the static TLS area:
-
-| Offset from `TPIDR_EL0` | Symbol | Type |
+| Offset in block | Symbol | Type |
 | --- | --- | --- |
-| +16 | `guest_tpidr` | `u64` — **rewriter ABI**, `GUEST_TPIDR_OFFSET` |
-| +24 | `host_sp` | `u64` |
-| +32 | `guest_context_top` | `u64` |
-| +40 | `in_guest` | `u8` |
-| +41 | `interrupt` | `u8` |
-| +42 | `is_guest_thread` | `u8` (added during implementation) |
-| +44 | `pending_host_signals` | `u32` |
-| +48 | `wait_waker_addr` | `u64` |
+| +0 | `litebox_tls_block` | the anchor symbol (aliases `guest_tpidr`) |
+| +0 | `guest_tpidr` | `u64` — the slot rewritten guests read/write |
+| +8 | `host_sp` | `u64` |
+| +16 | `guest_context_top` | `u64` |
+| +24 | `in_guest` | `u8` |
+| +25 | `interrupt` | `u8` |
+| +26 | `is_guest_thread` | `u8` (added during implementation) |
+| +28 | `pending_host_signals` | `u32` |
+| +32 | `wait_waker_addr` | `u64` |
+| +40 | `outbound_stub` | `u64` |
+| +48 | `outbound_pc` | `u64` |
 
-> **Amended during implementation: `.tdata` placement is necessary but NOT
-> sufficient.** The default linker script matches
-> `*(.tdata .tdata.* .gnu.linkonce.td.*)` with no sorting, so `.tdata` input
-> sections are laid out in input-object order. In the real runner link,
-> `tracing_subscriber`'s `fmt_layer::BUF` and `layer_filters::FILTERING` — two
-> 40-byte `.tdata` thread-locals — landed ahead of ours and pushed
-> `guest_tpidr` to offset 96. `assert_tls_layout()` caught it at startup and
-> reported the actual offset, which is exactly why it exists.
->
-> The fix is `litebox_platform_linux_userland/litebox_tls.ld`, an
-> `INSERT BEFORE .tbss` fragment respelling the `.tdata` rule with
-> `*(.tdata.litebox_tls)` first, applied through each consuming binary's
-> `build.rs`. This is **opt-in per binary**: Cargo gives a dependency no way to
-> inject link arguments into its dependents, so any future binary that runs
-> guest code must add the same link argument. `assert_tls_layout()` turns
-> forgetting it into a startup panic rather than silent corruption.
->
-> Rejected alternative: `INSERT BEFORE .tdata` with a separate output section
-> also works, but strands the section in the read-only segment and inflates
-> `PT_TLS` from 0xc8 to 0xc190 — 49 KB per thread.
+`is_guest_thread` occupies what was alignment padding. The x86-64 code it
+replaces tests `gsbase != 0`, which is a *thread-lifetime* property; `in_guest`
+is *momentary* and is 0 whenever a guest thread sits in the host, including
+while blocked in an interruptible wait. Using `in_guest` for the guest-thread
+probe would break the `record_pending_signal` / `wait_waker_addr` wakeup path.
 
-A second field, `is_guest_thread`, was added at offset 42 (previously alignment
-padding) during implementation. The x86-64 code it replaces tests `gsbase != 0`,
-which is a *thread-lifetime* property; `in_guest` is *momentary* and is 0
-whenever a guest thread sits in the host, including while blocked in an
-interruptible wait. Using `in_guest` for the guest-thread probe would break the
-`record_pending_signal` / `wait_waker_addr` wakeup path.
+**Where the block lands relative to `TPIDR_EL0` is deliberately not fixed.** It
+is wherever the linker puts our thread-locals inside the static TLS area, which
+depends on every other TLS object in the link and is therefore different for
+every binary that embeds LiteBox.
 
-Offsets are used as literal `const` operands in the transition assembly rather
-than `#:tprel_g1:` / `#:tprel_g0_nc:` relocation pairs. This is not an
-optimization: `syscall_callback` is entered with only `x16` free and cannot
-afford the second scratch register a relocation pair requires.
+### Addressing the block: one anchor sequence, one register
 
-Because the offsets are hardcoded, `LinuxUserland::new` calls
-`assert_tls_layout()`, which computes each symbol's true tprel offset via
-`#:tprel_g1:` / `#:tprel_g0_nc:` and compares it against the constant. If link
-order ever shifts, the process aborts with a clear message instead of silently
-corrupting either host TLS or the guest thread pointer.
+The transition assembly cannot spend a second scratch register on TLS
+addressing: `syscall_callback` is entered with only `x16` free. That is what
+originally motivated hardcoding absolute `TPIDR_EL0` offsets — the
+`#:tprel_g1:` / `#:tprel_g0_nc:` `MOVZ`/`MOVK` pair builds the offset in a
+register of its own before it can be added to the thread pointer, so it needs
+two.
+
+The AArch64 **local-exec** relocation pair `#:tprel_hi12:` / `#:tprel_lo12_nc:`
+does not:
+
+```
+mrs x16, tpidr_el0
+add x16, x16, #:tprel_hi12:litebox_tls_block, lsl #12
+add x16, x16, #:tprel_lo12_nc:litebox_tls_block
+```
+
+Three instructions, one register, and the linker fills in the offset. This is
+the `tls_anchor!` macro. Every fragment materializes the block base once and
+then addresses each field with a literal displacement from `tls_offset`.
+
+`assert_tls_layout()` still runs at `LinuxUserland::new`, but it now checks a
+different thing: that the block's *internal* layout matches `tls_offset`. That
+is a property of this crate alone and constrains nothing about the rest of the
+link. It also checks that the block's thread-pointer offset is still one a
+rewriter gate can encode (see below).
+
+### The guest thread-pointer slot: patched at load time, not baked in
+
+The rewriter virtualizes every guest `MSR`/`MRS TPIDR_EL0` into a load or store
+of `guest_tpidr` via a scaled `LDR`/`STR` off the host anchor. That immediate is
+baked into the rewritten *guest* binary — but its value is a property of the
+*host* runtime's link, and one rewritten binary has to run under any host build.
+The two cannot both be constants.
+
+So the rewriter emits the gates with a placeholder immediate
+(`GUEST_TPIDR_OFFSET_PLACEHOLDER`, deliberately the largest the field can hold),
+and the loader calls `aarch64_patch_guest_tpidr_offset` with the offset the
+runtime measured for itself, after reading the trampoline blob and before
+mapping it executable. This happens for every rewritten object — the executable
+and interpreter through `ElfParsedFile::load_trampoline`, each shared library
+through the shim's `mmap` pre-patched path — each of which carries its own
+trampoline.
+
+The patch sites need no side table. Everything in a trampoline from the shared
+SVC handler onwards is an instruction word the rewriter emitted (the header's
+callback slot is the blob's only data), and the placeholder saturates the scaled
+immediate, so a linear scan finds exactly the gates' slot accesses. Each hit is
+additionally checked to have one of the two register shapes a gate emits, so a
+blob the rewriter did not produce is rejected rather than silently mangled.
+
+Two properties are asserted rather than assumed. The measured offset must be
+8-aligned (the immediate's scale) and at most `0xFFF * 8 = 32760`. Both hold by
+construction — the block is `.align 3`, and 32KB of static TLS ahead of us is
+not a thing — but an exotic link now fails legibly at startup instead of
+faulting inside a guest gate. The placeholder is chosen so that an *unpatched*
+gate dereferences 32KB past the thread pointer and faults, rather than silently
+reading live host TLS.
+
+### Removed: the `litebox_tls.ld` linker script
+
+The original design pinned `guest_tpidr` at exactly `TPIDR_EL0 + 16` — the head
+of the static TLS area on TLS variant 1 — by emitting the block into a
+`.tdata.litebox_tls` section and forcing it to the front with an
+`INSERT BEFORE .tbss` linker fragment, applied through each consuming binary's
+`build.rs` (`-Wl,-T,litebox_tls.ld`). Without it, `tracing_subscriber`'s two
+40-byte `.tdata` thread-locals landed ahead of ours and pushed `guest_tpidr` to
+offset 96, which `assert_tls_layout()` caught at startup.
+
+Both the script and the `build.rs` are **deleted**. Three reasons:
+
+1. **It is not inheritable.** Cargo gives a library no way to inject link
+   arguments into its dependents, so *every* binary that embeds LiteBox had to
+   add the link argument itself. That is an unacceptable imposition for an
+   embeddable sandboxing library, and it can never be made automatic.
+2. **It is not portable.** `INSERT BEFORE` is a GNU-ld/lld directive. The
+   Windows and macOS hosts this design must eventually support have no
+   equivalent.
+3. **It is unnecessary.** Both things that needed the fixed offset now get it
+   dynamically: the host's own assembly through the local-exec anchor, and the
+   guest's gates through load-time patching.
+
+Measured after the change, the runner's block lands at `TPIDR_EL0 + 264` — a
+number nothing in the system knows ahead of time, and that is the point.
 
 ### Alternatives considered
 
 - **Squat on `tcbhead_t.private` at `tp + 8`.** glibc does not use that word on
   AArch64, and it would need no linker cooperation at all. Rejected: we would not
-  own the slot, so a future libc change corrupts memory silently, whereas the
-  `.tdata` block fails loudly at startup.
-- **Make `GUEST_TPIDR_OFFSET` configurable.** The rewriter is flexible here, but
-  any constant still has to be pinned against the host's TLS layout, so this
-  removes no work. 16 is kept.
+  own the slot, so a future libc change corrupts memory silently, whereas our own
+  block fails loudly at startup.
+- **Keep a fixed `GUEST_TPIDR_OFFSET`, configurable per build.** Any constant
+  still has to be pinned against the host's TLS layout, which is exactly the
+  imposition being removed. Rejected.
 - **Point `TPIDR_EL0` at a runtime-owned block.** Breaks glibc and `std` TLS on
   the host thread.
+- **Patch the host's own transition assembly at startup** instead of using
+  relocations. Requires making our own `.text` writable at runtime, for no
+  benefit over a relocation the linker already knows how to resolve.
 
 ## 3. Transition assembly
 
@@ -148,9 +208,11 @@ second thread-pointer register to prime.
 ### `syscall_callback`
 
 ```
-mrs  x16, tpidr_el0
-strb wzr, [x16, #40]        // in_guest = 0; must be first, see case 1 below
-ldr  x16, [x16, #32]        // guest_context_top
+mrs  x16, tpidr_el0         // ) tls_anchor!("x16"): x16 -> block base,
+add  x16, x16, #:tprel_hi12:litebox_tls_block, lsl #12   // ) three instructions,
+add  x16, x16, #:tprel_lo12_nc:litebox_tls_block         // ) one register
+strb wzr, [x16, #24]        // in_guest = 0; must be first, see case 1 below
+ldr  x16, [x16, #16]        // guest_context_top
 sub  x16, x16, #288         // -> PtRegs base
 stp  x0, x1, [x16]          // ... x2..x15 -> #16..#112
 ldp  x0, x1, [sp]           // x0 = guest x16, x1 = resume PC
@@ -160,9 +222,11 @@ add  x0, sp, #32
 str  x0, [x16, #248]        // sp: undo the gate's frame -> true guest SP
 str  x1, [x16, #256]        // pc
 ldr  x0, [sp, #16]          // this site's outbound stub
-mrs  x17, tpidr_el0
-str  x0, [x17, #56]         // outbound_stub
-str  x1, [x17, #64]         // outbound_pc
+mrs  x17, tpidr_el0         // ) tls_anchor!("x17")
+add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
+add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
+str  x0, [x17, #40]         // outbound_stub
+str  x1, [x17, #48]         // outbound_pc
 mrs  x0, nzcv
 str  x0, [x16, #264]        // pstate
 ldr  x0, [x16]
@@ -170,8 +234,10 @@ str  x0, [x16, #272]        // orig_x0
 str  w8, [x16, #280]        // syscallno
 mov  x0, #-38
 str  x0, [x16]              // regs[0] = -ENOSYS, matching the kernel
-mrs  x17, tpidr_el0
-ldr  x17, [x17, #24]        // host_sp
+mrs  x17, tpidr_el0         // ) tls_anchor!("x17")
+add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
+add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
+ldr  x17, [x17, #8]         // host_sp
 mov  sp, x17
 ldr  x0, [sp]               // thread_ctx
 bl   {syscall_handler}
@@ -202,13 +268,14 @@ outbound_N:
 ```
 
 `syscall_callback` copied the stub's address and its resume PC into the TLS
-control block (`outbound_stub` at 56, `outbound_pc` at 64) — deliberately, so
+control block (`outbound_stub` at +40, `outbound_pc` at +48 within the block) —
+deliberately, so
 nothing depends on the gate frame below `sp` surviving the round trip through
 the shim. `switch_to_guest` then does:
 
 ```
-ldr x1, [x17, #56]    // outbound_stub
-ldr x2, [x17, #64]    // outbound_pc
+ldr x1, [x17, #40]    // outbound_stub (x17 anchored on the block)
+ldr x2, [x17, #48]    // outbound_pc
 ldr x3, [x0, #256]    // ctx pc
 ldr x4, [x0, #248]    // ctx sp (the true guest SP)
 cmp x2, x3

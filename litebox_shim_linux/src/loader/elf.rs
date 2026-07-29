@@ -210,7 +210,8 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
         // (UnpatchedBinary error), the runtime patching during mmap will patch
         // code segments as they are mapped.
         if syscall_entry_point != 0 {
-            match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
+            let guest_tpidr_offset = task.global.platform.guest_tpidr_offset();
+            match parsed.parse_trampoline(&mut &file, syscall_entry_point, guest_tpidr_offset) {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.

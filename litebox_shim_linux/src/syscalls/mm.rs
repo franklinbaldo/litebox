@@ -850,6 +850,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
                 }
 
+                // Patch the AArch64 guest thread-pointer offset into this
+                // object's gates. Every rewritten object -- the executable and
+                // each shared library -- carries its own trampoline, and this is
+                // where the ones the guest's dynamic linker maps get patched
+                // (the executable and the interpreter go through
+                // `ElfParsedFile::load_trampoline` instead). Done here on the
+                // staging buffer, so the gates are already correct the first
+                // time the region is written, let alone made executable.
+                if let Some(offset) = self.global.platform.guest_tpidr_offset()
+                    && let Err(e) = litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset(
+                        &mut tramp_data,
+                        offset,
+                    )
+                {
+                    // The gates still hold the rewriter's placeholder, which
+                    // faults on use, and the code already branches to them.
+                    litebox_util_log::warn!(err:? = e; "failed to patch guest thread-pointer offset into trampoline");
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                    return false;
+                }
+
                 // Write to the mapped region.
                 if tramp_ptr
                     .copy_from_slice::<Platform>(0, &tramp_data)

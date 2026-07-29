@@ -522,6 +522,24 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// AArch64 only: the byte offset from the host thread-pointer anchor
+    /// (`TPIDR_EL0`) at which this platform keeps each thread's *guest* thread
+    /// pointer.
+    ///
+    /// AArch64-rewritten guest binaries virtualize every `MRS`/`MSR TPIDR_EL0`
+    /// into a load/store of that slot. The rewriter cannot bake the offset in —
+    /// it is a property of the *host* binary's link, and one rewritten binary
+    /// has to run under any host build — so it emits a placeholder and the
+    /// loader patches in the value returned here before the trampoline becomes
+    /// executable.
+    ///
+    /// Returns `None` when the platform needs no such patching: every non-AArch64
+    /// platform, and any AArch64 platform that does not virtualize the guest
+    /// thread pointer this way. The default is `None`.
+    fn guest_tpidr_offset(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// A provider for thread-local storage.

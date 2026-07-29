@@ -78,14 +78,59 @@ macro_rules! saved_tls_seg {
     };
 }
 
+/// Materializes the base of this thread's TLS control block into one register,
+/// using only that register.
+///
+/// The block's address relative to `TPIDR_EL0` is a link-time constant, but not
+/// a *compile*-time one: it is wherever the linker put our thread-locals within
+/// the static TLS area, which depends on every other TLS object in the link and
+/// is therefore different for every binary that embeds LiteBox. The transition
+/// assembly still needs it in one instruction sequence, with one scratch
+/// register — `syscall_callback` is entered with only `x16` free.
+///
+/// The AArch64 local-exec TLS relocation pair `#:tprel_hi12:` /
+/// `#:tprel_lo12_nc:` is exactly that: an `ADD`/`ADD` (or `ADD` plus a folded
+/// load/store displacement) that needs no second register, unlike the
+/// `#:tprel_g1:` / `#:tprel_g0_nc:` `MOVZ`/`MOVK` pair used by
+/// `tprel_offset!`, which must build the offset in a register of its own
+/// before it can be added to the thread pointer.
+///
+/// So: one anchor sequence per assembly fragment, then every field addressed by
+/// a literal displacement from [`tls_offset`]. Local-exec is correct here
+/// because this crate is only ever linked into the main executable; a
+/// `dlopen`ed LiteBox would need initial-exec instead.
+///
+/// Takes the register name as a string, e.g. `tls_anchor!("x16")`.
+#[cfg(target_arch = "aarch64")]
+macro_rules! tls_anchor {
+    ($reg:literal) => {
+        concat!(
+            "mrs ",
+            $reg,
+            ", tpidr_el0\n",
+            "add ",
+            $reg,
+            ", ",
+            $reg,
+            ", #:tprel_hi12:litebox_tls_block, lsl #12\n",
+            "add ",
+            $reg,
+            ", ",
+            $reg,
+            ", #:tprel_lo12_nc:litebox_tls_block\n",
+        )
+    };
+}
+
 /// Full TLS memory operand for a `.tbss` variable in normal host context
 /// (after the fs/gs swap).
 ///
 /// Example: `tls!("pending_host_signals")` expands to
 /// `"fs:pending_host_signals@tpoff"` on x86_64.
 ///
-/// AArch64 has no segment-relative addressing; it reads `TPIDR_EL0` into a
-/// scratch register and applies a literal offset from [`tls_offset`] instead.
+/// AArch64 has no segment-relative addressing; it anchors a scratch register on
+/// the TLS control block with `tls_anchor!` and applies a literal offset from
+/// [`tls_offset`] instead.
 #[cfg(target_arch = "x86_64")]
 macro_rules! tls {
     ($var:literal) => {
@@ -686,7 +731,7 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     // `assert_tls_layout`.
     unsafe {
         core::arch::asm!(
-            "mrs {addr}, tpidr_el0",
+            tls_anchor!("{addr}"),
             "add {addr}, {addr}, #{off}",
             "2:",
             "ldaxr {val:w}, [{addr}]",
@@ -763,100 +808,111 @@ fn run_thread_inner(
     });
 }
 
-/// Byte offsets of the AArch64 TLS control block from `TPIDR_EL0`.
+/// Byte offsets of the fields of the AArch64 TLS control block, *from the base
+/// of the block* — i.e. from the `litebox_tls_block` symbol, not from
+/// `TPIDR_EL0`.
 ///
-/// These are hardcoded rather than materialized through `#:tprel_g1:` /
-/// `#:tprel_g0_nc:` relocation pairs because `syscall_callback` is entered with
-/// only `x16` free and cannot spare the second scratch register a relocation
-/// pair needs. [`assert_tls_layout`] verifies them at startup.
+/// Where the block itself lands relative to `TPIDR_EL0` is decided by the link
+/// (see `tls_anchor!`), so only these intra-block deltas can be constants. They
+/// are hardcoded rather than materialized through a relocation per field because
+/// `syscall_callback` is entered with only `x16` free: one anchor sequence
+/// materializes the block base into that single register, and every field is
+/// then a literal displacement off it. [`assert_tls_layout`] verifies the
+/// deltas against the link at startup.
 #[cfg(target_arch = "aarch64")]
 mod tls_offset {
-    /// Guest thread pointer. Fixed by the rewriter ABI: must equal
-    /// `litebox_syscall_rewriter`'s `arm64::GUEST_TPIDR_OFFSET`, re-exported as
-    /// `litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET`. The assertion
-    /// below makes drift a compile error rather than silent guest-TLS
-    /// corruption.
-    pub(super) const GUEST_TPIDR: usize = 16;
-    const _: () = assert!(
-        GUEST_TPIDR == litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET as usize,
-        "tls_offset::GUEST_TPIDR must equal litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET; \
-         rewritten guest binaries address the guest thread pointer at the rewriter's offset"
-    );
-    pub(super) const HOST_SP: usize = 24;
-    pub(super) const GUEST_CONTEXT_TOP: usize = 32;
-    pub(super) const IN_GUEST: usize = 40;
-    pub(super) const INTERRUPT: usize = 41;
+    /// Guest thread pointer — the slot rewritten guest binaries read and write
+    /// in place of the hardware `TPIDR_EL0`.
+    ///
+    /// Unlike every other field this one is also part of the
+    /// `litebox_syscall_rewriter` ABI, but *dynamically*: the loader patches
+    /// each rewritten binary's gates with this slot's measured
+    /// thread-pointer-relative address (see
+    /// [`super::guest_tpidr_tp_offset`]), so nothing here has to be a
+    /// particular number. [`super::assert_tls_layout`] checks that the measured
+    /// address is one a gate can encode.
+    pub(super) const GUEST_TPIDR: usize = 0;
+    pub(super) const HOST_SP: usize = 8;
+    pub(super) const GUEST_CONTEXT_TOP: usize = 16;
+    pub(super) const IN_GUEST: usize = 24;
+    pub(super) const INTERRUPT: usize = 25;
     /// Set for a thread's whole guest lifetime, not just while guest code is
     /// executing. This is the AArch64 analogue of x86-64's `gsbase != 0`
     /// probe; see [`super::interrupt_signal_handler`] for why `IN_GUEST` is
     /// not a substitute. Lives in what used to be alignment padding, so it
     /// perturbs no other offset.
-    pub(super) const IS_GUEST_THREAD: usize = 42;
-    pub(super) const PENDING_HOST_SIGNALS: usize = 44;
-    pub(super) const WAIT_WAKER_ADDR: usize = 48;
+    pub(super) const IS_GUEST_THREAD: usize = 26;
+    pub(super) const PENDING_HOST_SIGNALS: usize = 28;
+    pub(super) const WAIT_WAKER_ADDR: usize = 32;
     /// Address of the rewriter's per-site *outbound stub* for the `SVC` the
     /// guest most recently took, as recorded by `syscall_callback` from the
     /// gate frame. `switch_to_guest` branches here — rather than straight to
     /// the resume PC — so that guest `x16` is restored; see that function.
     /// Zero means "no stub recorded" (e.g. the thread's first guest entry).
-    pub(super) const OUTBOUND_STUB: usize = 56;
+    pub(super) const OUTBOUND_STUB: usize = 40;
     /// The resume PC that [`OUTBOUND_STUB`] branches to, i.e. `svc_site + 4`.
     /// `switch_to_guest` uses the stub only when `PtRegs::pc` still equals
     /// this; a shim that redirected the PC (signal delivery, `execve`, ...)
     /// gets the direct-branch fallback instead.
-    pub(super) const OUTBOUND_PC: usize = 64;
+    pub(super) const OUTBOUND_PC: usize = 48;
 }
 
-// The block is emitted into `.tdata` so the linker places it ahead of every
-// `.tbss` object. That alone is not enough to put it at the head of the static
-// TLS area: `.tdata` input sections are laid out in input-object order, so any
-// dependency's thread-local can still land in front of it. `litebox_tls.ld`
-// forces the order; see that file. `assert_tls_layout` enforces the result.
+// A plain `.tbss` block: it is all zeros, and — unlike before — nothing depends
+// on where the linker puts it. Every access anchors on the `litebox_tls_block`
+// symbol through `tls_anchor!`, and rewritten guest binaries are patched at load
+// time with `guest_tpidr`'s measured offset, so the block is free to land
+// wherever the link happens to place it. `assert_tls_layout` checks the
+// intra-block deltas.
 #[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(
     "
-    .section .tdata.litebox_tls, \"awT\", @progbits
-    // `.align` is a power-of-two exponent on AArch64, so this is 16 bytes. The
-    // nearby x86-64 block spells 8-byte alignment as `.align 8`; do not
-    // 'harmonize' the two.
-    .align 4
+    .section .tbss, \"awT\", @nobits
+    // `.align` is a power-of-two exponent on AArch64, so this is 8 bytes, which
+    // is all the block's widest field needs. The nearby x86-64 block spells
+    // 8-byte alignment as `.align 8`; do not 'harmonize' the two.
+    .align 3
+    // The anchor `tls_anchor!` resolves against. Aliases `guest_tpidr`, but is
+    // named separately so the anchor does not silently follow a field that gets
+    // reordered.
+.globl litebox_tls_block
+litebox_tls_block:
 .globl guest_tpidr
 guest_tpidr:
-    .quad 0
+    .zero 8
 .globl host_sp
 host_sp:
-    .quad 0
+    .zero 8
 .globl guest_context_top
 guest_context_top:
-    .quad 0
+    .zero 8
 .globl in_guest
 in_guest:
-    .byte 0
+    .zero 1
 .globl interrupt
 interrupt:
-    .byte 0
-    // Occupies what was previously alignment padding between `interrupt` (41)
-    // and `pending_host_signals` (44), so introducing it shifts no other
+    .zero 1
+    // Occupies what was previously alignment padding between `interrupt` (25)
+    // and `pending_host_signals` (28), so introducing it shifts no other
     // symbol and leaves every literal offset baked into the transition
     // assembly untouched. `assert_tls_layout` enforces that. Keep the
-    // `.align 2` below: it is what still lands `pending_host_signals` at 44.
+    // `.align 2` below: it is what still lands `pending_host_signals` at 28.
 .globl is_guest_thread
 is_guest_thread:
-    .byte 0
+    .zero 1
     .align 2
 .globl pending_host_signals
 pending_host_signals:
-    .long 0
+    .zero 4
     .align 3
 .globl wait_waker_addr
 wait_waker_addr:
-    .quad 0
+    .zero 8
 .globl outbound_stub
 outbound_stub:
-    .quad 0
+    .zero 8
 .globl outbound_pc
 outbound_pc:
-    .quad 0
+    .zero 8
     "
 );
 
@@ -885,42 +941,83 @@ macro_rules! tprel_offset {
     }};
 }
 
-/// Verifies that the TLS control block landed where [`tls_offset`] says it did.
+/// The thread-pointer-relative byte offset of this thread's `guest_tpidr`
+/// slot, as fixed by this binary's link.
 ///
-/// The transition assembly addresses the block with literal offsets rather than
-/// relocations, so a silent shift would corrupt host TLS or the guest thread
-/// pointer at runtime. Panicking here converts that into a legible failure.
+/// This is the number the loader patches into every rewritten guest binary's
+/// thread-pointer gates (see
+/// `litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset`). It cannot be
+/// a constant on either side: it depends on where the linker put this crate's
+/// thread-locals within the static TLS area, which every embedder's link
+/// decides differently, and the same rewritten guest binary must run under any
+/// of them.
 ///
-/// Two distinct things can shift the block. The obvious one is another TLS
-/// object being linked ahead of `.tdata.litebox_tls`. The subtler one is
-/// alignment: AArch64 uses TLS variant 1, where the static block starts at
-/// `round_up(16, align(PT_TLS))`, and `align(PT_TLS)` is the maximum over
-/// *every* TLS object in the link. So a single thread-local anywhere — in this
-/// crate or any dependency — whose type wants more than 16-byte alignment
-/// shifts the whole block, even while `.tdata.litebox_tls` is still first. A
-/// cache-line-padded thread-local (`#[repr(align(64))]`) moves `guest_tpidr`
-/// from 16 to 64.
+/// The value is identical on every thread — a static TLS offset is a property
+/// of the image, not of a thread — so measuring it once is enough.
 ///
 /// # Panics
 ///
-/// Panics if any symbol's actual offset differs from its expected offset.
+/// Panics if the offset is not one a gate's scaled 12-bit immediate can encode.
+/// [`assert_tls_layout`] performs the same check at startup, so reaching a
+/// panic here means the layout changed since then, which cannot happen.
+#[cfg(target_arch = "aarch64")]
+fn guest_tpidr_tp_offset() -> u16 {
+    let offset = tprel_offset!(guest_tpidr);
+    u16::try_from(offset)
+        .ok()
+        .filter(|off| {
+            off.is_multiple_of(litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET_ALIGN)
+                && *off <= litebox_syscall_rewriter::AARCH64_MAX_GUEST_TPIDR_OFFSET
+        })
+        .expect("guest_tpidr must sit at a thread-pointer offset a rewriter gate can encode")
+}
+
+/// Verifies that the TLS control block is laid out the way [`tls_offset`] says,
+/// and that it landed somewhere a rewritten guest binary can be pointed at.
+///
+/// Two separate properties, because they now have separate consequences.
+///
+/// *Internal consistency.* The transition assembly materializes the block base
+/// once (see `tls_anchor!`) and then addresses each field with a literal
+/// displacement from [`tls_offset`]. Those displacements are compile-time
+/// constants; the actual layout is decided by the assembler and linker. A
+/// silent divergence — a field resized, reordered, or shifted by an alignment
+/// directive — would make the assembly read and write the wrong slots. This is
+/// purely a check on our own block: it constrains nothing about the rest of the
+/// link, and in particular says nothing about where the block sits relative to
+/// `TPIDR_EL0`, which is deliberately free.
+///
+/// *Reachability from a gate.* Where the block sits relative to `TPIDR_EL0` is
+/// free, but not unbounded: the loader patches `guest_tpidr`'s offset into each
+/// rewritten binary's gates, which address it with a 64-bit `LDR`/`STR` whose
+/// 12-bit immediate is scaled by 8. So the offset must be 8-aligned and at most
+/// `0xFFF * 8 = 32760`. Alignment is guaranteed by the block's own `.align 3`
+/// and AArch64's variant-1 TLS layout; the bound is 32KB of static TLS ahead of
+/// us, which nothing plausible reaches. Both are checked anyway, here, once, so
+/// that an exotic link fails legibly at startup instead of faulting inside a
+/// guest gate.
+///
+/// # Panics
+///
+/// Panics if any field's offset within the block differs from its
+/// [`tls_offset`] constant, or if the block's own thread-pointer offset is not
+/// encodable in a gate.
 #[cfg(target_arch = "aarch64")]
 fn assert_tls_layout() {
-    /// Compares one symbol's link-time offset against its expected constant.
-    /// The symbol name is written once and reused for the lookup, the
+    let base = tprel_offset!(litebox_tls_block);
+
+    /// Compares one symbol's offset within the block against its expected
+    /// constant. The symbol name is written once and reused for the lookup, the
     /// relocation and the message, so the three cannot drift apart.
     macro_rules! check {
         ($sym:ident, $expected:ident) => {{
-            let actual = tprel_offset!($sym);
+            let actual = tprel_offset!($sym).wrapping_sub(base);
             let expected = tls_offset::$expected;
             assert!(
                 actual == expected,
-                "TLS symbol `{}` is at thread-pointer offset {actual}, expected {expected}; \
-                 either this binary was linked without \
-                 `litebox_platform_linux_userland/litebox_tls.ld` (see \
-                 `litebox_runner_linux_userland/build.rs`), so another TLS object landed ahead \
-                 of `.tdata.litebox_tls`, or some TLS object in the link has alignment > 16, \
-                 which shifts the whole static TLS block",
+                "TLS symbol `{}` is at offset {actual} within the LiteBox TLS control block, \
+                 expected {expected}; the block's own layout has drifted from `tls_offset`, so \
+                 the transition assembly would address the wrong slots",
                 stringify!($sym),
             );
         }};
@@ -936,6 +1033,10 @@ fn assert_tls_layout() {
     check!(wait_waker_addr, WAIT_WAKER_ADDR);
     check!(outbound_stub, OUTBOUND_STUB);
     check!(outbound_pc, OUTBOUND_PC);
+
+    // Panics with the same message the loader would see, but at startup and
+    // once, rather than per rewritten binary.
+    let _ = guest_tpidr_tp_offset();
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1006,7 +1107,7 @@ fn set_guest_tpidr(value: usize) {
     // `assert_tls_layout`.
     unsafe {
         core::arch::asm! {
-            "mrs {tmp}, tpidr_el0",
+            tls_anchor!("{tmp}"),
             "str {val}, [{tmp}, #{off}]",
             tmp = out(reg) _,
             val = in(reg) value,
@@ -1035,7 +1136,7 @@ fn set_is_guest_thread(value: bool) {
     // whose offset from `TPIDR_EL0` is checked by `assert_tls_layout`.
     unsafe {
         core::arch::asm! {
-            "mrs {tmp}, tpidr_el0",
+            tls_anchor!("{tmp}"),
             "strb {val:w}, [{tmp}, #{off}]",
             tmp = out(reg) _,
             val = in(reg) u32::from(value),
@@ -1055,7 +1156,7 @@ fn is_guest_thread() -> bool {
     // including while guest code runs.
     unsafe {
         core::arch::asm! {
-            "mrs {tmp}, tpidr_el0",
+            tls_anchor!("{tmp}"),
             "ldrb {val:w}, [{tmp}, #{off}]",
             tmp = out(reg) _,
             val = out(reg) value,
@@ -1118,7 +1219,7 @@ fn get_guest_tpidr() -> usize {
     // block, whose offset from `TPIDR_EL0` is checked by `assert_tls_layout`.
     unsafe {
         core::arch::asm! {
-            "mrs {tmp}, tpidr_el0",
+            tls_anchor!("{tmp}"),
             "ldr {val}, [{tmp}, #{off}]",
             tmp = out(reg) _,
             val = out(reg) value,
@@ -1295,8 +1396,10 @@ interrupt_callback:
 /// Unlike x86-64 there is **no thread-pointer swapping anywhere**. `TPIDR_EL0`
 /// holds the host anchor for the entire lifetime of this call stack, including
 /// while guest code runs; the rewriter redirects every guest thread-pointer
-/// access to `[TPIDR_EL0 + 16]` (see [`tls_offset::GUEST_TPIDR`]). There is
-/// therefore no `rdfsbase`/`wrgsbase` analogue to prime.
+/// access to the `guest_tpidr` slot in the TLS control block, whose
+/// thread-pointer offset the loader patched into the guest's gates (see
+/// [`guest_tpidr_tp_offset`]). There is therefore no `rdfsbase`/`wrgsbase`
+/// analogue to prime.
 ///
 /// The `PtRegs` field offsets baked into the assembly below are pinned by
 /// `tests::test_ptregs_layout`.
@@ -1352,7 +1455,12 @@ unsafe extern "C-unwind" fn run_thread_arch(
     str x0, [sp]
 
     // Publish the host stack pointer and the top of the guest context.
+    // Anchor x8 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs x8, tpidr_el0
+    add x8, x8, #:tprel_hi12:litebox_tls_block, lsl #12
+    add x8, x8, #:tprel_lo12_nc:litebox_tls_block
     mov x9, sp
     str x9, [x8, #{HOST_SP}]
     add x9, x1, #{GUEST_CONTEXT_SIZE}
@@ -1388,16 +1496,21 @@ syscall_callback:
     // the store has not retired (pc equals the entry) or it has and
     // `in_guest` is 0. There is no third state.
     //
-    // AArch64 needs two instructions, which opens a state x86-64 does not
-    // have: pc == syscall_callback + 4, `in_guest` still 1. Case 1 therefore
-    // tests the half-open range
+    // AArch64 needs four (an anchor sequence plus the store), which opens a
+    // state x86-64 does not have: pc inside the prologue, `in_guest` still 1.
+    // Case 1 therefore tests the half-open range
     // `syscall_callback .. syscall_callback_in_guest_cleared` rather than an
     // equality, and the label below is what defines the upper bound. Keep the
     // label immediately after the `strb`: it is the assembler-enforced
     // statement that no instruction above it has cleared `in_guest` yet, so
     // the check can never drift out of sync with this code again.
     // See `in_syscall_callback_prologue`.
+    // Anchor x16 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs  x16, tpidr_el0
+    add  x16, x16, #:tprel_hi12:litebox_tls_block, lsl #12
+    add  x16, x16, #:tprel_lo12_nc:litebox_tls_block
     strb wzr, [x16, #{IN_GUEST}]
     .globl syscall_callback_in_guest_cleared
 syscall_callback_in_guest_cleared:
@@ -1442,7 +1555,12 @@ syscall_callback_in_guest_cleared:
     // below the guest SP and nothing guarantees it survives the round trip
     // through the shim. x17 is already spilled to regs[17], so it is free.
     ldr  x0,  [sp,  #{SVC_FRAME_OFF_STUB}]
+    // Anchor x17 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs  x17, tpidr_el0
+    add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
+    add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
     str  x0,  [x17, #{OUTBOUND_STUB}]
     str  x1,  [x17, #{OUTBOUND_PC}]
 
@@ -1465,7 +1583,12 @@ syscall_callback_in_guest_cleared:
     // `bl`, or the `.cfi_def_cfa x29, 96` rule would resolve against guest
     // memory if `syscall_handler` unwinds. `host_sp` is the frame base minus
     // the 16-byte `thread_ctx` slot, so the host `x29` is `host_sp + 16`.
+    // Anchor x17 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs  x17, tpidr_el0
+    add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
+    add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
     ldr  x17, [x17, #{HOST_SP}]
     mov  sp,  x17
     add  x29, sp,  #16
@@ -1485,7 +1608,12 @@ syscall_callback_in_guest_cleared:
     // `.cfi_def_cfa x29, 96` invariant above.
     .globl exception_callback
 exception_callback:
+    // Anchor x9 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs x9, tpidr_el0
+    add x9, x9, #:tprel_hi12:litebox_tls_block, lsl #12
+    add x9, x9, #:tprel_lo12_nc:litebox_tls_block
     ldr x9, [x9, #{HOST_SP}]
     mov sp, x9
     add x29, sp, #16
@@ -1502,7 +1630,12 @@ exception_callback:
     // before the `bl`; see the `.cfi_def_cfa x29, 96` invariant above.
     .globl interrupt_callback
 interrupt_callback:
+    // Anchor x9 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs x9, tpidr_el0
+    add x9, x9, #:tprel_hi12:litebox_tls_block, lsl #12
+    add x9, x9, #:tprel_lo12_nc:litebox_tls_block
     ldr x9, [x9, #{HOST_SP}]
     mov sp, x9
     add x29, sp, #16
@@ -1662,7 +1795,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 ///
 /// Note there is no thread-pointer restore here: `TPIDR_EL0` keeps holding the
 /// host anchor while the guest runs, and the rewriter redirects guest
-/// thread-pointer accesses to `[TPIDR_EL0 + 16]`.
+/// thread-pointer accesses to the `guest_tpidr` slot beside it.
 ///
 /// # The `switch_to_guest_start` / `switch_to_guest_end` bracket
 ///
@@ -1688,7 +1821,12 @@ switch_to_guest_start:
     // arrives after the check, the signal handler sees that the PC is between
     // `switch_to_guest_start` and `switch_to_guest_end` and jumps to
     // `interrupt_callback` itself.
+    // Anchor x17 on the TLS control block. Three instructions, one
+    // register: see the `tls_anchor!` macro for why the block base is a
+    // link-time relocation rather than a literal offset.
     mrs  x17, tpidr_el0
+    add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
+    add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
     mov  w16, #1
     strb w16, [x17, #{IN_GUEST}]
     ldrb w16, [x17, #{INTERRUPT}]
@@ -2039,7 +2177,7 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
         unsafe {
             let new_ptr = waker_ptr;
             core::arch::asm!(
-                "mrs {addr}, tpidr_el0",
+                tls_anchor!("{addr}"),
                 "add {addr}, {addr}, #{off}",
                 "2:",
                 "ldaxr {old}, [{addr}]",
@@ -2823,7 +2961,7 @@ impl ThreadContext<'_> {
         // SAFETY: writes a single byte in this thread's own TLS control block.
         unsafe {
             core::arch::asm!(
-                "mrs {tmp}, tpidr_el0",
+                tls_anchor!("{tmp}"),
                 "strb wzr, [{tmp}, #{off}]",
                 tmp = out(reg) _,
                 off = const tls_offset::INTERRUPT,
@@ -2851,6 +2989,11 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         // TODO: implement VDSO in the shim, don't try to pass through the
         // platform VDSO.
         None
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn guest_tpidr_offset(&self) -> Option<u16> {
+        Some(guest_tpidr_tp_offset())
     }
 }
 
@@ -3173,36 +3316,37 @@ fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
     set_interrupt: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
-    let tp: usize;
-    // SAFETY: reads the host thread pointer. `TPIDR_EL0` is never repointed at
-    // a guest value — the rewriter redirects guest thread-pointer accesses to
-    // the `guest_tpidr` slot instead — so it is the host anchor here even if
-    // this signal interrupted guest code.
+    let block: usize;
+    // SAFETY: materializes the base of this thread's TLS control block from
+    // `TPIDR_EL0`, which is never repointed at a guest value — the rewriter
+    // redirects guest thread-pointer accesses to the `guest_tpidr` slot instead
+    // — so it is the host anchor here even if this signal interrupted guest
+    // code. Reads no memory.
     unsafe {
         core::arch::asm!(
-            "mrs {}, tpidr_el0",
-            out(reg) tp,
+            tls_anchor!("{0}"),
+            out(reg) block,
             options(nostack, nomem, preserves_flags)
         );
     }
-    // SAFETY: `tp` addresses this thread's own TLS control block. Every offset
+    // SAFETY: `block` is this thread's own TLS control block. Every offset
     // used below is checked against the link-time layout by
     // `assert_tls_layout`, and each access is naturally aligned and in bounds
     // of that block. Volatile because these slots are also written by the
     // transition assembly, which the compiler cannot see.
     unsafe {
-        let in_guest = (tp + tls_offset::IN_GUEST) as *mut u8;
+        let in_guest = (block + tls_offset::IN_GUEST) as *mut u8;
         let was_in_guest = in_guest.read_volatile();
         in_guest.write_volatile(0);
         if set_interrupt {
-            ((tp + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
+            ((block + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
         }
         if was_in_guest == 0 {
             return None;
         }
         // `guest_context_top` points one past the end of the guest `PtRegs`,
         // as published by `run_thread_arch`; step back one to get its base.
-        let top = ((tp + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
+        let top = ((block + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
         Some((top as *mut litebox_common_linux::PtRegs).sub(1))
     }
 }
@@ -3480,15 +3624,15 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     // The exclusive monitor reservation is opened and closed within the loop.
     unsafe {
         core::arch::asm!(
-            "mrs {tp}, tpidr_el0",
-            "add {addr}, {tp}, #{pending_off}",
+            tls_anchor!("{block}"),
+            "add {addr}, {block}, #{pending_off}",
             "2:",
             "ldaxr {old:w}, [{addr}]",
             "orr {new:w}, {old:w}, {mask:w}",
             "stlxr {status:w}, {new:w}, [{addr}]",
             "cbnz {status:w}, 2b",
-            "ldr {waker}, [{tp}, #{waker_off}]",
-            tp = out(reg) _,
+            "ldr {waker}, [{block}, #{waker_off}]",
+            block = out(reg) _,
             addr = out(reg) _,
             old = out(reg) _,
             new = out(reg) _,
@@ -3742,14 +3886,39 @@ mod tests {
 
     extern crate std;
 
-    /// TLS layout is a property of a whole link, so this only validates the
-    /// test harness binary — not the shipped runner, which links a different
-    /// set of crates. A green run here is not a validated production layout;
-    /// the real safety net is `assert_tls_layout()` in `LinuxUserland::new`.
+    /// The intra-block layout `assert_tls_layout` checks is a property of this
+    /// crate alone, so a green run here does validate it for every link. Where
+    /// the block *lands* is a property of the whole link and differs between
+    /// this test harness and the shipped runner — which is exactly why nothing
+    /// is allowed to depend on it any more.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_tls_layout() {
         super::assert_tls_layout();
+    }
+
+    /// The block's thread-pointer offset is whatever this binary's link
+    /// produced. Nothing may assume a particular value — that assumption is
+    /// what used to force every embedder to add a linker script — but it must
+    /// stay encodable in the scaled 12-bit immediate of a rewriter gate, since
+    /// the loader patches it into every rewritten guest binary.
+    ///
+    /// Printed so that `--nocapture` shows the number actually being patched.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_guest_tpidr_offset_is_gate_encodable() {
+        let offset = super::guest_tpidr_tp_offset();
+        std::println!("guest_tpidr is at thread-pointer offset {offset}");
+        assert!(
+            offset.is_multiple_of(litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET_ALIGN),
+            "offset {offset} must be a multiple of the gates' immediate scale"
+        );
+        assert!(
+            offset <= litebox_syscall_rewriter::AARCH64_MAX_GUEST_TPIDR_OFFSET,
+            "offset {offset} must fit the gates' scaled 12-bit immediate"
+        );
+        // `guest_tpidr` is the first field, so it is also the block base.
+        assert_eq!(usize::from(offset), tprel_offset!(litebox_tls_block));
     }
 
     /// Pins the `PtRegs` field offsets that the AArch64 transition assembly

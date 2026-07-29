@@ -67,6 +67,10 @@ struct TrampolineInfo {
     size: usize,
     /// The entry point to jump to in the trampoline.
     syscall_entry_point: usize,
+    /// AArch64: the byte offset from `TPIDR_EL0` of the runtime's guest
+    /// thread-pointer slot, to be patched into the trampoline's gates at map
+    /// time. `None` on platforms that need no such patching.
+    guest_tpidr_offset: Option<u16>,
 }
 
 /// The magic number used to identify the LiteBox trampoline.
@@ -160,6 +164,11 @@ pub enum ElfLoadError<E> {
     InvalidProgramHeader,
     #[error("Invalid trampoline version")]
     InvalidTrampolineVersion,
+    /// The trampoline could not be patched with the platform's guest
+    /// thread-pointer offset, so its gates would still carry the rewriter's
+    /// (deliberately faulting) placeholder.
+    #[error("Unpatchable trampoline")]
+    UnpatchableTrampoline,
     #[error(transparent)]
     Fault(#[from] Fault),
 }
@@ -167,9 +176,9 @@ pub enum ElfLoadError<E> {
 impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
     fn from(value: ElfLoadError<E>) -> Self {
         match value {
-            ElfLoadError::InvalidProgramHeader | ElfLoadError::InvalidTrampolineVersion => {
-                Errno::ENOEXEC
-            }
+            ElfLoadError::InvalidProgramHeader
+            | ElfLoadError::InvalidTrampolineVersion
+            | ElfLoadError::UnpatchableTrampoline => Errno::ENOEXEC,
             ElfLoadError::Fault(Fault) => Errno::EFAULT,
             ElfLoadError::Map(err) => err.into(),
         }
@@ -233,7 +242,10 @@ impl ElfParsedFile {
     /// File layout: `[ELF][padding][trampoline code][header]`
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
-    /// into the trampoline at map time.
+    /// into the trampoline at map time. `guest_tpidr_offset` is the platform's
+    /// AArch64 guest thread-pointer slot offset (see
+    /// [`litebox::platform::SystemInfoProvider::guest_tpidr_offset`]), also
+    /// applied at map time; pass `None` where it does not apply.
     #[expect(
         clippy::missing_panics_doc,
         reason = "cannot panic: array slices are always the correct size"
@@ -242,6 +254,7 @@ impl ElfParsedFile {
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
+        guest_tpidr_offset: Option<u16>,
     ) -> Result<(), ElfParseError<F::Error>> {
         if syscall_entry_point == 0 {
             // Platform running in kernel mode does not need trampoline
@@ -328,6 +341,7 @@ impl ElfParsedFile {
             size: trampoline_size,
             file_offset,
             syscall_entry_point,
+            guest_tpidr_offset,
         });
         Ok(())
     }
@@ -526,6 +540,19 @@ impl ElfParsedFile {
                 },
             )
             .map_err(ElfLoadError::Map)?;
+
+        // Patch the guest thread-pointer offset into the gates. This must happen
+        // before the region becomes executable, and therefore before any guest
+        // instruction can reach a gate: until it does, every thread-pointer gate
+        // still carries the rewriter's placeholder offset, which deliberately
+        // faults.
+        if let Some(offset) = trampoline.guest_tpidr_offset {
+            let mut blob = alloc::vec![0u8; trampoline.size];
+            mem.read(trampoline_start, &mut blob)?;
+            litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset(&mut blob, offset)
+                .map_err(|_| ElfLoadError::UnpatchableTrampoline)?;
+            mem.write(trampoline_start, &blob)?;
+        }
 
         // Write the trampoline entry point at the start of the trampoline code.
         // The first 8 bytes (64-bit) or 4 bytes (32-bit) are reserved for the entry point.

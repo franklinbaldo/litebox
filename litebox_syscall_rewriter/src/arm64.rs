@@ -40,7 +40,7 @@
 //!   tail-jumps to the syscall callback.
 //! * `MSR TPIDR_EL0, Xn` — a write to the thread pointer. Replaced with a branch
 //!   to a per-site *MSR gate* that stores the guest value into the guest
-//!   thread-pointer slot at `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]`.
+//!   thread-pointer slot at `[TPIDR_EL0 + guest_tpidr_offset]`.
 //! * `MRS Xd, TPIDR_EL0` — a read of the thread pointer. Replaced with a branch
 //!   to a per-site *MRS gate* that loads the guest value from the same slot.
 //!   `MRS XZR, TPIDR_EL0` is a discarded read and is left native.
@@ -49,7 +49,7 @@
 //!
 //! The host owns the hardware `TPIDR_EL0` as a per-thread anchor; the guest's
 //! logical thread pointer is a host-managed memory slot at `[TPIDR_EL0 +
-//! GUEST_TPIDR_OFFSET]`. Every gated guest read/write of the thread pointer
+//! guest_tpidr_offset]`. Every gated guest read/write of the thread pointer
 //! addresses that slot with a scaled `LDR`/`STR` off the anchor:
 //!
 //! * the MSR gate reads the anchor (`MRS X16, TPIDR_EL0`) and stores the guest
@@ -150,7 +150,25 @@
 //! loader must write the syscall-callback address at offset 0 before any guest
 //! `SVC` reaches a gate. (`callback` may be passed to [`hook_syscalls_aarch64`]
 //! to prefill offset 0.) The callback reads host TLS from `TPIDR_EL0` and the
-//! guest thread pointer from `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]` itself.
+//! guest thread pointer from `[TPIDR_EL0 + guest_tpidr_offset]` itself.
+//!
+//! ## The guest thread-pointer offset is *not* baked in
+//!
+//! `guest_tpidr_offset` above is not a constant of this crate. It is the
+//! thread-pointer-relative address of the host runtime's own TLS control block,
+//! fixed by the *host* binary's link — and the same rewritten guest binary has
+//! to run under any host build. So the gates are emitted carrying
+//! [`GUEST_TPIDR_OFFSET_PLACEHOLDER`], and the loader calls
+//! [`patch_guest_tpidr_offset`] with the offset the runtime measured for
+//! itself, after reading the blob and before mapping it executable.
+//!
+//! The patch sites need no side table: everything from
+//! [`SHARED_SVC_HANDLER_OFFSET`] onwards is an instruction word this module
+//! emitted (the header's callback slot is the blob's only data), and the
+//! placeholder saturates the scaled immediate, so a linear scan for it finds
+//! exactly the gates' slot accesses. The scan additionally checks that each hit
+//! has one of the two register shapes a gate emits, so a blob this crate did not
+//! produce is rejected rather than silently mangled.
 //!
 //! ## Signal returns
 //!
@@ -163,7 +181,8 @@
 //! ## Runtime contract
 //!
 //! Per thread, the runtime sets the hardware `TPIDR_EL0` to the host anchor and
-//! reserves the guest thread-pointer slot at `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]`.
+//! reserves the guest thread-pointer slot at a fixed offset from it, which it
+//! reports to the loader for [`patch_guest_tpidr_offset`].
 //! No new callback ABI is introduced: the callback reaches host TLS through
 //! `TPIDR_EL0` directly. Multi-threaded correctness depends only on the runtime
 //! keeping the anchor valid and the slot reachable for every thread it starts;
@@ -237,27 +256,41 @@ const XZR: u8 = 31;
 // --- Guest thread-pointer virtualization ---
 //
 // The host owns the hardware `TPIDR_EL0` as a per-thread anchor; the guest's
-// logical thread pointer is a memory slot the runtime reserves at a fixed byte
+// logical thread pointer is a memory slot the runtime reserves at some byte
 // offset from that anchor. Every gated guest read/write of the thread pointer
-// addresses the slot with a scaled `LDR`/`STR` off `TPIDR_EL0`.
+// addresses the slot with a scaled `LDR`/`STR` off `TPIDR_EL0`. The rewriter
+// does not know the offset -- it is a property of the *host* runtime's link, not
+// of the guest binary -- so it emits a placeholder that the loader overwrites.
 
-/// Byte offset from the host anchor in `TPIDR_EL0` at which the runtime reserves
-/// this thread's guest thread-pointer slot. Every guest read/write of the thread
-/// pointer is virtualized to `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]` via a scaled
-/// `LDR`/`STR`.
+/// Scale of the guest thread-pointer slot's `LDR`/`STR` immediate, i.e. the
+/// alignment a runtime's slot must satisfy.
 ///
-/// Fixed ABI offset: the runtime points `TPIDR_EL0` at a per-thread block whose
-/// `guest_tp` field sits just past the AArch64 variant-1 16-byte TCB header, so a
-/// stray "deref `TPIDR_EL0` as a TCB" cannot mistake the guest pointer for the
-/// dtv slot. Because the scaled immediate is baked into statically rewritten
-/// binaries, this value is part of the rewriter/runtime ABI and must match the
-/// runtime's block layout.
+/// The gates address the slot with the 64-bit unsigned-offset `LDR`/`STR` form,
+/// whose 12-bit immediate is scaled by 8. Re-exported as
+/// [`crate::AARCH64_GUEST_TPIDR_OFFSET_ALIGN`].
+pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = 8;
+
+/// Largest byte offset from the host anchor at which a runtime may place the
+/// guest thread-pointer slot: `0xFFF * 8`, the top of the scaled 12-bit
+/// immediate. Re-exported as [`crate::AARCH64_MAX_GUEST_TPIDR_OFFSET`].
 ///
-/// Re-exported from the crate root as [`crate::AARCH64_GUEST_TPIDR_OFFSET`] so a
-/// runtime can tie itself to it at compile time rather than by comment;
-/// `litebox_platform_linux_userland`'s `tls_offset::GUEST_TPIDR` does exactly
-/// that with a `const` assertion.
-pub const GUEST_TPIDR_OFFSET: u16 = 16;
+/// Far beyond any plausible static-TLS offset, so in practice this bound only
+/// exists to be asserted.
+pub const MAX_GUEST_TPIDR_OFFSET: u16 = 0xFFF * GUEST_TPIDR_OFFSET_ALIGN;
+
+/// Placeholder byte offset baked into every emitted gate's guest thread-pointer
+/// access, to be replaced at load time by [`patch_guest_tpidr_offset`].
+///
+/// Deliberately [`MAX_GUEST_TPIDR_OFFSET`], the largest value the field can
+/// hold. Two reasons:
+///
+/// * it cannot collide with a real runtime offset (a static TLS control block
+///   32KB past the thread pointer is not a thing), so a scan for it cannot
+///   mistake an already-patched gate for an unpatched one; and
+/// * an *unpatched* gate therefore dereferences an address 32KB past the thread
+///   pointer, which is unmapped and faults, rather than silently reading or
+///   corrupting live host TLS.
+pub const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
 
 // --- SVC gate stack frame ---
 //
@@ -323,6 +356,15 @@ const HEADER_CALLBACK_OFFSET: usize = 0;
 /// follow it and are each appended dynamically, so this shared prologue is the
 /// only fixed-offset region the emitters reference.
 const SHARED_SVC_HANDLER_OFFSET: usize = HEADER_CALLBACK_OFFSET + 8;
+
+/// Size of the shared SVC handler (`LDR X16, =callback ; BR X16`).
+const SHARED_SVC_HANDLER_BYTES: usize = 2 * 4;
+
+/// First byte of the per-site gates, i.e. the total size of the shared prologue.
+/// Everything from [`SHARED_SVC_HANDLER_OFFSET`] onwards is instructions this
+/// module emitted, which is what lets [`patch_guest_tpidr_offset`] scan for its
+/// patch sites instead of carrying a side table of them.
+const GATES_START_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_BYTES;
 
 // ============================================================
 // Instruction encoders
@@ -956,7 +998,7 @@ fn emit_svc_gate(
 /// A thin shim that conveys nothing TLS-related: it loads the syscall-callback
 /// pointer from the trampoline header and tail-jumps to it. The callback reads
 /// host TLS from `TPIDR_EL0` (the host anchor) and the guest thread pointer from
-/// `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]` itself, so the handler carries no TLS state.
+/// `[TPIDR_EL0 + guest_tpidr_offset]` itself, so the handler carries no TLS state.
 ///
 /// Nothing in the handler clobbers NZCV, so the guest's pre-svc flags reach the
 /// callback unchanged with no save/restore.
@@ -991,13 +1033,13 @@ fn emit_shared_svc_handler(
 ///
 /// Virtualizes a guest `MSR TPIDR_EL0, Xn` write. The hardware register holds the
 /// host anchor, so the gate stores the guest value into the guest thread-pointer
-/// slot at `[TPIDR_EL0 + GUEST_TPIDR_OFFSET]`:
+/// slot at `[TPIDR_EL0 + guest_tpidr_offset]`:
 ///
 /// 1. spill X16/X17 and capture the guest value `Xn` to the frame while all guest
 ///    registers are still pristine (so `Xn` needs no special-casing, even when it
 ///    is one of the scratch registers just spilled (X16/X17) or XZR);
 /// 2. `MRS X16, TPIDR_EL0` reads the host anchor;
-/// 3. reload the captured value into X17 and `STR X17, [X16, #GUEST_TPIDR_OFFSET]`
+/// 3. reload the captured value into X17 and `STR X17, [X16, #guest_tpidr_offset]`
 ///    stores it into the guest thread-pointer slot;
 /// 4. restore X16/X17 and branch back to the instruction after the original MSR.
 ///
@@ -1044,7 +1086,7 @@ fn emit_msr_gate(
     // MRS X16, <host anchor> — read the host anchor.
     asm.emit(host.anchor_read(X16));
 
-    // LDR X17, [SP, #16] ; STR X17, [X16, #GUEST_TPIDR_OFFSET] — store the guest
+    // LDR X17, [SP, #16] ; STR X17, [X16, #<tpidr offset>] — store the guest
     // value into its slot off the host anchor.
     asm.emit(Insn::LdrUimm {
         rt: X17,
@@ -1054,7 +1096,7 @@ fn emit_msr_gate(
     asm.emit(Insn::StrUimm {
         rt: X17,
         rn: X16,
-        imm_bytes: GUEST_TPIDR_OFFSET,
+        imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
     });
 
     // Restore: LDP X16, X17, [SP] ; ADD SP, SP, #32.
@@ -1080,7 +1122,7 @@ fn emit_msr_gate(
 /// Virtualizes a guest `MRS Xd, TPIDR_EL0` read. The hardware register holds the
 /// host anchor, so the gate reads the anchor and then loads the guest thread
 /// pointer from its slot, reusing `Xd` as scratch (no frame needed):
-/// `MRS Xd, TPIDR_EL0 ; LDR Xd, [Xd, #GUEST_TPIDR_OFFSET] ; B <site+4>`.
+/// `MRS Xd, TPIDR_EL0 ; LDR Xd, [Xd, #guest_tpidr_offset] ; B <site+4>`.
 fn emit_mrs_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
@@ -1095,13 +1137,117 @@ fn emit_mrs_gate(
     asm.emit(Insn::LdrUimm {
         rt: rd,
         rn: rd,
-        imm_bytes: GUEST_TPIDR_OFFSET,
+        imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
     });
     if !asm.branch_to(checked_add_u64(site.vaddr, 4, "MRS return")?)? {
         return Ok(GateBuild::Unreachable);
     }
     trampoline_data.extend_from_slice(&asm.finish());
     Ok(GateBuild::Emitted)
+}
+
+// ============================================================
+// Load-time guest thread-pointer offset patching
+// ============================================================
+
+/// Bits \[31:10] of an unsigned-offset load/store: everything except `Rn`
+/// (\[9:5]) and `Rt` (\[4:0]), i.e. the opcode *and* the scaled `imm12`.
+const LDST_UIMM12_OPCODE_AND_IMM_MASK: u32 = 0xFFFF_FC00;
+/// The scaled 12-bit immediate field of an unsigned-offset load/store, \[21:10].
+const LDST_UIMM12_IMM_MASK: u32 = 0x003F_FC00;
+/// Bit position of that immediate field.
+const LDST_UIMM12_IMM_SHIFT: u32 = 10;
+
+/// Rewrites the guest thread-pointer offset in every gate of one emitted
+/// trampoline, replacing [`GUEST_TPIDR_OFFSET_PLACEHOLDER`] with `offset`.
+///
+/// The rewriter cannot know this offset: it is the thread-pointer-relative
+/// address of the *host* runtime's TLS control block, fixed by the host
+/// binary's link, and the same rewritten guest binary must run under any host
+/// build. So the gates are emitted with a placeholder and the loader supplies
+/// the runtime's measured offset here, before the trampoline is made
+/// executable and before any guest code runs.
+///
+/// Returns the number of instructions patched. Zero is normal and not an error:
+/// a binary whose only patch sites are `SVC` has no thread-pointer gate.
+///
+/// # Errors
+///
+/// Fails if `offset` is not addressable by a gate (not a multiple of
+/// [`GUEST_TPIDR_OFFSET_ALIGN`], or above [`MAX_GUEST_TPIDR_OFFSET`]), or if
+/// the blob is not a well-formed trampoline — either too short to hold the
+/// shared prologue, not a whole number of instruction words, or containing a
+/// placeholder-bearing instruction in a shape no gate emits. All three mean the
+/// caller is about to run something this rewriter did not produce, so failing
+/// is the only safe answer.
+pub(crate) fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
+    if !offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN) || offset > MAX_GUEST_TPIDR_OFFSET {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "guest thread-pointer offset {offset} is not addressable by a gate: it must be a \
+             multiple of {GUEST_TPIDR_OFFSET_ALIGN} and at most {MAX_GUEST_TPIDR_OFFSET}"
+        )));
+    }
+
+    // Skip the header: its callback slot holds an arbitrary 64-bit address,
+    // which — unlike everything from the shared SVC handler onwards — is data
+    // and could bit-for-bit resemble an instruction. Everything at or after
+    // `SHARED_SVC_HANDLER_OFFSET` is a word the emitters above produced.
+    if trampoline.len() < GATES_START_OFFSET {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "trampoline is {} bytes, too short to hold the {GATES_START_OFFSET}-byte shared \
+             prologue",
+            trampoline.len()
+        )));
+    }
+    if !trampoline.len().is_multiple_of(4) {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "trampoline is {} bytes, not a whole number of AArch64 instructions",
+            trampoline.len()
+        )));
+    }
+
+    let placeholder_imm = u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER / GUEST_TPIDR_OFFSET_ALIGN)
+        << LDST_UIMM12_IMM_SHIFT;
+    let ldr_pattern = Opcode::LdrUimm.bits() | placeholder_imm;
+    let str_pattern = Opcode::StrUimm.bits() | placeholder_imm;
+    let new_imm = u32::from(offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
+
+    let mut patched = 0usize;
+    for (index, word) in trampoline[SHARED_SVC_HANDLER_OFFSET..]
+        .chunks_exact_mut(4)
+        .enumerate()
+    {
+        let insn = u32::from_le_bytes(word.try_into().expect("chunks_exact_mut(4) yields 4 bytes"));
+        let opcode_and_imm = insn & LDST_UIMM12_OPCODE_AND_IMM_MASK;
+        if opcode_and_imm != ldr_pattern && opcode_and_imm != str_pattern {
+            continue;
+        }
+
+        // Only two shapes carry the placeholder: the MRS gate's
+        // `LDR Xd, [Xd, #off]` (destination reused as its own base) and the MSR
+        // gate's `STR X17, [X16, #off]`. Anything else means the blob is not
+        // one of ours — refuse rather than corrupt an unknown instruction.
+        let rt = (insn & 0x1F) as u8;
+        let rn = ((insn >> 5) & 0x1F) as u8;
+        let well_formed = if opcode_and_imm == ldr_pattern {
+            rt == rn && rt != XZR
+        } else {
+            rt == X17 && rn == X16
+        };
+        if !well_formed {
+            let vaddr_offset = SHARED_SVC_HANDLER_OFFSET + index * 4;
+            return Err(Error::TrampolinePatchFailure(format!(
+                "trampoline byte {vaddr_offset}: instruction {insn:#010x} carries the guest \
+                 thread-pointer placeholder but is not a shape any gate emits"
+            )));
+        }
+
+        let patched_insn = (insn & !LDST_UIMM12_IMM_MASK) | new_imm;
+        word.copy_from_slice(&patched_insn.to_le_bytes());
+        patched += 1;
+    }
+
+    Ok(patched)
 }
 
 // ============================================================
@@ -1231,17 +1377,14 @@ mod tests {
     // Gate and shared-handler sizes. The emitters append each gate dynamically
     // (`gate_offset = trampoline_data.len()`), so these sizes drive no emission;
     // the tests use them to slice individual gates out of the trampoline blob and
-    // to assert its total length. `GATES_START_OFFSET` is the fixed shared-prologue
-    // size that the per-site gates follow.
+    // to assert its total length.
     /// Bytes emitted per SVC site: the gate proper plus its outbound stub.
     const SVC_GATE_SIZE: usize = SVC_GATE_BYTES + SVC_OUTBOUND_STUB_BYTES;
-    const SHARED_SVC_HANDLER_INSNS: usize = 2;
-    const SHARED_SVC_HANDLER_SIZE: usize = SHARED_SVC_HANDLER_INSNS * 4;
+    const SHARED_SVC_HANDLER_INSNS: usize = SHARED_SVC_HANDLER_BYTES / 4;
     const MSR_GATE_INSNS: usize = 9;
     const MSR_GATE_SIZE: usize = MSR_GATE_INSNS * 4;
     const MRS_GATE_INSNS: usize = 3;
     const MRS_GATE_SIZE: usize = MRS_GATE_INSNS * 4;
-    const GATES_START_OFFSET: usize = SHARED_SVC_HANDLER_OFFSET + SHARED_SVC_HANDLER_SIZE;
 
     /// Top-6 opcode bits, isolating the `B`/`BL` major opcode for read-back checks.
     const OPCODE_TOP6_MASK: u32 = 0xFC00_0000;
@@ -1330,29 +1473,31 @@ mod tests {
             .unwrap(),
             0xF900_0A11
         );
-        // The guest thread-pointer slot lives at the fixed ABI offset
-        // GuestThreadBlock::guest_tp; pin both the value and the emitted word.
-        assert_eq!(GUEST_TPIDR_OFFSET, 16);
-        // Slot access at GUEST_TPIDR_OFFSET: `ldr x9,[x9,#16]` / `str x17,[x16,#16]`.
+        // The guest thread-pointer slot is emitted with the placeholder offset
+        // that `patch_guest_tpidr_offset` overwrites at load time; pin both the
+        // value and the emitted words. The placeholder saturates the scaled
+        // 12-bit immediate (`imm12 = 0xFFF`).
+        assert_eq!(GUEST_TPIDR_OFFSET_PLACEHOLDER, 32760);
+        // Slot access: `ldr x9,[x9,#32760]` / `str x17,[x16,#32760]`.
         assert_eq!(
             Insn::LdrUimm {
                 rt: 9,
                 rn: 9,
-                imm_bytes: GUEST_TPIDR_OFFSET
+                imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER
             }
             .encode()
             .unwrap(),
-            0xF940_0929
+            0xF97F_FD29
         );
         assert_eq!(
             Insn::StrUimm {
                 rt: 17,
                 rn: 16,
-                imm_bytes: GUEST_TPIDR_OFFSET
+                imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER
             }
             .encode()
             .unwrap(),
-            0xF900_0A11
+            0xF93F_FE11
         );
         // `BRK #0xB10B`, the trap that replaces an out-of-range patch site.
         assert_eq!(Insn::Brk(TRAP_BRK_IMM).encode().unwrap(), 0xD436_2160);
@@ -1396,6 +1541,29 @@ mod tests {
                 .expect("expected a trampoline (input has patch sites)")
                 .trampoline,
         )
+    }
+
+    /// Like [`hook_words`] but prefills the trampoline's callback slot, so a
+    /// test can plant arbitrary data there.
+    fn hook_words_with_callback(
+        words: &[u32],
+        base: u64,
+        tramp_base: u64,
+        callback: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for w in words {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        let sections = vec![TextSectionInfo {
+            vaddr: base,
+            file_offset: 0,
+            size: buf.len() as u64,
+        }];
+        hook_syscalls_aarch64(&mut buf, &sections, tramp_base, callback, Host::Linux)
+            .unwrap()
+            .expect("expected a trampoline (input has patch sites)")
+            .trampoline
     }
 
     /// Like [`hook_words`] but returns the raw `Option` outcome so callers can
@@ -1566,11 +1734,11 @@ mod tests {
             let anc_i = (0..MSR_GATE_INSNS)
                 .find(|&i| word_at(gate, i * 4) == anchor)
                 .expect("MSR gate must read the host anchor");
-            // Store to the slot: STR X17, [X16, #GUEST_TPIDR_OFFSET].
+            // Store to the slot: STR X17, [X16, #<placeholder>].
             let store = Insn::StrUimm {
                 rt: X17,
                 rn: X16,
-                imm_bytes: GUEST_TPIDR_OFFSET,
+                imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
             }
             .encode()
             .unwrap();
@@ -1601,7 +1769,7 @@ mod tests {
                 Insn::LdrUimm {
                     rt: d,
                     rn: d,
-                    imm_bytes: GUEST_TPIDR_OFFSET
+                    imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER
                 }
                 .encode()
                 .unwrap()
@@ -1708,5 +1876,161 @@ mod tests {
             (base + 4).cast_signed(),
             "outbound stub must return to site + 4"
         );
+    }
+
+    // --- Load-time guest thread-pointer offset patching ---
+
+    /// The offset a real host runtime might measure for itself: not the
+    /// placeholder, and not the value this code used to hardcode.
+    const MEASURED_OFFSET: u16 = 96;
+
+    #[test]
+    fn patch_rewrites_both_gate_shapes_and_leaves_everything_else_alone() {
+        // One MSR site and one MRS site, so both patchable shapes are present.
+        let (_p, mut tramp) = hook_words(
+            &[msr_tpidr_el0(3), Insn::MrsTpidrEl0(9).encode().unwrap()],
+            0x1000,
+            0x400000,
+        );
+        let before = tramp.clone();
+
+        let patched = patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap();
+        assert_eq!(patched, 2, "one MSR store and one MRS load");
+
+        // Exactly two words changed, and each became the same instruction with
+        // the measured offset in place of the placeholder.
+        let changed: alloc::vec::Vec<usize> = (0..tramp.len() / 4)
+            .filter(|&i| word_at(&tramp, i * 4) != word_at(&before, i * 4))
+            .collect();
+        assert_eq!(changed.len(), 2);
+        for i in changed {
+            let old = word_at(&before, i * 4);
+            let new = word_at(&tramp, i * 4);
+            assert_eq!(
+                old & !LDST_UIMM12_IMM_MASK,
+                new & !LDST_UIMM12_IMM_MASK,
+                "only the immediate field may change"
+            );
+            assert_eq!(
+                (new & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT,
+                u32::from(MEASURED_OFFSET / GUEST_TPIDR_OFFSET_ALIGN)
+            );
+        }
+
+        // Spot-check the exact encodings the gates must now hold.
+        let msr_store = Insn::StrUimm {
+            rt: X17,
+            rn: X16,
+            imm_bytes: MEASURED_OFFSET,
+        }
+        .encode()
+        .unwrap();
+        let mrs_load = Insn::LdrUimm {
+            rt: 9,
+            rn: 9,
+            imm_bytes: MEASURED_OFFSET,
+        }
+        .encode()
+        .unwrap();
+        let words: alloc::vec::Vec<u32> = (0..tramp.len() / 4)
+            .map(|i| word_at(&tramp, i * 4))
+            .collect();
+        assert!(words.contains(&msr_store), "MSR gate store must be patched");
+        assert!(words.contains(&mrs_load), "MRS gate load must be patched");
+
+        // Patching is idempotent in the sense that a second pass finds nothing:
+        // the placeholder is gone.
+        assert_eq!(
+            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn patch_leaves_an_svc_only_trampoline_untouched() {
+        // The SVC gate and its outbound stub are full of `LDR`/`STR` words with
+        // an `SP` base. None of them may be mistaken for a thread-pointer
+        // access, and the header's callback slot is data that must be skipped.
+        let (_p, mut tramp) = hook_words(&[SVC_0], 0x1000, 0x400000);
+        let before = tramp.clone();
+        assert_eq!(
+            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            0
+        );
+        assert_eq!(tramp, before);
+    }
+
+    #[test]
+    fn patch_skips_a_callback_slot_that_looks_like_a_gate_instruction() {
+        // The callback address is arbitrary data. Prefill it with two copies of
+        // a word that *is* a placeholder-bearing gate load, and check the patch
+        // pass does not touch the header.
+        let decoy = Insn::LdrUimm {
+            rt: 9,
+            rn: 9,
+            imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+        }
+        .encode()
+        .unwrap();
+        let callback = (u64::from(decoy) << 32) | u64::from(decoy);
+        let mut tramp = hook_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
+        assert_eq!(
+            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            0
+        );
+        assert_eq!(
+            u64::from_le_bytes(tramp[..8].try_into().unwrap()),
+            callback,
+            "the callback slot is data and must survive verbatim"
+        );
+    }
+
+    #[test]
+    fn patch_rejects_an_offset_a_gate_cannot_address() {
+        let (_p, mut tramp) =
+            hook_words(&[Insn::MrsTpidrEl0(9).encode().unwrap()], 0x1000, 0x400000);
+        for bad in [4u16, 12, MAX_GUEST_TPIDR_OFFSET + 8] {
+            assert!(
+                matches!(
+                    patch_guest_tpidr_offset(&mut tramp, bad),
+                    Err(Error::TrampolinePatchFailure(_))
+                ),
+                "offset {bad} must be rejected"
+            );
+        }
+        // The bounds themselves are accepted.
+        assert!(patch_guest_tpidr_offset(&mut tramp, MAX_GUEST_TPIDR_OFFSET).is_ok());
+    }
+
+    #[test]
+    fn patch_rejects_a_blob_that_is_not_a_trampoline() {
+        // Shorter than the shared prologue.
+        let mut short = vec![0u8; GATES_START_OFFSET - 4];
+        assert!(matches!(
+            patch_guest_tpidr_offset(&mut short, MEASURED_OFFSET),
+            Err(Error::TrampolinePatchFailure(_))
+        ));
+
+        // Not a whole number of instructions.
+        let mut ragged = vec![0u8; GATES_START_OFFSET + 2];
+        assert!(matches!(
+            patch_guest_tpidr_offset(&mut ragged, MEASURED_OFFSET),
+            Err(Error::TrampolinePatchFailure(_))
+        ));
+
+        // A placeholder-bearing instruction in a shape no gate emits.
+        let mut foreign = vec![0u8; GATES_START_OFFSET + 4];
+        let bogus = Insn::LdrUimm {
+            rt: 1,
+            rn: 2,
+            imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+        }
+        .encode()
+        .unwrap();
+        foreign[GATES_START_OFFSET..].copy_from_slice(&bogus.to_le_bytes());
+        assert!(matches!(
+            patch_guest_tpidr_offset(&mut foreign, MEASURED_OFFSET),
+            Err(Error::TrampolinePatchFailure(_))
+        ));
     }
 }
