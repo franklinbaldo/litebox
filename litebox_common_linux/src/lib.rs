@@ -3306,10 +3306,18 @@ impl PtRegs {
     /// If `idx` is greater than 5, this function will panic.
     #[cfg(target_arch = "aarch64")]
     pub fn syscall_arg(&self, idx: usize) -> usize {
-        if idx < 6 {
-            self.regs[idx]
-        } else {
-            panic!("Invalid syscall argument index: {idx}")
+        match idx {
+            // Not `regs[0]`. On syscall entry the arm64 kernel saves the
+            // caller's `x0` into `orig_x0` and overwrites `regs[0]` with
+            // `-ENOSYS`, so that a syscall it never dispatches returns
+            // `-ENOSYS`. `syscall_get_arguments` in
+            // `arch/arm64/include/asm/syscall.h` therefore reads `orig_x0` for
+            // argument 0 and `regs[1..=5]` for the rest, and
+            // `litebox_platform_linux_userland`'s `syscall_callback`
+            // reproduces exactly that entry state.
+            0 => self.orig_x0,
+            1..6 => self.regs[idx],
+            _ => panic!("Invalid syscall argument index: {idx}"),
         }
     }
 
@@ -3460,5 +3468,35 @@ impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<U
         } else {
             Some(UserPtrMut::from_usize(v))
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_tests {
+    use super::PtRegs;
+
+    /// Argument 0 comes from `orig_x0`, not `regs[0]`.
+    ///
+    /// On arm64 the kernel clobbers `regs[0]` with `-ENOSYS` on syscall entry
+    /// and stashes the real first argument in `orig_x0`; `syscall_get_arguments`
+    /// in `arch/arm64/include/asm/syscall.h` reads `orig_x0` for `args[0]` and
+    /// `regs[1..=5]` for the rest. `syscall_callback` reproduces that entry
+    /// state, so reading `regs[0]` here would hand every syscall `-ENOSYS` as
+    /// its first argument.
+    #[test]
+    fn test_syscall_arg0_is_orig_x0() {
+        let mut regs = PtRegs::default();
+        regs.regs[0] = (-38isize).cast_unsigned(); // -ENOSYS, as the kernel leaves it
+        regs.orig_x0 = 0xdead_beef;
+        for (i, v) in (1..6).zip([0x11, 0x22, 0x33, 0x44, 0x55]) {
+            regs.regs[i] = v;
+        }
+
+        assert_eq!(regs.syscall_arg(0), 0xdead_beef);
+        assert_eq!(regs.syscall_arg(1), 0x11);
+        assert_eq!(regs.syscall_arg(2), 0x22);
+        assert_eq!(regs.syscall_arg(3), 0x33);
+        assert_eq!(regs.syscall_arg(4), 0x44);
+        assert_eq!(regs.syscall_arg(5), 0x55);
     }
 }
