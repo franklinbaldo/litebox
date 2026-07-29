@@ -98,6 +98,11 @@ macro_rules! tls {
 ///
 /// Example: `saved_tls!("in_guest")` expands to
 /// `"gs:in_guest@tpoff"` on x86_64.
+///
+/// x86-64 only: it expands via `saved_tls_seg!`, and AArch64 has no saved
+/// segment register to address through — `TPIDR_EL0` is the host anchor in
+/// signal handlers already.
+#[cfg(target_arch = "x86_64")]
 macro_rules! saved_tls {
     ($var:literal) => {
         concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
@@ -742,6 +747,20 @@ fn run_thread_inner(
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
+    // Mark this thread as a guest thread for the duration of its guest
+    // lifetime, so signal handlers can tell it apart from an ordinary host
+    // thread. x86-64 gets this for free from `gsbase != 0`; see
+    // `set_is_guest_thread`. Save and restore rather than unconditionally
+    // clearing, so a nested entry (e.g. `reenter_thread` reached from inside a
+    // shim callback) does not un-mark the thread while an outer frame is still
+    // running the guest. The guard also runs on unwind, since `run_thread_arch`
+    // is `extern "C-unwind"`.
+    #[cfg(target_arch = "aarch64")]
+    let was_guest_thread = is_guest_thread();
+    #[cfg(target_arch = "aarch64")]
+    set_is_guest_thread(true);
+    #[cfg(target_arch = "aarch64")]
+    let _guest_thread_guard = litebox::utils::defer(|| set_is_guest_thread(was_guest_thread));
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| unsafe {
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
@@ -764,6 +783,12 @@ mod tls_offset {
     pub(super) const GUEST_CONTEXT_TOP: usize = 32;
     pub(super) const IN_GUEST: usize = 40;
     pub(super) const INTERRUPT: usize = 41;
+    /// Set for a thread's whole guest lifetime, not just while guest code is
+    /// executing. This is the AArch64 analogue of x86-64's `gsbase != 0`
+    /// probe; see [`super::interrupt_signal_handler`] for why `IN_GUEST` is
+    /// not a substitute. Lives in what used to be alignment padding, so it
+    /// perturbs no other offset.
+    pub(super) const IS_GUEST_THREAD: usize = 42;
     pub(super) const PENDING_HOST_SIGNALS: usize = 44;
     pub(super) const WAIT_WAKER_ADDR: usize = 48;
 }
@@ -794,6 +819,14 @@ in_guest:
     .byte 0
 .globl interrupt
 interrupt:
+    .byte 0
+    // Occupies what was previously alignment padding between `interrupt` (41)
+    // and `pending_host_signals` (44), so introducing it shifts no other
+    // symbol and leaves every literal offset baked into the transition
+    // assembly untouched. `assert_tls_layout` enforces that. Keep the
+    // `.align 2` below: it is what still lands `pending_host_signals` at 44.
+.globl is_guest_thread
+is_guest_thread:
     .byte 0
     .align 2
 .globl pending_host_signals
@@ -875,6 +908,7 @@ fn assert_tls_layout() {
     check!(guest_context_top, GUEST_CONTEXT_TOP);
     check!(in_guest, IN_GUEST);
     check!(interrupt, INTERRUPT);
+    check!(is_guest_thread, IS_GUEST_THREAD);
     check!(pending_host_signals, PENDING_HOST_SIGNALS);
     check!(wait_waker_addr, WAIT_WAKER_ADDR);
 }
@@ -955,6 +989,56 @@ fn set_guest_tpidr(value: usize) {
             options(nostack, preserves_flags)
         }
     }
+}
+
+/// Marks (or unmarks) the current thread as a guest thread for the whole of
+/// its guest lifetime.
+///
+/// This is the AArch64 stand-in for x86-64's `gsbase != 0` probe. On x86-64,
+/// `gsbase` is non-zero from the moment a thread enters guest execution until
+/// it leaves, which makes it a *thread-lifetime* property. AArch64 has no such
+/// incidentally-repurposed register — `TPIDR_EL0` is valid on every thread in
+/// the process, guest or not — so the property is recorded explicitly.
+///
+/// Deliberately a plain byte and not an atomic RMW: only the owning thread
+/// ever writes this slot, and it is read either by that same thread or by a
+/// signal handler running on it, so there is no cross-thread race to order
+/// against.
+#[cfg(target_arch = "aarch64")]
+fn set_is_guest_thread(value: bool) {
+    // SAFETY: writes a single byte in this thread's own TLS control block,
+    // whose offset from `TPIDR_EL0` is checked by `assert_tls_layout`.
+    unsafe {
+        core::arch::asm! {
+            "mrs {tmp}, tpidr_el0",
+            "strb {val:w}, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            val = in(reg) u32::from(value),
+            off = const tls_offset::IS_GUEST_THREAD,
+            options(nostack, preserves_flags)
+        }
+    }
+}
+
+/// Reads the current thread's guest-thread marker. See [`set_is_guest_thread`].
+#[cfg(target_arch = "aarch64")]
+fn is_guest_thread() -> bool {
+    let value: u32;
+    // SAFETY: reads a single byte in this thread's own TLS control block,
+    // whose offset from `TPIDR_EL0` is checked by `assert_tls_layout`. Safe to
+    // call from a signal handler: `TPIDR_EL0` is the host anchor at all times,
+    // including while guest code runs.
+    unsafe {
+        core::arch::asm! {
+            "mrs {tmp}, tpidr_el0",
+            "ldrb {val:w}, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            val = out(reg) value,
+            off = const tls_offset::IS_GUEST_THREAD,
+            options(nostack, preserves_flags)
+        }
+    }
+    value != 0
 }
 
 /// Reads the guest's virtualized thread pointer. See [`set_guest_tpidr`].
@@ -1616,6 +1700,21 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             );
         }
 
+        // AArch64 needs no thread-pointer mirroring: there is no second
+        // thread-pointer register, and `TPIDR_EL0` already holds the host
+        // anchor on every thread. What the x86-64 mirroring *also* achieves,
+        // incidentally, is making a test thread pass the `gsbase != 0`
+        // guest-thread probe in `interrupt_signal_handler`. That part does
+        // need an explicit equivalent, or test threads would re-raise
+        // process-wide instead of recording pending signals locally, diverging
+        // from x86-64 behaviour.
+        #[cfg(target_arch = "aarch64")]
+        let was_guest_thread = is_guest_thread();
+        #[cfg(target_arch = "aarch64")]
+        set_is_guest_thread(true);
+        #[cfg(target_arch = "aarch64")]
+        let _guest_thread_guard = litebox::utils::defer(|| set_is_guest_thread(was_guest_thread));
+
         ThreadHandle::run_with_handle(f)
     }
 }
@@ -1975,6 +2074,42 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
                 // platform and is not exposed to the guest.
                 Err(litebox::platform::ArchSpecificError::RegisterReserved)
             }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl litebox::platform::ArchSpecificProvider for LinuxUserland {
+    // Hardware `TPIDR_EL0` holds the *host* thread pointer for this thread's
+    // entire lifetime, including while guest code executes. The guest's own
+    // thread pointer lives in the runtime-owned `guest_tpidr` slot, which the
+    // syscall rewriter redirects every guest `MSR`/`MRS TPIDR_EL0` to. So the
+    // guest thread pointer is read and written purely as memory here; the
+    // system register is never touched.
+    fn set_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+        val: usize,
+    ) -> Result<(), litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::TpidrEl0 => {
+                if litebox_common_linux::arch::is_valid_user_tls_base(val) {
+                    set_guest_tpidr(val);
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                }
+            }
+            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
+    fn get_arch_specific_register(
+        &self,
+        reg: &litebox::platform::ArchSpecificRegister,
+    ) -> Result<usize, litebox::platform::ArchSpecificError> {
+        match reg {
+            litebox::platform::ArchSpecificRegister::TpidrEl0 => Ok(get_guest_tpidr()),
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
     }
@@ -2372,11 +2507,39 @@ extern "C-unwind" fn exception_handler(
     error: usize,
     cr2: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
     let info = litebox::shim::ExceptionInfo {
         exception: litebox::shim::Exception(trapno.try_into().unwrap()),
         error_code: error.try_into().unwrap(),
         cr2,
         kernel_mode: false,
+    };
+    // On AArch64 the hardware trap number and error code are not visible to
+    // userspace, so `exception_signal_handler` passes the signal number in
+    // `trapno` and zero in `error`, and the exception class is recovered from
+    // the signal.
+    #[cfg(target_arch = "aarch64")]
+    let info = {
+        let _ = error;
+        let exception = match i32::try_from(trapno).unwrap_or(0) {
+            libc::SIGILL => litebox::shim::Exception::INSTRUCTION_ABORT_LOWER_EL,
+            libc::SIGTRAP => litebox::shim::Exception::BRK64,
+            // Everything else reaching this handler -- SIGSEGV, SIGBUS, and
+            // SIGFPE, which has no ESR exception class of its own -- is
+            // reported as a data abort. That describes an unexpected memory
+            // fault more truthfully than a fabricated class would.
+            _ => litebox::shim::Exception::DATA_ABORT_LOWER_EL,
+        };
+        litebox::shim::ExceptionInfo {
+            exception,
+            fault_address: cr2,
+            // The real ESR_EL1 is not exposed to userspace — the arm64 signal
+            // frame carries no syndrome register — so synthesize one holding
+            // just the exception class in bits 31:26. The instruction-specific
+            // syndrome (ISS) bits 24:0 are unavoidably zero.
+            esr: u64::from(exception.0) << 26,
+            kernel_mode: false,
+        }
     };
     thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info));
 }
@@ -2739,6 +2902,114 @@ fn set_signal_return(
     sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
 }
 
+/// Called from signal handlers to fix up thread state after potentially running
+/// in the guest.
+///
+/// Clears `in_guest` and optionally sets `interrupt`. If `in_guest` was
+/// previously set, returns the guest context pointer (which does not
+/// necessarily have up-to-date guest register state yet).
+///
+/// Unlike the x86-64 counterpart there is no host-TLS recovery step:
+/// `TPIDR_EL0` holds the host anchor at all times, including throughout guest
+/// execution, so ordinary TLS addressing already works on entry.
+#[cfg(target_arch = "aarch64")]
+fn signal_handler_exit_guest(
+    _context: &libc::ucontext_t,
+    set_interrupt: bool,
+) -> Option<*mut litebox_common_linux::PtRegs> {
+    let tp: usize;
+    // SAFETY: reads the host thread pointer. `TPIDR_EL0` is never repointed at
+    // a guest value — the rewriter redirects guest thread-pointer accesses to
+    // the `guest_tpidr` slot instead — so it is the host anchor here even if
+    // this signal interrupted guest code.
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, tpidr_el0",
+            out(reg) tp,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    // SAFETY: `tp` addresses this thread's own TLS control block. Every offset
+    // used below is checked against the link-time layout by
+    // `assert_tls_layout`, and each access is naturally aligned and in bounds
+    // of that block. Volatile because these slots are also written by the
+    // transition assembly, which the compiler cannot see.
+    unsafe {
+        let in_guest = (tp + tls_offset::IN_GUEST) as *mut u8;
+        let was_in_guest = in_guest.read_volatile();
+        in_guest.write_volatile(0);
+        if set_interrupt {
+            ((tp + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
+        }
+        if was_in_guest == 0 {
+            return None;
+        }
+        // `guest_context_top` points one past the end of the guest `PtRegs`,
+        // as published by `run_thread_arch`; step back one to get its base.
+        let top = ((tp + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
+        Some((top as *mut litebox_common_linux::PtRegs).sub(1))
+    }
+}
+
+/// Copies register state from a Linux signal context to a LiteBox PtRegs
+/// structure.
+#[cfg(target_arch = "aarch64")]
+fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
+    let m = &context.uc_mcontext;
+    // Zip rather than index, so a length mismatch between `PtRegs::regs` and
+    // `mcontext_t::regs` truncates instead of panicking or reading past an end.
+    for (dst, src) in regs.regs.iter_mut().zip(m.regs.iter()) {
+        *dst = (*src).trunc();
+    }
+    regs.sp = m.sp.trunc();
+    regs.pc = m.pc.trunc();
+    regs.pstate = m.pstate;
+    // This `PtRegs` slot is reused across guest entries, so `syscallno` may
+    // still hold a syscall number written by `syscall_callback` on an earlier
+    // trip through the guest. Leaving it would tell the shim a syscall is in
+    // flight during what is actually an exception or an interrupt. Follow the
+    // arm64 kernel and mark "not in a syscall" explicitly.
+    //
+    // Note x86-64's `copy_signal_context` deliberately differs: it sets
+    // `orig_rax = rax` and has no `syscallno` field to invalidate.
+    regs.orig_x0 = regs.regs[0];
+    regs.syscallno = NO_SYSCALL;
+}
+
+/// The arm64 kernel's `syscallno` sentinel for "this context is not in a
+/// syscall" (`NO_SYSCALL` in `arch/arm64/include/asm/ptrace.h`).
+#[cfg(target_arch = "aarch64")]
+const NO_SYSCALL: i32 = -1;
+
+/// Widens a host-pointer-sized value into an AArch64 general-purpose register
+/// slot in `mcontext_t`.
+///
+/// AArch64 is always 64-bit, so this never fails; it exists so the conversion
+/// reads as a widening rather than a lossy `as` cast.
+#[cfg(target_arch = "aarch64")]
+fn to_greg(value: usize) -> u64 {
+    u64::try_from(value).expect("aarch64 pointers are 64-bit")
+}
+
+/// Updates a Linux signal context to return to `f` with the given arguments.
+#[cfg(target_arch = "aarch64")]
+fn set_signal_return(
+    context: &mut libc::ucontext_t,
+    f: unsafe extern "C" fn(),
+    p0: isize,
+    p1: isize,
+    p2: isize,
+    p3: isize,
+) {
+    let m = &mut context.uc_mcontext;
+    m.pc = to_greg(f as usize);
+    // AAPCS64: first four integer arguments in x0-x3.
+    m.regs[0] = to_greg(p0.reinterpret_as_unsigned());
+    m.regs[1] = to_greg(p1.reinterpret_as_unsigned());
+    m.regs[2] = to_greg(p2.reinterpret_as_unsigned());
+    m.regs[3] = to_greg(p3.reinterpret_as_unsigned());
+}
+
 /// Signal handler for hardware exceptions (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGTRAP).
 unsafe extern "C" fn exception_signal_handler(
     signum: libc::c_int,
@@ -2746,7 +3017,12 @@ unsafe extern "C" fn exception_signal_handler(
     context: &mut libc::ucontext_t,
 ) {
     // Return an error code for the syscall and log it in debug mode.
-    #[cfg(debug_assertions)]
+    //
+    // Gated to x86-64 rather than ported: the only producer of SIGSYS here is
+    // the seccomp filter installed by `enable_seccomp_filter`, which is itself
+    // `#[cfg(target_arch = "x86_64")]`. On AArch64 no SIGSYS this runtime
+    // caused can reach here, so decoding one would be dead code.
+    #[cfg(all(debug_assertions, target_arch = "x86_64"))]
     if signum == libc::SIGSYS {
         use core::fmt::Write as _;
         #[cfg(target_arch = "x86_64")]
@@ -2792,6 +3068,23 @@ unsafe extern "C" fn exception_signal_handler(
         sigctx.gregs[libc::REG_ERR as usize].trunc(),
         sigctx.gregs[libc::REG_CR2 as usize].trunc(),
     );
+    // AArch64 exposes no trap number or error code to userspace, so the signal
+    // number stands in for the trap and the error code is always zero;
+    // `exception_handler` recovers an exception class from it. The four-argument
+    // shape is kept so `exception_callback`'s x1/x2/x3 marshalling is shared.
+    //
+    // The fault address comes from `uc_mcontext.fault_address`, not
+    // `siginfo.si_addr`. That field is what the arm64 kernel copies out of
+    // `current->thread.fault_address`, i.e. FAR_EL1 — exactly what
+    // `ExceptionInfo::fault_address` is documented to carry. `si_addr` is a
+    // per-signal derived value and for SIGILL is the faulting *PC*, which
+    // would put a program counter in a field named `fault_address`.
+    #[cfg(target_arch = "aarch64")]
+    let (trapno, err, cr2) = (
+        isize::try_from(signum).expect("signal numbers are small"),
+        0isize,
+        TruncateExt::<usize>::trunc(sigctx.fault_address).reinterpret_as_signed(),
+    );
     set_signal_return(context, exception_callback, 0, trapno, err, cr2);
 }
 
@@ -2809,12 +3102,20 @@ unsafe fn next_signal_handler(
                     .reinterpret_as_unsigned()
                     .trunc()
             }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc.trunc()
+            }
         };
         if let Some(fixup_addr) = litebox::mm::exception_table::search_exception_tables(ip) {
             #[cfg(target_arch = "x86_64")]
             {
                 context.uc_mcontext.gregs[libc::REG_RIP as usize] =
                     fixup_addr.reinterpret_as_signed() as i64;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                context.uc_mcontext.pc = to_greg(fixup_addr);
             }
             return;
         }
@@ -2852,30 +3153,70 @@ unsafe fn next_signal_handler(
     }
 }
 
-/// Records a pending host signal in the `.tbss` bitmask and wakes any condvar
-/// the thread is blocked on.
+/// Records a pending host signal in the TLS bitmask and wakes any condvar the
+/// thread is blocked on.
 ///
 /// # Safety
 ///
-/// Must be called from a signal handler on a guest thread whose saved host TLS
-/// segment register is valid.
+/// Must be called from a signal handler on a guest thread.
+///
+/// On x86-64 that additionally requires the thread's saved host TLS segment
+/// register (`gsbase`) to be valid, since the bitmask is reached through it.
+/// On AArch64 there is no such precondition to check: `TPIDR_EL0` holds the
+/// host anchor on every thread at all times, so the TLS control block is
+/// always addressable.
 unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     let mask: u32 = 1u32 << (signal.as_i32() - 1);
+    #[cfg(target_arch = "x86_64")]
+    let waker_addr: usize;
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
             mask = in(reg) mask,
             options(nostack)
         );
-    }
-    let waker_addr: usize;
-    unsafe {
         core::arch::asm!(
             concat!("mov {}, ", saved_tls!("wait_waker_addr")),
             out(reg) waker_addr,
             options(nostack, preserves_flags)
         );
     }
+
+    // An `ldxr`/`stxr` retry loop rather than the LSE `stset`: `stset` is
+    // ARMv8.1-A, while the `aarch64-unknown-linux-gnu` baseline is ARMv8.0-A,
+    // so using it would need `+lse` and would raise this crate's hardware
+    // floor. The acquire/release pairing gives the same sequentially
+    // consistent ordering as the x86-64 `lock or`.
+    #[cfg(target_arch = "aarch64")]
+    let waker_addr: usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: both slots are in this thread's own TLS control block at offsets
+    // checked by `assert_tls_layout`, and both accesses are naturally aligned.
+    // The exclusive monitor reservation is opened and closed within the loop.
+    unsafe {
+        core::arch::asm!(
+            "mrs {tp}, tpidr_el0",
+            "add {addr}, {tp}, #{pending_off}",
+            "2:",
+            "ldaxr {old:w}, [{addr}]",
+            "orr {new:w}, {old:w}, {mask:w}",
+            "stlxr {status:w}, {new:w}, [{addr}]",
+            "cbnz {status:w}, 2b",
+            "ldr {waker}, [{tp}, #{waker_off}]",
+            tp = out(reg) _,
+            addr = out(reg) _,
+            old = out(reg) _,
+            new = out(reg) _,
+            status = out(reg) _,
+            waker = out(reg) waker_addr,
+            mask = in(reg) mask,
+            pending_off = const tls_offset::PENDING_HOST_SIGNALS,
+            waker_off = const tls_offset::WAIT_WAKER_ADDR,
+            options(nostack)
+        );
+    }
+
     if waker_addr == 0 {
         return;
     }
@@ -2930,14 +3271,29 @@ unsafe fn interrupt_signal_handler(
             return;
         };
 
-        // Check whether the saved host TLS segment is valid (i.e. this is a
-        // guest thread). If not, re-raise the signal process-wide.
+        // Check whether this is a guest thread. If not, re-raise the signal
+        // process-wide.
+        //
+        // This asks a *thread-lifetime* question -- "was this thread ever
+        // handed to `run_thread_arch`?" -- not "is guest code executing right
+        // now?". Do NOT substitute `in_guest` here: `in_guest` is momentary
+        // and is 0 whenever a guest thread is sitting in the host, including
+        // while it is parked in an interruptible wait. That parked case is
+        // precisely what `record_pending_signal` and `wait_waker_addr` exist
+        // to serve, so using `in_guest` would route it down the re-raise path
+        // and drop the wakeup.
         let is_guest_thread;
         #[cfg(target_arch = "x86_64")]
         {
             let gsbase: u64;
             unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
             is_guest_thread = gsbase != 0;
+        }
+        // AArch64 has no register that incidentally encodes this the way
+        // `gsbase` does on x86-64, so it is recorded explicitly.
+        #[cfg(target_arch = "aarch64")]
+        {
+            is_guest_thread = self::is_guest_thread();
         }
 
         if is_guest_thread {
@@ -2969,6 +3325,8 @@ unsafe fn interrupt_signal_handler(
     let ip = context.uc_mcontext.gregs[libc::REG_RIP as usize]
         .reinterpret_as_unsigned()
         .trunc();
+    #[cfg(target_arch = "aarch64")]
+    let ip = context.uc_mcontext.pc.trunc();
 
     // Case 1: at the beginning of the syscall handler.
     //
@@ -3081,12 +3439,19 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
+    // These are used only by `test_seccomp_filter`, which is x86-64 only
+    // because `enable_seccomp_filter` is.
+    #[cfg(target_arch = "x86_64")]
     use std::net::Shutdown;
+    #[cfg(target_arch = "x86_64")]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    #[cfg(target_arch = "x86_64")]
     use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
-    use litebox::{fs::OFlags, platform::RawMutex};
+    #[cfg(target_arch = "x86_64")]
+    use litebox::fs::OFlags;
+    use litebox::platform::RawMutex;
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;

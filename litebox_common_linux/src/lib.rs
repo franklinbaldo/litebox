@@ -3205,6 +3205,21 @@ pub mod arch {
     pub const PSR_DIT_BIT: u64 = 1 << 24;
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
+
+    /// Returns whether `base` is a valid AArch64 Linux user thread-pointer
+    /// (`TPIDR_EL0`) value.
+    ///
+    /// The counterpart of x86-64's [`super::arch::is_valid_user_fs_base`], and
+    /// the same rule: the base must lie below the top of the user address
+    /// space. The motivation differs, though. On x86-64 the check exists
+    /// because a non-canonical `wrfsbase` operand raises #GP; AArch64
+    /// `MSR TPIDR_EL0` accepts any 64-bit value without faulting, so this is
+    /// purely a containment check that keeps a guest from parking its thread
+    /// pointer over kernel-half addresses.
+    #[must_use]
+    pub fn is_valid_user_tls_base(base: usize) -> bool {
+        base < USER_ADDR_END
+    }
 }
 
 impl PtRegs {

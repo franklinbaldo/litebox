@@ -48,7 +48,22 @@ pub enum ArchSpecificRegister {
 /// Architecture-specific registers for AArch64.
 #[cfg(target_arch = "aarch64")]
 #[non_exhaustive]
-pub enum ArchSpecificRegister {}
+pub enum ArchSpecificRegister {
+    /// The guest thread pointer, i.e. the value the guest observes when it
+    /// reads `TPIDR_EL0`.
+    ///
+    /// AArch64 has no `arch_prctl`, so this register is how the shim services
+    /// `CLONE_SETTLS` — the role [`ArchSpecificRegister::FsBase`] plays on
+    /// x86-64.
+    ///
+    /// A platform may virtualize this rather than program the hardware
+    /// register. `litebox_platform_linux_userland` does exactly that: hardware
+    /// `TPIDR_EL0` holds the *host* thread pointer at all times, even while
+    /// guest code runs, and the guest value lives in a runtime-owned slot
+    /// beside it, because the syscall rewriter redirects every guest read and
+    /// write of the thread pointer to that slot.
+    TpidrEl0,
+}
 
 /// Errors that can be produced by a [`ArchSpecificProvider`] operation.
 #[non_exhaustive]
