@@ -22,7 +22,9 @@ mod error;
 pub mod event;
 pub mod pipe;
 mod policy;
+pub mod readiness;
 mod session;
+pub mod socket;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,16 +34,16 @@ use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
-pub use policy::{PolicyEngine, PolicyProfile};
+pub use policy::{PolicyEngine, PolicyProfile, SocketPolicy};
 use session::ObjectReference;
-pub use session::{BrokerSession, CallerCredential, ObjectRights};
+pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
+use socket::SocketProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
 /// Resource limits for broker-owned authority state.
 ///
-/// These limits are global to the broker core, not per session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
@@ -49,6 +51,10 @@ pub struct BrokerCoreLimits {
     pub max_references: usize,
     /// Maximum total capacity in bytes reserved by live pipes.
     pub max_total_pipe_capacity: usize,
+    /// Maximum live platform socket resources across all sessions.
+    pub max_sockets: usize,
+    /// Maximum live platform socket resources owned by one session.
+    pub max_sockets_per_session: usize,
 }
 
 impl BrokerCoreLimits {
@@ -56,6 +62,8 @@ impl BrokerCoreLimits {
     pub const DEFAULT: Self = Self {
         max_references: 4096,
         max_total_pipe_capacity: 64 * 1024 * 1024,
+        max_sockets: 1024,
+        max_sockets_per_session: 256,
     };
 
     /// Creates a broker core limit set.
@@ -63,6 +71,23 @@ impl BrokerCoreLimits {
         Self {
             max_references,
             max_total_pipe_capacity,
+            max_sockets: Self::DEFAULT.max_sockets,
+            max_sockets_per_session: Self::DEFAULT.max_sockets_per_session,
+        }
+    }
+
+    /// Creates a broker core limit set with every limit specified explicitly.
+    pub const fn new_with_all_limits(
+        max_references: usize,
+        max_total_pipe_capacity: usize,
+        max_sockets: usize,
+        max_sockets_per_session: usize,
+    ) -> Self {
+        Self {
+            max_references,
+            max_total_pipe_capacity,
+            max_sockets,
+            max_sockets_per_session,
         }
     }
 }
@@ -85,19 +110,26 @@ pub struct BrokerCore {
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
+    pub(crate) pending_references: Arc<AtomicUsize>,
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
+    pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    pub(crate) socket_provider: Arc<dyn SocketProvider>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
-    /// Creates the broker core with the provided policy engine.
-    pub fn new(policy: PolicyEngine) -> Result<Self> {
-        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT)
+    /// Creates the broker core with a broker-wide platform socket provider.
+    pub fn new(policy: PolicyEngine, socket_provider: Arc<dyn SocketProvider>) -> Result<Self> {
+        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT, socket_provider)
     }
 
-    /// Creates the broker core with explicit authority-state limits.
-    pub fn new_with_limits(policy: PolicyEngine, limits: BrokerCoreLimits) -> Result<Self> {
+    /// Creates the broker core with explicit limits and a socket provider.
+    pub fn new_with_limits(
+        policy: PolicyEngine,
+        limits: BrokerCoreLimits,
+        socket_provider: Arc<dyn SocketProvider>,
+    ) -> Result<Self> {
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -108,8 +140,17 @@ impl BrokerCore {
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
+            pending_references: Arc::new(AtomicUsize::new(0)),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
+            reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            socket_provider,
         })
+    }
+
+    /// Returns the configured authority-state limits.
+    #[must_use]
+    pub const fn limits(&self) -> BrokerCoreLimits {
+        self.limits
     }
 
     pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {
@@ -147,7 +188,7 @@ impl BrokerCore {
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(BrokerSession::new(
             self.clone(),
-            session::SessionId(session_id),
+            SessionId(session_id),
             caller_credential,
         ))
     }

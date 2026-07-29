@@ -12,6 +12,24 @@ use std::{
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 
+struct TestReadinessSink;
+
+impl litebox_broker_core::readiness::ReadinessSink for TestReadinessSink {
+    fn max_tracked_objects(&self) -> usize {
+        usize::MAX
+    }
+
+    fn publish(
+        &self,
+        _handle: litebox_broker_protocol::ObjectHandle,
+        _readiness: litebox_broker_protocol::readiness::ReadinessFlags,
+    ) -> litebox_broker_core::Result<()> {
+        Ok(())
+    }
+
+    fn retire(&self, _handle: litebox_broker_protocol::ObjectHandle) {}
+}
+
 #[must_use]
 struct Runner {
     command: std::process::Command,
@@ -353,8 +371,11 @@ fn spawn_test_broker(
             let control_listener =
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
-            let broker =
-                litebox_broker_core::BrokerCore::new(policy).expect("failed to create broker core");
+            let broker = litebox_broker_core::BrokerCore::new(
+                policy,
+                std::sync::Arc::new(litebox_broker_core::socket::UnsupportedSocketProvider),
+            )
+            .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
             for _ in 0..connection_count {
@@ -395,6 +416,7 @@ fn spawn_test_broker(
                     &broker,
                     &mut channel,
                     &shared_buffers,
+                    std::sync::Arc::new(TestReadinessSink),
                     |channel| {
                         channel.send_memfd(shared_buffers.memory(), None)?;
                         channel.send_memfd(control_ring.memory(), None)

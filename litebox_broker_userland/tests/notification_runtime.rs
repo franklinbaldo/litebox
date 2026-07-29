@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
@@ -47,19 +48,26 @@ fn spawn_host(
     + 'static,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
+        let broker = BrokerCore::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+            Arc::new(UnsupportedSocketProvider),
+        )
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
         let control_memory = MemfdSharedMemory::create(CONTROL_RING_MEMORY_SIZE).unwrap();
         let control_ring = ControlRing::new(control_memory).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
-        let association = setup_connection(&broker, &mut control, &shared_buffers, |channel| {
-            channel.send_memfd(shared_buffers.memory(), None)?;
-            channel.send_memfd(control_ring.memory(), None)
-        })
+        let association = setup_connection(
+            &broker,
+            &mut control,
+            &shared_buffers,
+            Arc::new(ReadinessPublisherRuntime::new()),
+            |channel| {
+                channel.send_memfd(shared_buffers.memory(), None)?;
+                channel.send_memfd(control_ring.memory(), None)
+            },
+        )
         .unwrap()
         .unwrap();
         let (mut request_source, response_sink, notifications, shutdown) =
@@ -122,9 +130,10 @@ fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotificati
 
 #[test]
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
-    let broker = BrokerCore::new(PolicyEngine::with_unauthenticated_rights(
-        ObjectRights::all(),
-    ))
+    let broker = BrokerCore::new(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+        Arc::new(UnsupportedSocketProvider),
+    )
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -140,13 +149,18 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
 
     let host_thread = std::thread::spawn(move || {
         let mut control = UnixStreamHostSetupChannel::from_accepted(host_control);
-        let association =
-            setup_connection(&broker, &mut control, &host_shared_buffers, |channel| {
+        let association = setup_connection(
+            &broker,
+            &mut control,
+            &host_shared_buffers,
+            Arc::new(ReadinessPublisherRuntime::new()),
+            |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
                 channel.send_memfd(host_control_ring.memory(), None)
-            })
-            .unwrap()
-            .unwrap();
+            },
+        )
+        .unwrap()
+        .unwrap();
         let (mut request_source, response_sink, mut notifications, _shutdown) =
             control.into_active(host_control_ring).unwrap();
         notifications.send_notification(&host_notification).unwrap();

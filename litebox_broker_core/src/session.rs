@@ -2,9 +2,11 @@
 // Licensed under the MIT license.
 
 use alloc::{sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
+use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -28,7 +30,7 @@ pub enum CallerCredential {
 /// Broker-assigned session identity.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct SessionId(pub u64);
+pub struct SessionId(pub u64);
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -49,8 +51,15 @@ pub(crate) struct ObjectReference {
 }
 
 pub(crate) enum ObjectEntry {
+    Reserved,
     Event(EventObject),
     Pipe(PipeObject),
+    Socket(SocketObject),
+}
+
+struct SessionReferences {
+    handles: Vec<ObjectHandle>,
+    pending_handles: usize,
 }
 
 /// Broker-owned authority token for one authenticated caller session.
@@ -65,7 +74,9 @@ pub struct BrokerSession {
     /// Broker-entry-authenticated caller credential for this session.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this session.
-    reference_handles: Mutex<Vec<ObjectHandle>>,
+    references: Mutex<SessionReferences>,
+    /// Socket quota held by pending, live, and closing in-flight resources.
+    pub(crate) reserved_sockets: Arc<AtomicUsize>,
 }
 
 impl BrokerSession {
@@ -79,7 +90,11 @@ impl BrokerSession {
             core,
             session_id,
             caller_credential,
-            reference_handles: Mutex::new(Vec::new()),
+            references: Mutex::new(SessionReferences {
+                handles: Vec::new(),
+                pending_handles: 0,
+            }),
+            reserved_sockets: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -88,21 +103,49 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
-        let mut reference_handles = self.reference_handles.lock();
-        reference_handles
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
+        let object = Arc::new(RwLock::new(object));
+        let mut session_references = self.references.lock();
+        let additional = session_references
+            .pending_handles
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        if session_references.handles.try_reserve(additional).is_err() {
+            return Err(BrokerError::OutOfMemory);
+        }
         let mut references = self.core.references.write();
-        if references.len() >= self.core.limits.max_references {
-            return Err(BrokerError::ResourceExhausted);
-        }
-        let handle = self.core.allocate_reference_handle()?;
-        if references.contains_key(&handle) {
-            return Err(BrokerError::Internal);
-        }
+        let preparation = (|| {
+            let pending = self.core.pending_references.load(Ordering::Relaxed);
+            if references
+                .len()
+                .checked_add(pending)
+                .is_none_or(|count| count >= self.core.limits.max_references)
+            {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            references
+                .try_reserve(
+                    pending
+                        .checked_add(1)
+                        .ok_or(BrokerError::ResourceExhausted)?,
+                )
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            let handle = self.core.allocate_reference_handle()?;
+            if references.contains_key(&handle) {
+                return Err(BrokerError::Internal);
+            }
+            Ok(handle)
+        })();
+        let handle = match preparation {
+            Ok(handle) => handle,
+            Err(error) => {
+                drop(references);
+                drop(session_references);
+                return Err(error);
+            }
+        };
         self.insert_object_reference(
             &mut references,
-            &mut reference_handles,
+            &mut session_references.handles,
             handle,
             object,
             rights,
@@ -120,29 +163,55 @@ impl BrokerSession {
             .core
             .policy
             .principal_object_rights(self.caller_credential)?;
-        let mut reference_handles = self.reference_handles.lock();
-        reference_handles
-            .try_reserve(2)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let mut references = self.core.references.write();
-        if references
-            .len()
+        let first = Arc::new(RwLock::new(first));
+        let second = Arc::new(RwLock::new(second));
+        let mut session_references = self.references.lock();
+        let additional = session_references
+            .pending_handles
             .checked_add(2)
-            .is_none_or(|count| count > self.core.limits.max_references)
-        {
-            return Err(BrokerError::ResourceExhausted);
+            .ok_or(BrokerError::ResourceExhausted)?;
+        if session_references.handles.try_reserve(additional).is_err() {
+            return Err(BrokerError::OutOfMemory);
         }
-        let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
-        if first_handle == second_handle
-            || references.contains_key(&first_handle)
-            || references.contains_key(&second_handle)
-        {
-            return Err(BrokerError::Internal);
-        }
+        let mut references = self.core.references.write();
+        let preparation = (|| {
+            let pending = self.core.pending_references.load(Ordering::Relaxed);
+            if references
+                .len()
+                .checked_add(pending)
+                .and_then(|count| count.checked_add(2))
+                .is_none_or(|count| count > self.core.limits.max_references)
+            {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            references
+                .try_reserve(
+                    pending
+                        .checked_add(2)
+                        .ok_or(BrokerError::ResourceExhausted)?,
+                )
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            let (first_handle, second_handle) = self.core.allocate_reference_handle_pair()?;
+            if first_handle == second_handle
+                || references.contains_key(&first_handle)
+                || references.contains_key(&second_handle)
+            {
+                return Err(BrokerError::Internal);
+            }
+            Ok((first_handle, second_handle))
+        })();
+        let (first_handle, second_handle) = match preparation {
+            Ok(handles) => handles,
+            Err(error) => {
+                drop(references);
+                drop(session_references);
+                return Err(error);
+            }
+        };
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
             self.insert_object_reference(
                 &mut references,
-                &mut reference_handles,
+                &mut session_references.handles,
                 handle,
                 object,
                 rights,
@@ -151,19 +220,69 @@ impl BrokerSession {
         Ok((first_handle, second_handle))
     }
 
+    pub(crate) fn reserve_object_reference(
+        &self,
+        rights: ObjectRights,
+    ) -> Result<PendingObjectReference<'_>> {
+        let object = Arc::new(RwLock::new(ObjectEntry::Reserved));
+        let mut session_references = self.references.lock();
+        let next_session_pending = session_references
+            .pending_handles
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        session_references
+            .handles
+            .try_reserve(next_session_pending)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        let mut references = self.core.references.write();
+        let pending_references = self.core.pending_references.load(Ordering::Relaxed);
+        if references
+            .len()
+            .checked_add(pending_references)
+            .is_none_or(|count| count >= self.core.limits.max_references)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        let handle = self.core.allocate_reference_handle()?;
+        if references.contains_key(&handle) {
+            return Err(BrokerError::Internal);
+        }
+        references
+            .try_reserve(
+                pending_references
+                    .checked_add(1)
+                    .ok_or(BrokerError::ResourceExhausted)?,
+            )
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        self.core
+            .pending_references
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                pending.checked_add(1)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+        session_references.pending_handles = next_session_pending;
+        Ok(PendingObjectReference {
+            session: self,
+            handle,
+            rights,
+            object,
+            active: true,
+        })
+    }
+
     fn insert_object_reference(
         &self,
         references: &mut HashMap<ObjectHandle, ObjectReference>,
         reference_handles: &mut Vec<ObjectHandle>,
         handle: ObjectHandle,
-        object: ObjectEntry,
+        object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
     ) {
         let session_reference_index = reference_handles.len();
         references.insert(
             handle,
             ObjectReference {
-                object: Arc::new(RwLock::new(object)),
+                object,
                 session_id: self.session_id,
                 rights,
                 session_reference_index,
@@ -172,50 +291,18 @@ impl BrokerSession {
         reference_handles.push(handle);
     }
 
-    pub(crate) fn with_authorized_object<T>(
+    /// Returns an authorized object lease without holding the reference-table lock.
+    ///
+    /// Callers explicitly choose the object-lock lifetime. Socket operations use
+    /// that control to release all broker locks before calling an external
+    /// platform implementation, then reacquire only the object lock if they need
+    /// to update broker-owned state.
+    pub(crate) fn authorized_object(
         &self,
-        handle: ObjectHandle,
-        required_rights: ObjectRights,
-        f: impl FnOnce(&ObjectEntry) -> Result<T>,
-    ) -> Result<T> {
-        let object = {
-            let references = self.core.references.read();
-            self.authorize_use_object(&references, handle, required_rights)?
-        };
-        let object = object.read();
-        f(&object)
-    }
-
-    pub(crate) fn with_authorized_object_mut<T>(
-        &self,
-        handle: ObjectHandle,
-        required_rights: ObjectRights,
-        f: impl FnOnce(&mut ObjectEntry) -> Result<T>,
-    ) -> Result<T> {
-        let object = {
-            let references = self.core.references.read();
-            self.authorize_use_object(&references, handle, required_rights)?
-        };
-        let mut object = object.write();
-        f(&mut object)
-    }
-
-    /// Returns the current readiness of a broker-owned object.
-    pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
-        self.with_authorized_object(handle, ObjectRights::WAIT, |object| {
-            Ok(match object {
-                ObjectEntry::Event(event) => event.readiness(),
-                ObjectEntry::Pipe(pipe) => pipe.readiness(),
-            })
-        })
-    }
-
-    fn authorize_use_object(
-        &self,
-        references: &HashMap<ObjectHandle, ObjectReference>,
         handle: ObjectHandle,
         required_rights: ObjectRights,
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
+        let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
         if reference.session_id != self.session_id {
             return Err(BrokerError::UnknownObject);
@@ -223,8 +310,22 @@ impl BrokerSession {
         if !reference.rights.contains(required_rights) {
             return Err(BrokerError::InvalidRights);
         }
-        let object = Arc::clone(&reference.object);
-        Ok(object)
+        Ok(Arc::clone(&reference.object))
+    }
+
+    /// Returns the current readiness of a broker-owned object.
+    pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
+        let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+        let socket = {
+            let object = object.read();
+            match &*object {
+                ObjectEntry::Event(event) => return Ok(event.readiness()),
+                ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
+                ObjectEntry::Socket(socket) => socket.resource(),
+                ObjectEntry::Reserved => return Err(BrokerError::Internal),
+            }
+        };
+        Ok(socket.readiness())
     }
 
     /// Closes one object reference owned by this session.
@@ -239,7 +340,8 @@ impl BrokerSession {
     }
 
     fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
-        let mut reference_handles = self.reference_handles.lock();
+        let mut session_references = self.references.lock();
+        let reference_handles = &mut session_references.handles;
         let mut references = self.core.references.write();
         let reference = references
             .remove(&handle)
@@ -280,7 +382,7 @@ impl BrokerSession {
         if let Err(error) = removal_result {
             let replaced_reference = references.insert(handle, reference);
             drop(references);
-            drop(reference_handles);
+            drop(session_references);
             if replaced_reference.is_some() {
                 return Err(BrokerError::Internal);
             }
@@ -290,10 +392,89 @@ impl BrokerSession {
     }
 }
 
+pub(crate) struct PendingObjectReference<'session> {
+    session: &'session BrokerSession,
+    handle: ObjectHandle,
+    rights: ObjectRights,
+    object: Arc<RwLock<ObjectEntry>>,
+    active: bool,
+}
+
+impl PendingObjectReference<'_> {
+    pub(crate) const fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
+    pub(crate) fn commit(mut self, object: ObjectEntry) -> Result<ObjectHandle> {
+        if !matches!(&*self.object.read(), ObjectEntry::Reserved) {
+            return Err(BrokerError::Internal);
+        }
+        let mut session_references = self.session.references.lock();
+        let mut references = self.session.core.references.write();
+        if references.contains_key(&self.handle) {
+            drop(references);
+            drop(session_references);
+            return Err(BrokerError::Internal);
+        }
+        if !release_pending_reference(
+            &self.session.core.pending_references,
+            &mut session_references,
+        ) {
+            self.active = false;
+            drop(references);
+            drop(session_references);
+            return Err(BrokerError::Internal);
+        }
+        self.active = false;
+        *self.object.write() = object;
+        self.session.insert_object_reference(
+            &mut references,
+            &mut session_references.handles,
+            self.handle,
+            Arc::clone(&self.object),
+            self.rights,
+        );
+        Ok(self.handle)
+    }
+}
+
+impl Drop for PendingObjectReference<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let mut session_references = self.session.references.lock();
+            let released = release_pending_reference(
+                &self.session.core.pending_references,
+                &mut session_references,
+            );
+            self.active = false;
+            assert!(
+                released,
+                "pending object reference counters are inconsistent"
+            );
+        }
+    }
+}
+
+fn release_pending_reference(
+    core_pending_references: &AtomicUsize,
+    session_references: &mut SessionReferences,
+) -> bool {
+    let next_pending_handles = session_references.pending_handles.checked_sub(1);
+    let core_released = core_pending_references
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+            pending.checked_sub(1)
+        })
+        .is_ok();
+    if let Some(next_pending_handles) = next_pending_handles {
+        session_references.pending_handles = next_pending_handles;
+    }
+    next_pending_handles.is_some() && core_released
+}
+
 impl Drop for BrokerSession {
     fn drop(&mut self) {
         loop {
-            let Some(handle) = self.reference_handles.lock().pop() else {
+            let Some(handle) = self.references.lock().handles.pop() else {
                 break;
             };
             // Do not restore an inconsistent handle: retrying it forever would
@@ -315,25 +496,54 @@ impl Drop for BrokerSession {
             // run while either reference index lock is held.
             drop(reference);
         }
+        self.core.socket_provider.close_session(self.session_id);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::{SessionReferences, release_pending_reference};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
+        SocketPolicy,
     };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use std::{sync::Arc, vec::Vec};
+
+    #[test]
+    fn pending_reference_release_checks_both_counters() {
+        let core_pending_references = AtomicUsize::new(1);
+        let mut session_references = SessionReferences {
+            handles: Vec::new(),
+            pending_handles: 1,
+        };
+        assert!(release_pending_reference(
+            &core_pending_references,
+            &mut session_references
+        ));
+        assert_eq!(core_pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(session_references.pending_handles, 0);
+
+        assert!(!release_pending_reference(
+            &core_pending_references,
+            &mut session_references
+        ));
+        assert_eq!(core_pending_references.load(Ordering::Relaxed), 0);
+        assert_eq!(session_references.pending_handles, 0);
+    }
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
+        let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let broker = BrokerCore::new_with_limits(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(2, 4),
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp),
+            BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
+            socket_provider.clone(),
         )
         .unwrap();
 
@@ -343,6 +553,7 @@ mod tests {
         check_pipe_reader_closure(&broker);
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
+        crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
@@ -356,7 +567,7 @@ mod tests {
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let handle = crate::event::create(&session, 0).unwrap();
-        let unknown_handle = ObjectHandle(handle.0 + 1);
+        let unknown_handle = ObjectHandle(handle.0.checked_add(1).unwrap());
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(

@@ -15,6 +15,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::BrokerRequest;
@@ -53,9 +54,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
-        ObjectRights::all(),
-    ))?;
+    let broker = BrokerCore::new(
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+        Arc::new(UnsupportedSocketProvider),
+    )?;
 
     let mut runner_command = Command::new(&args.runner);
     runner_command
@@ -100,40 +102,46 @@ fn serve_runner(
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let mut control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    let association =
-        match setup_connection(broker, &mut control_channel, &shared_buffers, |channel| {
+    let readiness = Arc::new(ReadinessPublisherRuntime::new());
+    let association = match setup_connection(
+        broker,
+        &mut control_channel,
+        &shared_buffers,
+        readiness.clone(),
+        |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;
             Ok(())
-        })? {
-            Ok(association) => association,
-            Err(ConnectionTermination::PeerClosed) => {
-                return Err(IoError::new(
-                    ErrorKind::UnexpectedEof,
-                    "runner closed before completing broker setup",
-                )
-                .into());
-            }
-            Err(ConnectionTermination::ProtocolViolation) => {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    "runner violated the broker protocol during setup",
-                )
-                .into());
-            }
-            Err(_) => {
-                return Err(IoError::new(
-                    ErrorKind::InvalidData,
-                    "runner ended broker setup unexpectedly",
-                )
-                .into());
-            }
-        };
+        },
+    )? {
+        Ok(association) => association,
+        Err(ConnectionTermination::PeerClosed) => {
+            return Err(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "runner closed before completing broker setup",
+            )
+            .into());
+        }
+        Err(ConnectionTermination::ProtocolViolation) => {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "runner violated the broker protocol during setup",
+            )
+            .into());
+        }
+        Err(_) => {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "runner ended broker setup unexpectedly",
+            )
+            .into());
+        }
+    };
     let (request_source, response_sink, notification_channel, shutdown) =
         control_channel.into_active(control_ring)?;
     dispatch_requests(
         association,
-        Arc::new(ReadinessPublisherRuntime::new()),
+        readiness,
         request_source,
         response_sink,
         notification_channel,
@@ -555,9 +563,10 @@ mod tests {
         let (outcome_sender, outcome) = sync_channel(1);
         let (start, started) = sync_channel(1);
         let host = std::thread::spawn(move || {
-            let broker = BrokerCore::new(PolicyEngine::with_host_guaranteed_rights(
-                ObjectRights::all(),
-            ))
+            let broker = BrokerCore::new(
+                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+                Arc::new(UnsupportedSocketProvider),
+            )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =
@@ -568,10 +577,16 @@ mod tests {
                 host_stream,
                 Instant::now() + SETUP_TIMEOUT,
             );
-            let association = setup_connection(&broker, &mut control, &shared_buffers, |channel| {
-                channel.send_memfd(shared_buffers.memory(), None)?;
-                channel.send_memfd(control_ring.memory(), None)
-            })
+            let association = setup_connection(
+                &broker,
+                &mut control,
+                &shared_buffers,
+                readiness.clone(),
+                |channel| {
+                    channel.send_memfd(shared_buffers.memory(), None)?;
+                    channel.send_memfd(control_ring.memory(), None)
+                },
+            )
             .unwrap()
             .unwrap();
             let (request_source, response_sink, notifications, shutdown) =
