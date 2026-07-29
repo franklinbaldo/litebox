@@ -112,11 +112,14 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     if nolibc {
         args.push("-nostdlib");
     }
-    args.push(match std::env::consts::ARCH {
-        "x86_64" => "-m64",
-        "x86" => "-m32",
-        _ => unimplemented!(),
-    });
+    // `-m64`/`-m32` pick between the two ABIs an x86 gcc can target. An AArch64
+    // gcc has no such choice to make and rejects both flags.
+    match std::env::consts::ARCH {
+        "x86_64" => args.push("-m64"),
+        "x86" => args.push("-m32"),
+        "aarch64" => (),
+        arch => unimplemented!("no gcc ABI flag known for {arch}"),
+    }
 
     // Create command string for caching
     let mut command_parts = vec!["gcc"];

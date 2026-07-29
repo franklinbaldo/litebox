@@ -12,6 +12,14 @@ use std::{
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 
+/// The multiarch directory the host's shared libraries actually live in.
+/// `find_dependencies` reports paths under it, and the guest's
+/// `LD_LIBRARY_PATH` has to be able to find them again inside the tar.
+#[cfg(target_arch = "x86_64")]
+const MULTIARCH_LIB_DIR: &str = "lib/x86_64-linux-gnu";
+#[cfg(target_arch = "aarch64")]
+const MULTIARCH_LIB_DIR: &str = "lib/aarch64-linux-gnu";
+
 #[must_use]
 struct Runner {
     command: std::process::Command,
@@ -29,7 +37,7 @@ impl Runner {
 
         // create tar file containing the rewritten executable and all dependencies
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
-        let dirs_to_create = ["lib64", "lib/x86_64-linux-gnu", "lib32"];
+        let dirs_to_create = ["lib64", MULTIARCH_LIB_DIR, "lib32"];
         for dir in dirs_to_create {
             std::fs::create_dir_all(tar_dir.join(dir)).unwrap();
         }
