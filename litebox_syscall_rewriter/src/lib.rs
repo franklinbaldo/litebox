@@ -1507,6 +1507,37 @@ pub const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 ///   (the shim's `MAP_FIXED` straddles a mapping boundary and fails) or be
 ///   silently torn down by the trim, so a full alignment unit is skipped past
 ///   the aligned end of the object.
+///
+/// # TODO: this address can land inside another object, and corrupts it silently
+///
+/// Both rules above only establish that the address is clear of *this* object
+/// and of the loader's own scaffolding for it. Neither can establish that it is
+/// free, because nothing reserves it: the trampoline lives outside every
+/// `PT_LOAD`, so the dynamic loader never learns the range exists and never
+/// accounts for it when choosing where to put anything else. glibc packs
+/// objects adjacently, so no free gap is guaranteed -- the next object may
+/// already own the range by the time the shim maps here.
+///
+/// The failure mode is the worst kind. The shim maps the trampoline with
+/// `MAP_FIXED`, and `MAP_FIXED` over a range *fully* covered by an existing
+/// mapping straddles no mapping boundary, so it does not fail: it silently
+/// replaces the victim's pages. There is no error and no warning, and no fault
+/// until the overwritten code or data is used, arbitrarily far from the cause.
+///
+/// Reproduction, with perl: `libperl` maps `[0xffffff1d0000, 0xffffff589000)`
+/// and `libc`'s trampoline is placed at `[0xffffff1e0000, 0xffffff1ea000)` --
+/// 64 KiB *inside* libperl. Mapping it overwrites ~40 KiB of libperl's
+/// text/rodata, corrupting a `DT_NEEDED` string, which surfaces later as an
+/// unrelated-looking failure.
+///
+/// This predates the AArch64 port and is architecture-independent: the baseline
+/// placement rule overlapped libperl too, by 0x8000. Adjusting the arithmetic
+/// here cannot fix it, only change which programs happen to collide.
+///
+/// The likely fix is to stop having the runtime guess at a free gap and make the
+/// range reserved instead: emit a `PT_LOAD` covering the trampoline, so the
+/// dynamic loader includes it in the object's span and places every other object
+/// clear of it -- the same guarantee every ordinary segment already gets.
 pub fn trampoline_addr_for(max_load_end: u64, max_align: u64) -> Result<u64> {
     // Guard against a bogus `p_align`: the masking below requires a power of two.
     let align = if max_align.is_power_of_two() {

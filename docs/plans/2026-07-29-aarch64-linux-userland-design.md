@@ -127,10 +127,13 @@ So the rewriter emits the gates with a placeholder immediate
 (`GUEST_TPIDR_OFFSET_PLACEHOLDER`, deliberately the largest the field can hold),
 and the loader calls `aarch64_patch_guest_tpidr_offset` with the offset the
 runtime measured for itself, after reading the trampoline blob and before
-mapping it executable. This happens for every rewritten object — the executable
-and interpreter through `ElfParsedFile::load_trampoline`, each shared library
-through the shim's `mmap` pre-patched path — each of which carries its own
-trampoline.
+mapping it executable. This happens for every rewritten object — the executable,
+the interpreter and every shared library alike — each of which carries its own
+trampoline. All three go through one place: the shim's `mmap` pre-patched path
+(`do_mmap_file` → `maybe_patch_exec_segment`). The executable and the
+interpreter are not special, because the shim's `MapMemory` implements
+`map_file` as `sys_mmap`, so loading them lands in `do_mmap_file` exactly like a
+library the guest's own dynamic linker maps later.
 
 The patch sites need no side table. Everything in a trampoline from the shared
 SVC handler onwards is an instruction word the rewriter emitted (the header's
@@ -379,7 +382,42 @@ plausibly correct, but is not exercised by the hello-world target.
    `litebox_runner_linux_userland/tests/run.rs` hardcodes `lib/x86_64-linux-gnu`
    and needs an AArch64 arm.
 
-## 8. Out of scope
+## 8. Known issues
+
+### The appended trampoline can be placed inside another object
+
+Accepted as a known issue and deliberately not fixed here. It is pre-existing
+and architecture-independent, not something this port introduces.
+
+The trampoline the rewriter appends lives *outside* every `PT_LOAD`, so the
+dynamic loader never learns the range exists and never reserves it. Its address
+is chosen at runtime by `litebox_syscall_rewriter::trampoline_addr_for`, which
+can only establish that the address is clear of *its own* object and of the
+loader's scaffolding for that object — never that it is free overall. glibc
+packs objects adjacently, so no free gap is guaranteed, and by the time the shim
+maps here the next object may already own the range.
+
+The failure mode is silent corruption of an adjacent object, not a clean error.
+The shim maps the trampoline with `MAP_FIXED`; over a range *fully* covered by an
+existing mapping that straddles no mapping boundary, so it succeeds and simply
+replaces the victim's pages. Nothing faults until the overwritten bytes are used,
+arbitrarily far from the cause.
+
+Reproduction, with perl: `libperl` maps `[0xffffff1d0000, 0xffffff589000)`, and
+`libc`'s trampoline is placed at `[0xffffff1e0000, 0xffffff1ea000)` — 64 KiB
+*inside* libperl. Mapping it overwrites ~40 KiB of libperl's text/rodata,
+corrupting a `DT_NEEDED` string. The baseline placement rule overlapped libperl
+too, by 0x8000, so this is not a regression from the aarch64 placement change.
+
+Adjusting the arithmetic in `trampoline_addr_for` cannot fix this, only change
+which programs collide. The likely fix is to stop guessing at a free gap at
+runtime and make the range genuinely reserved: have the rewriter emit a `PT_LOAD`
+covering the trampoline, so the dynamic loader maps it as part of the object's
+span and places everything else clear of it — the guarantee every ordinary
+segment already has. The `TODO` lives on `trampoline_addr_for`, where the
+address is chosen.
+
+## 9. Out of scope
 
 Threads, dynamic linking, real signal delivery to the guest, and the full
 `tests/run.rs` matrix.
