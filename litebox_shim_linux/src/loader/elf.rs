@@ -70,7 +70,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        // `st_size` is `usize` on x86-64 but `i64` in the asm-generic layout
+        // aarch64 uses; `try_from` covers both and rejects a negative size.
+        u64::try_from(self.task.sys_fstat(self.fd)?.st_size).map_err(|_| Errno::EINVAL)
     }
 }
 
@@ -367,7 +369,11 @@ mod tests {
     const PROGRAM_HEADER_SIZE_U16: u16 = 56;
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
-    const EM_X86_64: u16 = 62;
+    /// The `e_machine` the loader accepts, which is the host architecture.
+    #[cfg(target_arch = "x86_64")]
+    const EM_HOST: u16 = 62; // EM_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const EM_HOST: u16 = 183; // EM_AARCH64
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
@@ -404,7 +410,7 @@ mod tests {
         buf.extend_from_slice(&[2, 1, 1, 0]);
         buf.extend_from_slice(&[0; 8]);
         push_u16(buf, elf_type);
-        push_u16(buf, EM_X86_64);
+        push_u16(buf, EM_HOST);
         push_u32(buf, 1);
         push_u64(buf, entry);
         push_u64(buf, u64::from(ELF_HEADER_SIZE_U16));

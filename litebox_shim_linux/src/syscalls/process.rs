@@ -1843,9 +1843,13 @@ mod tests {
             );
 
              // `process_signals` is called when about to switch back to userspace, so simulate that here.
-             let mut stack = [0u8; 4096];
+             // Must exceed the signal frame: the aarch64 `rt_sigframe` is over
+             // 4 KiB on its own, because `sigcontext.__reserved` is 4096 bytes.
+             let mut stack = [0u8; 16384];
              #[cfg(target_arch = "x86_64")]
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
+             #[cfg(target_arch = "aarch64")]
+             let mut regs = litebox_common_linux::PtRegs { sp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              task.process_signals(&mut regs);
             assert_eq!(
                 regs.get_ip(), callback_addr,

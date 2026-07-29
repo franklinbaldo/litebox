@@ -18,7 +18,9 @@ use crate::ShimFS;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+#[cfg(target_arch = "aarch64")]
+use litebox::utils::ReinterpretUnsignedExt as _;
+use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
 

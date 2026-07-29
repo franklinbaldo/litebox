@@ -3,9 +3,13 @@
 
 //! Signal handling syscalls and support.
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
+#[cfg(target_arch = "aarch64")]
+use aarch64 as arch;
 use litebox_common_linux::signal::SignalDisposition;
 #[cfg(target_arch = "x86_64")]
 use x86_64 as arch;
@@ -49,13 +53,19 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 sp: 0,
                 flags: SsFlags::DISABLE,
                 size: 0,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }),
             last_exception: Cell::new(litebox::shim::ExceptionInfo {
                 exception: litebox::shim::Exception(0),
+                #[cfg(target_arch = "x86_64")]
                 error_code: 0,
+                #[cfg(target_arch = "x86_64")]
                 cr2: 0,
+                #[cfg(target_arch = "aarch64")]
+                fault_address: 0,
+                #[cfg(target_arch = "aarch64")]
+                esr: 0,
                 kernel_mode: false,
             }),
         }
@@ -76,7 +86,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 flags: SsFlags::DISABLE,
                 sp: 0,
                 size: 0,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             }
             .into(),
@@ -101,7 +111,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             };
         }
@@ -156,7 +166,7 @@ impl<Platform: ShimPlatform> SignalHandlers<Platform> {
                         restorer: 0,
                         flags: SaFlags::empty(),
                         mask: SigSet::empty(),
-                        #[cfg(target_arch = "x86_64")]
+                        #[cfg(target_pointer_width = "64")]
                         __pad: 0,
                     },
                     immutable: i == SignalHandlersInner::sig_index(Signal::SIGKILL)
@@ -268,7 +278,7 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_KERNEL,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
     }
@@ -281,7 +291,7 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
         signo: signal.as_i32(),
         errno: 0,
         code: SI_USER,
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(target_pointer_width = "64")]
         __pad: 0,
         data: SiginfoData::new_zeroed(),
     }
@@ -313,7 +323,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 sp: ss.sp,
                 flags: ss.flags & SsFlags::AUTODISARM,
                 size: ss.size,
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             });
             Ok(())
@@ -326,7 +336,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             sp: 0,
             flags: SsFlags::DISABLE,
             size: 0,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(target_pointer_width = "64")]
             __pad: 0,
         });
     }
@@ -699,7 +709,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             signo: signal.as_i32(),
             errno: 0,
             code: SI_KERNEL,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(target_pointer_width = "64")]
             __pad: 0,
             data: SiginfoData::new_zeroed(),
         };
@@ -730,7 +740,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 restorer: 0,
                 flags: SaFlags::empty(),
                 mask: SigSet::empty(),
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(target_pointer_width = "64")]
                 __pad: 0,
             };
             // Don't allow further changes to this action.
@@ -739,19 +749,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
-        let signal = match info.exception {
-            Exception::DIVIDE_ERROR => Signal::SIGFPE,
-            Exception::BREAKPOINT => Signal::SIGTRAP,
-            Exception::INVALID_OPCODE => Signal::SIGILL,
-            // Page faults and unknown exceptions map to SIGSEGV. There may be
-            // more appropriate signals in some other cases (e.g., SIGBUS).
-            _ => Signal::SIGSEGV,
+        #[cfg(target_arch = "x86_64")]
+        let (signal, fault_address) = {
+            let signal = match info.exception {
+                Exception::DIVIDE_ERROR => Signal::SIGFPE,
+                Exception::BREAKPOINT => Signal::SIGTRAP,
+                Exception::INVALID_OPCODE => Signal::SIGILL,
+                // Page faults and unknown exceptions map to SIGSEGV. There may be
+                // more appropriate signals in some other cases (e.g., SIGBUS).
+                _ => Signal::SIGSEGV,
+            };
+            // For page faults, provide the faulting address.
+            let fault_address = if info.exception == Exception::PAGE_FAULT {
+                info.cr2
+            } else {
+                0
+            };
+            (signal, fault_address)
         };
-        // For page faults, provide the faulting address.
-        let fault_address = if info.exception == Exception::PAGE_FAULT {
-            info.cr2
-        } else {
-            0
+        // This inverts the mapping `litebox_platform_linux_userland`'s
+        // `exception_signal_handler` performs, which is the only producer of
+        // aarch64 `ExceptionInfo` today. That mapping is lossy: it folds both
+        // SIGSEGV and SIGBUS into `DATA_ABORT_LOWER_EL`, so a guest SIGBUS is
+        // reported here as SIGSEGV. Recovering the distinction would need the
+        // ESR_EL1 ISS fault status code, which the platform cannot synthesize
+        // from a signal number (it leaves ESR bits 25:0 zero).
+        #[cfg(target_arch = "aarch64")]
+        let (signal, fault_address) = match info.exception {
+            Exception::BRK64
+            | Exception::BREAKPOINT_LOWER_EL
+            | Exception::BREAKPOINT_CURRENT_EL => (Signal::SIGTRAP, 0),
+            Exception::INSTRUCTION_ABORT_LOWER_EL | Exception::INSTRUCTION_ABORT_CURRENT_EL => {
+                (Signal::SIGILL, info.fault_address)
+            }
+            // Data aborts and unknown exception classes map to SIGSEGV.
+            _ => (Signal::SIGSEGV, info.fault_address),
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
