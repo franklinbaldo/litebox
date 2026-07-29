@@ -722,14 +722,20 @@ mod tls_offset {
 core::arch::global_asm!(
     "
     .section .tdata.litebox_tls, \"awT\", @progbits
+    // `.align` is a power-of-two exponent on AArch64, so this is 16 bytes. The
+    // nearby x86-64 block spells 8-byte alignment as `.align 8`; do not
+    // 'harmonize' the two.
     .align 4
 .globl guest_tpidr
 guest_tpidr:
     .quad 0
+.globl host_sp
 host_sp:
     .quad 0
+.globl guest_context_top
 guest_context_top:
     .quad 0
+.globl in_guest
 in_guest:
     .byte 0
 .globl interrupt
@@ -746,10 +752,17 @@ wait_waker_addr:
     "
 );
 
-/// Materializes the link-time thread-pointer-relative offset of a TLS symbol.
+/// Materializes the link-time thread-pointer-relative offset of a TLS symbol,
+/// named either as a bare identifier or as a string literal.
 #[cfg(target_arch = "aarch64")]
 macro_rules! tprel_offset {
-    ($var:literal) => {{
+    ($var:ident) => {
+        tprel_offset!(@sym stringify!($var))
+    };
+    ($var:literal) => {
+        tprel_offset!(@sym $var)
+    };
+    (@sym $var:expr) => {{
         let offset: usize;
         // SAFETY: reads no memory; materializes a link-time constant only.
         unsafe {
@@ -767,50 +780,49 @@ macro_rules! tprel_offset {
 /// Verifies that the TLS control block landed where [`tls_offset`] says it did.
 ///
 /// The transition assembly addresses the block with literal offsets rather than
-/// relocations, so a silent shift — caused by another TLS object being linked
-/// ahead of `.tdata.litebox_tls` — would corrupt host TLS or the guest thread
+/// relocations, so a silent shift would corrupt host TLS or the guest thread
 /// pointer at runtime. Panicking here converts that into a legible failure.
+///
+/// Two distinct things can shift the block. The obvious one is another TLS
+/// object being linked ahead of `.tdata.litebox_tls`. The subtler one is
+/// alignment: AArch64 uses TLS variant 1, where the static block starts at
+/// `round_up(16, align(PT_TLS))`, and `align(PT_TLS)` is the maximum over
+/// *every* TLS object in the link. So a single thread-local anywhere — in this
+/// crate or any dependency — whose type wants more than 16-byte alignment
+/// shifts the whole block, even while `.tdata.litebox_tls` is still first. A
+/// cache-line-padded thread-local (`#[repr(align(64))]`) moves `guest_tpidr`
+/// from 16 to 64.
 ///
 /// # Panics
 ///
 /// Panics if any symbol's actual offset differs from its expected offset.
 #[cfg(target_arch = "aarch64")]
 fn assert_tls_layout() {
-    let check = |name: &str, actual: usize, expected: usize| {
-        assert!(
-            actual == expected,
-            "TLS symbol `{name}` is at thread-pointer offset {actual}, expected {expected}; \
-             another TLS object was linked ahead of `.tdata.litebox_tls`"
-        );
-    };
+    /// Compares one symbol's link-time offset against its expected constant.
+    /// The symbol name is written once and reused for the lookup, the
+    /// relocation and the message, so the three cannot drift apart.
+    macro_rules! check {
+        ($sym:ident, $expected:ident) => {{
+            let actual = tprel_offset!($sym);
+            let expected = tls_offset::$expected;
+            assert!(
+                actual == expected,
+                "TLS symbol `{}` is at thread-pointer offset {actual}, expected {expected}; \
+                 either another TLS object was linked ahead of `.tdata.litebox_tls`, or some \
+                 TLS object in the link has alignment > 16, which shifts the whole static TLS \
+                 block",
+                stringify!($sym),
+            );
+        }};
+    }
 
-    check(
-        "guest_tpidr",
-        tprel_offset!("guest_tpidr"),
-        tls_offset::GUEST_TPIDR,
-    );
-    check("host_sp", tprel_offset!("host_sp"), tls_offset::HOST_SP);
-    check(
-        "guest_context_top",
-        tprel_offset!("guest_context_top"),
-        tls_offset::GUEST_CONTEXT_TOP,
-    );
-    check("in_guest", tprel_offset!("in_guest"), tls_offset::IN_GUEST);
-    check(
-        "interrupt",
-        tprel_offset!("interrupt"),
-        tls_offset::INTERRUPT,
-    );
-    check(
-        "pending_host_signals",
-        tprel_offset!("pending_host_signals"),
-        tls_offset::PENDING_HOST_SIGNALS,
-    );
-    check(
-        "wait_waker_addr",
-        tprel_offset!("wait_waker_addr"),
-        tls_offset::WAIT_WAKER_ADDR,
-    );
+    check!(guest_tpidr, GUEST_TPIDR);
+    check!(host_sp, HOST_SP);
+    check!(guest_context_top, GUEST_CONTEXT_TOP);
+    check!(in_guest, IN_GUEST);
+    check!(interrupt, INTERRUPT);
+    check!(pending_host_signals, PENDING_HOST_SIGNALS);
+    check!(wait_waker_addr, WAIT_WAKER_ADDR);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2645,6 +2657,10 @@ mod tests {
 
     extern crate std;
 
+    /// TLS layout is a property of a whole link, so this only validates the
+    /// test harness binary — not the shipped runner, which links a different
+    /// set of crates. A green run here is not a validated production layout;
+    /// the real safety net is `assert_tls_layout()` in `LinuxUserland::new`.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_tls_layout() {
