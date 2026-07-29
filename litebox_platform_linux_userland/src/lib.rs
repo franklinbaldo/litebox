@@ -83,6 +83,10 @@ macro_rules! saved_tls_seg {
 ///
 /// Example: `tls!("pending_host_signals")` expands to
 /// `"fs:pending_host_signals@tpoff"` on x86_64.
+///
+/// AArch64 has no segment-relative addressing; it reads `TPIDR_EL0` into a
+/// scratch register and applies a literal offset from [`tls_offset`] instead.
+#[cfg(target_arch = "x86_64")]
 macro_rules! tls {
     ($var:literal) => {
         concat!(tls_seg!(), ":", $var, tls_suffix!())
@@ -648,11 +652,37 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
     let lo: u32;
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             "xor {tmp:e}, {tmp:e}",
             concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
             tmp = out(reg) lo,
+            options(nostack)
+        );
+    }
+    // AArch64 has no `xchg`. The x86-64 `xchg` is an implicitly `lock`ed,
+    // fully ordered read-modify-write, so match it with the standard
+    // sequentially-consistent RMW mapping: an acquire exclusive load paired
+    // with a release exclusive store (`ldaxr`/`stlxr`). Deliberately not
+    // `swpal`, which requires LSE (ARMv8.1) and would raise the baseline this
+    // crate runs on.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reads and clears a naturally aligned `u32` in this thread's own
+    // TLS control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_layout`.
+    unsafe {
+        core::arch::asm!(
+            "mrs {addr}, tpidr_el0",
+            "add {addr}, {addr}, #{off}",
+            "2:",
+            "ldaxr {val:w}, [{addr}]",
+            "stlxr {status:w}, wzr, [{addr}]",
+            "cbnz {status:w}, 2b",
+            addr = out(reg) _,
+            val = out(reg) lo,
+            status = out(reg) _,
+            off = const tls_offset::PENDING_HOST_SIGNALS,
             options(nostack)
         );
     }
@@ -899,6 +929,47 @@ fn get_guest_fsbase() -> usize {
         core::arch::asm! {
             "mov {}, fs:guest_fsbase@tpoff",
             out(reg) value,
+            options(nostack, preserves_flags)
+        }
+    }
+    value
+}
+
+/// Writes the guest's virtualized thread pointer.
+///
+/// The hardware `TPIDR_EL0` always holds the *host* anchor, so the guest's
+/// thread pointer lives in the runtime-owned slot beside it. The rewriter
+/// redirects every guest `MSR TPIDR_EL0` to this same slot.
+#[cfg(target_arch = "aarch64")]
+fn set_guest_tpidr(value: usize) {
+    // SAFETY: writes a naturally aligned `u64` in this thread's own TLS
+    // control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_layout`.
+    unsafe {
+        core::arch::asm! {
+            "mrs {tmp}, tpidr_el0",
+            "str {val}, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            val = in(reg) value,
+            off = const tls_offset::GUEST_TPIDR,
+            options(nostack, preserves_flags)
+        }
+    }
+}
+
+/// Reads the guest's virtualized thread pointer. See [`set_guest_tpidr`].
+#[cfg(target_arch = "aarch64")]
+fn get_guest_tpidr() -> usize {
+    let value: usize;
+    // SAFETY: reads a naturally aligned `u64` in this thread's own TLS control
+    // block, whose offset from `TPIDR_EL0` is checked by `assert_tls_layout`.
+    unsafe {
+        core::arch::asm! {
+            "mrs {tmp}, tpidr_el0",
+            "ldr {val}, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            val = out(reg) value,
+            off = const tls_offset::GUEST_TPIDR,
             options(nostack, preserves_flags)
         }
     }
@@ -1291,6 +1362,96 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     );
 }
 
+/// Switches to the provided guest context.
+///
+/// # Safety
+/// The context must be a valid guest context. This can only be called if
+/// `run_thread_arch` is on the stack; after the guest exits, it will return to
+/// the interior of `run_thread_arch`.
+///
+/// Do not call this at a point where the stack needs to be unwound to run
+/// destructors.
+///
+/// # Guest `x16` (IP0) is deliberately not restored
+///
+/// AArch64 has no memory-indirect branch: there is no `BR [mem]`, so the
+/// branch target must first be materialized into a general-purpose register.
+/// That register is by definition one that would otherwise hold restored guest
+/// state, so restoring all 31 GPRs *and* branching is impossible in a single
+/// pass. `x16` is chosen because:
+///
+/// * `x16`/`x17` (IP0/IP1) are the AAPCS intra-procedure-call scratch
+///   registers. A linker-inserted veneer on any long branch may clobber them,
+///   so no conforming AArch64 code can rely on their values across a branch.
+/// * The rewriter's per-site SVC gate has *already* clobbered `x16` before the
+///   callback runs (it spills the guest value to `[SP, #0]` and reuses `x16`
+///   to compute the resume address), so the guest value is not live here in
+///   the syscall-return path anyway.
+///
+/// This does deviate from the rewriter's documented contract, which says the
+/// callback restores `X16` from `[SP, #0]`.
+///
+/// TODO: have the rewriter emit a per-site *outbound* stub
+/// (`ldr x16, [sp, #0]; add sp, sp, #16; b site+4`) so `x16` is fully
+/// restored. That is a pure static branch, so it needs no scratch register and
+/// stays host-portable. See
+/// `docs/plans/2026-07-29-aarch64-linux-userland-design.md` section 3.
+///
+/// Note there is no thread-pointer restore here: `TPIDR_EL0` keeps holding the
+/// host anchor while the guest runs, and the rewriter redirects guest
+/// thread-pointer accesses to `[TPIDR_EL0 + 16]`.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
+    core::arch::naked_asm!(
+    "
+switch_to_guest_start:
+    // Set `in_guest` now, then check for a pending interrupt. If an interrupt
+    // arrives after the check, the signal handler sees that the PC is between
+    // `switch_to_guest_start` and `switch_to_guest_end` and jumps to
+    // `interrupt_callback` itself. `interrupt_callback` lives in
+    // `run_thread_arch`'s asm block; the assembler resolves the reference
+    // within the object file, exactly as the x86-64 path does.
+    mrs  x17, tpidr_el0
+    mov  w16, #1
+    strb w16, [x17, #{IN_GUEST}]
+    ldrb w16, [x17, #{INTERRUPT}]
+    cbnz w16, interrupt_callback
+
+    // x0 holds `ctx` and stays live until the final two loads.
+    ldr  x16, [x0, #264]          // pstate
+    msr  nzcv, x16
+    ldr  x16, [x0, #248]          // guest sp
+    mov  sp, x16
+    ldr  x1,  [x0, #8]
+    ldp  x2,  x3,  [x0, #16]
+    ldp  x4,  x5,  [x0, #32]
+    ldp  x6,  x7,  [x0, #48]
+    ldp  x8,  x9,  [x0, #64]
+    ldp  x10, x11, [x0, #80]
+    ldp  x12, x13, [x0, #96]
+    ldp  x14, x15, [x0, #112]
+    // regs[16] is intentionally skipped; see the doc comment.
+    ldr  x17, [x0, #136]
+    ldr  x18, [x0, #144]
+    ldp  x19, x20, [x0, #152]
+    ldp  x21, x22, [x0, #168]
+    ldp  x23, x24, [x0, #184]
+    ldp  x25, x26, [x0, #200]
+    ldp  x27, x28, [x0, #216]
+    ldr  x29, [x0, #232]
+    ldr  x30, [x0, #240]
+    ldr  x16, [x0, #256]          // guest PC -- x16 is the branch register
+    ldr  x0,  [x0, #0]            // guest x0, last use of ctx
+    br   x16
+switch_to_guest_end:
+"
+    ,
+    IN_GUEST = const tls_offset::IN_GUEST,
+    INTERRUPT = const tls_offset::INTERRUPT,
+    );
+}
+
 /// Non-guest threads (e.g., network workers, background tasks) should call this
 /// function at the start of their execution so the kernel only delivers
 /// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
@@ -1520,10 +1681,36 @@ impl litebox::platform::RawMutexProvider for LinuxUserland {
         Self: litebox::sync::RawSyncPrimitivesProvider,
     {
         let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
                 inout(reg) waker_ptr,
+                options(nostack),
+            );
+        }
+        // Same sequentially-consistent `ldaxr`/`stlxr` exchange as
+        // `take_pending_host_signals`, on a 64-bit slot. The interrupt signal
+        // handler reads this slot, so the ordering must match the x86-64
+        // `xchg` it replaces.
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: exchanges a naturally aligned `u64` in this thread's own TLS
+        // control block, whose offset from `TPIDR_EL0` is checked by
+        // `assert_tls_layout`.
+        unsafe {
+            let new_ptr = waker_ptr;
+            core::arch::asm!(
+                "mrs {addr}, tpidr_el0",
+                "add {addr}, {addr}, #{off}",
+                "2:",
+                "ldaxr {old}, [{addr}]",
+                "stlxr {status:w}, {new}, [{addr}]",
+                "cbnz {status:w}, 2b",
+                addr = out(reg) _,
+                old = out(reg) waker_ptr,
+                new = in(reg) new_ptr,
+                status = out(reg) _,
+                off = const tls_offset::WAIT_WAKER_ADDR,
                 options(nostack),
             );
         }
@@ -2191,9 +2378,21 @@ impl ThreadContext<'_> {
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             core::arch::asm!(
                 concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
+                options(nostack, preserves_flags)
+            );
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: writes a single byte in this thread's own TLS control block.
+        unsafe {
+            core::arch::asm!(
+                "mrs {tmp}, tpidr_el0",
+                "strb wzr, [{tmp}, #{off}]",
+                tmp = out(reg) _,
+                off = const tls_offset::INTERRUPT,
                 options(nostack, preserves_flags)
             );
         }
