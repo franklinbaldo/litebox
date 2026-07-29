@@ -1400,6 +1400,16 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 /// Note there is no thread-pointer restore here: `TPIDR_EL0` keeps holding the
 /// host anchor while the guest runs, and the rewriter redirects guest
 /// thread-pointer accesses to `[TPIDR_EL0 + 16]`.
+///
+/// # The `switch_to_guest_start` / `switch_to_guest_end` bracket
+///
+/// `interrupt_signal_handler` case 3 tests whether the interrupted PC lies
+/// inside this range. The range must span **every** instruction from the
+/// `in_guest` store onward, not merely the final few: `mov sp, x16` installs
+/// the *guest* stack pointer roughly twenty instructions before `br x16`, and
+/// for that entire window neither the host nor the guest register state is
+/// self-consistent. `interrupt_callback` is what repairs it, by reloading `SP`
+/// from `host_sp`. Do not shrink the bracketed region.
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
@@ -1409,14 +1419,23 @@ switch_to_guest_start:
     // Set `in_guest` now, then check for a pending interrupt. If an interrupt
     // arrives after the check, the signal handler sees that the PC is between
     // `switch_to_guest_start` and `switch_to_guest_end` and jumps to
-    // `interrupt_callback` itself. `interrupt_callback` lives in
-    // `run_thread_arch`'s asm block; the assembler resolves the reference
-    // within the object file, exactly as the x86-64 path does.
+    // `interrupt_callback` itself.
     mrs  x17, tpidr_el0
     mov  w16, #1
     strb w16, [x17, #{IN_GUEST}]
     ldrb w16, [x17, #{INTERRUPT}]
-    cbnz w16, interrupt_callback
+    // The condition is inverted around an unconditional branch on purpose; do
+    // not 'simplify' this back to `cbnz w16, interrupt_callback`.
+    // `interrupt_callback` lives in `run_thread_arch`'s separate `naked_asm!`
+    // block, so the reference is a cross-section relocation resolved by the
+    // linker, not by the assembler. A conditional branch emits
+    // `R_AARCH64_CONDBR19`, which reaches only +/-1MiB and for which the
+    // linker inserts no veneer -- it hard-fails with `relocation truncated to
+    // fit` if CGU partitioning or LTO ever places the two functions further
+    // apart. `B` emits `R_AARCH64_JUMP26`: +/-128MiB and veneer-able.
+    cbz  w16, 3f
+    b    interrupt_callback
+3:
 
     // x0 holds `ctx` and stays live until the final two loads.
     ldr  x16, [x0, #264]          // pstate
