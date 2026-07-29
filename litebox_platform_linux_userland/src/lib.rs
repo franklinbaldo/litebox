@@ -32,6 +32,12 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
+/// `AT_FDCWD`: resolve relative paths against the current working directory.
+///
+/// `openat` is used in place of `open` throughout this crate because AArch64
+/// has no `open` syscall; with `AT_FDCWD` the two are equivalent on x86-64.
+const AT_FDCWD: usize = (-100isize).cast_unsigned();
+
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -189,8 +195,9 @@ impl LinuxUserland {
             .map(|tun_device_name| {
                 let tun_path = b"/dev/net/tun\0";
                 let tun_fd = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::open,
+                    syscalls::syscall4(
+                        syscalls::Sysno::openat,
+                        AT_FDCWD,
                         tun_path.as_ptr() as usize,
                         (litebox::fs::OFlags::RDWR
                             | litebox::fs::OFlags::CLOEXEC
@@ -325,8 +332,9 @@ impl LinuxUserland {
         // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
         let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                AT_FDCWD,
                 path.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -596,7 +604,16 @@ impl LinuxUserland {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
             },
             SeccompAction::Allow,
-            seccompiler::TargetArch::x86_64,
+            {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    seccompiler::TargetArch::x86_64
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    seccompiler::TargetArch::aarch64
+                }
+            },
         )
         .unwrap();
         // TODO: bpf program can be compiled offline
@@ -1461,7 +1478,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         Instant {
-            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            #[cfg_attr(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                expect(clippy::useless_conversion)
+            )]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -1474,7 +1494,10 @@ impl litebox::platform::TimeProvider for LinuxUserland {
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, t.as_mut_ptr()) };
         let t = unsafe { t.assume_init() };
         SystemTime {
-            #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+            #[cfg_attr(
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                expect(clippy::useless_conversion)
+            )]
             inner: Duration::new(
                 t.tv_sec.reinterpret_as_unsigned().into(),
                 t.tv_nsec.reinterpret_as_unsigned().trunc(),
@@ -1611,7 +1634,7 @@ fn futex_timeout(
     unsafe {
         syscalls::syscall6(
             {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     syscalls::Sysno::futex
                 }
@@ -1645,7 +1668,7 @@ fn futex_val2(
     unsafe {
         syscalls::syscall6(
             {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     syscalls::Sysno::futex
                 }
@@ -1685,6 +1708,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    /// 48-bit user virtual address space.
+    #[cfg(target_arch = "aarch64")]
+    const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000;
 
     fn allocate_pages(
         &self,
@@ -1714,7 +1740,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let r = unsafe {
             syscalls::syscall6(
                 {
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                     {
                         syscalls::Sysno::mmap
                     }
@@ -1811,8 +1837,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             std::ffi::CString::new(file_path.as_os_str().as_encoded_bytes()).unwrap();
         // TODO(jb): We should likely be storing pre-opened FDs, right?
         let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
+            syscalls::syscall4(
+                syscalls::Sysno::openat,
+                AT_FDCWD,
                 file_path_cstr.as_ptr() as usize,
                 OFlags::RDONLY.bits() as usize,
                 0,
@@ -1830,7 +1857,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let result = unsafe {
             syscalls::syscall6(
                 {
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                     {
                         syscalls::Sysno::mmap
                     }
@@ -1841,7 +1868,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 flags.bits().reinterpret_as_unsigned() as usize,
                 fd,
                 {
-                    #[cfg(target_arch = "x86_64")]
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                     {
                         file_offset
                     }
@@ -2764,21 +2791,28 @@ mod tests {
         let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
-        let pathname = c"/tmp/test_seccomp";
-        let mkdir_res = unsafe {
-            syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
-        };
-        assert_eq!(
-            mkdir_res.unwrap_err(),
-            syscalls::Errno::EINVAL,
-            "mkdir should be blocked by seccomp filter"
-        );
+        // `mkdir` only exists as a syscall on x86-64; AArch64 has `mkdirat`
+        // only, and the filter denies both by default, so this sub-case is
+        // inherently x86-only.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let pathname = c"/tmp/test_seccomp";
+            let mkdir_res = unsafe {
+                syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+            };
+            assert_eq!(
+                mkdir_res.unwrap_err(),
+                syscalls::Errno::EINVAL,
+                "mkdir should be blocked by seccomp filter"
+            );
+        }
 
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
         let open_res = unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::open,
+            syscalls::syscall3(
+                syscalls::Sysno::openat,
+                super::AT_FDCWD,
                 pathname.as_ptr() as usize,
                 OFlags::RDWR.bits() as usize,
             )
@@ -2786,7 +2820,7 @@ mod tests {
         assert_eq!(
             open_res.unwrap_err(),
             syscalls::Errno::EINVAL,
-            "open with RDWR should be blocked by seccomp filter"
+            "openat with RDWR should be blocked by seccomp filter"
         );
     }
 }
