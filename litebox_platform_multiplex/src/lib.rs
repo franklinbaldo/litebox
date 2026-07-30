@@ -18,6 +18,14 @@
 //!
 //! By default, this crate picks the Linux userland platform.
 
+// The LVBS and SNP platforms are x86-64-only: `litebox_platform_lvbs` and
+// `litebox_platform_linux_kernel` are both gated on `target_arch = "x86_64"` and so compile to
+// empty crates elsewhere. When one of those platforms is selected there is nothing to multiplex on
+// other architectures, so compile this crate away too rather than failing to name a `Platform`.
+#![cfg_attr(
+    any(feature = "platform_lvbs", feature = "platform_linux_snp"),
+    cfg(target_arch = "x86_64")
+)]
 #![no_std]
 
 extern crate alloc;

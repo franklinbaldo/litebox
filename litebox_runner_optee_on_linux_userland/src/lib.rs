@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// This crate is x86-64-only: it depends on `litebox_common_optee` and `litebox_shim_optee`, which
+// are themselves gated on `target_arch = "x86_64"` and so compile to empty crates elsewhere, and it
+// reads the x86-64 `PtRegs` register layout directly (`rax`).
+#![cfg(target_arch = "x86_64")]
+
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
