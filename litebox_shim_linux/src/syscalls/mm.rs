@@ -183,7 +183,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
+            self.try_cow_mmap_file(suggested_addr, len, prot, &flags, fd, offset)
         {
             cow_result?
         } else {
@@ -231,7 +231,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         suggested_addr: Option<usize>,
         len: usize,
-        prot: &ProtFlags,
+        prot: ProtFlags,
         flags: &MapFlags,
         fd: i32,
         offset: usize,
@@ -540,11 +540,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let mut result = Ok(());
         for (lo, hi) in excluded {
             if lo > cursor {
-                let r = self.sys_mprotect_raw(
-                    UserPtrMut::<u8>::from_usize(cursor),
-                    lo - cursor,
-                    ProtFlags::from_bits_retain(prot.bits()),
-                );
+                let r =
+                    self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(cursor), lo - cursor, prot);
                 result = result.and(r);
             }
             cursor = cursor.max(hi);

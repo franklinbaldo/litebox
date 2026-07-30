@@ -15,7 +15,7 @@ use crate::syscalls::signal::{DeliverFault, SignalState};
 use crate::{ShimFS, ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _, WidenExt as _};
 use litebox_common_linux::{
     AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,
     signal::{SigAction, Siginfo, Ucontext, aarch64::Sigcontext},
@@ -42,15 +42,6 @@ struct SignalFrame {
     /// unwinder walk out of the handler.
     next_frame_fp: usize,
     next_frame_lr: usize,
-}
-
-/// Widens a register slot. Infallible: the crate requires 64-bit pointers.
-#[inline]
-fn widen(value: usize) -> u64 {
-    const {
-        assert!(core::mem::size_of::<usize>() == core::mem::size_of::<u64>());
-    }
-    u64::from_ne_bytes(value.to_ne_bytes())
 }
 
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
@@ -268,7 +259,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
         let mut regs = [0u64; AARCH64_GENERAL_REGISTER_COUNT];
         for (dst, src) in regs.iter_mut().zip(ctx.regs.iter()) {
-            *dst = widen(*src);
+            *dst = (*src).widen();
         }
 
         let frame = SignalFrame {
@@ -281,10 +272,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 __unused: [0; _],
                 __align_pad: [0; _],
                 mcontext: Sigcontext {
-                    fault_address: widen(last_exception.fault_address),
+                    fault_address: last_exception.fault_address.widen(),
                     regs,
-                    sp: widen(ctx.sp),
-                    pc: widen(ctx.pc),
+                    sp: ctx.sp.widen(),
+                    pc: ctx.pc.widen(),
                     pstate: ctx.pstate,
                     __reserved_pad: [0; _],
                     // All-zero is the kernel's terminating `_aarch64_ctx`

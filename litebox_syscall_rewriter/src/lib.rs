@@ -868,17 +868,6 @@ fn append_trampoline_footer(
     out.extend_from_slice(header.as_bytes());
 }
 
-/// Rewrite an AArch64 ELF, appending the trampoline and trailing header.
-///
-/// `input_binary` is the original, unmodified ELF; `buf` is the mutable copy
-/// (patched in place by the arm64 module). `callback` is the absolute address
-/// stored in the trampoline's callback slot (0 when the loader fills it in
-/// later).
-///
-/// Like the x86-64 path, a binary with no patch sites is emitted as the
-/// original bytes followed by a size-0 trampoline sentinel header (the arm64
-/// module signals this by returning `None`). Otherwise the output layout is
-/// `[patched ELF][padding to page boundary][trampoline code][header]`.
 /// Rewrites an AArch64 ELF, honouring `placement`.
 ///
 /// The trampoline's size is only known once the stubs have been generated, but
@@ -921,6 +910,19 @@ fn hook_aarch64_elf(
     )
 }
 
+/// Rewrites an AArch64 ELF at a fixed trampoline address, appending the
+/// trampoline and trailing header.
+///
+/// `input_binary` is the original, unmodified ELF; `buf` is the mutable copy
+/// (patched in place by the arm64 module). `callback` is the absolute address
+/// stored in the trampoline's callback slot (0 when the loader fills it in
+/// later). `trampoline_limit` is the first address the trampoline may not
+/// reach; overshooting it is reported as [`Error::TrampolineTooLarge`].
+///
+/// Like the x86-64 path, a binary with no patch sites is emitted as the
+/// original bytes followed by a size-0 trampoline sentinel header (the arm64
+/// module signals this by returning `None`). Otherwise the output layout is
+/// `[patched ELF][padding to page boundary][trampoline code][header]`.
 fn hook_aarch64_elf_at(
     input_binary: &[u8],
     buf: &mut [u8],
@@ -1575,7 +1577,7 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
 }
 
 /// The guest page size assumed when laying out the appended trampoline.
-pub const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
+pub(crate) const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 
 /// Computes the virtual address at which the appended trampoline is placed.
 ///
@@ -1652,7 +1654,7 @@ pub fn trampoline_addr_for(max_load_end: u64, max_align: u64, e_machine: u16) ->
 
 /// A `PT_LOAD` segment, reduced to the fields trampoline placement needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LoadSegment {
+pub(crate) struct LoadSegment {
     /// `p_vaddr`.
     pub vaddr: u64,
     /// `p_filesz`.
@@ -1665,7 +1667,7 @@ pub struct LoadSegment {
 
 /// Where an object's appended trampoline goes, and how large it may grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TrampolinePlacement {
+pub(crate) struct TrampolinePlacement {
     /// Page-aligned virtual address (object-relative for `ET_DYN`).
     pub addr: u64,
     /// Maximum number of bytes that may be written at [`Self::addr`].
@@ -1722,7 +1724,7 @@ pub struct TrampolinePlacement {
 /// An object whose segments leave no gap (or too small a one) falls back to
 /// [`trampoline_addr_for`], with `inside_load_span: false` to mark the address
 /// as unreserved. The shim validates such an address before mapping it.
-pub fn trampoline_placement_for(
+pub(crate) fn trampoline_placement_for(
     segments: &[LoadSegment],
     e_machine: u16,
 ) -> Result<TrampolinePlacement> {

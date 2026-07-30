@@ -267,17 +267,27 @@ fn test_static_exec_with_rewriter() {
     }
 }
 
-#[test]
-fn test_host_program_with_rewrite_syscalls() {
-    let target = common::compile("./tests/hello.c", "host_program_rewriter", true, false);
+/// Compiles a C fixture, rewrites it, and runs it directly under the runner's
+/// `--rewrite-syscalls` mode (no tar rootfs), returning the completed output.
+///
+/// The three tests that use this differ only in the fixture and in what they
+/// assert about the result, so the compile / resolve-the-runner-binary / spawn
+/// sequence lives here rather than three times over.
+fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Output {
+    let target = common::compile(source, unique_name, true, false);
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
-    let output = std::process::Command::new(binary_path)
+    std::process::Command::new(binary_path)
         .args(["--unstable", "--rewrite-syscalls"])
         .arg(target)
         .output()
-        .expect("Failed to run litebox_runner_linux_userland");
+        .expect("Failed to run litebox_runner_linux_userland")
+}
+
+#[test]
+fn test_host_program_with_rewrite_syscalls() {
+    let output = run_rewritten_fixture("./tests/hello.c", "host_program_rewriter");
 
     assert!(
         output.status.success(),
@@ -302,20 +312,7 @@ fn test_host_program_with_rewrite_syscalls() {
 /// On non-AArch64 hosts the fixture compiles to a trivially passing program.
 #[test]
 fn test_svc_scratch_registers_survive_rewritten_syscall() {
-    let target = common::compile(
-        "./tests/svc_scratch_regs.c",
-        "svc_scratch_regs_rewriter",
-        true,
-        false,
-    );
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
-
-    let output = std::process::Command::new(binary_path)
-        .args(["--unstable", "--rewrite-syscalls"])
-        .arg(target)
-        .output()
-        .expect("Failed to run litebox_runner_linux_userland");
+    let output = run_rewritten_fixture("./tests/svc_scratch_regs.c", "svc_scratch_regs_rewriter");
 
     assert!(
         output.status.success(),
@@ -340,15 +337,7 @@ fn test_svc_scratch_registers_survive_rewritten_syscall() {
 /// just without the register-level assertions.
 #[test]
 fn test_signal_handler_returns_through_sigreturn() {
-    let target = common::compile("./tests/sigreturn.c", "sigreturn_rewriter", true, false);
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
-
-    let output = std::process::Command::new(binary_path)
-        .args(["--unstable", "--rewrite-syscalls"])
-        .arg(target)
-        .output()
-        .expect("Failed to run litebox_runner_linux_userland");
+    let output = run_rewritten_fixture("./tests/sigreturn.c", "sigreturn_rewriter");
 
     assert!(
         output.status.success(),
@@ -684,7 +673,7 @@ fn test_runner_with_ls() {
     let libs = common::find_dependencies(ls_path.to_str().unwrap());
     let lib_guest_dir = libs
         .iter()
-        .map(|lib| PathBuf::from(lib))
+        .map(PathBuf::from)
         .find(|lib| {
             !lib.file_name()
                 .unwrap_or_default()

@@ -670,16 +670,7 @@ impl LinuxUserland {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
             },
             SeccompAction::Allow,
-            {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    seccompiler::TargetArch::x86_64
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    seccompiler::TargetArch::aarch64
-                }
-            },
+            seccompiler::TargetArch::x86_64,
         )
         .unwrap();
         // TODO: bpf program can be compiled offline
@@ -3548,8 +3539,11 @@ unsafe fn next_signal_handler(
 /// always addressable.
 unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     let mask: u32 = 1u32 << (signal.as_i32() - 1);
-    #[cfg(target_arch = "x86_64")]
     let waker_addr: usize;
+
+    // SAFETY: the bitmask and waker slot are reached through this thread's own
+    // saved host TLS segment, which the caller guarantees is valid, and both
+    // accesses are naturally aligned.
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
@@ -3583,12 +3577,10 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     // is harmless here precisely because there is no cross-thread relationship
     // to establish — `wait_waker_addr` is only ever published by this thread's
     // own `update_waker`.
-    #[cfg(target_arch = "aarch64")]
-    let waker_addr: usize;
-    #[cfg(target_arch = "aarch64")]
     // SAFETY: both slots are in this thread's own TLS control block at offsets
     // checked by `assert_tls_layout`, and both accesses are naturally aligned.
     // The exclusive monitor reservation is opened and closed within the loop.
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!(
             tls_anchor!("{block}"),
@@ -3870,20 +3862,19 @@ mod tests {
     /// stay encodable in the scaled 12-bit immediate of a rewriter gate, since
     /// the loader patches it into every rewritten guest binary.
     ///
+    /// Encodability is enforced by the call itself: `guest_tpidr_tp_offset`
+    /// filters on exactly the alignment and range a gate's immediate allows and
+    /// panics otherwise, so returning at all is the assertion. Re-asserting the
+    /// two conditions here would be vacuous. What is *not* implied by the call
+    /// is that the measured offset is the block base, which the loader relies on
+    /// when it patches gates, so that is checked.
+    ///
     /// Printed so that `--nocapture` shows the number actually being patched.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_guest_tpidr_offset_is_gate_encodable() {
         let offset = super::guest_tpidr_tp_offset();
         std::println!("guest_tpidr is at thread-pointer offset {offset}");
-        assert!(
-            offset.is_multiple_of(litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET_ALIGN),
-            "offset {offset} must be a multiple of the gates' immediate scale"
-        );
-        assert!(
-            offset <= litebox_syscall_rewriter::AARCH64_MAX_GUEST_TPIDR_OFFSET,
-            "offset {offset} must fit the gates' scaled 12-bit immediate"
-        );
         // `guest_tpidr` is the first field, so it is also the block base.
         assert_eq!(usize::from(offset), tprel_offset!(litebox_tls_block));
     }

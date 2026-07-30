@@ -27,9 +27,10 @@ static void die(const char *msg) {
     exit(2);
 }
 
-// Defined locally rather than taken from `helpers.h`: this file predates that
-// header and defines its own `die()` with a different exit status, so including
-// it would change observable behaviour.
+// `die()` is defined locally rather than taken from `helpers.h`: that header
+// declares its own `static inline void die()`, so including it here would be a
+// conflicting redefinition and fail to compile. The two also differ in exit
+// status (2 here, 1 there), which this file's expectations depend on.
 #if defined(__x86_64__) || defined(__i386__)
 #define SPIN_HINT() __asm__ __volatile__("pause")
 #elif defined(__aarch64__)
