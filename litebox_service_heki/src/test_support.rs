@@ -156,6 +156,7 @@ impl MockVtl0Gate {
 }
 
 struct MockFrameTxn {
+    state: Arc<Mutex<MockVtl0State>>,
     owned_ranges: BTreeSet<(u64, u64)>,
     new_ranges: Vec<(u64, u64)>,
     protection_updates: BTreeMap<(u64, u64), MemAttr>,
@@ -257,13 +258,16 @@ impl FrameTxn for MockFrameTxn {
         let mut statuses = Vec::with_capacity(ranges.len());
         for range in ranges {
             let requested = normalized_range(*range);
+            let globally_owned = self.state.lock().unwrap().owned_ranges.clone();
             let status = if requested.0 >= requested.1 {
                 Ok(ReservationStatus::AlreadyOwned)
             } else if ranges_overlap(&seen, requested) {
                 Err(VsmError::ProtectedFrameOverlap)
             } else if ranges_cover(&owned_before, requested) {
                 Ok(ReservationStatus::AlreadyOwned)
-            } else if ranges_overlap(&owned_before, requested) {
+            } else if ranges_overlap(&owned_before, requested)
+                || ranges_overlap(&globally_owned, requested)
+            {
                 Err(VsmError::ProtectedFrameOverlap)
             } else {
                 Ok(ReservationStatus::New)
@@ -336,7 +340,11 @@ impl Vtl0Gate for MockVtl0Gate {
     ) -> Result<(), VsmError> {
         let mut state = self.state.lock().unwrap();
         let range = normalized_range(range);
-        insert_range(&mut state.owned_ranges, range);
+        if attr.contains(MemAttr::MEM_ATTR_WRITE) {
+            subtract_ranges(&mut state.owned_ranges, range);
+        } else {
+            insert_range(&mut state.owned_ranges, range);
+        }
         apply_protection(&mut state.protections, range, attr);
         state.protection_operations.push((range.0, range.1, attr));
         Ok(())
@@ -355,12 +363,9 @@ impl Vtl0Gate for MockVtl0Gate {
         initial: &[PhysFrameRange<Size4KiB>],
         f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
     ) -> Result<(), VsmError> {
-        let owned_ranges = {
-            let state = self.state.lock().unwrap();
-            state.owned_ranges.clone()
-        };
         let mut txn = MockFrameTxn {
-            owned_ranges,
+            state: Arc::clone(&self.state),
+            owned_ranges: BTreeSet::new(),
             new_ranges: Vec::new(),
             protection_updates: BTreeMap::new(),
         };
@@ -389,6 +394,11 @@ impl Vtl0Gate for MockVtl0Gate {
         state.owned_ranges = committed_ownership;
         for (range, attr) in txn.protection_updates {
             apply_protection(&mut state.protections, range, attr);
+            if attr.contains(MemAttr::MEM_ATTR_WRITE) {
+                subtract_ranges(&mut state.owned_ranges, range);
+            } else {
+                insert_range(&mut state.owned_ranges, range);
+            }
         }
         Ok(())
     }
@@ -577,42 +587,28 @@ mod tests {
     }
 
     #[test]
-    fn transaction_reserve_reports_new_and_already_owned_consistently() {
+    fn transaction_reserve_reports_repeated_transaction_ownership_consistently() {
         let gate = MockVtl0Gate::new();
-        let existing = frame_range(0x10000, 0x11000);
         let fresh = frame_range(0x12000, 0x13000);
-        gate.protect_frames_transactionally(&[existing], &mut |_| Ok(()))
-            .unwrap();
 
         gate.protect_frames_transactionally(&[], &mut |txn| {
+            assert_eq!(txn.reserve(&[fresh])?, vec![ReservationStatus::New]);
             assert_eq!(
-                txn.reserve(&[existing, fresh])?,
-                vec![ReservationStatus::AlreadyOwned, ReservationStatus::New]
-            );
-            assert_eq!(
-                txn.reserve(&[existing, fresh])?,
-                vec![
-                    ReservationStatus::AlreadyOwned,
-                    ReservationStatus::AlreadyOwned
-                ]
+                txn.reserve(&[fresh])?,
+                vec![ReservationStatus::AlreadyOwned]
             );
             Ok(())
         })
         .unwrap();
 
-        assert_eq!(
-            gate.owned_ranges(),
-            vec![(0x10000, 0x11000), (0x12000, 0x13000)]
-        );
+        assert_eq!(gate.owned_ranges(), vec![(0x12000, 0x13000)]);
     }
 
     #[test]
-    fn transaction_reserve_reports_covered_subrange_as_already_owned() {
+    fn transaction_reserve_reports_transaction_owned_subrange_as_already_owned() {
         let gate = MockVtl0Gate::new();
-        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x14000)], &mut |_| Ok(()))
-            .unwrap();
 
-        gate.protect_frames_transactionally(&[], &mut |txn| {
+        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x14000)], &mut |txn| {
             assert_eq!(
                 txn.reserve(&[frame_range(0x11000, 0x13000)])?,
                 vec![ReservationStatus::AlreadyOwned]
@@ -626,6 +622,20 @@ mod tests {
             gate.protections(),
             vec![(0x11000, 0x13000, MemAttr::MEM_ATTR_READ)]
         );
+    }
+
+    #[test]
+    fn transaction_reserve_rejects_frames_owned_by_another_transaction() {
+        let gate = MockVtl0Gate::new();
+        let existing = frame_range(0x10000, 0x11000);
+        gate.protect_frames_transactionally(&[existing], &mut |_| Ok(()))
+            .unwrap();
+
+        let result = gate
+            .protect_frames_transactionally(&[], &mut |txn| txn.reserve(&[existing]).map(|_| ()));
+
+        assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
+        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x11000)]);
     }
 
     #[test]
@@ -674,6 +684,49 @@ mod tests {
         gate.unprotect_frames(range).unwrap();
         assert!(gate.owned_ranges().is_empty());
         assert!(gate.protections().is_empty());
+    }
+
+    #[test]
+    fn direct_writable_protection_removes_registry_ownership() {
+        let gate = MockVtl0Gate::new();
+        let range = frame_range(0x10000, 0x12000);
+        gate.protect_frame(range, MemAttr::MEM_ATTR_READ).unwrap();
+
+        let writable = MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE;
+        gate.protect_frame(range, writable).unwrap();
+
+        assert!(gate.owned_ranges().is_empty());
+        assert_eq!(gate.protections(), vec![(0x10000, 0x12000, writable)]);
+        assert_eq!(
+            gate.protection_operations(),
+            vec![
+                (0x10000, 0x12000, MemAttr::MEM_ATTR_READ),
+                (0x10000, 0x12000, writable),
+            ]
+        );
+    }
+
+    #[test]
+    fn transactional_writable_protection_removes_reserved_ownership() {
+        let gate = MockVtl0Gate::new();
+        let range = frame_range(0x10000, 0x12000);
+        let writable = MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE;
+
+        gate.protect_frames_transactionally(&[range], &mut |txn| txn.protect(range, writable))
+            .unwrap();
+
+        assert!(gate.owned_ranges().is_empty());
+        assert_eq!(gate.protections(), vec![(0x10000, 0x12000, writable)]);
+    }
+
+    #[test]
+    fn transactional_reservation_without_protection_remains_owned() {
+        let gate = MockVtl0Gate::new();
+
+        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x12000)], &mut |_| Ok(()))
+            .unwrap();
+
+        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x12000)]);
     }
 
     #[test]

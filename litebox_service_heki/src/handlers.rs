@@ -720,7 +720,7 @@ fn copy_heki_pages_from_vtl0<P: Vtl0Gate>(
 
         range = range.checked_add(heki_page.nranges)?;
         if range > nranges
-            || (range == nranges && heki_page.next_pa != 0)
+            || (range == nranges && (heki_page.next_pa != 0 || heki_page.next != 0))
             || (range < nranges
                 && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa)))
         {
@@ -989,6 +989,22 @@ mod tests {
 
         assert!(matches!(
             heki.protect_memory(pa, HEKI_MAX_RANGES as u64),
+            Err(VsmError::HekiPagesCopyFailed)
+        ));
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_a_terminal_page_with_a_nonnull_kernel_link() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let (pa, nranges) = gate.write_heki_ranges(&[protection_range(0, MemAttr::MEM_ATTR_READ)]);
+        let mut page = gate.read_vtl0_val::<HekiPage>(pa).unwrap();
+        page.next = 0xffff_8000_0000_1000;
+        gate.overwrite_heki_page(pa, &page);
+
+        assert!(matches!(
+            heki.protect_memory(pa, nranges),
             Err(VsmError::HekiPagesCopyFailed)
         ));
         assert!(gate.protection_operations().is_empty());
