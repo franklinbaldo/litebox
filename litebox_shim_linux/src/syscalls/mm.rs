@@ -27,7 +27,56 @@ use object::endian::LittleEndian;
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the runtime syscall rewriter supports only x86-64 and AArch64 hosts");
+
 const ENDIAN: LittleEndian = LittleEndian;
+
+/// How far a runtime-emitted trampoline may sit from the code segment it
+/// serves: the reach of the branch the rewritten site uses to get there.
+///
+/// * x86-64 — `JMP rel32`, ±2GB (kept slightly short of the limit, as it always
+///   has been, so that a segment straddling the boundary is still rejected).
+/// * AArch64 — `B imm26`, ±128MB (`2^27 - 4`).
+///
+/// Beyond this the site cannot reach its stub, so the caller falls back to
+/// trapping every site instead.
+#[cfg(target_arch = "aarch64")]
+const RUNTIME_TRAMPOLINE_MAX_DISTANCE: usize = 0x07FF_FFFC;
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_TRAMPOLINE_MAX_DISTANCE: usize = 0x7FFF_0000;
+
+/// Alignment applied to a trampoline's write cursor between consecutive blobs.
+///
+/// Each AArch64 blob starts with an 8-byte callback slot that its shared `SVC`
+/// handler reads with a 64-bit `LDR` literal, so the slot has to stay 8-byte
+/// aligned for that load to be single-copy atomic. Blob lengths are not always a
+/// multiple of 8 (an `SVC` gate plus its outbound stub is 44 bytes), so the
+/// cursor is rounded up between blobs. x86-64 stubs have no such requirement.
+#[cfg(target_arch = "aarch64")]
+const RUNTIME_STUB_ALIGN: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_STUB_ALIGN: usize = 1;
+
+/// Whether a fresh trampoline allocation starts with an 8-byte slot holding the
+/// runtime's syscall entry point, shared by every stub in that allocation.
+///
+/// x86-64 stubs reach the entry *indirectly* through such a slot, so it occupies
+/// bytes 0..8 and the stubs start after it. AArch64 blobs are self-contained —
+/// the rewriter emits a callback slot at the head of each one — so there is no
+/// shared header and the first blob starts at offset 0.
+#[cfg(target_arch = "aarch64")]
+const RUNTIME_TRAMPOLINE_HAS_SHARED_ENTRY_SLOT: bool = false;
+#[cfg(target_arch = "x86_64")]
+const RUNTIME_TRAMPOLINE_HAS_SHARED_ENTRY_SLOT: bool = true;
+
+/// Byte offset of the first runtime-emitted blob within a fresh trampoline
+/// allocation: past the shared entry slot where there is one.
+const RUNTIME_TRAMPOLINE_FIRST_STUB_OFFSET: usize = if RUNTIME_TRAMPOLINE_HAS_SHARED_ENTRY_SLOT {
+    8
+} else {
+    0
+};
 
 /// Bakes the runtime's guest thread-pointer offset into every gate of a staged
 /// AArch64 trampoline, and proves none was left holding the rewriter's
@@ -123,6 +172,33 @@ pub(crate) struct ElfPatchState {
 
 /// Per-process collection of ELF patching state, keyed by fd number.
 pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
+
+/// Runtime rewriting state for one region of guest code that lives in anonymous
+/// memory — a JIT's code buffer, or any executable mapping the guest builds
+/// itself rather than loading from a file.
+///
+/// This is deliberately *not* [`ElfPatchState`]: there is no fd to key on, no
+/// ELF header to parse, and no `PT_LOAD` span to place a trampoline in. All that
+/// carries over is the trampoline bump allocator.
+pub(crate) struct AnonCodeRegion {
+    /// The guest code range this entry serves, as `(start, len)`. Matched
+    /// exactly, so a guest that re-`mprotect`s the same buffer keeps appending
+    /// to the same trampoline instead of allocating a new one each time.
+    code: (usize, usize),
+    /// Start address of this region's trampoline.
+    trampoline_addr: usize,
+    /// Write position within the trampoline, as a byte offset from
+    /// `trampoline_addr`.
+    trampoline_cursor: usize,
+    /// Total number of trampoline bytes currently mapped.
+    trampoline_mapped_len: usize,
+}
+
+/// Per-process collection of anonymous-code rewriting state.
+///
+/// A `Vec` rather than a map: a guest has a handful of JIT regions at most, and
+/// lookups are by containment rather than by an exact key.
+pub(crate) type AnonCodeCache = alloc::vec::Vec<AnonCodeRegion>;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -445,8 +521,39 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
             self.clear_file_mappings_for_range(addr.as_usize(), len);
+            self.drop_anon_code_regions_in_range(addr.as_usize(), len);
         }
         result
+    }
+
+    /// Release the rewriting state, and the trampoline, of any anonymous code
+    /// region the unmapped range fully covers.
+    ///
+    /// Only *fully* covered regions: a rewritten site still branches into the
+    /// trampoline, so tearing one down while any of the code it serves is still
+    /// mapped would turn that site into a fault. Dropping the entry also means a
+    /// buffer the guest maps again at the same address is rewritten afresh
+    /// rather than appended to a trampoline whose stubs nothing branches to.
+    fn drop_anon_code_regions_in_range(&self, unmap_start: usize, unmap_len: usize) {
+        let unmap_end = unmap_start.saturating_add(unmap_len);
+        let stale: alloc::vec::Vec<(usize, usize)> = {
+            let mut cache = self.global.anon_code_cache.lock();
+            let mut stale = alloc::vec::Vec::new();
+            cache.retain(|region| {
+                let (start, len) = region.code;
+                let covered = start >= unmap_start && start.saturating_add(len) <= unmap_end;
+                if covered {
+                    stale.push((region.trampoline_addr, region.trampoline_mapped_len));
+                }
+                !covered
+            });
+            stale
+        };
+        for (tramp_addr, tramp_len) in stale {
+            if tramp_len > 0 {
+                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(tramp_addr), tramp_len);
+            }
+        }
     }
 
     /// Raw munmap without clearing file_mappings — used internally by the
@@ -482,11 +589,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
+        // Intercept transitions to PROT_EXEC: rewrite anything that is about to
+        // become executable and has not been rewritten yet.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0 {
                 self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
+                self.maybe_patch_anonymous_code(addr, len, syscall_entry);
             }
         }
         self.mprotect_around_trampolines(addr.as_usize(), len, prot)
@@ -531,6 +640,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .filter(|&(lo, hi)| lo < end && hi > start)
                 .collect()
         };
+        // A JIT region's trampoline is just as much LiteBox's own code as an
+        // object's is, and the guest is just as unaware of it, so it is excluded
+        // on the same grounds.
+        excluded.extend(
+            self.global
+                .anon_code_cache
+                .lock()
+                .iter()
+                .filter(|region| region.trampoline_mapped_len > 0)
+                .map(|region| {
+                    (
+                        region.trampoline_addr,
+                        region.trampoline_addr + region.trampoline_mapped_len,
+                    )
+                })
+                .filter(|&(lo, hi)| lo < end && hi > start),
+        );
         if excluded.is_empty() {
             return self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(start), len, prot);
         }
@@ -658,6 +784,395 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
             self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
+    }
+
+    /// Rewrite guest code that is about to become executable but belongs to no
+    /// file — a JIT's code buffer, or any executable mapping the guest builds
+    /// in anonymous memory.
+    ///
+    /// # Why this is not the file path
+    ///
+    /// Everything in [`Self::maybe_patch_exec_segment`] hangs off an fd: the ELF
+    /// header says whether the object is pre-patched, the program headers say
+    /// where its `PT_LOAD`s end, and the trampoline goes in the gap inside the
+    /// span the guest's loader reserved. An anonymous mapping has none of that.
+    /// It is never pre-patched, there are no program headers, and there is no
+    /// reserved span to place a trampoline in.
+    ///
+    /// # Why it is nevertheless mandatory
+    ///
+    /// A raw syscall instruction left in an executable page executes against the
+    /// host kernel and bypasses the shim completely. That is a sandbox escape,
+    /// so the only acceptable outcomes for a site found here are "redirected
+    /// into a gate" and "replaced with a trap" — never "left alone".
+    ///
+    /// # Where the trampoline goes, and why that is safe
+    ///
+    /// The file path has to use `MAP_FIXED`, because for a pre-patched object
+    /// the code already branches to one specific address. This path never does:
+    /// nothing branches anywhere until *after* the trampoline has been placed,
+    /// so its address is an output, not an input. It is requested
+    /// `MAP_FIXED_NOREPLACE` at the page after the code region — close, and the
+    /// natural free spot — and if that page is taken the VM manager picks a free
+    /// address instead. Neither can land on another mapping's live pages:
+    /// `MAP_FIXED_NOREPLACE` fails rather than replacing, and an unhinted
+    /// mapping only ever gets free space. The invariant
+    /// [`Self::trampoline_range_is_safe_to_map`] exists to protect therefore
+    /// cannot be violated here — not because it is checked, but because the
+    /// operation it guards against is never performed.
+    ///
+    /// Whatever address comes out is then range-checked against
+    /// [`RUNTIME_TRAMPOLINE_MAX_DISTANCE`], since a stub the rewritten site
+    /// cannot branch to is no better than no stub at all; out of range falls
+    /// back to trapping every site.
+    ///
+    /// # Limits
+    ///
+    /// A guest that maps a page `PROT_WRITE | PROT_EXEC` and writes code into it
+    /// never issues the `mprotect` this hook rides on, so its code is not seen.
+    /// Closing that requires refusing simultaneously writable and executable
+    /// guest memory, which is a policy decision well beyond this function.
+    fn maybe_patch_anonymous_code(&self, addr: UserPtrMut<u8>, len: usize, syscall_entry: usize) {
+        let start = addr.as_usize();
+        let end = start.saturating_add(len);
+        if len == 0 {
+            return;
+        }
+
+        // Ranges the file path owns, and ranges that are LiteBox's own emitted
+        // code. Rewriting either from here would be wrong: the first is handled
+        // (with its own trampoline and its own pre-patched/unpatched decision)
+        // by `maybe_patch_on_mprotect_exec`, and the second is not guest code at
+        // all.
+        {
+            let cache = self.global.elf_patch_cache.lock();
+            for state in cache.values() {
+                let overlaps_tracked = state
+                    .file_mappings
+                    .iter()
+                    .chain(state.patched_ranges.iter())
+                    .any(|&(seg_start, seg_len)| {
+                        seg_start < end && seg_start.saturating_add(seg_len) > start
+                    });
+                let tramp_end = state
+                    .trampoline_addr
+                    .saturating_add(state.trampoline_mapped_len);
+                let overlaps_trampoline =
+                    state.trampoline_mapped && state.trampoline_addr < end && tramp_end > start;
+                if overlaps_tracked || overlaps_trampoline {
+                    return;
+                }
+            }
+        }
+        if self.global.anon_code_cache.lock().iter().any(|region| {
+            region.trampoline_addr < end
+                && region
+                    .trampoline_addr
+                    .saturating_add(region.trampoline_mapped_len)
+                    > start
+        }) {
+            return;
+        }
+
+        // The region has to be readable and writable to be examined and
+        // rewritten. The caller applies the guest's requested protection
+        // immediately afterwards, so nothing has to be restored here.
+        if self
+            .sys_mprotect_raw(addr, len, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .is_err()
+        {
+            panic!("fatal: failed to mprotect anonymous code region RW for patching");
+        }
+        let Some(code_owned) = addr.to_owned_slice::<Platform>(len) else {
+            panic!("fatal: failed to read anonymous code region for patching");
+        };
+        let mut code_buf = code_owned.into_vec();
+        let code_vaddr = start as u64;
+
+        // Trapping a scratch copy answers two questions at once: whether there
+        // is anything here to rewrite at all (so a JIT's data page, or code the
+        // guest has already had rewritten, costs no trampoline), and what to
+        // write back if the rewrite cannot be completed safely.
+        let mut trapped_buf = code_buf.clone();
+        let site_count =
+            match litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut trapped_buf, code_vaddr)
+            {
+                Ok(count) => count,
+                Err(e) => {
+                    litebox_util_log::warn!(
+                        err:? = e, addr:? = start, len:? = len;
+                        "could not scan an anonymous code region; leaving it unpatched"
+                    );
+                    return;
+                }
+            };
+        if site_count == 0 {
+            return;
+        }
+
+        let write_traps = |task: &Self| {
+            litebox_util_log::warn!(
+                count:? = site_count, addr:? = start, len:? = len;
+                "trapping syscall sites in an anonymous code region"
+            );
+            assert!(
+                addr.copy_from_slice::<Platform>(0, &trapped_buf).is_some(),
+                "fatal: failed to write trap bytes back to an anonymous code region"
+            );
+            let _ = task;
+        };
+
+        // Find or create this region's trampoline. A JIT that re-`mprotect`s the
+        // same buffer after emitting more code appends to the trampoline it
+        // already has rather than allocating another.
+        let mut cache = self.global.anon_code_cache.lock();
+        let index = if let Some(index) = cache.iter().position(|r| r.code == (start, len)) {
+            index
+        } else {
+            let Some(region) = self.allocate_anon_trampoline(start, len, syscall_entry) else {
+                drop(cache);
+                write_traps(self);
+                return;
+            };
+            cache.push(region);
+            cache.len() - 1
+        };
+
+        let (trampoline_addr, cursor) = {
+            let region = &cache[index];
+            (region.trampoline_addr, region.trampoline_cursor)
+        };
+
+        let patch_result = self.emit_runtime_stubs(
+            &mut code_buf,
+            code_vaddr,
+            trampoline_addr,
+            cursor,
+            syscall_entry,
+        );
+        let Ok((stubs, skipped)) = patch_result else {
+            drop(cache);
+            write_traps(self);
+            return;
+        };
+        if !skipped.is_empty() {
+            litebox_util_log::warn!(
+                count:? = skipped.len(), addrs:? = skipped;
+                "patch site(s) in an anonymous code region could not be redirected and were trapped"
+            );
+        }
+        if stubs.is_empty() {
+            // Nothing was redirected, but the rewriter may still have trapped
+            // sites it could not reach; those edits are in `code_buf`.
+            assert!(
+                addr.copy_from_slice::<Platform>(0, &code_buf).is_some(),
+                "fatal: failed to write patched anonymous code back"
+            );
+            return;
+        }
+
+        if !self.grow_anon_trampoline(&mut cache[index], cursor, stubs.len()) {
+            drop(cache);
+            write_traps(self);
+            return;
+        }
+        let region = &mut cache[index];
+
+        // Stubs first, so a rewritten branch never targets uninitialized memory.
+        let tramp_ptr = UserPtrMut::<u8>::from_usize(region.trampoline_addr);
+        if self
+            .sys_mprotect_raw(
+                tramp_ptr,
+                region.trampoline_mapped_len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
+            .is_err()
+        {
+            panic!("fatal: failed to mprotect an anonymous region's trampoline RW");
+        }
+        let write_ptr = UserPtrMut::<u8>::from_usize(region.trampoline_addr + cursor);
+        assert!(
+            write_ptr.copy_from_slice::<Platform>(0, &stubs).is_some(),
+            "fatal: failed to write trampoline stubs for an anonymous code region"
+        );
+        assert!(
+            addr.copy_from_slice::<Platform>(0, &code_buf).is_some(),
+            "fatal: failed to write patched anonymous code back"
+        );
+        region.trampoline_cursor = cursor
+            .saturating_add(stubs.len())
+            .next_multiple_of(RUNTIME_STUB_ALIGN);
+        if self
+            .sys_mprotect_raw(
+                tramp_ptr,
+                region.trampoline_mapped_len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            )
+            .is_err()
+        {
+            panic!("fatal: failed to restore an anonymous region's trampoline to RX");
+        }
+    }
+
+    /// Place a trampoline for the anonymous code region `[start, start + len)`.
+    ///
+    /// Returns `None` when no address within
+    /// [`RUNTIME_TRAMPOLINE_MAX_DISTANCE`] of the whole region could be
+    /// obtained, which leaves the caller to trap the region's sites instead. See
+    /// [`Self::maybe_patch_anonymous_code`] for why no `MAP_FIXED` appears here.
+    fn allocate_anon_trampoline(
+        &self,
+        start: usize,
+        len: usize,
+        syscall_entry: usize,
+    ) -> Option<AnonCodeRegion> {
+        let hint = start.checked_add(align_up(len, PAGE_SIZE))?;
+        let allocated = self
+            .do_mmap_anonymous(
+                Some(hint),
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            )
+            .or_else(|_| {
+                self.do_mmap_anonymous(
+                    None,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                )
+            });
+        let Ok(ptr) = allocated else {
+            litebox_util_log::warn!("failed to allocate a trampoline for an anonymous code region");
+            return None;
+        };
+        let trampoline_addr = ptr.as_usize();
+
+        // Measure against both ends of the region: a stub is reachable only if
+        // every site that branches to it is in range.
+        let distance = trampoline_addr
+            .abs_diff(start)
+            .max(trampoline_addr.abs_diff(start.saturating_add(len)));
+        if distance > RUNTIME_TRAMPOLINE_MAX_DISTANCE {
+            litebox_util_log::warn!(
+                distance:? = distance;
+                "trampoline too far from an anonymous code region"
+            );
+            let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(trampoline_addr), PAGE_SIZE);
+            return None;
+        }
+
+        // x86-64 stubs share one indirect-call slot at the head of the
+        // allocation; AArch64 blobs carry their own. See
+        // [`RUNTIME_TRAMPOLINE_FIRST_STUB_OFFSET`].
+        if RUNTIME_TRAMPOLINE_HAS_SHARED_ENTRY_SLOT
+            && UserPtrMut::<u8>::from_usize(trampoline_addr)
+                .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
+                .is_none()
+        {
+            litebox_util_log::warn!("failed to write the syscall entry point to a trampoline");
+            let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(trampoline_addr), PAGE_SIZE);
+            return None;
+        }
+
+        Some(AnonCodeRegion {
+            code: (start, len),
+            trampoline_addr,
+            trampoline_cursor: RUNTIME_TRAMPOLINE_FIRST_STUB_OFFSET,
+            trampoline_mapped_len: PAGE_SIZE,
+        })
+    }
+
+    /// Extend `region`'s trampoline so that `stub_len` bytes fit at `cursor`.
+    /// Returns whether the space is now available.
+    fn grow_anon_trampoline(
+        &self,
+        region: &mut AnonCodeRegion,
+        cursor: usize,
+        stub_len: usize,
+    ) -> bool {
+        let Some(needed) = cursor.checked_add(stub_len).map(|e| align_up(e, PAGE_SIZE)) else {
+            litebox_util_log::warn!("trampoline cursor overflow");
+            return false;
+        };
+        if needed <= region.trampoline_mapped_len {
+            return true;
+        }
+        let extra_start = region.trampoline_addr + region.trampoline_mapped_len;
+        let extra_len = needed - region.trampoline_mapped_len;
+        if self
+            .do_mmap_anonymous(
+                Some(extra_start),
+                extra_len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            )
+            .is_err()
+        {
+            litebox_util_log::warn!("failed to expand an anonymous region's trampoline");
+            return false;
+        }
+        region.trampoline_mapped_len = needed;
+        true
+    }
+
+    /// Rewrite `code` in place and return the trampoline blob it needs, with the
+    /// architecture-specific parts of the runtime rewriter's contract applied.
+    ///
+    /// Both runtime callers — the file-backed path and the anonymous path — go
+    /// through here, because both of those parts are easy to get subtly wrong
+    /// and neither fails loudly:
+    ///
+    /// * `syscall_entry_addr` means different things per architecture (the
+    ///   address of the shared indirect slot on x86-64, the callback address
+    ///   itself on AArch64), and getting it wrong yields a trampoline that jumps
+    ///   somewhere arbitrary.
+    /// * AArch64 gates are emitted with a placeholder guest thread-pointer
+    ///   offset which must be replaced with the runtime's measured one. An
+    ///   unpatched gate does *not* fault — it reads and writes a consistent
+    ///   address in host memory — so the failure is silent corruption.
+    fn emit_runtime_stubs(
+        &self,
+        code: &mut [u8],
+        code_vaddr: u64,
+        trampoline_addr: usize,
+        trampoline_cursor: usize,
+        syscall_entry: usize,
+    ) -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u64>), litebox_syscall_rewriter::Error> {
+        #[cfg(target_arch = "aarch64")]
+        let syscall_entry_addr = syscall_entry as u64;
+        #[cfg(target_arch = "x86_64")]
+        let syscall_entry_addr = trampoline_addr as u64;
+        #[cfg(target_arch = "x86_64")]
+        let _ = syscall_entry;
+
+        let (stubs, skipped) = litebox_syscall_rewriter::patch_code_segment(
+            code,
+            code_vaddr,
+            (trampoline_addr + trampoline_cursor) as u64,
+            syscall_entry_addr,
+        )
+        .inspect_err(|e| litebox_util_log::warn!(err:? = e; "patch_code_segment failed"))?;
+
+        // Shadowed rather than bound `mut` above: only AArch64 rewrites the
+        // stubs after the fact, so a `mut` binding would be an unused-mut
+        // warning everywhere else, and CI builds with `-Dwarnings`.
+        #[cfg(target_arch = "aarch64")]
+        let stubs = {
+            let mut stubs = stubs;
+            if !stubs.is_empty()
+                && let Err(e) = finalize_aarch64_trampoline_gates(self.global.platform, &mut stubs)
+            {
+                litebox_util_log::error!(
+                    err:% = e;
+                    "refusing to install runtime stubs whose guest thread-pointer gates are unpatched"
+                );
+                return Err(litebox_syscall_rewriter::Error::TrampolinePatchFailure(e));
+            }
+            stubs
+        };
+
+        Ok((stubs, skipped))
     }
 
     /// Initialize ELF patch state for an fd on its first mmap.
@@ -1147,13 +1662,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
-            // Verify the trampoline is within JMP rel32 range (+-2GB) of the
-            // entire code segment, not just its start.
+            // Keep the trampoline close enough to the entire code segment, not
+            // just its start: a stub is only usable if every site that branches
+            // to it is within the branch's reach.
             let far_end = addr_usize.saturating_add(len);
             let distance = actual_addr
                 .abs_diff(addr_usize)
                 .max(actual_addr.abs_diff(far_end));
-            if distance > 0x7FFF_0000 {
+            if distance > RUNTIME_TRAMPOLINE_MAX_DISTANCE {
                 litebox_util_log::warn!(
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
@@ -1165,18 +1681,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
             state.trampoline_addr = actual_addr;
 
-            // Write the 8-byte syscall entry point at the start.
+            // On x86-64 the emitted stubs reach the callback indirectly through
+            // a single slot shared by the whole allocation, written here; on
+            // AArch64 every blob carries its own. See
+            // [`RUNTIME_TRAMPOLINE_FIRST_STUB_OFFSET`].
             let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
-            if entry_ptr
-                .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
-                .is_none()
+            if RUNTIME_TRAMPOLINE_HAS_SHARED_ENTRY_SLOT
+                && entry_ptr
+                    .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
+                    .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
                 let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
                 self.apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
-            state.trampoline_cursor = 8; // stubs start after the 8-byte entry
+            state.trampoline_cursor = RUNTIME_TRAMPOLINE_FIRST_STUB_OFFSET;
             state.trampoline_mapped = true;
             state.trampoline_mapped_len = PAGE_SIZE;
         }
@@ -1236,30 +1756,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let original_code = code_buf.clone();
 
         let code_vaddr = addr_usize as u64;
-        let trampoline_write_vaddr = (state.trampoline_addr + state.trampoline_cursor) as u64;
-        let syscall_entry_addr = state.trampoline_addr as u64;
 
-        let patch_result = litebox_syscall_rewriter::patch_code_segment(
-            &mut code_buf,
-            code_vaddr,
-            trampoline_write_vaddr,
-            syscall_entry_addr,
-        );
-        let patch_result = match patch_result {
-            Ok((stubs, skipped_addrs)) => {
+        let patch_result = self
+            .emit_runtime_stubs(
+                &mut code_buf,
+                code_vaddr,
+                state.trampoline_addr,
+                state.trampoline_cursor,
+                syscall_entry,
+            )
+            .map(|(stubs, skipped_addrs)| {
                 if !skipped_addrs.is_empty() {
                     litebox_util_log::warn!(
                         count:? = skipped_addrs.len(), addrs:? = skipped_addrs;
-                        "syscall instruction(s) could not be patched"
+                        "patch site(s) could not be redirected"
                     );
                 }
-                Ok(stubs)
-            }
-            Err(e) => Err(e),
-        };
+                stubs
+            });
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
-                let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
+                // Round the cursor up so the next blob starts aligned; the stubs
+                // just emitted still occupy only `cursor..cursor + stubs.len()`.
+                let Some(new_cursor) = state
+                    .trampoline_cursor
+                    .checked_add(stubs.len())
+                    .and_then(|c| c.checked_next_multiple_of(RUNTIME_STUB_ALIGN))
+                else {
                     litebox_util_log::warn!("trampoline cursor overflow");
                     self.apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
@@ -1336,8 +1859,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
                 // Fall through to restore RX protections below.
             }
-            Err(e) => {
-                litebox_util_log::warn!(err:? = e; "patch_code_segment failed");
+            Err(_) => {
                 self.apply_trap_fallback(mapped_addr, len, true);
                 restore_trampoline_rx(self, state);
                 return true;

@@ -264,6 +264,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox: self.litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            anon_code_cache: litebox::sync::Mutex::new(alloc::vec::Vec::new()),
         });
         LinuxShim(global)
     }
@@ -1235,6 +1236,9 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform, FS>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Runtime syscall-rewriting state for executable code the guest builds in
+    /// anonymous memory (a JIT), which no fd describes.
+    anon_code_cache: litebox::sync::Mutex<Platform, syscalls::mm::AnonCodeCache>,
 }
 
 struct Task<Platform: ShimPlatform, FS: ShimFS> {

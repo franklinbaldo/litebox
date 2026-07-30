@@ -355,6 +355,28 @@ fn test_signal_handler_returns_through_sigreturn() {
     );
 }
 
+/// Code the guest maps at runtime — a JIT, or any executable mapping built in
+/// anonymous memory rather than loaded from a pre-rewritten ELF — has to be
+/// rewritten before it becomes executable, exactly like a code segment loaded
+/// from a file. A raw syscall instruction left in such a page executes against
+/// the host kernel and bypasses the shim entirely, which is a sandbox escape,
+/// not a missing feature.
+///
+/// The fixture checks both halves: that the syscall instruction is gone after
+/// the `mprotect`, and that `uname(2)` issued from the JIT'd page reports
+/// LiteBox's `sysname` rather than the host kernel's.
+#[test]
+fn test_jit_mapped_syscall_is_rewritten() {
+    let output = run_rewritten_fixture("./tests/jit_syscall.c", "jit_syscall_rewriter");
+
+    assert!(
+        output.status.success(),
+        "a syscall in a runtime-mapped code page escaped the shim ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// Get the path of a program using `which`
 fn run_which(prog: &str) -> std::path::PathBuf {
     let prog_path_str = std::process::Command::new("which")
