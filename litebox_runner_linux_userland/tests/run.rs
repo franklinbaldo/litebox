@@ -621,8 +621,7 @@ fn dir_entries(dir: &Path) -> Vec<String> {
             return true;
         }
         std::fs::read_dir(path)
-            .map(|entries| entries.flatten().any(|e| holds_a_file(&e.path())))
-            .unwrap_or(false)
+            .is_ok_and(|entries| entries.flatten().any(|e| holds_a_file(&e.path())))
     }
 
     let mut names = std::fs::read_dir(dir)
