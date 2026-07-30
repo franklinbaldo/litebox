@@ -270,27 +270,53 @@ const XZR: u8 = 31;
 // does not know the offset -- it is a property of the *host* runtime's link, not
 // of the guest binary -- so it emits a placeholder that the loader overwrites.
 
+/// Largest value the `imm12` field of an unsigned-offset `LDR`/`STR` can hold.
+///
+/// The field is 12 bits wide and unsigned, so it counts `0..=0xFFF` *scaled
+/// units*, not bytes.
+const LDST_UIMM12_IMM_MAX: u16 = (1 << 12) - 1;
+
+/// Scale applied to that `imm12` by the 64-bit form of the instruction, i.e.
+/// the operand width in bytes.
+///
+/// A 64-bit `LDR Xt, [Xn, #imm]` multiplies the encoded immediate by 8, which
+/// is both why the reachable offsets are sparse and why any offset the gates
+/// address must be 8-aligned.
+const LDST_UIMM12_SCALE_64BIT: u16 = 8;
+
+/// Largest byte offset a 64-bit unsigned-offset `LDR`/`STR` can encode:
+/// `0xFFF * 8 = 32760`.
+///
+/// Derived from the encoding rather than written out, because that is the only
+/// thing that makes it true.
+const LDR_UIMM12_MAX_BYTE_OFFSET: u16 = LDST_UIMM12_IMM_MAX * LDST_UIMM12_SCALE_64BIT;
+
 /// Scale of the guest thread-pointer slot's `LDR`/`STR` immediate, i.e. the
 /// alignment a runtime's slot must satisfy.
 ///
 /// The gates address the slot with the 64-bit unsigned-offset `LDR`/`STR` form,
-/// whose 12-bit immediate is scaled by 8. Re-exported as
+/// so this is exactly that form's scale. Re-exported as
 /// [`crate::AARCH64_GUEST_TPIDR_OFFSET_ALIGN`].
-pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = 8;
+pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
 
 /// Largest byte offset from the host anchor at which a runtime may place the
-/// guest thread-pointer slot: `0xFFF * 8`, the top of the scaled 12-bit
-/// immediate. Re-exported as [`crate::AARCH64_MAX_GUEST_TPIDR_OFFSET`].
+/// guest thread-pointer slot. Re-exported as
+/// [`crate::AARCH64_MAX_GUEST_TPIDR_OFFSET`].
+///
+/// This is not an independent policy choice: the gates reach the slot with a
+/// single 64-bit unsigned-offset `LDR`/`STR`, so the bound *is*
+/// [`LDR_UIMM12_MAX_BYTE_OFFSET`] and the two must not drift apart.
 ///
 /// Far beyond any plausible static-TLS offset, so in practice this bound only
 /// exists to be asserted.
-pub const MAX_GUEST_TPIDR_OFFSET: u16 = 0xFFF * GUEST_TPIDR_OFFSET_ALIGN;
+pub const MAX_GUEST_TPIDR_OFFSET: u16 = LDR_UIMM12_MAX_BYTE_OFFSET;
 
 /// Placeholder byte offset baked into every emitted gate's guest thread-pointer
 /// access, to be replaced at load time by [`patch_guest_tpidr_offset`].
 ///
-/// Deliberately [`MAX_GUEST_TPIDR_OFFSET`], the largest value the field can
-/// hold, because it cannot collide with a real runtime offset (a static TLS
+/// Deliberately [`MAX_GUEST_TPIDR_OFFSET`] — equivalently
+/// [`LDR_UIMM12_MAX_BYTE_OFFSET`], the largest value the field can hold —
+/// because it cannot collide with a real runtime offset (a static TLS
 /// control block 32KB past the thread pointer is not a thing). That makes a
 /// scan for it exact: it can never mistake an already-patched gate for an
 /// unpatched one, which is what lets both [`patch_guest_tpidr_offset`] and
@@ -491,16 +517,20 @@ fn data_imm12(op: Opcode, rd: u8, rn: u8, imm12: u16) -> Option<u32> {
 }
 
 /// `op | imm12<<10 | rn<<5 | rt` — unsigned scaled (×8) 64-bit load/store
-/// (`STR`/`LDR [Xn, #imm]`). `imm_bytes` must be a multiple of 8.
+/// (`STR`/`LDR [Xn, #imm]`). `imm_bytes` must be a multiple of
+/// [`LDST_UIMM12_SCALE_64BIT`] and at most [`LDR_UIMM12_MAX_BYTE_OFFSET`].
 fn ldst_uimm12(op: Opcode, rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
-    if !imm_bytes.is_multiple_of(8) {
+    if !imm_bytes.is_multiple_of(LDST_UIMM12_SCALE_64BIT) || imm_bytes > LDR_UIMM12_MAX_BYTE_OFFSET
+    {
         return None;
     }
-    let imm12 = imm_bytes / 8;
-    if imm12 >= (1 << 12) {
-        return None;
-    }
-    Some(op.bits() | (u32::from(imm12) << 10) | (u32::from(rn) << 5) | u32::from(rt))
+    let imm12 = imm_bytes / LDST_UIMM12_SCALE_64BIT;
+    Some(
+        op.bits()
+            | (u32::from(imm12) << LDST_UIMM12_IMM_SHIFT)
+            | (u32::from(rn) << 5)
+            | u32::from(rt),
+    )
 }
 
 /// `op | imm7<<15 | rt2<<10 | rn<<5 | rt` — signed scaled (×8) 64-bit load/store
