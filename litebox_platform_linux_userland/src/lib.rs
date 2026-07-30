@@ -492,7 +492,6 @@ impl LinuxUserland {
         };
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[allow(
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
@@ -513,7 +512,13 @@ impl LinuxUserland {
             // TUN and terminal
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
+            // `wait_on_tun` calls `poll(3)`. On x86-64 glibc dispatches that to
+            // the `poll` syscall; the AArch64 (asm-generic) syscall table has no
+            // `poll`, and glibc implements `poll(3)` there via `ppoll`.
+            #[cfg(target_arch = "x86_64")]
             (libc::SYS_poll, vec![]),
+            #[cfg(target_arch = "aarch64")]
+            (libc::SYS_ppoll, vec![]),
             // memory management
             (libc::SYS_mmap, vec![]),
             (libc::SYS_mprotect, vec![]),
@@ -670,7 +675,11 @@ impl LinuxUserland {
                 SeccompAction::Errno(libc::EINVAL.cast_unsigned())
             },
             SeccompAction::Allow,
-            seccompiler::TargetArch::x86_64,
+            if cfg!(target_arch = "x86_64") {
+                seccompiler::TargetArch::x86_64
+            } else {
+                seccompiler::TargetArch::aarch64
+            },
         )
         .unwrap();
         // TODO: bpf program can be compiled offline
@@ -3387,23 +3396,37 @@ unsafe extern "C" fn exception_signal_handler(
 ) {
     // Return an error code for the syscall and log it in debug mode.
     //
-    // Gated to x86-64 rather than ported: the only producer of SIGSYS here is
-    // the seccomp filter installed by `enable_seccomp_filter`, which is itself
-    // `#[cfg(target_arch = "x86_64")]`. On AArch64 no SIGSYS this runtime
-    // caused can reach here, so decoding one would be dead code.
-    #[cfg(all(debug_assertions, target_arch = "x86_64"))]
+    // The only producer of SIGSYS here is the seccomp filter installed by
+    // `enable_seccomp_filter`, which is now installed on both architectures,
+    // so this decoding applies on both.
+    #[cfg(debug_assertions)]
     if signum == libc::SIGSYS {
         use core::fmt::Write as _;
+        // x86-64 passes the syscall number and the return value in the same
+        // register (RAX), so one index does both. AArch64 splits them: the
+        // number is in x8 and the return value in x0.
         #[cfg(target_arch = "x86_64")]
-        let eax_idx = libc::REG_RAX as usize;
-        let sysno = context.uc_mcontext.gregs[eax_idx];
-        context.uc_mcontext.gregs[eax_idx] = i64::from(-libc::EINVAL);
+        let (sysno, arg1) = {
+            let sysno = context.uc_mcontext.gregs[libc::REG_RAX as usize];
+            context.uc_mcontext.gregs[libc::REG_RAX as usize] = i64::from(-libc::EINVAL);
+            (
+                sysno,
+                context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const core::ffi::c_char,
+            )
+        };
+        #[cfg(target_arch = "aarch64")]
+        let (sysno, arg1) = {
+            let sysno = context.uc_mcontext.regs[8].cast_signed();
+            context.uc_mcontext.regs[0] = i64::from(-libc::EINVAL).cast_unsigned();
+            (
+                sysno,
+                context.uc_mcontext.regs[1] as *const core::ffi::c_char,
+            )
+        };
         // Signal-safe: format on the stack via arrayvec (no heap allocation).
         let mut buf = arrayvec::ArrayString::<320>::new();
         if sysno == libc::SYS_openat {
-            #[cfg(target_arch = "x86_64")]
-            let rsi = context.uc_mcontext.gregs[libc::REG_RSI as usize] as *const i8;
-            let c_path = unsafe { core::ffi::CStr::from_ptr(rsi) };
+            let c_path = unsafe { core::ffi::CStr::from_ptr(arg1) };
             // libc may call `openat` for certain files that we can ignore, e.g., /proc/sys/vm/overcommit_memory.
             // Log the paths in case we need to allow some of them in the future.
             let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
@@ -3826,17 +3849,11 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::AtomicU32;
-    // These are used only by `test_seccomp_filter`, which is x86-64 only
-    // because `enable_seccomp_filter` is.
-    #[cfg(target_arch = "x86_64")]
     use std::net::Shutdown;
-    #[cfg(target_arch = "x86_64")]
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    #[cfg(target_arch = "x86_64")]
     use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
-    #[cfg(target_arch = "x86_64")]
     use litebox::fs::OFlags;
     use litebox::platform::RawMutex;
 
@@ -4254,10 +4271,10 @@ mod tests {
         }
     }
 
-    /// `LinuxUserland::enable_seccomp_filter` is itself gated to x86-64 (the
-    /// rule list names syscalls such as `poll` that do not exist on AArch64),
-    /// so the test that exercises it is gated the same way.
-    #[cfg(target_arch = "x86_64")]
+    /// Exercises the filter installed by `LinuxUserland::enable_seccomp_filter`
+    /// on both supported architectures. In particular it pins both halves of
+    /// the `openat` flags condition, whose argument index (2, not 1) is the
+    /// same on x86-64 and AArch64.
     #[test]
     fn test_seccomp_filter() {
         fn test_memfd(name: &std::ffi::CStr) -> OwnedFd {
@@ -4322,14 +4339,23 @@ mod tests {
         let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
+        // `mkdirat` is in the allow-list on neither architecture, so it stands
+        // in for "a syscall the filter does not name at all". `mkdir` was used
+        // here before, but it does not exist on the AArch64 (asm-generic)
+        // syscall table; `mkdirat` exists on both.
         let pathname = c"/tmp/test_seccomp";
         let mkdir_res = unsafe {
-            syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
+            syscalls::syscall3(
+                syscalls::Sysno::mkdirat,
+                super::AT_FDCWD,
+                pathname.as_ptr() as usize,
+                0o755,
+            )
         };
         assert_eq!(
             mkdir_res.unwrap_err(),
             syscalls::Errno::EINVAL,
-            "mkdir should be blocked by seccomp filter"
+            "mkdirat should be blocked by seccomp filter"
         );
 
         // The filter allows `openat` only when the flags argument is exactly
