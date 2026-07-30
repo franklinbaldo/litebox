@@ -53,7 +53,7 @@ pub enum ArchSpecificRegister {
     /// reads `TPIDR_EL0`.
     ///
     /// AArch64 has no `arch_prctl`, so this register is how the shim services
-    /// `CLONE_SETTLS` — the role [`ArchSpecificRegister::FsBase`] plays on
+    /// `CLONE_SETTLS` — the role `ArchSpecificRegister::FsBase` plays on
     /// x86-64.
     ///
     /// A platform may virtualize this rather than program the hardware

@@ -872,7 +872,7 @@ fn append_trampoline_footer(
 ///
 /// The trampoline's size is only known once the stubs have been generated, but
 /// its *address* is baked into every rewritten site, so placement has to be
-/// decided first. That is safe because [`trampoline_placement_for`]'s choice of
+/// decided first. That is safe because `trampoline_placement_for`'s choice of
 /// address does not depend on the size -- only its validity does. So the
 /// rewrite runs once at the preferred address and, in the rare case that the
 /// trampoline outgrew the object's inter-segment hole, runs again at the
@@ -1614,7 +1614,7 @@ pub(crate) const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
 /// exactly the previous object's reservation end -- so there is no free gap
 /// here at all once more than one shared object is loaded.
 ///
-/// [`trampoline_placement_for`] therefore prefers a hole *inside* the object's
+/// `trampoline_placement_for` therefore prefers a hole *inside* the object's
 /// own load span and only falls back to this address when the object has no
 /// usable hole. Callers of the fallback must treat the address as unverified:
 /// the shim refuses to map a trampoline that would replace another object's

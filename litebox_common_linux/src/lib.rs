@@ -3216,7 +3216,7 @@ pub mod arch {
     /// Returns whether `base` is a valid AArch64 Linux user thread-pointer
     /// (`TPIDR_EL0`) value.
     ///
-    /// The counterpart of x86-64's [`super::arch::is_valid_user_fs_base`], and
+    /// The counterpart of x86-64's `is_valid_user_fs_base`, and
     /// the same rule: the base must lie below the top of the user address
     /// space. The motivation differs, though. On x86-64 the check exists
     /// because a non-canonical `wrfsbase` operand raises #GP; AArch64

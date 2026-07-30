@@ -303,7 +303,7 @@ pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
 ///
 /// This is not an independent policy choice: the gates reach the slot with a
 /// single 64-bit unsigned-offset `LDR`/`STR`, so the bound *is*
-/// [`LDR_UIMM12_MAX_BYTE_OFFSET`] and the two must not drift apart.
+/// `LDR_UIMM12_MAX_BYTE_OFFSET` and the two must not drift apart.
 ///
 /// Far beyond any plausible static-TLS offset, so in practice this bound only
 /// exists to be asserted.
@@ -313,7 +313,7 @@ pub const MAX_GUEST_TPIDR_OFFSET: u16 = LDR_UIMM12_MAX_BYTE_OFFSET;
 /// access, to be replaced at load time by [`patch_guest_tpidr_offset`].
 ///
 /// Deliberately [`MAX_GUEST_TPIDR_OFFSET`] — equivalently
-/// [`LDR_UIMM12_MAX_BYTE_OFFSET`], the largest value the field can hold —
+/// `LDR_UIMM12_MAX_BYTE_OFFSET`, the largest value the field can hold —
 /// because it cannot collide with a real runtime offset (a static TLS
 /// control block 32KB past the thread pointer is not a thing). That makes a
 /// scan for it exact: it can never mistake an already-patched gate for an
@@ -516,7 +516,7 @@ fn data_imm12(op: Opcode, rd: u8, rn: u8, imm12: u16) -> Option<u32> {
 
 /// `op | imm12<<10 | rn<<5 | rt` — unsigned scaled (×8) 64-bit load/store
 /// (`STR`/`LDR [Xn, #imm]`). `imm_bytes` must be a multiple of
-/// [`LDST_UIMM12_SCALE_64BIT`] and at most [`LDR_UIMM12_MAX_BYTE_OFFSET`].
+/// `LDST_UIMM12_SCALE_64BIT` and at most `LDR_UIMM12_MAX_BYTE_OFFSET`.
 fn ldst_uimm12(op: Opcode, rt: u8, rn: u8, imm_bytes: u16) -> Option<u32> {
     if !imm_bytes.is_multiple_of(LDST_UIMM12_SCALE_64BIT) || imm_bytes > LDR_UIMM12_MAX_BYTE_OFFSET
     {

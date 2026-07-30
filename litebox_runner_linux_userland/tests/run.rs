@@ -9,6 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Only the broker helpers use this, and they are gated to x86-64 Linux, so
+// the constant has to carry the same gate or it is dead code elsewhere.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 

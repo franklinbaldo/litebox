@@ -129,7 +129,7 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     /// `x30` at the vDSO's `__kernel_rt_sigreturn`, so a guest signal handler
     /// has no return path of its own. LiteBox exposes no vDSO, so it maps an
     /// equivalent stub into guest address space on first signal delivery; see
-    /// [`crate::syscalls::signal::arch::sigreturn_trampoline`].
+    /// `syscalls::signal::arch::sigreturn_trampoline`.
     ///
     /// Process-wide because it lives in the (process-wide) address space, and
     /// behind a mutex rather than an atomic so two threads taking a signal at
