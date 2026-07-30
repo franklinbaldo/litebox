@@ -27,9 +27,10 @@ struct MockVtl0State {
     next_sparse_pa: u64,
     owned_ranges: BTreeSet<(u64, u64)>,
     protections: BTreeMap<(u64, u64), MemAttr>,
+    protection_operations: Vec<(u64, u64, MemAttr)>,
     ringbuffer: Option<(u64, u64)>,
     end_of_boot_reached: bool,
-    control_registers_locked: bool,
+    lock_count: usize,
 }
 
 impl MockVtl0Gate {
@@ -122,6 +123,10 @@ impl MockVtl0Gate {
             .collect()
     }
 
+    pub(super) fn protection_operations(&self) -> Vec<(u64, u64, MemAttr)> {
+        self.state.lock().unwrap().protection_operations.clone()
+    }
+
     pub(super) fn ringbuffer(&self) -> Option<(u64, u64)> {
         self.state.lock().unwrap().ringbuffer
     }
@@ -131,7 +136,11 @@ impl MockVtl0Gate {
     }
 
     pub(super) fn control_registers_locked(&self) -> bool {
-        self.state.lock().unwrap().control_registers_locked
+        self.lock_count() > 0
+    }
+
+    pub(super) fn lock_count(&self) -> usize {
+        self.state.lock().unwrap().lock_count
     }
 }
 
@@ -318,6 +327,7 @@ impl Vtl0Gate for MockVtl0Gate {
         let range = normalized_range(range);
         insert_range(&mut state.owned_ranges, range);
         apply_protection(&mut state.protections, range, attr);
+        state.protection_operations.push((range.0, range.1, attr));
         Ok(())
     }
 
@@ -381,7 +391,7 @@ impl Vtl0Gate for MockVtl0Gate {
     }
 
     fn lock_control_registers(&self) -> Result<(), VsmError> {
-        self.state.lock().unwrap().control_registers_locked = true;
+        self.state.lock().unwrap().lock_count += 1;
         Ok(())
     }
 }

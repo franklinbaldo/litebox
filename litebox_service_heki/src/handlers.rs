@@ -817,3 +817,74 @@ impl<'a> ValidatedTextPatch<'a> {
         writer.write_vtl0_bytes(&self.pages[..self.page_count], self.offset, self.bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Heki;
+    use crate::test_support::MockVtl0Gate;
+    use alloc::vec::Vec;
+    use litebox_common_lvbs::{HEKI_MAX_RANGES, HekiRange, MemAttr, PAGE_SIZE};
+
+    const TARGET_PA: u64 = 0x4000_0000;
+    const TARGET_VA: u64 = 0xffff_8000_4000_0000;
+
+    fn protection_range(index: usize, attr: MemAttr) -> HekiRange {
+        let offset = index as u64 * 2 * PAGE_SIZE as u64;
+        HekiRange {
+            va: TARGET_VA + offset,
+            pa: TARGET_PA + offset,
+            epa: TARGET_PA + offset + PAGE_SIZE as u64,
+            attributes: attr.bits(),
+        }
+    }
+
+    #[test]
+    fn protect_memory_applies_every_range_in_a_multi_page_chain() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let ranges: Vec<_> = (0..=HEKI_MAX_RANGES)
+            .map(|index| {
+                let attr = if index.is_multiple_of(2) {
+                    MemAttr::MEM_ATTR_READ
+                } else {
+                    MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_EXEC
+                };
+                protection_range(index, attr)
+            })
+            .collect();
+        let expected: Vec<_> = ranges
+            .iter()
+            .map(|range| (range.pa, range.epa, range.mem_attr().unwrap()))
+            .collect();
+        let (pa, nranges) = gate.write_heki_ranges(&ranges);
+
+        assert_eq!(heki.protect_memory(pa, nranges).unwrap(), 0);
+        assert_eq!(gate.protection_operations(), expected);
+    }
+
+    #[test]
+    fn protect_memory_accepts_an_aligned_empty_range_without_protecting_frames() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let empty = HekiRange {
+            va: TARGET_VA,
+            pa: TARGET_PA,
+            epa: TARGET_PA,
+            attributes: MemAttr::MEM_ATTR_READ.bits(),
+        };
+        let (pa, nranges) = gate.write_heki_ranges(&[empty]);
+
+        assert_eq!(heki.protect_memory(pa, nranges).unwrap(), 0);
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn lock_regs_records_each_lock_request() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+
+        assert_eq!(heki.lock_regs().unwrap(), 0);
+        assert_eq!(heki.lock_regs().unwrap(), 0);
+        assert_eq!(gate.lock_count(), 2);
+    }
+}
