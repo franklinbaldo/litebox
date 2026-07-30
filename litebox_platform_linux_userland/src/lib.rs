@@ -2590,6 +2590,82 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     res
 }
 
+/// Make code just written to `range` visible to the instruction fetch path,
+/// before that range becomes executable.
+///
+/// This is an AArch64 requirement, not a generic cache-flush hook. AArch64's
+/// instruction cache is not architecturally coherent with the data cache, so
+/// instructions written through the data path are not guaranteed to be observed
+/// by instruction fetch until the D-cache is cleaned to the point of unification
+/// and the I-cache is invalidated over the range — what a compiler runtime's
+/// `__clear_cache` does. Omitting it does not fail cleanly: the fetch path may
+/// see whatever happened to be in the I-cache, which depends on the machine, its
+/// cache geometry and what ran before, so the symptom is intermittent and looks
+/// like anything but a cache problem.
+///
+/// x86-64 has no counterpart and no call site: its instruction cache is coherent
+/// with the data cache, so a store to code is snooped by the fetch path, and the
+/// `mprotect` that makes the range executable serializes as well. (x86-64 does
+/// have cache maintenance such as `CLFLUSH`, but that serves data-cache and
+/// persistence purposes, not instruction-stream coherence.)
+#[cfg(target_arch = "aarch64")]
+fn sync_instruction_stream(range: core::ops::Range<usize>) {
+    if range.start >= range.end {
+        return;
+    }
+    let start = range.start;
+    let end = range.end;
+    // `CTR_EL0` holds the cache line sizes: `DminLine` [19:16] and `IminLine`
+    // [3:0] are log2 of the smallest line size in 4-byte words, so the line size
+    // in bytes is `4 << field`. Linux traps and emulates `MRS ..., CTR_EL0` on
+    // parts where the register is not directly readable from EL0, so reading it
+    // here is the supported way to obtain these.
+    //
+    // SAFETY: the block only performs cache maintenance over `range` and issues
+    // barriers; every named register is a caller-supplied scratch operand.
+    unsafe {
+        core::arch::asm!(
+            "mrs    {ctr}, ctr_el0",
+            // Clean the D-cache to the point of unification, one line at a time.
+            "ubfx   {tmp}, {ctr}, #16, #4",
+            "mov    {dline}, #4",
+            "lsl    {dline}, {dline}, {tmp}",
+            "sub    {tmp}, {dline}, #1",
+            "bic    {cur}, {start}, {tmp}",
+            "0:",
+            "dc     cvau, {cur}",
+            "add    {cur}, {cur}, {dline}",
+            "cmp    {cur}, {end}",
+            "b.lo   0b",
+            // Order the cleans before the invalidates.
+            "dsb    ish",
+            // Invalidate the I-cache to the point of unification.
+            "and    {tmp}, {ctr}, #0xf",
+            "mov    {iline}, #4",
+            "lsl    {iline}, {iline}, {tmp}",
+            "sub    {tmp}, {iline}, #1",
+            "bic    {cur}, {start}, {tmp}",
+            "1:",
+            "ic     ivau, {cur}",
+            "add    {cur}, {cur}, {iline}",
+            "cmp    {cur}, {end}",
+            "b.lo   1b",
+            // Order the invalidates before any subsequent fetch, then discard
+            // anything already prefetched.
+            "dsb    ish",
+            "isb",
+            start = in(reg) start,
+            end = in(reg) end,
+            ctr = out(reg) _,
+            dline = out(reg) _,
+            iline = out(reg) _,
+            cur = out(reg) _,
+            tmp = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
@@ -2698,6 +2774,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mprotect failed");
+        // A range becoming executable may hold code written while it was
+        // writable — the shim's syscall rewriter does exactly that, both to
+        // guest code segments and to the trampolines it emits. On AArch64 those
+        // stores are not guaranteed to be visible to the instruction fetch path
+        // until the caches are synchronized, so do it here, on the last step
+        // before the range can be executed at all. x86-64 needs nothing, so even
+        // the check is AArch64-only.
+        //
+        // TODO: strictly only a W->X transition needs this; `update_permissions`
+        // is not told the old permissions, so every transition to X pays for it.
+        #[cfg(target_arch = "aarch64")]
+        if new_permissions.contains(MemoryRegionPermissions::EXEC) {
+            sync_instruction_stream(range);
+        }
         Ok(())
     }
 
