@@ -25,11 +25,39 @@
 static volatile sig_atomic_t handler_runs = 0;
 static volatile sig_atomic_t handler_signo = 0;
 
+// Deliberately trash the registers the test uses as sentinels.
+//
+// Without this the test proves far less than it looks like it does: a handler
+// that only bumps two `sig_atomic_t`s happens not to touch `x9`/`x10` anywhere
+// on the delivery path, so the sentinels survive whether or not
+// `rt_sigreturn` restores them. (Verified: deleting the restore of `regs[9]`
+// in the shim's `restore_sigcontext` left this test passing.) Writing junk
+// into them here makes the assertions in `check_registers_survived`
+// distinguish "restored from the saved `sigcontext`" from "never disturbed".
+//
+// `x9`/`x10` are caller-saved, so the compiler emits no reload after this and
+// the junk really does reach `rt_sigreturn`. `x19` is callee-saved and the
+// clobber list makes the compiler restore it before the handler returns, so it
+// stays a weaker check — kept because a `rt_sigreturn` that restored the wrong
+// slot would still show up there.
+static void clobber_sentinel_registers(void) {
+#ifdef __aarch64__
+    long junk = (long)handler_runs * 0x5eed5eed5eed5eedL + 1;
+    asm volatile("mov x9, %[j]\n\t"
+                 "mov x10, %[j]\n\t"
+                 "mov x19, %[j]"
+                 :
+                 : [j] "r"(junk)
+                 : "x9", "x10", "x19");
+#endif
+}
+
 static void handler(int signo, siginfo_t *info, void *ucontext) {
     (void)info;
     (void)ucontext;
     handler_runs++;
     handler_signo = signo;
+    clobber_sentinel_registers();
 }
 
 static void install_handler(int signo) {

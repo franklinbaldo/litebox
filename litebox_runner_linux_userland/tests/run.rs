@@ -12,9 +12,13 @@ use std::{
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 
-/// The multiarch directory the host's shared libraries actually live in.
-/// `find_dependencies` reports paths under it, and the guest's
-/// `LD_LIBRARY_PATH` has to be able to find them again inside the tar.
+/// The multiarch directory a Debian-style host keeps its shared libraries in.
+///
+/// Staged so that libraries `find_dependencies` reports under it keep their
+/// host path inside the tar. The guest's `LD_LIBRARY_PATH` (`/lib64:/lib32:/lib`)
+/// does not name this directory; ld.so finds it anyway because it searches
+/// `/lib/<multiarch>` by default. On hosts that resolve libraries elsewhere
+/// (e.g. `/usr/lib`) this directory is staged empty and goes unused.
 #[cfg(target_arch = "x86_64")]
 const MULTIARCH_LIB_DIR: &str = "lib/x86_64-linux-gnu";
 #[cfg(target_arch = "aarch64")]
@@ -89,6 +93,13 @@ impl Runner {
         }
     }
 
+    /// The staged rootfs directory that becomes the guest's tar filesystem.
+    /// Tests that assert on what the guest *sees* should derive their
+    /// expectations from this rather than hardcoding a host layout.
+    fn tar_dir(&self) -> &Path {
+        &self.tar_dir
+    }
+
     fn env(&mut self, env: impl AsRef<std::ffi::OsStr>) -> &mut Self {
         self.command.arg("--env").arg(env);
         self
@@ -107,7 +118,6 @@ impl Runner {
         self
     }
 
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn args(&mut self, args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>) -> &mut Self {
         for arg in args {
             self.arg(arg);
@@ -145,7 +155,6 @@ impl Runner {
     }
 
     #[must_use]
-    #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn output(&mut self) -> Vec<u8> {
         self.run_inner(true)
     }
@@ -355,7 +364,6 @@ fn test_signal_handler_returns_through_sigreturn() {
 }
 
 /// Get the path of a program using `which`
-#[cfg(target_arch = "x86_64")]
 fn run_which(prog: &str) -> std::path::PathBuf {
     let prog_path_str = std::process::Command::new("which")
         .arg(prog)
@@ -597,34 +605,104 @@ console.log(content);
     broker_thread.join();
 }
 
-#[cfg(target_arch = "x86_64")]
+/// `ls` under LiteBox, dynamically linked against the host's real libc.
+///
+/// This is the dynamic-linking path the trampoline-placement work exists for:
+/// `ls` pulls in five or so shared objects, each of which gets its own rewritten
+/// copy with its own appended trampoline, and each of those trampolines has to
+/// land somewhere that does not overwrite a neighbour.
+///
+/// Expectations are derived from the staged rootfs rather than hardcoded. The
+/// host's library layout is not portable — `MULTIARCH_LIB_DIR` differs per
+/// architecture, and a host that keeps its libraries under `/usr/lib64` stages
+/// `usr` where a Debian-style host stages `lib64` — so asking the tar what it
+/// contains is both correct everywhere and a stronger check: it asserts the
+/// guest sees *exactly* the rootfs we handed it.
+fn dir_entries(dir: &Path) -> Vec<String> {
+    // Entries that hold no file anywhere beneath them are skipped: the staging
+    // code unconditionally creates `lib64`, `lib32` and `out`, but an empty
+    // directory does not survive into the guest's tar filesystem, so the guest
+    // legitimately does not list it. Everything that *does* contain a file must
+    // be visible.
+    fn holds_a_file(path: &Path) -> bool {
+        if path.is_file() {
+            return true;
+        }
+        std::fs::read_dir(path)
+            .map(|entries| entries.flatten().any(|e| holds_a_file(&e.path())))
+            .unwrap_or(false)
+    }
+
+    let mut names = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("cannot read staged rootfs {}: {e}", dir.display()))
+        .flatten()
+        .filter(|entry| holds_a_file(&entry.path()))
+        // The tar is built with `--exclude=*.cache-checksum`, so those files
+        // are staging bookkeeping the guest never sees.
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "cache-checksum")
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+fn assert_ls_listed(output: &[u8], dir: &Path, expected: &[String]) {
+    let output_str = String::from_utf8_lossy(output);
+    let listed = output_str.split_whitespace().collect::<Vec<_>>();
+    assert!(!expected.is_empty(), "nothing staged in {}", dir.display());
+    for each in [".", ".."]
+        .iter()
+        .copied()
+        .chain(expected.iter().map(String::as_str))
+    {
+        assert!(
+            listed.contains(&each),
+            "ls of {} did not list {each}:\n{output_str}",
+            dir.display(),
+        );
+    }
+}
+
 #[test]
 fn test_runner_with_ls() {
     let ls_path = run_which("ls");
-    let output = Runner::new(&ls_path, "ls_rewriter").arg("-a").output();
 
-    let output_str = String::from_utf8_lossy(&output);
-    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "lib", "lib64"] {
-        assert!(
-            normalized.contains(&each),
-            "unexpected ls output:\n{output_str}\n{each} not found",
-        );
-    }
+    let mut runner = Runner::new(&ls_path, "ls_rewriter");
+    let expected_root = dir_entries(runner.tar_dir());
+    let output = runner.arg("-a").output();
+    assert_ls_listed(&output, Path::new("/"), &expected_root);
 
-    // test `ls` subdir
-    let output = Runner::new(&ls_path, "ls_lib_rewriter")
-        .args(["-a", "/lib/x86_64-linux-gnu"])
+    // The same, one level down, in the directory `ls`'s own shared objects were
+    // staged into. Which directory that is comes from `ldd`, not from a
+    // constant: this host resolves them under `/usr/lib`, a Debian-style host
+    // under `/lib/<multiarch>`.
+    let libs = common::find_dependencies(ls_path.to_str().unwrap());
+    let lib_guest_dir = libs
+        .iter()
+        .map(|lib| PathBuf::from(lib))
+        .find(|lib| {
+            !lib.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with("ld-")
+        })
+        .and_then(|lib| lib.parent().map(Path::to_path_buf))
+        .expect("ls has no resolvable shared-library dependency to list");
+
+    let mut runner = Runner::new(&ls_path, "ls_lib_rewriter");
+    let staged_lib_dir = runner
+        .tar_dir()
+        .join(lib_guest_dir.strip_prefix("/").unwrap());
+    let expected_libs = dir_entries(&staged_lib_dir);
+    let output = runner
+        .args(["-a", lib_guest_dir.to_str().unwrap()])
         .output();
-
-    let output_str = String::from_utf8_lossy(&output);
-    let normalized = output_str.split_whitespace().collect::<Vec<_>>();
-    for each in [".", "..", "libc.so.6", "libpcre2-8.so.0", "libselinux.so.1"] {
-        assert!(
-            normalized.contains(&each),
-            "unexpected ls output:\n{output_str}\n{each} not found",
-        );
-    }
+    assert_ls_listed(&output, &staged_lib_dir, &expected_libs);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

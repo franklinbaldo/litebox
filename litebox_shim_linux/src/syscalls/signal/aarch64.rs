@@ -17,8 +17,8 @@ use core::mem::offset_of;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
-    signal::{aarch64::Sigcontext, SigAction, Siginfo, Ucontext},
-    MapFlags, ProtFlags, PtRegs, AARCH64_GENERAL_REGISTER_COUNT,
+    AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,
+    signal::{SigAction, Siginfo, Ucontext, aarch64::Sigcontext},
 };
 use litebox_syscall_rewriter::{
     AARCH64_SVC_FRAME_BYTES, AARCH64_SVC_FRAME_RETADDR_OFFSET, AARCH64_SVC_FRAME_STUB_OFFSET,
