@@ -10,7 +10,10 @@ use std::{
 };
 
 use litebox_common_linux::vmap::PhysPageAddr;
-use litebox_common_lvbs::{FrameTxn, MemAttr, PAGE_SIZE, ReservationStatus, VsmError, Vtl0Gate};
+use litebox_common_lvbs::{
+    FrameTxn, HEKI_MAX_RANGES, HekiPage, HekiRange, MemAttr, PAGE_SIZE, ReservationStatus,
+    VsmError, Vtl0Gate,
+};
 use x86_64::structures::paging::{Size4KiB, frame::PhysFrameRange};
 
 #[derive(Clone, Default)]
@@ -21,6 +24,7 @@ pub(super) struct MockVtl0Gate {
 #[derive(Default)]
 struct MockVtl0State {
     pages: BTreeMap<u64, [u8; PAGE_SIZE]>,
+    next_sparse_pa: u64,
     owned_ranges: BTreeSet<(u64, u64)>,
     protections: BTreeMap<(u64, u64), MemAttr>,
     ringbuffer: Option<(u64, u64)>,
@@ -57,6 +61,45 @@ impl MockVtl0Gate {
             address += u64::try_from(count).expect("copy length always fits in u64");
             bytes = &bytes[count..];
         }
+    }
+
+    pub(super) fn write_heki_ranges(&self, ranges: &[HekiRange]) -> (u64, u64) {
+        assert!(
+            !ranges.is_empty(),
+            "HEKI range chains must contain at least one range"
+        );
+
+        let page_count = ranges.len().div_ceil(HEKI_MAX_RANGES);
+        let mut state = self.state.lock().unwrap();
+        let mut page_addresses = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            let mut address = if state.next_sparse_pa == 0 {
+                0x1000_0000
+            } else {
+                state.next_sparse_pa
+            };
+            while state.pages.contains_key(&address) {
+                address += 0x11_000;
+            }
+            state.next_sparse_pa = address + 0x11_000;
+            page_addresses.push(address);
+        }
+
+        for (index, chunk) in ranges.chunks(HEKI_MAX_RANGES).enumerate() {
+            let mut page = HekiPage::new();
+            page.nranges = chunk.len() as u64;
+            page.ranges[..chunk.len()].copy_from_slice(chunk);
+            if let Some(&next_address) = page_addresses.get(index + 1) {
+                // This mock models the kernel's virtual link with an identity VA/PA mapping.
+                page.next = next_address;
+                page.next_pa = next_address;
+            }
+            // HekiPage is exactly one fully initialized 4 KiB page.
+            let bytes = unsafe { core::mem::transmute::<HekiPage, [u8; PAGE_SIZE]>(page) };
+            state.pages.insert(page_addresses[index], bytes);
+        }
+
+        (page_addresses[0], ranges.len() as u64)
     }
 
     pub(super) fn owned_ranges(&self) -> Vec<(u64, u64)> {
@@ -346,9 +389,12 @@ impl Vtl0Gate for MockVtl0Gate {
 #[cfg(test)]
 mod tests {
     use super::MockVtl0Gate;
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
     use litebox_common_linux::vmap::PhysPageAddr;
-    use litebox_common_lvbs::{MemAttr, PAGE_SIZE, ReservationStatus, VsmError, Vtl0Gate};
+    use litebox_common_lvbs::{
+        HEKI_MAX_RANGES, HekiPage, HekiRange, MemAttr, PAGE_SIZE, ReservationStatus, VsmError,
+        Vtl0Gate,
+    };
     use x86_64::{
         PhysAddr,
         structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
@@ -383,6 +429,47 @@ mod tests {
             gate.read_vtl0_bytes(&missing, 0, &mut [0]),
             Err(VsmError::Vtl0CopyFailed)
         ));
+    }
+
+    #[test]
+    fn builds_kernel_shaped_heki_page_chain() {
+        let gate = MockVtl0Gate::new();
+        let ranges: Vec<_> = (0..=HEKI_MAX_RANGES)
+            .map(|index| HekiRange {
+                va: 0xffff_8000_0000_0000 + index as u64 * PAGE_SIZE as u64,
+                pa: 0x20_0000 + index as u64 * PAGE_SIZE as u64,
+                epa: 0x20_1000 + index as u64 * PAGE_SIZE as u64,
+                attributes: MemAttr::MEM_ATTR_READ.bits(),
+            })
+            .collect();
+
+        let (first_pa, total_count) = gate.write_heki_ranges(&ranges);
+        let first = gate.read_vtl0_val::<HekiPage>(first_pa).unwrap();
+        let second = gate.read_vtl0_val::<HekiPage>(first.next_pa).unwrap();
+        let first_nranges = first.nranges;
+        let first_next = first.next;
+        let first_next_pa = first.next_pa;
+        let second_nranges = second.nranges;
+        let second_next = second.next;
+        let second_next_pa = second.next_pa;
+
+        assert_eq!(first_nranges, HEKI_MAX_RANGES as u64);
+        assert_eq!(second_nranges, 1);
+        assert_ne!(first_pa, 0);
+        assert_eq!(first_pa % PAGE_SIZE as u64, 0);
+        assert_ne!(first_pa, first_next_pa);
+        assert_eq!(first_next_pa % PAGE_SIZE as u64, 0);
+        // The mock uses an identity VA/PA mapping for kernel-compatible links.
+        assert_eq!(first_next, first_next_pa);
+        assert_eq!(second_next, 0);
+        assert_eq!(second_next_pa, 0);
+        assert_eq!(total_count, ranges.len() as u64);
+    }
+
+    #[test]
+    #[should_panic(expected = "HEKI range chains must contain at least one range")]
+    fn rejects_empty_heki_page_chain() {
+        MockVtl0Gate::new().write_heki_ranges(&[]);
     }
 
     #[test]
