@@ -15,6 +15,8 @@ extern crate alloc;
 
 mod handlers;
 mod mem_integrity;
+#[cfg(test)]
+mod test_support;
 
 use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
 use core::ffi::{CStr, c_char};
