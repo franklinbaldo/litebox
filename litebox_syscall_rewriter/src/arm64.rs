@@ -878,6 +878,30 @@ pub(crate) fn hook_syscalls_aarch64(
     }))
 }
 
+/// Replace every patch site in `buf` with `BRK #TRAP_BRK_IMM`.
+///
+/// The fail-safe behind [`hook_syscalls_aarch64`]: when a trampoline cannot be
+/// placed, a site left native escapes to the host kernel, so every site the
+/// hooking pass would have redirected is trapped instead. That includes the
+/// thread-pointer sites, not just `SVC` — an `MSR TPIDR_EL0` left native would
+/// silently overwrite the *host's* anchor, which is worse than a fault.
+///
+/// Returns the number of sites trapped.
+#[cfg(any(test, target_arch = "aarch64"))]
+pub(crate) fn trap_all_patch_sites(
+    buf: &mut [u8],
+    text_sections: &[TextSectionInfo],
+) -> Result<usize> {
+    let sites = find_patch_sites(text_sections, buf)?;
+    let brk = Insn::Brk(TRAP_BRK_IMM)
+        .encode()
+        .expect("BRK always encodes");
+    for site in &sites {
+        buf[site.file_offset..site.file_offset + 4].copy_from_slice(&brk.to_le_bytes());
+    }
+    Ok(sites.len())
+}
+
 /// Emit the header slot and the shared SVC handler — the fixed-size shared
 /// prologue that per-site gates follow.
 fn emit_shared_prologue(

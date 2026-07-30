@@ -25,6 +25,17 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
 
+// The *runtime* patching entry points ([`patch_code_segment`] and
+// [`trap_all_syscalls_in_code`]) rewrite code for the architecture this crate is
+// running on, so they dispatch on `target_arch`, and only x86-64 and AArch64 are
+// implemented. Fail loudly here rather than letting an empty `cfg` arm produce a
+// function with no body. The ahead-of-time entry points are unaffected: they
+// select the architecture from the input object and are built for every host.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "litebox_syscall_rewriter's runtime patching entry points support only x86-64 and AArch64 hosts"
+);
+
 mod arm64;
 
 /// Alignment an AArch64 runtime's guest thread-pointer slot must satisfy.
@@ -1520,12 +1531,52 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
 /// region — the caller is responsible for making the region writable before
 /// calling and restoring permissions afterwards.
 ///
+/// The region is rewritten for the architecture this crate is running on: an
+/// already-mapped region is about to execute *here*, so unlike the ahead-of-time
+/// entry points there is no input object to take the architecture from.
+///
 /// # Returns
 ///
 /// `(trampoline_stubs, skipped_addrs)`. The caller must copy the stubs to
-/// `trampoline_write_vaddr`. Returns empty vecs if no syscall instructions
+/// `trampoline_write_vaddr`. Returns empty vecs if no patchable instructions
 /// are found in `code`.
+///
+/// # Architecture-specific parameters
+///
+/// `syscall_entry_addr` means different things on the two architectures,
+/// because the emitted stubs reach the callback differently:
+///
+/// * x86-64 stubs jump *indirectly* through a shared 8-byte slot the caller
+///   places once per trampoline allocation, so this is the address of that slot.
+/// * AArch64 stubs are self-contained: the AArch64 emitter emits a
+///   callback slot at the head of every blob it produces and the blob's shared
+///   `SVC` handler loads from it, so this is the callback address itself.
+///
+/// On AArch64 the emitted blob's thread-pointer gates carry
+/// [`AARCH64_MAX_GUEST_TPIDR_OFFSET`] as a placeholder, exactly as the
+/// ahead-of-time path's do. The caller **must** run
+/// [`aarch64_patch_guest_tpidr_offset`] over the returned stubs and prove with
+/// [`aarch64_find_guest_tpidr_placeholder`] that none survives, before writing
+/// them anywhere the guest can execute.
 pub fn patch_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        patch_aarch64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        patch_x86_64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
+    }
+}
+
+/// [`patch_code_segment`] for an x86-64 host.
+#[cfg(target_arch = "x86_64")]
+fn patch_x86_64_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
@@ -1558,13 +1609,73 @@ pub fn patch_code_segment(
     }
 }
 
-/// Replace all `syscall` instructions in `code` with trap sequences (`ICEBP; HLT`).
+/// [`patch_code_segment`] for an AArch64 host.
 ///
-/// This is the fallback when trampoline-based patching cannot be performed
-/// (e.g. trampoline allocation failed or is too far away).
+/// The whole mapped region is handed to `arm64::hook_syscalls_aarch64` as a
+/// single synthetic text section. A runtime region has no section table to
+/// consult and, when it is anonymous memory, no ELF at all — but the AArch64
+/// scanner does not need one: instructions are fixed-width and 4-byte aligned,
+/// so it steps the region in instruction units. `file_offset` is 0 because for
+/// this caller the buffer *is* the section.
 ///
-/// Returns the number of syscall instructions that were patched.
+/// The AOT emitter is reused verbatim rather than duplicated, which is what
+/// makes the runtime-emitted gates carry the same per-site outbound stubs (the
+/// `X16`-restoring sequence `switch_to_guest` resumes through) and the same
+/// thread-pointer placeholder as gates emitted ahead of time. A second emitter
+/// would have to re-derive both contracts and could drift from them silently.
+#[cfg(any(test, target_arch = "aarch64"))]
+fn patch_aarch64_code_segment(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let section = TextSectionInfo {
+        vaddr: code_vaddr,
+        file_offset: 0,
+        size: code.len() as u64,
+    };
+    let Some(outcome) = arm64::hook_syscalls_aarch64(
+        code,
+        &[section],
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        arm64::Host::Linux,
+    )?
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+
+    Ok((outcome.trampoline, outcome.trapped_sites))
+}
+
+/// Replace every syscall patch site in `code` with a trap instruction, so that
+/// reaching one faults instead of escaping to the host kernel.
+///
+/// This is the fail-safe when trampoline-based patching cannot be performed
+/// (e.g. trampoline allocation failed or the trampoline is out of branch range).
+/// It has to cover exactly the sites the architecture's rewriter would have
+/// redirected, or the fail-safe silently fails safe on nothing:
+///
+/// * x86-64 — `syscall` instructions become `ICEBP; HLT`.
+/// * AArch64 — every site the AArch64 scanner recognizes (`SVC`, and the `MSR`/`MRS
+///   TPIDR_EL0` thread-pointer accesses it virtualizes) becomes `BRK`.
+///
+/// Returns the number of patch sites that were trapped.
 pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        trap_all_aarch64_patch_sites(code, code_vaddr)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        trap_all_x86_64_syscalls(code, code_vaddr)
+    }
+}
+
+/// [`trap_all_syscalls_in_code`] for an x86-64 host.
+#[cfg(target_arch = "x86_64")]
+fn trap_all_x86_64_syscalls(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
     let instructions = decode_section_instructions(Arch::X86_64, code, code_vaddr)?;
     let mut count = 0;
     for inst in &instructions {
@@ -1574,6 +1685,17 @@ pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usi
         }
     }
     Ok(count)
+}
+
+/// [`trap_all_syscalls_in_code`] for an AArch64 host.
+#[cfg(any(test, target_arch = "aarch64"))]
+fn trap_all_aarch64_patch_sites(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+    let section = TextSectionInfo {
+        vaddr: code_vaddr,
+        file_offset: 0,
+        size: code.len() as u64,
+    };
+    arm64::trap_all_patch_sites(code, &[section])
 }
 
 /// The guest page size assumed when laying out the appended trampoline.
@@ -2476,6 +2598,105 @@ mod tests {
             matches!(err, Error::UnpatchableSyscalls(_)),
             "expected UnpatchableSyscalls, got {err:?}"
         );
+    }
+
+    /// The runtime (mmap-time) AArch64 entry point: a bare code region with no
+    /// ELF around it still gets its `SVC` redirected into a gate, and the gate
+    /// blob is self-describing — its own callback slot at offset 0.
+    #[test]
+    fn aarch64_runtime_patch_redirects_svc_into_an_emitted_gate() {
+        let mut code = 0xD400_0001u32.to_le_bytes().to_vec(); // SVC #0
+        let code_vaddr = 0x1000_0000;
+        let trampoline_vaddr = 0x1000_1000;
+        let syscall_entry_addr = 0x1000_0000_0000;
+
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, code_vaddr, trampoline_vaddr, syscall_entry_addr)
+                .unwrap();
+
+        assert!(
+            trapped.is_empty(),
+            "a nearby trampoline should be reachable"
+        );
+        assert!(!trampoline.is_empty(), "runtime patching emits a blob");
+        assert_eq!(
+            u64::from_le_bytes(trampoline[..8].try_into().unwrap()),
+            syscall_entry_addr,
+            "the blob's callback slot holds the runtime's syscall entry directly"
+        );
+
+        let branch = u32::from_le_bytes(code[..4].try_into().unwrap());
+        assert_eq!(branch & 0xFC00_0000, 0x1400_0000, "the SVC becomes a B");
+        let imm26 = i64::from(branch & 0x03FF_FFFF);
+        let disp = ((imm26 << 38) >> 38) << 2;
+        assert_eq!(
+            code_vaddr.wrapping_add(disp.cast_unsigned()),
+            trampoline_vaddr + 16,
+            "the B targets the first gate, past the 16-byte shared prologue"
+        );
+    }
+
+    /// A region with no patch sites must not produce a trampoline: the caller
+    /// would otherwise map and charge a page for nothing, and — on the shim's
+    /// runtime path — advance its trampoline cursor past a blob no code
+    /// branches to.
+    #[test]
+    fn aarch64_runtime_patch_of_syscall_free_code_emits_nothing() {
+        let mut code = 0xD503_201Fu32.to_le_bytes().to_vec(); // NOP
+        let before = code.clone();
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+        assert!(trampoline.is_empty());
+        assert!(trapped.is_empty());
+        assert_eq!(code, before, "syscall-free code is left untouched");
+    }
+
+    /// The runtime path emits the same thread-pointer placeholder the
+    /// ahead-of-time path does, so the shim's loader-side finalization applies
+    /// to it unchanged. If that stopped holding, runtime-emitted gates would
+    /// redirect the guest's thread pointer into host memory *without faulting*,
+    /// so it is asserted rather than assumed.
+    #[test]
+    fn aarch64_runtime_gates_carry_the_thread_pointer_placeholder() {
+        // MRS X0, TPIDR_EL0 — a thread-pointer read, which is gated.
+        let mut code = 0xD53B_D040u32.to_le_bytes().to_vec();
+        let (mut trampoline, trapped) =
+            patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+        assert!(trapped.is_empty());
+        assert!(
+            aarch64_find_guest_tpidr_placeholder(&trampoline).is_some(),
+            "a runtime-emitted thread-pointer gate must arrive unpatched"
+        );
+        assert_eq!(
+            aarch64_patch_guest_tpidr_offset(&mut trampoline, 96).unwrap(),
+            1
+        );
+        assert!(aarch64_find_guest_tpidr_placeholder(&trampoline).is_none());
+    }
+
+    /// The fail-safe: when no trampoline can be placed, every site the hooking
+    /// pass would have redirected becomes a `BRK`. A site left native is a
+    /// direct escape to the host kernel, so "found nothing, trapped nothing" is
+    /// not an acceptable outcome.
+    #[test]
+    fn aarch64_trap_fallback_traps_every_patch_site() {
+        let mut code = Vec::new();
+        code.extend_from_slice(&0xD400_0001u32.to_le_bytes()); // SVC #0
+        code.extend_from_slice(&0xD503_201Fu32.to_le_bytes()); // NOP
+        code.extend_from_slice(&0xD51B_D040u32.to_le_bytes()); // MSR TPIDR_EL0, X0
+        code.extend_from_slice(&0xD53B_D041u32.to_le_bytes()); // MRS X1, TPIDR_EL0
+
+        let count = trap_all_aarch64_patch_sites(&mut code, 0x1000).unwrap();
+
+        assert_eq!(count, 3, "SVC and both thread-pointer accesses are sites");
+        for (index, word) in code.chunks_exact(4).enumerate() {
+            let insn = u32::from_le_bytes(word.try_into().unwrap());
+            if index == 1 {
+                assert_eq!(insn, 0xD503_201F, "the NOP is not a patch site");
+            } else {
+                assert_eq!(insn & 0xFFE0_001F, 0xD420_0000, "site {index} becomes BRK");
+            }
+        }
     }
 
     const NT_STUB_BUILD_SYSNO: u32 = 0x1234;
