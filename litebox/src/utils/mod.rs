@@ -68,41 +68,6 @@ impl_truncate! { i32, i8 }
 impl_truncate! { i16, i8 }
 
 impl_truncate! { usize, usize }
-
-/// An extension trait that widens a pointer-sized integer to a fixed 64-bit one.
-///
-/// The sibling of [`TruncateExt`], for the direction that loses nothing. It
-/// exists because `usize as u64` is a silent *truncation* on a hypothetical
-/// 128-bit-pointer target and a widening everywhere else, so the plain cast
-/// documents nothing; this asserts at compile time that the conversion is
-/// lossless. `From` cannot be used because `usize: Into<u64>` does not hold.
-///
-/// Used for guest register slots, which LiteBox models as `usize` but which the
-/// kernel's `sigcontext` layouts define as fixed-width `u64`.
-pub trait WidenExt<To> {
-    /// Widen `self` to `To`, preserving the value.
-    fn widen(self) -> To;
-}
-
-macro_rules! impl_widen {
-    ($from:ty, $to:ty) => {
-        impl WidenExt<$to> for $from {
-            #[inline(always)]
-            fn widen(self) -> $to {
-                const {
-                    assert!(
-                        core::mem::size_of::<$from>() <= core::mem::size_of::<$to>(),
-                        "widening must not lose bits",
-                    );
-                }
-                <$to>::from_ne_bytes(self.to_ne_bytes())
-            }
-        }
-    };
-}
-
-impl_widen! { usize, u64 }
-impl_widen! { isize, i64 }
 impl_truncate! { u64, u64 }
 impl_truncate! { u32, u32 }
 impl_truncate! { isize, isize }

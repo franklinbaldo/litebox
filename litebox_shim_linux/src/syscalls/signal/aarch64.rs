@@ -15,7 +15,7 @@ use crate::syscalls::signal::{DeliverFault, SignalState};
 use crate::{ShimFS, ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
 use litebox::mm::linux::PAGE_SIZE;
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _, WidenExt as _};
+use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
     AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,
     signal::{SigAction, Siginfo, Ucontext, aarch64::Sigcontext},
@@ -259,7 +259,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
         let mut regs = [0u64; AARCH64_GENERAL_REGISTER_COUNT];
         for (dst, src) in regs.iter_mut().zip(ctx.regs.iter()) {
-            *dst = (*src).widen();
+            *dst = *src as u64;
         }
 
         let frame = SignalFrame {
@@ -272,10 +272,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                 __unused: [0; _],
                 __align_pad: [0; _],
                 mcontext: Sigcontext {
-                    fault_address: last_exception.fault_address.widen(),
+                    fault_address: last_exception.fault_address as u64,
                     regs,
-                    sp: ctx.sp.widen(),
-                    pc: ctx.pc.widen(),
+                    sp: ctx.sp as u64,
+                    pc: ctx.pc as u64,
                     pstate: ctx.pstate,
                     __reserved_pad: [0; _],
                     // All-zero is the kernel's terminating `_aarch64_ctx`
