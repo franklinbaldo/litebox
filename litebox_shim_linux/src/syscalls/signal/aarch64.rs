@@ -17,8 +17,8 @@ use core::mem::offset_of;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
-    AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,
-    signal::{SigAction, Siginfo, Ucontext, aarch64::Sigcontext},
+    signal::{aarch64::Sigcontext, SigAction, Siginfo, Ucontext},
+    MapFlags, ProtFlags, PtRegs, AARCH64_GENERAL_REGISTER_COUNT,
 };
 use litebox_syscall_rewriter::{
     AARCH64_SVC_FRAME_BYTES, AARCH64_SVC_FRAME_RETADDR_OFFSET, AARCH64_SVC_FRAME_STUB_OFFSET,
@@ -211,10 +211,7 @@ mod trampoline {
 /// The stub is one anonymous `PROT_READ | PROT_EXEC` guest page obtained through
 /// the shim's ordinary `mmap` path, so it is a first-class, *reserved* mapping
 /// in the process's memory manager: `mmap` will never hand the same range out
-/// again, and it cannot silently overwrite another object. (Contrast the
-/// rewriter's appended trampoline, whose placement is not covered by any
-/// reservation — see the TODO on `trampoline_addr_for`. Deliberately not
-/// repeating that here.)
+/// again, and it cannot silently overwrite another object.
 ///
 /// It lives for the life of the address space. A guest *can* `munmap` it, just
 /// as it can `munmap` the vDSO on a real kernel; the consequence is identical

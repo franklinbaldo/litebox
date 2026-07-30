@@ -2424,7 +2424,8 @@ mod tests {
     /// max-page-size on x86-64 is 0x200000, so x86-64 objects routinely have a
     /// `p_align` above the page size -- but their placement must not move,
     /// because any change to this address changes which programs collide (see
-    /// the TODO on `trampoline_addr_for`). This also covers cross-rewriting an
+    /// "Why the slow-path rule is gated on `e_machine`" on
+    /// `trampoline_addr_for`). This also covers cross-rewriting an
     /// x86-64 binary from an aarch64 host, where `cfg(target_arch)` would be
     /// the wrong test.
     #[test]

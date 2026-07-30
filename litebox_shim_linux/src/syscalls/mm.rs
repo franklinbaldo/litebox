@@ -101,7 +101,8 @@ pub(crate) struct ElfPatchState {
     ///
     /// This is what the guest's dynamic loader reserves for the object, so it
     /// is the only region a trampoline can be placed in without risking another
-    /// object's pages. Empty when the base address could not be derived.
+    /// object's pages. Empty (`start == end`) when the load base could not be
+    /// derived, which whitelists nothing.
     load_span: (usize, usize),
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
     trampoline_cursor: usize,
@@ -794,9 +795,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } else {
                 0
             };
-            // Use the same placement rule as the rewriter so the runtime and
-            // ahead-of-time paths agree; see `trampoline_addr_for` for why the
-            // maximum segment alignment (not the page size) governs this.
+            // The ahead-of-time path uses `trampoline_placement_for`, which
+            // prefers a hole inside the object's own load span. This runtime
+            // path deliberately does not: it has no program-header view it can
+            // trust to pick a hole from a partially mapped file, so it takes
+            // the `trampoline_addr_for` fallback rule (see that function for
+            // why the maximum segment alignment, not the page size, governs
+            // it). For an AArch64 object that does have a usable hole the two
+            // paths therefore choose different addresses; that is fine, because
+            // `trampoline_range_is_safe_to_map` validates whatever comes out
+            // before anything is mapped, and refuses an address that would
+            // land on another object's live pages.
             let Ok(offset) = litebox_syscall_rewriter::trampoline_addr_for(
                 max_load_end,
                 max_load_align,
@@ -811,15 +820,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // The span the guest's dynamic loader reserves for this object. Used to
         // decide whether a trampoline address is one the object owns; see
         // `trampoline_range_is_safe_to_map`.
-        let load_base = if e_type == ET_DYN {
-            base_addr.unwrap_or(0)
+        //
+        // Unlike the placement guess above, this cannot fall back to a guessed
+        // base: the span is a *permission* to map over a range, so an unknown
+        // base has to yield the empty span (which whitelists nothing) rather
+        // than a link-time span that would whitelist somebody else's pages.
+        let load_span = if e_type == ET_DYN {
+            match base_addr {
+                None => (0, 0),
+                Some(load_base) => (
+                    load_base.wrapping_add(min_load_start.trunc()),
+                    load_base.wrapping_add(align_up(max_load_end.trunc(), PAGE_SIZE)),
+                ),
+            }
         } else {
-            0
+            (
+                min_load_start.trunc(),
+                align_up(max_load_end.trunc(), PAGE_SIZE),
+            )
         };
-        let load_span = (
-            load_base.wrapping_add(min_load_start.trunc()),
-            load_base.wrapping_add(align_up(max_load_end.trunc(), PAGE_SIZE)),
-        );
 
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();

@@ -16,10 +16,14 @@ syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 seccompiler = { version = "0.5.0" }
 
-# AArch64 only. The guest thread-pointer offset baked into rewritten binaries is
-# a rewriter/runtime ABI constant; depending on the rewriter lets
-# `tls_offset::GUEST_TPIDR` assert equality with it at compile time instead of
-# relying on a comment. Target-gated so no other target grows the edge, and
+# AArch64 only. The SVC-frame layout that the rewriter's outbound stub builds is
+# a rewriter/runtime ABI: `run_thread_arch` and `switch_to_guest` feed
+# `AARCH64_SVC_FRAME_BYTES` / `AARCH64_SVC_FRAME_STUB_OFFSET` /
+# `AARCH64_SVC_FRAME_X16_OFFSET` straight into `naked_asm!` as `const` operands,
+# so the two sides cannot drift. The same dependency supplies the gate
+# encodability bounds (`AARCH64_GUEST_TPIDR_OFFSET_ALIGN` /
+# `AARCH64_MAX_GUEST_TPIDR_OFFSET`) that `guest_tpidr_tp_offset` checks the
+# actual TLS layout against. Target-gated so no other target grows the edge, and
 # `default-features = false` to keep the rewriter's binary-only `std`/`anyhow`/
 # `clap` dependencies out of the graph.
 [target.'cfg(target_arch = "aarch64")'.dependencies]

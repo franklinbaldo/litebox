@@ -1,6 +1,8 @@
 # AArch64 support for `litebox_platform_linux_userland`
 
-Status: accepted design, not yet implemented.
+Status: implemented on `sanghle/aarch64-userland`. Retained as the design
+record; sections marked "resolved" describe how the shipped code differs from
+the original plan.
 
 Goal: run a rewritten static hello-world end to end under
 `litebox_runner_linux_userland` on `aarch64-unknown-linux-gnu`.
@@ -383,16 +385,20 @@ with the same user-address validation `is_valid_user_fs_base` applies on x86-64.
 This is what the shim needs for `CLONE_SETTLS`, since AArch64 has no
 `arch_prctl`.
 
-`litebox_shim_linux` does not currently build for AArch64: roughly 51 errors,
-concentrated in `syscalls/signal/mod.rs` (23), `syscalls/process.rs` (13),
-`lib.rs` (9) and `syscalls/mm.rs` (4), plus single errors in `misc.rs` and
-`file.rs`. These are predominantly `ExceptionInfo` and `PtRegs` field mismatches
-and x86-only syscall constants. Signal delivery is made to compile and be
-plausibly correct, but is not exercised by the hello-world target.
+`litebox_shim_linux` needed a port to AArch64: `ExceptionInfo` and `PtRegs`
+field mismatches and x86-only syscall constants throughout `syscalls/signal/`,
+`syscalls/process.rs`, `syscalls/mm.rs`, `misc.rs` and `file.rs`. Guest signal
+delivery is implemented and exercised end to end by
+`litebox_runner_linux_userland/tests/sigreturn.c`, which takes a real `SIGALRM`
+through the guest handler and back out via `rt_sigreturn`.
 
 ## 7. Verification
 
-1. `assert_tls_layout()` passes as a unit test, pinning `guest_tpidr` to +16.
+1. `assert_tls_layout()` passes as a unit test. It pins the block's *internal*
+   layout against `tls_offset` and checks that the block's thread-pointer offset
+   is still one a rewriter gate can encode. It deliberately asserts nothing
+   about the block's absolute position, which is a property of the whole link
+   (see §2).
 2. The crate builds and its existing unit tests (`test_raw_mutex`,
    `test_reserved_pages`, `test_seccomp_filter`) pass on AArch64.
 3. A `tests/loader.rs`-style direct `run_thread` exercises the transition
@@ -402,42 +408,57 @@ plausibly correct, but is not exercised by the hello-world target.
    `litebox_runner_linux_userland/tests/run.rs` hardcodes `lib/x86_64-linux-gnu`
    and needs an AArch64 arm.
 
-## 8. Known issues
+## 8. Resolved: trampoline placement
 
-### The appended trampoline can be placed inside another object
+The trampoline the rewriter appends used to live *outside* every `PT_LOAD`, so
+the dynamic loader never learned the range existed and never reserved it. Its
+address was chosen by `litebox_syscall_rewriter::trampoline_addr_for`, which can
+only establish that the address is clear of *its own* object and of the loader's
+scaffolding for that object — never that it is free overall. glibc packs objects
+adjacently, so no free gap is guaranteed, and by the time the shim mapped there
+the next object could already own the range.
 
-Accepted as a known issue and deliberately not fixed here. It is pre-existing
-and architecture-independent, not something this port introduces.
-
-The trampoline the rewriter appends lives *outside* every `PT_LOAD`, so the
-dynamic loader never learns the range exists and never reserves it. Its address
-is chosen at runtime by `litebox_syscall_rewriter::trampoline_addr_for`, which
-can only establish that the address is clear of *its own* object and of the
-loader's scaffolding for that object — never that it is free overall. glibc
-packs objects adjacently, so no free gap is guaranteed, and by the time the shim
-maps here the next object may already own the range.
-
-The failure mode is silent corruption of an adjacent object, not a clean error.
+The failure mode was silent corruption of an adjacent object, not a clean error.
 The shim maps the trampoline with `MAP_FIXED`; over a range *fully* covered by an
 existing mapping that straddles no mapping boundary, so it succeeds and simply
 replaces the victim's pages. Nothing faults until the overwritten bytes are used,
 arbitrarily far from the cause.
 
-Reproduction, with perl: `libperl` maps `[0xffffff1d0000, 0xffffff589000)`, and
-`libc`'s trampoline is placed at `[0xffffff1e0000, 0xffffff1ea000)` — 64 KiB
-*inside* libperl. Mapping it overwrites ~40 KiB of libperl's text/rodata,
+The motivating case, with perl: `libperl` maps `[0xffffff1d0000, 0xffffff589000)`,
+and `libc`'s trampoline was placed at `[0xffffff1e0000, 0xffffff1ea000)` — 64 KiB
+*inside* libperl. Mapping it overwrote ~40 KiB of libperl's text/rodata,
 corrupting a `DT_NEEDED` string. The baseline placement rule overlapped libperl
-too, by 0x8000, so this is not a regression from the aarch64 placement change.
+too, by 0x8000, so this was never a regression from the aarch64 placement change.
 
-Adjusting the arithmetic in `trampoline_addr_for` cannot fix this, only change
-which programs collide. The likely fix is to stop guessing at a free gap at
-runtime and make the range genuinely reserved: have the rewriter emit a `PT_LOAD`
-covering the trampoline, so the dynamic loader maps it as part of the object's
-span and places everything else clear of it — the guarantee every ordinary
-segment already has. The `TODO` lives on `trampoline_addr_for`, where the
-address is chosen.
+Adjusting the arithmetic in `trampoline_addr_for` could not fix this, only change
+which programs collide. The fix, in two halves:
+
+1. **Stop guessing at a free gap.** `trampoline_placement_for` prefers a hole
+   *inside* the object's own `PT_LOAD` span — an inter-segment gap the loader
+   reserves for this object and maps `PROT_NONE` — and only falls back to
+   `trampoline_addr_for`'s past-the-end address when the object has no usable
+   hole. A hole inside the reservation carries the same guarantee an ordinary
+   segment has: no other object can be placed there.
+2. **Validate whatever address comes out.** `litebox_shim_linux`'s
+   `trampoline_range_is_safe_to_map` refuses to map a trampoline over another
+   mapping's live pages, so an impossible layout fails loudly instead of
+   corrupting memory silently. This covers the fallback path, and the runtime
+   patching path in `syscalls/mm.rs`, which has no trustworthy program-header
+   view and so always uses the fallback rule.
+
+`trampoline_addr_for`'s slow-path rule remains gated on `EM_AARCH64`. That is
+risk management, not semantics: because any change to the fallback address
+changes which programs happen to collide, x86-64 keeps the historical
+page-granular rule until the trampoline gets a `PT_LOAD` of its own.
 
 ## 9. Out of scope
 
-Threads, dynamic linking, real signal delivery to the guest, and the full
-`tests/run.rs` matrix.
+Threads, dynamic linking and guest signal delivery are all implemented and
+covered by `tests/run.rs` on AArch64. What remains out of scope here:
+
+- Giving the appended trampoline its own `PT_LOAD`, which would let
+  `trampoline_addr_for`'s `e_machine` gate go away (§8).
+- AArch64 hosts other than Linux userland; the local-exec anchor and the
+  `TPIDR_EL0` virtualization are shared, but nothing else is ported.
+- Cross-rewriting AArch64 guests from an x86-64 host, which the rewriter
+  supports but no test exercises.

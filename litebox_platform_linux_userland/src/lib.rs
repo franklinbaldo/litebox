@@ -1801,7 +1801,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 ///
 /// `interrupt_signal_handler` case 3 tests whether the interrupted PC lies
 /// inside this range. The range must span **every** instruction from the
-/// `in_guest` store onward, not merely the final few: `mov sp, x16` installs
+/// `in_guest` store onward, not merely the final few: `mov sp, x4` installs
 /// the *guest* stack pointer roughly twenty instructions before `br x16`, and
 /// for that entire window neither the host nor the guest register state is
 /// self-consistent. `interrupt_callback` is what repairs it, by reloading `SP`

@@ -211,7 +211,7 @@
 use alloc::format;
 use alloc::vec::Vec;
 
-use crate::{Error, Result, TextSectionInfo, checked_add_u64};
+use crate::{checked_add_u64, Error, Result, TextSectionInfo};
 
 // ============================================================
 // Constants
@@ -1502,11 +1502,9 @@ mod tests {
             "handler ends in BR X16"
         );
         // No MRS TPIDR_EL0 anywhere in the handler.
-        assert!(
-            !words
-                .iter()
-                .any(|&w| w & MRS_TPIDR_EL0_MASK == MRS_TPIDR_EL0_BITS)
-        );
+        assert!(!words
+            .iter()
+            .any(|&w| w & MRS_TPIDR_EL0_MASK == MRS_TPIDR_EL0_BITS));
     }
 
     #[test]
@@ -1588,15 +1586,13 @@ mod tests {
     fn encoder_range_checks() {
         assert!(Insn::B(2).encode().is_none()); // not 4-aligned
         assert!(Insn::B(1 << 27).encode().is_none()); // out of ±128MB
-        assert!(
-            Insn::StrUimm {
-                rt: 0,
-                rn: 0,
-                imm_bytes: 4
-            }
-            .encode()
-            .is_none()
-        ); // not 8-scaled
+        assert!(Insn::StrUimm {
+            rt: 0,
+            rn: 0,
+            imm_bytes: 4
+        }
+        .encode()
+        .is_none()); // not 8-scaled
     }
 
     #[test]
@@ -1796,9 +1792,7 @@ mod tests {
             let (_p, tramp) = hook_words(&[msr_tpidr_el0(n)], 0x1000, 0x500000);
             let gate = &tramp[GATES_START_OFFSET..GATES_START_OFFSET + MSR_GATE_SIZE];
             // Self-contained: never BL out.
-            assert!(
-                (0..MSR_GATE_INSNS).all(|i| word_at(gate, i * 4) & OPCODE_TOP6_MASK != BL_TOP6)
-            );
+            assert!((0..MSR_GATE_INSNS).all(|i| word_at(gate, i * 4) & OPCODE_TOP6_MASK != BL_TOP6));
             // Capture the guest value while pristine: STR Xn, [SP, #16].
             let capture = Insn::StrUimm {
                 rt: n,
