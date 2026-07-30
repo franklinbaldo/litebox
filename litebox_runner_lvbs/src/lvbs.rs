@@ -8,14 +8,14 @@ use litebox_platform_lvbs::{
     host::{
         bootparam::save_boot_info,
         per_cpu_variables::{
-            allocate_per_cpu_variables, init_per_cpu_variables, PerCpuVariablesAsm,
+            PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
         },
     },
     mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
     serial_println,
 };
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
+use x86_64::structures::paging::PageTableFlags;
 
 /// `log` backend that forwards to the serial console.
 struct HostLogger;

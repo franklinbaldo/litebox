@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// This crate is x86-64-only: it depends on `litebox_common_lvbs`, `litebox_common_optee` and
+// `litebox_shim_optee`, which are themselves gated on `target_arch = "x86_64"` and so compile to
+// empty crates elsewhere. `src/main.rs` already carries the same gate.
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 extern crate alloc;
