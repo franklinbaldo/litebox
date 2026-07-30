@@ -308,19 +308,21 @@ impl Vtl0Gate for MockVtl0Gate {
             .new_ranges
             .iter()
             .any(|&range| ranges_overlap(&state.owned_ranges, range))
-            || txn.protection_updates.keys().any(|&range| {
-                !ranges_cover(&state.owned_ranges, range)
-                    && !txn
-                        .new_ranges
-                        .iter()
-                        .any(|&new| new.0 <= range.0 && range.1 <= new.1)
-            })
         {
             return Err(VsmError::ProtectedFrameOverlap);
         }
-        for range in txn.new_ranges {
-            insert_range(&mut state.owned_ranges, range);
+        let mut committed_ownership = state.owned_ranges.clone();
+        for &range in &txn.new_ranges {
+            insert_range(&mut committed_ownership, range);
         }
+        if txn
+            .protection_updates
+            .keys()
+            .any(|&range| !ranges_cover(&committed_ownership, range))
+        {
+            return Err(VsmError::ProtectedFrameOverlap);
+        }
+        state.owned_ranges = committed_ownership;
         for (range, attr) in txn.protection_updates {
             apply_protection(&mut state.protections, range, attr);
         }
@@ -633,6 +635,26 @@ mod tests {
                 (0x10000, 0x11000, MemAttr::MEM_ATTR_READ),
                 (0x14000, 0x15000, MemAttr::MEM_ATTR_EXEC),
             ]
+        );
+    }
+
+    #[test]
+    fn transaction_commit_accepts_protection_covered_by_adjacent_new_ranges() {
+        let gate = MockVtl0Gate::new();
+
+        gate.protect_frames_transactionally(&[], &mut |txn| {
+            assert_eq!(
+                txn.reserve(&[frame_range(0x10000, 0x12000), frame_range(0x12000, 0x14000),])?,
+                vec![ReservationStatus::New, ReservationStatus::New]
+            );
+            txn.protect(frame_range(0x10000, 0x14000), MemAttr::MEM_ATTR_READ)
+        })
+        .unwrap();
+
+        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x14000)]);
+        assert_eq!(
+            gate.protections(),
+            vec![(0x10000, 0x14000, MemAttr::MEM_ATTR_READ)]
         );
     }
 
