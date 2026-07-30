@@ -146,9 +146,29 @@ Two properties are asserted rather than assumed. The measured offset must be
 8-aligned (the immediate's scale) and at most `0xFFF * 8 = 32760`. Both hold by
 construction — the block is `.align 3`, and 32KB of static TLS ahead of us is
 not a thing — but an exotic link now fails legibly at startup instead of
-faulting inside a guest gate. The placeholder is chosen so that an *unpatched*
-gate dereferences 32KB past the thread pointer and faults, rather than silently
-reading live host TLS.
+faulting inside a guest gate.
+
+The placeholder saturates the immediate for the scan's benefit and for nothing
+else. In particular an **unpatched gate does not fault**. It reads *and* writes
+the guest thread pointer at the same address 32KB past the host anchor, so it is
+self-consistent: a guest exercising `__thread` variables and `errno` produces
+entirely correct results while quietly corrupting eight bytes of whatever the
+host has mapped there. There is no symptom to notice, so the absence of
+placeholders is *checked* rather than trusted. The loader's
+`finalize_aarch64_trampoline_gates` treats three things as fatal for the binary,
+unmapping the staged trampoline and refusing the mapping:
+
+1. the platform supplying no `guest_tpidr_offset()`, which on a host that runs
+   AArch64 guests is a configuration error rather than a valid state;
+2. the rewriter rejecting the blob or the offset; and
+3. any placeholder surviving the patch pass, per
+   `aarch64_find_guest_tpidr_placeholder`.
+
+Case 3 is a scan of the staged bytes rather than a count of patched sites,
+because a count cannot distinguish "this trampoline has no gates" from "this
+pass did not recognize its gates". Case 1 is why a post-patch check alone would
+not have been enough: the loader used to skip patching altogether when the
+platform reported nothing.
 
 ### Removed: the `litebox_tls.ld` linker script
 

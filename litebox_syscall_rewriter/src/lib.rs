@@ -60,9 +60,26 @@ pub use arm64::MAX_GUEST_TPIDR_OFFSET as AARCH64_MAX_GUEST_TPIDR_OFFSET;
 /// [`AARCH64_GUEST_TPIDR_OFFSET_ALIGN`] or exceeds
 /// [`AARCH64_MAX_GUEST_TPIDR_OFFSET`], or if `trampoline` is not a well-formed
 /// blob this crate emitted. A loader must treat either as fatal for the binary:
-/// running an unpatched gate would dereference the placeholder.
+/// an unpatched gate does not fault, it silently redirects the guest's thread
+/// pointer into host memory 32KB past the anchor.
 pub fn aarch64_patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
     arm64::patch_guest_tpidr_offset(trampoline, offset)
+}
+
+/// Byte offset of the first gate in an emitted AArch64 trampoline that still
+/// carries the rewriter's guest thread-pointer placeholder, or `None` if every
+/// gate has been patched.
+///
+/// A loader must call this after [`aarch64_patch_guest_tpidr_offset`] and
+/// refuse to make the trampoline executable if it returns `Some`. The check is
+/// not belt-and-braces: an unpatched gate does **not** fault. It reads and
+/// writes the same address 32KB past the host thread pointer, so it is
+/// self-consistent — the guest runs correctly while silently corrupting eight
+/// bytes of host memory. A loader that skips patching (say, because its
+/// platform reported no offset) therefore has no symptom to notice, and this
+/// is the only thing standing between that mistake and memory corruption.
+pub fn aarch64_find_guest_tpidr_placeholder(trampoline: &[u8]) -> Option<usize> {
+    arm64::find_guest_tpidr_placeholder(trampoline)
 }
 
 /// Size of the stack frame an AArch64 `SVC` gate carves out of the guest stack.

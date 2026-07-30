@@ -170,6 +170,14 @@
 //! has one of the two register shapes a gate emits, so a blob this crate did not
 //! produce is rejected rather than silently mangled.
 //!
+//! The placeholder saturates the immediate to make that scan exact, and for no
+//! other reason. An *unpatched* gate does not fault: it reads and writes the
+//! guest thread pointer at the same address 32KB past the host anchor, so it is
+//! self-consistent and a guest running on it behaves correctly while corrupting
+//! eight bytes of host memory. A loader therefore cannot rely on noticing the
+//! mistake later; it must call [`find_guest_tpidr_placeholder`] and refuse to
+//! map the trampoline if anything is left.
+//!
 //! ## Signal returns
 //!
 //! This crate emits no sigreturn gate; `rt_sigreturn` is handled by the runtime.
@@ -282,14 +290,20 @@ pub const MAX_GUEST_TPIDR_OFFSET: u16 = 0xFFF * GUEST_TPIDR_OFFSET_ALIGN;
 /// access, to be replaced at load time by [`patch_guest_tpidr_offset`].
 ///
 /// Deliberately [`MAX_GUEST_TPIDR_OFFSET`], the largest value the field can
-/// hold. Two reasons:
+/// hold, because it cannot collide with a real runtime offset (a static TLS
+/// control block 32KB past the thread pointer is not a thing). That makes a
+/// scan for it exact: it can never mistake an already-patched gate for an
+/// unpatched one, which is what lets both [`patch_guest_tpidr_offset`] and
+/// [`find_guest_tpidr_placeholder`] work off the emitted words alone, with no
+/// side table of patch sites.
 ///
-/// * it cannot collide with a real runtime offset (a static TLS control block
-///   32KB past the thread pointer is not a thing), so a scan for it cannot
-///   mistake an already-patched gate for an unpatched one; and
-/// * an *unpatched* gate therefore dereferences an address 32KB past the thread
-///   pointer, which is unmapped and faults, rather than silently reading or
-///   corrupting live host TLS.
+/// It buys **no** safety at run time. An unpatched gate does not fault: it
+/// reads and writes the same address 32KB past the host thread pointer, so it
+/// is self-consistent and a guest using it behaves correctly while quietly
+/// corrupting eight bytes of whatever the host happens to have mapped there.
+/// Nothing may rely on an unpatched gate trapping. A loader must instead prove
+/// no placeholder survives — see [`find_guest_tpidr_placeholder`] — before
+/// making a trampoline executable.
 pub const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
 
 // --- SVC gate stack frame ---
@@ -1208,8 +1222,7 @@ pub(crate) fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Re
         )));
     }
 
-    let placeholder_imm = u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER / GUEST_TPIDR_OFFSET_ALIGN)
-        << LDST_UIMM12_IMM_SHIFT;
+    let placeholder_imm = placeholder_imm_field();
     let ldr_pattern = Opcode::LdrUimm.bits() | placeholder_imm;
     let str_pattern = Opcode::StrUimm.bits() | placeholder_imm;
     let new_imm = u32::from(offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
@@ -1250,6 +1263,42 @@ pub(crate) fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Re
     }
 
     Ok(patched)
+}
+
+/// The `imm12` field, already shifted into place, that an unpatched gate's
+/// `LDR`/`STR` carries.
+fn placeholder_imm_field() -> u32 {
+    u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT
+}
+
+/// Byte offset of the first instruction in `trampoline` that still carries
+/// [`GUEST_TPIDR_OFFSET_PLACEHOLDER`], or `None` if no gate is left unpatched.
+///
+/// This is the loader's proof obligation. An unpatched gate does *not* fault:
+/// it reads and writes the same bogus address, so it is self-consistent and the
+/// guest keeps working while corrupting eight bytes of host memory 32KB past
+/// the thread pointer. Nothing observable goes wrong, which is exactly why the
+/// absence of placeholders has to be checked rather than assumed.
+///
+/// Like [`patch_guest_tpidr_offset`] this skips the header's callback slot,
+/// which is a 64-bit address and could bit-for-bit resemble a gate
+/// instruction. Only the shape-independent opcode-and-immediate pattern is
+/// matched: a placeholder-bearing word in a shape no gate emits is still a
+/// reason to refuse, not to ignore.
+pub(crate) fn find_guest_tpidr_placeholder(trampoline: &[u8]) -> Option<usize> {
+    let placeholder_imm = placeholder_imm_field();
+    let ldr_pattern = Opcode::LdrUimm.bits() | placeholder_imm;
+    let str_pattern = Opcode::StrUimm.bits() | placeholder_imm;
+
+    trampoline
+        .get(SHARED_SVC_HANDLER_OFFSET..)?
+        .chunks_exact(4)
+        .position(|word| {
+            let insn = u32::from_le_bytes(word.try_into().expect("chunks_exact(4) yields 4 bytes"));
+            let opcode_and_imm = insn & LDST_UIMM12_OPCODE_AND_IMM_MASK;
+            opcode_and_imm == ldr_pattern || opcode_and_imm == str_pattern
+        })
+        .map(|index| SHARED_SVC_HANDLER_OFFSET + index * 4)
 }
 
 // ============================================================
@@ -1985,6 +2034,53 @@ mod tests {
             callback,
             "the callback slot is data and must survive verbatim"
         );
+    }
+
+    /// The check a loader needs: an unpatched gate is *detectable*, because it
+    /// is not detectable any other way. It does not fault when executed — it
+    /// reads and writes the same address 32KB past the thread pointer, so the
+    /// guest behaves correctly and quietly corrupts host memory.
+    #[test]
+    fn find_placeholder_reports_gates_before_patching_and_none_after() {
+        let (_p, mut tramp) = hook_words(
+            &[msr_tpidr_el0(3), Insn::MrsTpidrEl0(9).encode().unwrap()],
+            0x1000,
+            0x400000,
+        );
+
+        let at = find_guest_tpidr_placeholder(&tramp).expect("an unpatched gate must be found");
+        assert!(at >= SHARED_SVC_HANDLER_OFFSET && at.is_multiple_of(4));
+
+        assert_eq!(
+            patch_guest_tpidr_offset(&mut tramp, MEASURED_OFFSET).unwrap(),
+            2
+        );
+        assert_eq!(
+            find_guest_tpidr_placeholder(&tramp),
+            None,
+            "patching must leave no gate on the placeholder"
+        );
+    }
+
+    #[test]
+    fn find_placeholder_ignores_svc_gates_and_the_callback_slot() {
+        // An SVC-only trampoline has no thread-pointer gate at all, and its
+        // `LDR`/`STR` words off `SP` must not be mistaken for one.
+        let (_p, tramp) = hook_words(&[SVC_0], 0x1000, 0x400000);
+        assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
+
+        // The callback slot is a 64-bit address, i.e. data. Even when it
+        // happens to spell a placeholder-bearing gate load, it is not one.
+        let decoy = Insn::LdrUimm {
+            rt: 9,
+            rn: 9,
+            imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+        }
+        .encode()
+        .unwrap();
+        let callback = (u64::from(decoy) << 32) | u64::from(decoy);
+        let tramp = hook_words_with_callback(&[SVC_0], 0x1000, 0x400000, callback);
+        assert_eq!(find_guest_tpidr_placeholder(&tramp), None);
     }
 
     #[test]

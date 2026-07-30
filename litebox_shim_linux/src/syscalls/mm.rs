@@ -29,6 +29,62 @@ compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is loss
 
 const ENDIAN: LittleEndian = LittleEndian;
 
+/// Bakes the runtime's guest thread-pointer offset into every gate of a staged
+/// AArch64 trampoline, and proves none was left holding the rewriter's
+/// placeholder.
+///
+/// AArch64-rewritten guests have no thread pointer of their own: the host owns
+/// the hardware `TPIDR_EL0` anchor, and every guest `MRS`/`MSR TPIDR_EL0` was
+/// rewritten into a load/store of a runtime-owned slot at
+/// `[TPIDR_EL0 + guest_tpidr_offset]`. The rewriter cannot know that offset —
+/// it is a property of the *host* binary's link — so it emits a placeholder
+/// and the offset is patched in here, on the staging buffer, before the region
+/// is written let alone made executable.
+///
+/// Both failures below are fatal for the object, and deliberately so. An
+/// unpatched gate does not trap: it reads and writes the *same* address 32KB
+/// past the host thread pointer, so it is self-consistent, and a guest running
+/// on it produces entirely correct results while corrupting eight bytes of
+/// whatever the host has mapped there. There is no symptom to notice later,
+/// which is why this is checked here and refused rather than warned about.
+///
+/// # Errors
+///
+/// Fails if the platform reports no offset — on a platform that runs AArch64
+/// guests that is a configuration error, not a valid state, since every
+/// rewritten object's gates depend on it — or if the rewriter rejects the blob,
+/// or if any placeholder survives the patch pass.
+#[cfg(target_arch = "aarch64")]
+fn finalize_aarch64_trampoline_gates(
+    platform: &impl litebox::platform::SystemInfoProvider,
+    trampoline: &mut [u8],
+) -> Result<(), alloc::string::String> {
+    use alloc::format;
+
+    let Some(offset) = platform.guest_tpidr_offset() else {
+        return Err(alloc::string::String::from(
+            "platform supplied no guest thread-pointer offset, so every gate in this trampoline \
+             would keep the rewriter's placeholder and redirect the guest's thread pointer into \
+             host memory",
+        ));
+    };
+
+    litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset(trampoline, offset)
+        .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))?;
+
+    // The patch pass reports how many sites it rewrote, but a count cannot
+    // distinguish "no gates" from "gates this pass failed to recognize". Scan
+    // the staged bytes for the placeholder itself instead: that is the exact
+    // property the guest's correctness depends on.
+    if let Some(at) = litebox_syscall_rewriter::aarch64_find_guest_tpidr_placeholder(trampoline) {
+        return Err(format!(
+            "trampoline byte {at} still holds the guest thread-pointer placeholder after patching \
+             with offset {offset}"
+        ));
+    }
+    Ok(())
+}
+
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
@@ -853,7 +909,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
                 }
 
-                // Patch the AArch64 guest thread-pointer offset into this
+                // Bake the AArch64 guest thread-pointer offset into this
                 // object's gates. Every rewritten object carries its own
                 // trampoline, and every one of them is set up right here: the
                 // initial executable and the interpreter, because the ELF
@@ -862,15 +918,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // library the guest's own dynamic linker maps. Done on the
                 // staging buffer, so the gates are already correct the first
                 // time the region is written, let alone made executable.
-                if let Some(offset) = self.global.platform.guest_tpidr_offset()
-                    && let Err(e) = litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset(
-                        &mut tramp_data,
-                        offset,
-                    )
+                #[cfg(target_arch = "aarch64")]
+                if let Err(e) =
+                    finalize_aarch64_trampoline_gates(&*self.global.platform, &mut tramp_data)
                 {
-                    // The gates still hold the rewriter's placeholder, which
-                    // faults on use, and the code already branches to them.
-                    litebox_util_log::warn!(err:? = e; "failed to patch guest thread-pointer offset into trampoline");
+                    litebox_util_log::error!(err:% = e; "refusing to map a trampoline whose guest thread-pointer gates are not patched");
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
@@ -1175,6 +1227,93 @@ mod tests {
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
+
+    /// The loader's gate-finalization step: what it accepts, and what it must
+    /// refuse rather than map.
+    ///
+    /// The refusals matter more than the acceptance. A trampoline that keeps
+    /// the rewriter's placeholder runs *correctly* — each gate reads and writes
+    /// the guest thread pointer at the same bogus address 32KB past the host
+    /// anchor, so the guest is self-consistent and only host memory suffers.
+    /// Nothing downstream can notice, so this is the only place the mistake can
+    /// be caught.
+    #[cfg(target_arch = "aarch64")]
+    mod aarch64_trampoline_gates {
+        use litebox::platform::SystemInfoProvider;
+
+        /// A platform that supplies whatever offset the test wants — including
+        /// none, which is what a misconfigured AArch64 platform looks like.
+        struct StubPlatform(Option<u16>);
+
+        impl SystemInfoProvider for StubPlatform {
+            fn get_syscall_entry_point(&self) -> usize {
+                0
+            }
+            fn get_vdso_address(&self) -> Option<usize> {
+                None
+            }
+            fn guest_tpidr_offset(&self) -> Option<u16> {
+                self.0
+            }
+        }
+
+        /// A trampoline holding one unpatched MRS gate load,
+        /// `LDR X9, [X9, #placeholder]`, behind the 8-byte callback slot and
+        /// the 8-byte shared SVC handler.
+        fn unpatched_trampoline() -> alloc::vec::Vec<u8> {
+            const LDR_UIMM12: u32 = 0xF940_0000;
+            let imm12 = u32::from(
+                litebox_syscall_rewriter::AARCH64_MAX_GUEST_TPIDR_OFFSET
+                    / litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET_ALIGN,
+            );
+            let gate = LDR_UIMM12 | (imm12 << 10) | (9 << 5) | 9;
+            let mut tramp = alloc::vec![0u8; 16];
+            tramp.extend_from_slice(&gate.to_le_bytes());
+            assert_eq!(
+                litebox_syscall_rewriter::aarch64_find_guest_tpidr_placeholder(&tramp),
+                Some(16),
+                "the fixture must start out unpatched, or these tests prove nothing"
+            );
+            tramp
+        }
+
+        #[test]
+        fn a_supplied_offset_is_baked_into_every_gate() {
+            let mut tramp = unpatched_trampoline();
+            super::super::finalize_aarch64_trampoline_gates(&StubPlatform(Some(96)), &mut tramp)
+                .expect("a well-formed trampoline and a valid offset must be accepted");
+            assert_eq!(
+                litebox_syscall_rewriter::aarch64_find_guest_tpidr_placeholder(&tramp),
+                None
+            );
+        }
+
+        #[test]
+        fn a_platform_with_no_offset_is_refused() {
+            let mut tramp = unpatched_trampoline();
+            let err =
+                super::super::finalize_aarch64_trampoline_gates(&StubPlatform(None), &mut tramp)
+                    .expect_err(
+                        "an AArch64 platform that supplies no offset must be fatal for the \
+                         binary, not a silent skip",
+                    );
+            assert!(err.contains("no guest thread-pointer offset"), "{err}");
+            // And the caller is not left thinking the blob is usable.
+            assert_eq!(
+                litebox_syscall_rewriter::aarch64_find_guest_tpidr_placeholder(&tramp),
+                Some(16)
+            );
+        }
+
+        #[test]
+        fn an_offset_no_gate_can_encode_is_refused() {
+            let mut tramp = unpatched_trampoline();
+            let err =
+                super::super::finalize_aarch64_trampoline_gates(&StubPlatform(Some(4)), &mut tramp)
+                    .expect_err("an offset the gates' scaled immediate cannot hold is fatal");
+            assert!(err.contains("failed to patch"), "{err}");
+        }
+    }
 
     #[test]
     fn test_anonymous_mmap() {

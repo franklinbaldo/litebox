@@ -994,8 +994,8 @@ fn guest_tpidr_tp_offset() -> u16 {
 /// `0xFFF * 8 = 32760`. Alignment is guaranteed by the block's own `.align 3`
 /// and AArch64's variant-1 TLS layout; the bound is 32KB of static TLS ahead of
 /// us, which nothing plausible reaches. Both are checked anyway, here, once, so
-/// that an exotic link fails legibly at startup instead of faulting inside a
-/// guest gate.
+/// that an exotic link fails legibly at startup rather than one rewritten
+/// binary at a time, as the loader's patch pass rejects the offset.
 ///
 /// # Panics
 ///
@@ -3919,6 +3919,107 @@ mod tests {
         );
         // `guest_tpidr` is the first field, so it is also the block base.
         assert_eq!(usize::from(offset), tprel_offset!(litebox_tls_block));
+    }
+
+    /// The load-time gate patching actually happens, and lands on *this*
+    /// runtime's `guest_tpidr` slot.
+    ///
+    /// This exists because nothing else can catch the patching being skipped.
+    /// An unpatched gate performs both the guest's thread-pointer read and its
+    /// write at the placeholder offset, so it is self-consistent: a guest built
+    /// on `__thread` variables and `errno` produces entirely correct results
+    /// while silently corrupting eight bytes of host memory 32KB past the
+    /// thread pointer. There is no wrong answer to observe. So this asserts on
+    /// the state instead — that no gate keeps the placeholder, and that the
+    /// address a patched gate dereferences is inside the runtime's own TLS
+    /// control block.
+    ///
+    /// It goes through [`litebox::platform::SystemInfoProvider`] rather than
+    /// [`super::guest_tpidr_tp_offset`] on purpose: that trait method is the
+    /// loader's only source for the offset, so a platform that stopped
+    /// supplying one — the exact configuration error this guards — fails here.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_gate_patching_lands_in_the_runtime_tls_block() {
+        use litebox::platform::SystemInfoProvider as _;
+
+        /// `LDR Xt, [Xn, #imm12*8]`, the 64-bit unsigned-offset form an MRS
+        /// gate uses to reach the guest thread-pointer slot.
+        const LDR_UIMM12: u32 = 0xF940_0000;
+        /// Position and extent of that scaled 12-bit immediate.
+        const IMM12_SHIFT: u32 = 10;
+        const IMM12_MASK: u32 = 0x003F_FC00;
+        const ALIGN: u16 = litebox_syscall_rewriter::AARCH64_GUEST_TPIDR_OFFSET_ALIGN;
+
+        // One MRS gate load — `LDR X9, [X9, #placeholder]` — behind the
+        // trampoline's 8-byte callback slot and 8-byte shared SVC handler.
+        // Encoded here rather than by running the rewriter over an ELF, but not
+        // taken on trust: the two rewriter entry points used below both
+        // validate the shape, and the assertion immediately following pins that
+        // this blob really is in the unpatched state.
+        let placeholder_imm12 =
+            u32::from(litebox_syscall_rewriter::AARCH64_MAX_GUEST_TPIDR_OFFSET / ALIGN);
+        let gate = LDR_UIMM12 | (placeholder_imm12 << IMM12_SHIFT) | (9 << 5) | 9;
+        let mut tramp = std::vec![0u8; 16];
+        tramp.extend_from_slice(&gate.to_le_bytes());
+        assert_eq!(
+            litebox_syscall_rewriter::aarch64_find_guest_tpidr_placeholder(&tramp),
+            Some(16),
+            "the synthetic gate must be in the state the rewriter emits, or everything below \
+             passes vacuously"
+        );
+
+        let platform = LinuxUserland::new(None);
+        let offset = platform.guest_tpidr_offset().expect(
+            "an AArch64 platform must supply a guest thread-pointer offset; without one the \
+             loader leaves every gate on the placeholder, which does not fault — it silently \
+             redirects the guest's thread pointer into host memory",
+        );
+        assert_eq!(
+            litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset(&mut tramp, offset).unwrap(),
+            1
+        );
+        assert_eq!(
+            litebox_syscall_rewriter::aarch64_find_guest_tpidr_placeholder(&tramp),
+            None,
+            "no gate may still hold the placeholder once the loader has staged the trampoline"
+        );
+
+        // Follow the patched gate the way the guest would. The offset is read
+        // back out of the instruction, not reused from `offset`, so a patch
+        // that wrote the immediate wrong is still caught.
+        let patched = u32::from_le_bytes(tramp[16..20].try_into().unwrap());
+        let gate_offset =
+            usize::try_from((patched & IMM12_MASK) >> IMM12_SHIFT).unwrap() * usize::from(ALIGN);
+        let tp: usize;
+        // SAFETY: reads the thread pointer; touches no memory.
+        unsafe {
+            core::arch::asm!(
+                "mrs {tp}, tpidr_el0",
+                tp = out(reg) tp,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        let gate_target = tp + gate_offset;
+
+        // Compared against the slot's address as the *linker* resolves it, so
+        // this is an independent check of the number rather than a restatement
+        // of it.
+        assert_eq!(
+            gate_target,
+            tp + tprel_offset!(guest_tpidr),
+            "a patched gate must dereference this thread's own `guest_tpidr` slot"
+        );
+
+        // And that address is inside the runtime's TLS control block — the
+        // property the placeholder violates by 32KB.
+        let block = tp + tprel_offset!(litebox_tls_block);
+        let block_end = block + super::tls_offset::OUTBOUND_PC + 8;
+        assert!(
+            (block..block_end).contains(&gate_target),
+            "gate dereferences {gate_target:#x}, outside the runtime TLS control block \
+             {block:#x}..{block_end:#x}"
+        );
     }
 
     /// Pins the `PtRegs` field offsets that the AArch64 transition assembly

@@ -534,9 +534,14 @@ pub trait SystemInfoProvider {
     /// loader patches in the value returned here before the trampoline becomes
     /// executable.
     ///
-    /// Returns `None` when the platform needs no such patching: every non-AArch64
-    /// platform, and any AArch64 platform that does not virtualize the guest
-    /// thread pointer this way. The default is `None`.
+    /// Returns `None` when the platform needs no such patching, i.e. every
+    /// non-AArch64 platform. On an AArch64 platform that runs rewritten guests
+    /// `None` is a configuration error rather than a valid state, and the
+    /// loader treats it as fatal for the binary: an unpatched gate does *not*
+    /// fault. It reads and writes the same address 32KB past the thread
+    /// pointer, so it is self-consistent and the guest goes on producing
+    /// correct results while silently corrupting eight bytes of host memory.
+    /// The default is `None`.
     fn guest_tpidr_offset(&self) -> Option<u16> {
         None
     }
