@@ -27,7 +27,9 @@ static void die(const char *msg) {
     exit(2);
 }
 
-// Spin hint: `pause` is x86-only; AArch64 spells it `yield`.
+// Defined locally rather than taken from `helpers.h`: this file predates that
+// header and defines its own `die()` with a different exit status, so including
+// it would change observable behaviour.
 #if defined(__x86_64__) || defined(__i386__)
 #define SPIN_HINT() __asm__ __volatile__("pause")
 #elif defined(__aarch64__)

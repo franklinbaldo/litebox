@@ -55,6 +55,14 @@ int test_pause_returns_eintr(void) {
 
 // Same check but via the raw syscall (no libc wrapper munging), since the
 // shim intercepts the raw syscall.
+//
+// `pause` is a legacy syscall that the asm-generic table omits, so it does not
+// exist on AArch64 (or any other architecture using the generic table); glibc
+// implements `pause()` there on top of `ppoll`. There is no raw `pause` to
+// exercise, so this case is skipped rather than emulated -- emulating it would
+// test our substitute, not the guest's syscall path. The libc-level cases above
+// and below still cover `pause()` on every architecture.
+#ifdef SYS_pause
 int test_pause_raw_syscall(void) {
     struct sigaction sa;
     sa.sa_handler = alarm_handler;
@@ -79,6 +87,7 @@ int test_pause_raw_syscall(void) {
     printf("pause_raw_syscall: PASS\n");
     return 0;
 }
+#endif // SYS_pause
 
 // pause() is never restarted, even when the catching handler was installed
 // with SA_RESTART. See `man 7 signal`: pause is one of the syscalls that
@@ -162,7 +171,11 @@ int main(void) {
     printf("Starting pause tests...\n");
 
     if (test_pause_returns_eintr() != 0) return 1;
+#ifdef SYS_pause
     if (test_pause_raw_syscall() != 0) return 1;
+#else
+    printf("pause_raw_syscall: SKIP (no SYS_pause on this architecture)\n");
+#endif
     if (test_pause_not_restarted_under_sa_restart() != 0) return 1;
     if (test_pause_ignores_ignored_signal() != 0) return 1;
 
