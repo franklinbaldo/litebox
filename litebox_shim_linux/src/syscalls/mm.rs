@@ -6,7 +6,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
+    mm::linux::{MappingError, PAGE_SIZE, PageRange, VmFlags},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
@@ -97,6 +97,12 @@ pub(crate) struct ElfPatchState {
     trampoline_file_size: usize,
     /// Start address of the trampoline region (runtime).
     trampoline_addr: usize,
+    /// The address range this object's `PT_LOAD` segments span, at runtime.
+    ///
+    /// This is what the guest's dynamic loader reserves for the object, so it
+    /// is the only region a trampoline can be placed in without risking another
+    /// object's pages. Empty when the base address could not be derived.
+    load_span: (usize, usize),
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
     trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
@@ -485,7 +491,71 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
             }
         }
-        self.sys_mprotect_raw(addr, len, prot)
+        self.mprotect_around_trampolines(addr.as_usize(), len, prot)
+    }
+
+    /// Applies `prot` to `[start, start + len)`, skipping any bytes occupied by
+    /// a trampoline.
+    ///
+    /// # Why the guest is not allowed to reprotect a trampoline
+    ///
+    /// A trampoline placed in an object's inter-segment gap sits inside a range
+    /// the guest's loader reprotects on its own account: glibc `mprotect`s
+    /// `[first_segment.mapend, last_segment.mapstart)` to `PROT_NONE` once it
+    /// has mapped the first segment, which is *after* the shim has populated
+    /// the trampoline. Letting that through would strip the trampoline's
+    /// executability and turn every rewritten syscall into a fault.
+    ///
+    /// The trampoline is LiteBox's own code injected into the guest's address
+    /// space, not something the guest asked for or knows about, so excluding it
+    /// from guest protection changes is the correct semantics generally, not
+    /// just a workaround for this one caller. The rest of the request is
+    /// applied normally, so a guest reprotecting a wider region still gets what
+    /// it asked for everywhere it can observe.
+    fn mprotect_around_trampolines(
+        &self,
+        start: usize,
+        len: usize,
+        prot: ProtFlags,
+    ) -> Result<(), Errno> {
+        let end = start.saturating_add(len);
+        let mut excluded: alloc::vec::Vec<(usize, usize)> = {
+            let cache = self.global.elf_patch_cache.lock();
+            cache
+                .values()
+                .filter(|state| state.trampoline_mapped && state.trampoline_mapped_len > 0)
+                .map(|state| {
+                    (
+                        state.trampoline_addr,
+                        state.trampoline_addr + state.trampoline_mapped_len,
+                    )
+                })
+                .filter(|&(lo, hi)| lo < end && hi > start)
+                .collect()
+        };
+        if excluded.is_empty() {
+            return self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(start), len, prot);
+        }
+        excluded.sort_unstable();
+
+        let mut cursor = start;
+        let mut result = Ok(());
+        for (lo, hi) in excluded {
+            if lo > cursor {
+                let r = self.sys_mprotect_raw(
+                    UserPtrMut::<u8>::from_usize(cursor),
+                    lo - cursor,
+                    ProtFlags::from_bits_retain(prot.bits()),
+                );
+                result = result.and(r);
+            }
+            cursor = cursor.max(hi);
+        }
+        if cursor < end {
+            let r = self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(cursor), end - cursor, prot);
+            result = result.and(r);
+        }
+        result
     }
 
     /// Raw mprotect without exec interception — used internally by the
@@ -658,6 +728,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
         // by matching the segment whose p_offset corresponds to file_offset.
         let mut max_load_end: u64 = 0;
+        let mut min_load_start: u64 = u64::MAX;
         let mut max_load_align: u64 = 0;
         let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
@@ -681,6 +752,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if end > max_load_end {
                 max_load_end = end;
             }
+            min_load_start = min_load_start.min(align_down(p_vaddr.trunc(), PAGE_SIZE) as u64);
             max_load_align = max_load_align.max(ph.p_align.get(ENDIAN));
             // Match segment by page-aligned file offset to derive base address.
             if base_addr.is_none()
@@ -736,6 +808,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             base + offset
         };
 
+        // The span the guest's dynamic loader reserves for this object. Used to
+        // decide whether a trampoline address is one the object owns; see
+        // `trampoline_range_is_safe_to_map`.
+        let load_base = if e_type == ET_DYN {
+            base_addr.unwrap_or(0)
+        } else {
+            0
+        };
+        let load_span = (
+            load_base.wrapping_add(min_load_start.trunc()),
+            load_base.wrapping_add(align_up(max_load_end.trunc(), PAGE_SIZE)),
+        );
+
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
@@ -743,6 +828,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             trampoline_file_offset: tramp_file_offset,
             trampoline_file_size: tramp_file_size.trunc(),
             trampoline_addr: trampoline_vaddr,
+            load_span,
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
@@ -750,6 +836,61 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
         });
+    }
+
+    /// Whether `[start, start + len)` may be handed to the trampoline's
+    /// `MAP_FIXED` without destroying anything.
+    ///
+    /// # Why this check has to exist
+    ///
+    /// The trampoline is described by no program header, so the guest's dynamic
+    /// loader cannot account for it, and the shim has to map it at an exact
+    /// address because the rewritten code already branches there. `MAP_FIXED`
+    /// over a range *fully* covered by an existing mapping straddles no mapping
+    /// boundary, so it does not fail -- it silently replaces the victim's pages.
+    /// Nothing faults until the overwritten code or data is used, arbitrarily
+    /// far from the cause. That failure mode has to be made impossible rather
+    /// than merely unlikely, so every trampoline address is validated here
+    /// before it is used, whatever rule produced it.
+    ///
+    /// # What counts as safe
+    ///
+    /// * Unmapped, or mapped `PROT_NONE`. A `PROT_NONE` range is a reservation
+    ///   with no contents to destroy -- either the guest loader's inter-segment
+    ///   hole or `ElfParsedFile::load`'s explicit trampoline reservation.
+    /// * Inside `load_span`, the object's own `PT_LOAD` span. The guest loader
+    ///   reserves that whole span for this object before mapping the individual
+    ///   segments into it, so no other object can be there, and the gap the
+    ///   rewriter picks is one the loader is about to make `PROT_NONE` anyway.
+    ///
+    /// Anything else is another object's live pages, and mapping over it is
+    /// refused.
+    fn trampoline_range_is_safe_to_map(
+        &self,
+        state: &ElfPatchState,
+        start: usize,
+        len: usize,
+    ) -> bool {
+        let end = start.saturating_add(len);
+        let (span_start, span_end) = state.load_span;
+        if span_start < span_end && start >= span_start && end <= span_end {
+            return true;
+        }
+        for (range, flags) in self.global.pm.mappings() {
+            if range.end <= start || range.start >= end {
+                continue;
+            }
+            if flags.intersects(VmFlags::VM_ACCESS_FLAGS) {
+                litebox_util_log::error!(
+                    tramp_start:? = start, tramp_end:? = end,
+                    victim_start:? = range.start, victim_end:? = range.end,
+                    victim_flags:? = flags;
+                    "refusing to map a trampoline over another mapping's live pages"
+                );
+                return false;
+            }
+        }
+        true
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
@@ -871,11 +1012,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let tramp_addr = state.trampoline_addr;
                 let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
 
-                // Allocate RW region at the trampoline address. Use MAP_FIXED
-                // because the code already contains JMPs to this exact address
-                // and we MUST map here. The region may already be reserved as
-                // PROT_NONE by the ElfLoader's reserve() call, which would
-                // cause MAP_FIXED_NOREPLACE to fail with EEXIST.
+                // The code already branches to this exact address, so there is
+                // nowhere else to put the trampoline: it is MAP_FIXED or
+                // nothing. MAP_FIXED_NOREPLACE is not an option because the
+                // range is legitimately already reserved, either PROT_NONE by
+                // `ElfParsedFile::load` or as part of this object's own span.
+                // That makes an explicit check the only thing standing between
+                // a bad address and silent corruption.
+                if !self.trampoline_range_is_safe_to_map(state, tramp_addr, tramp_len) {
+                    return false;
+                }
                 let alloc_result = self.do_mmap_anonymous(
                     Some(tramp_addr),
                     tramp_len,
