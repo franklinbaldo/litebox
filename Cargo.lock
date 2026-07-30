@@ -1809,6 +1809,7 @@ dependencies = [
  "p384",
  "sha2",
  "spin 0.10.0",
+ "tempfile",
  "thiserror",
  "zerocopy",
  "zeroize",

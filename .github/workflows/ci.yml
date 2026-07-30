@@ -49,6 +49,12 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install libssl-dev
+        # Used by litebox_shim_optee's differential test, which compiles the
+        # original OP-TEE C key derivation against libcrypto and diffs it
+        # against the Rust port.
+        run: |
+          sudo apt install -y libssl-dev
       - uses: Swatinem/rust-cache@v2
       - name: Cache custom out directories
         uses: actions/cache@v5
