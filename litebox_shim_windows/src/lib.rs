@@ -7,6 +7,11 @@
 //! The actual NT syscall, PE loading, and Windows process environment support
 //! will be filled in piece by piece.
 
+// This crate is x86-64-only: it reads and writes the x86-64 `PtRegs` register layout directly
+// (`rip`, `rsp`, `eflags`, `orig_rax`, ...). Following the convention used by the other
+// architecture-specific crates in this workspace, compile it away on other architectures so a
+// workspace build still succeeds there.
+#![cfg(target_arch = "x86_64")]
 #![no_std]
 
 extern crate alloc;
