@@ -920,7 +920,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 // time the region is written, let alone made executable.
                 #[cfg(target_arch = "aarch64")]
                 if let Err(e) =
-                    finalize_aarch64_trampoline_gates(&*self.global.platform, &mut tramp_data)
+                    finalize_aarch64_trampoline_gates(self.global.platform, &mut tramp_data)
                 {
                     litebox_util_log::error!(err:% = e; "refusing to map a trampoline whose guest thread-pointer gates are not patched");
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
