@@ -719,7 +719,10 @@ fn copy_heki_pages_from_vtl0<P: Vtl0Gate>(
         visited_pages.insert(cur_pa.as_u64());
 
         range = range.checked_add(heki_page.nranges)?;
-        if range < nranges && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa))
+        if range > nranges
+            || (range == nranges && heki_page.next_pa != 0)
+            || (range < nranges
+                && (heki_page.next_pa == 0 || visited_pages.contains(&heki_page.next_pa)))
         {
             return None;
         }
@@ -822,8 +825,10 @@ impl<'a> ValidatedTextPatch<'a> {
 mod tests {
     use super::Heki;
     use crate::test_support::MockVtl0Gate;
-    use alloc::vec::Vec;
-    use litebox_common_lvbs::{HEKI_MAX_RANGES, HekiRange, MemAttr, PAGE_SIZE};
+    use alloc::{vec, vec::Vec};
+    use litebox_common_lvbs::{
+        HEKI_MAX_RANGES, HekiPage, HekiRange, MemAttr, PAGE_SIZE, VsmError, Vtl0Gate,
+    };
 
     const TARGET_PA: u64 = 0x4000_0000;
     const TARGET_VA: u64 = 0xffff_8000_4000_0000;
@@ -875,6 +880,117 @@ mod tests {
         let (pa, nranges) = gate.write_heki_ranges(&[empty]);
 
         assert_eq!(heki.protect_memory(pa, nranges).unwrap(), 0);
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_calls_after_end_of_boot_without_protecting_frames() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let (pa, nranges) = gate.write_heki_ranges(&[protection_range(0, MemAttr::MEM_ATTR_READ)]);
+        gate.set_end_of_boot_reached();
+
+        assert!(matches!(
+            heki.protect_memory(pa, nranges),
+            Err(VsmError::OperationAfterEndOfBoot(
+                "kernel memory protection"
+            ))
+        ));
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_a_misaligned_range() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let mut range = protection_range(0, MemAttr::MEM_ATTR_READ);
+        range.pa += 1;
+        let (pa, nranges) = gate.write_heki_ranges(&[range]);
+
+        assert!(matches!(
+            heki.protect_memory(pa, nranges),
+            Err(VsmError::AddressNotPageAligned)
+        ));
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_accepts_unknown_attribute_bits_allowed_by_mem_attr() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let range = HekiRange {
+            attributes: u64::MAX,
+            ..protection_range(0, MemAttr::empty())
+        };
+        let expected_attr = range.mem_attr().unwrap();
+        let (pa, nranges) = gate.write_heki_ranges(&[range]);
+
+        assert_eq!(heki.protect_memory(pa, nranges).unwrap(), 0);
+        assert_eq!(
+            gate.protection_operations(),
+            vec![(range.pa, range.epa, expected_attr)]
+        );
+    }
+
+    #[test]
+    fn protect_memory_rejects_a_linked_page_cycle() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let ranges = vec![protection_range(0, MemAttr::MEM_ATTR_READ); HEKI_MAX_RANGES + 1];
+        let (first_pa, nranges) = gate.write_heki_ranges(&ranges);
+        let first = gate.read_vtl0_val::<HekiPage>(first_pa).unwrap();
+        let mut second = gate.read_vtl0_val::<HekiPage>(first.next_pa).unwrap();
+        second.next = first_pa;
+        second.next_pa = first_pa;
+        gate.overwrite_heki_page(first.next_pa, &second);
+
+        assert!(matches!(
+            heki.protect_memory(first_pa, nranges + 1),
+            Err(VsmError::HekiPagesCopyFailed)
+        ));
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_a_declared_total_larger_than_the_chain() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let (pa, nranges) = gate.write_heki_ranges(&[protection_range(0, MemAttr::MEM_ATTR_READ)]);
+
+        assert!(matches!(
+            heki.protect_memory(pa, nranges + 1),
+            Err(VsmError::HekiPagesCopyFailed)
+        ));
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_a_page_that_overshoots_the_declared_total() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let (pa, _) = gate.write_heki_ranges(&[
+            protection_range(0, MemAttr::MEM_ATTR_READ),
+            protection_range(1, MemAttr::MEM_ATTR_READ),
+        ]);
+
+        assert!(matches!(
+            heki.protect_memory(pa, 1),
+            Err(VsmError::HekiPagesCopyFailed)
+        ));
+        assert!(gate.protection_operations().is_empty());
+    }
+
+    #[test]
+    fn protect_memory_rejects_a_hidden_trailing_page() {
+        let gate = MockVtl0Gate::new();
+        let heki = Heki::new(gate.clone());
+        let ranges = vec![protection_range(0, MemAttr::MEM_ATTR_READ); HEKI_MAX_RANGES + 1];
+        let (pa, _) = gate.write_heki_ranges(&ranges);
+
+        assert!(matches!(
+            heki.protect_memory(pa, HEKI_MAX_RANGES as u64),
+            Err(VsmError::HekiPagesCopyFailed)
+        ));
         assert!(gate.protection_operations().is_empty());
     }
 

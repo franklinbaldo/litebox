@@ -103,6 +103,17 @@ impl MockVtl0Gate {
         (page_addresses[0], ranges.len() as u64)
     }
 
+    pub(super) fn overwrite_heki_page(&self, address: u64, page: &HekiPage) {
+        assert_eq!(
+            address % PAGE_SIZE as u64,
+            0,
+            "page address must be aligned"
+        );
+        // HekiPage is exactly one fully initialized 4 KiB page.
+        let bytes = unsafe { core::mem::transmute::<HekiPage, [u8; PAGE_SIZE]>(*page) };
+        self.state.lock().unwrap().pages.insert(address, bytes);
+    }
+
     pub(super) fn owned_ranges(&self) -> Vec<(u64, u64)> {
         self.state
             .lock()
