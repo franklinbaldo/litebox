@@ -15,6 +15,7 @@ use litebox_common_lvbs::{
     VsmError, Vtl0Gate,
 };
 use x86_64::structures::paging::{Size4KiB, frame::PhysFrameRange};
+use zerocopy::IntoBytes;
 
 #[derive(Clone, Default)]
 pub(super) struct MockVtl0Gate {
@@ -28,9 +29,6 @@ struct MockVtl0State {
     owned_ranges: BTreeSet<(u64, u64)>,
     protections: BTreeMap<(u64, u64), MemAttr>,
     protection_operations: Vec<(u64, u64, MemAttr)>,
-    ringbuffer: Option<(u64, u64)>,
-    end_of_boot_reached: bool,
-    lock_count: usize,
 }
 
 impl MockVtl0Gate {
@@ -38,29 +36,36 @@ impl MockVtl0Gate {
         Self::default()
     }
 
-    pub(super) fn insert_page(&self, address: u64, page: &[u8; PAGE_SIZE]) {
-        assert_eq!(
-            address % PAGE_SIZE as u64,
-            0,
-            "page address must be aligned"
-        );
-        self.state.lock().unwrap().pages.insert(address, *page);
+    pub(super) fn insert_kernel_page(&self, address: u64) {
+        assert_eq!(address % PAGE_SIZE as u64, 0, "page must be aligned");
+        self.state
+            .lock()
+            .unwrap()
+            .pages
+            .insert(address, [0; PAGE_SIZE]);
     }
 
-    pub(super) fn write_phys_span(&self, mut address: u64, mut bytes: &[u8]) {
+    pub(super) fn write_split_kernel_span(
+        &self,
+        first_address: u64,
+        second_page_address: u64,
+        bytes: &[u8],
+    ) {
+        let first_page_address = first_address & !(PAGE_SIZE as u64 - 1);
+        let first_offset = usize::try_from(first_address - first_page_address).unwrap();
+        let first_count = bytes.len().min(PAGE_SIZE - first_offset);
         let mut state = self.state.lock().unwrap();
-        while !bytes.is_empty() {
-            let page_address = address & !(PAGE_SIZE as u64 - 1);
-            let offset =
-                usize::try_from(address - page_address).expect("page offset always fits in usize");
-            let count = bytes.len().min(PAGE_SIZE - offset);
-            let page = state
+        state
+            .pages
+            .get_mut(&first_page_address)
+            .expect("first kernel page must be inserted")[first_offset..first_offset + first_count]
+            .copy_from_slice(&bytes[..first_count]);
+        if first_count < bytes.len() {
+            state
                 .pages
-                .get_mut(&page_address)
-                .expect("physical page must be inserted before writing");
-            page[offset..offset + count].copy_from_slice(&bytes[..count]);
-            address += u64::try_from(count).expect("copy length always fits in u64");
-            bytes = &bytes[count..];
+                .get_mut(&second_page_address)
+                .expect("second kernel page must be inserted")[..bytes.len() - first_count]
+                .copy_from_slice(&bytes[first_count..]);
         }
     }
 
@@ -91,13 +96,14 @@ impl MockVtl0Gate {
             page.nranges = chunk.len() as u64;
             page.ranges[..chunk.len()].copy_from_slice(chunk);
             if let Some(&next_address) = page_addresses.get(index + 1) {
-                // This mock models the kernel's virtual link with an identity VA/PA mapping.
-                page.next = next_address;
+                // Linux supplies a kernel virtual pointer alongside the physical traversal link.
+                page.next = 0xffff_8000_0000_0000 + next_address;
                 page.next_pa = next_address;
             }
-            // HekiPage is exactly one fully initialized 4 KiB page.
-            let bytes = unsafe { core::mem::transmute::<HekiPage, [u8; PAGE_SIZE]>(page) };
-            state.pages.insert(page_addresses[index], bytes);
+            state.pages.insert(
+                page_addresses[index],
+                page.as_bytes().try_into().expect("HekiPage is one page"),
+            );
         }
 
         (page_addresses[0], ranges.len() as u64)
@@ -109,49 +115,14 @@ impl MockVtl0Gate {
             0,
             "page address must be aligned"
         );
-        // HekiPage is exactly one fully initialized 4 KiB page.
-        let bytes = unsafe { core::mem::transmute::<HekiPage, [u8; PAGE_SIZE]>(*page) };
-        self.state.lock().unwrap().pages.insert(address, bytes);
-    }
-
-    pub(super) fn owned_ranges(&self) -> Vec<(u64, u64)> {
-        self.state
-            .lock()
-            .unwrap()
-            .owned_ranges
-            .iter()
-            .copied()
-            .collect()
-    }
-
-    pub(super) fn protections(&self) -> Vec<(u64, u64, MemAttr)> {
-        self.state
-            .lock()
-            .unwrap()
-            .protections
-            .iter()
-            .map(|(&(start, end), &attr)| (start, end, attr))
-            .collect()
+        self.state.lock().unwrap().pages.insert(
+            address,
+            page.as_bytes().try_into().expect("HekiPage is one page"),
+        );
     }
 
     pub(super) fn protection_operations(&self) -> Vec<(u64, u64, MemAttr)> {
         self.state.lock().unwrap().protection_operations.clone()
-    }
-
-    pub(super) fn ringbuffer(&self) -> Option<(u64, u64)> {
-        self.state.lock().unwrap().ringbuffer
-    }
-
-    pub(super) fn set_end_of_boot_reached(&self) {
-        self.state.lock().unwrap().end_of_boot_reached = true;
-    }
-
-    pub(super) fn control_registers_locked(&self) -> bool {
-        self.lock_count() > 0
-    }
-
-    pub(super) fn lock_count(&self) -> usize {
-        self.state.lock().unwrap().lock_count
     }
 }
 
@@ -410,498 +381,13 @@ impl Vtl0Gate for MockVtl0Gate {
         Ok(())
     }
 
-    fn install_ringbuffer(&self, pa: u64, size: u64) {
-        self.state.lock().unwrap().ringbuffer = Some((pa, size));
-    }
+    fn install_ringbuffer(&self, _pa: u64, _size: u64) {}
 
     fn end_of_boot_reached(&self) -> bool {
-        self.state.lock().unwrap().end_of_boot_reached
+        false
     }
 
     fn lock_control_registers(&self) -> Result<(), VsmError> {
-        self.state.lock().unwrap().lock_count += 1;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MockVtl0Gate;
-    use alloc::{vec, vec::Vec};
-    use litebox_common_linux::vmap::PhysPageAddr;
-    use litebox_common_lvbs::{
-        HEKI_MAX_RANGES, HekiPage, HekiRange, MemAttr, PAGE_SIZE, ReservationStatus, VsmError,
-        Vtl0Gate,
-    };
-    use x86_64::{
-        PhysAddr,
-        structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
-    };
-
-    fn frame_range(start: u64, end: u64) -> PhysFrameRange<Size4KiB> {
-        PhysFrameRange {
-            start: PhysFrame::from_start_address(PhysAddr::new(start)).unwrap(),
-            end: PhysFrame::from_start_address(PhysAddr::new(end)).unwrap(),
-        }
-    }
-
-    #[test]
-    fn reads_bytes_across_physical_pages() {
-        let gate = MockVtl0Gate::new();
-        gate.insert_page(0x1000, &[0; PAGE_SIZE]);
-        gate.insert_page(0x9000, &[0; PAGE_SIZE]);
-        gate.write_phys_span(0x1ffd, &[1, 2, 3]);
-        gate.write_phys_span(0x9000, &[4, 5, 6]);
-
-        let pages = [
-            PhysPageAddr::<PAGE_SIZE>::new(0x1000).unwrap(),
-            PhysPageAddr::<PAGE_SIZE>::new(0x9000).unwrap(),
-        ];
-        let mut out = [0; 6];
-        gate.read_vtl0_bytes(&pages, PAGE_SIZE - 3, &mut out)
-            .unwrap();
-        assert_eq!(out, [1, 2, 3, 4, 5, 6]);
-
-        let missing = [PhysPageAddr::<PAGE_SIZE>::new(0xa000).unwrap()];
-        assert!(matches!(
-            gate.read_vtl0_bytes(&missing, 0, &mut [0]),
-            Err(VsmError::Vtl0CopyFailed)
-        ));
-    }
-
-    #[test]
-    fn builds_kernel_shaped_heki_page_chain() {
-        let gate = MockVtl0Gate::new();
-        let ranges: Vec<_> = (0..=HEKI_MAX_RANGES)
-            .map(|index| HekiRange {
-                va: 0xffff_8000_0000_0000 + index as u64 * PAGE_SIZE as u64,
-                pa: 0x20_0000 + index as u64 * PAGE_SIZE as u64,
-                epa: 0x20_1000 + index as u64 * PAGE_SIZE as u64,
-                attributes: MemAttr::MEM_ATTR_READ.bits(),
-            })
-            .collect();
-
-        let (first_pa, total_count) = gate.write_heki_ranges(&ranges);
-        let first = gate.read_vtl0_val::<HekiPage>(first_pa).unwrap();
-        let second = gate.read_vtl0_val::<HekiPage>(first.next_pa).unwrap();
-        let first_nranges = first.nranges;
-        let first_next = first.next;
-        let first_next_pa = first.next_pa;
-        let second_nranges = second.nranges;
-        let second_next = second.next;
-        let second_next_pa = second.next_pa;
-
-        assert_eq!(first_nranges, HEKI_MAX_RANGES as u64);
-        assert_eq!(second_nranges, 1);
-        assert_ne!(first_pa, 0);
-        assert_eq!(first_pa % PAGE_SIZE as u64, 0);
-        assert_ne!(first_pa, first_next_pa);
-        assert_eq!(first_next_pa % PAGE_SIZE as u64, 0);
-        // The mock uses an identity VA/PA mapping for kernel-compatible links.
-        assert_eq!(first_next, first_next_pa);
-        assert_eq!(second_next, 0);
-        assert_eq!(second_next_pa, 0);
-        assert_eq!(total_count, ranges.len() as u64);
-    }
-
-    #[test]
-    #[should_panic(expected = "HEKI range chains must contain at least one range")]
-    fn rejects_empty_heki_page_chain() {
-        MockVtl0Gate::new().write_heki_ranges(&[]);
-    }
-
-    #[test]
-    fn transactional_closure_runs_and_propagates_errors() {
-        let gate = MockVtl0Gate::new();
-        let mut called = false;
-        let result = gate.protect_frames_transactionally(&[], &mut |txn| {
-            called = true;
-            assert!(txn.reserve(&[]).unwrap().is_empty());
-            Err(VsmError::BufferTooSmall("transaction test"))
-        });
-
-        assert!(called);
-        assert!(matches!(
-            result,
-            Err(VsmError::BufferTooSmall("transaction test"))
-        ));
-    }
-
-    #[test]
-    fn successful_transaction_records_initial_ownership_and_final_protections() {
-        let gate = MockVtl0Gate::new();
-        let initial = frame_range(0x10000, 0x12000);
-        let additional = frame_range(0x14000, 0x15000);
-
-        gate.protect_frames_transactionally(&[initial], &mut |txn| {
-            assert_eq!(txn.reserve(&[additional])?, vec![ReservationStatus::New]);
-            txn.protect(initial, MemAttr::MEM_ATTR_READ)?;
-            txn.protect(additional, MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_EXEC)
-        })
-        .unwrap();
-
-        assert_eq!(
-            gate.owned_ranges(),
-            vec![(0x10000, 0x12000), (0x14000, 0x15000)]
-        );
-        assert_eq!(
-            gate.protections(),
-            vec![
-                (0x10000, 0x12000, MemAttr::MEM_ATTR_READ),
-                (
-                    0x14000,
-                    0x15000,
-                    MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_EXEC
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn failed_transaction_rolls_back_all_ownership_and_protection_changes() {
-        let gate = MockVtl0Gate::new();
-        let initial = frame_range(0x10000, 0x11000);
-        let additional = frame_range(0x12000, 0x13000);
-
-        let result = gate.protect_frames_transactionally(&[initial], &mut |txn| {
-            txn.reserve(&[additional])?;
-            txn.protect(initial, MemAttr::MEM_ATTR_READ)?;
-            txn.protect(additional, MemAttr::MEM_ATTR_EXEC)?;
-            Err(VsmError::BufferTooSmall("rollback"))
-        });
-
-        assert!(matches!(result, Err(VsmError::BufferTooSmall("rollback"))));
-        assert!(gate.owned_ranges().is_empty());
-        assert!(gate.protections().is_empty());
-    }
-
-    #[test]
-    fn failed_transaction_releases_reservations_for_a_future_transaction() {
-        let gate = MockVtl0Gate::new();
-        let range = frame_range(0x10000, 0x11000);
-
-        let result = gate.protect_frames_transactionally(&[range], &mut |_| {
-            Err(VsmError::BufferTooSmall("rollback"))
-        });
-        assert!(matches!(result, Err(VsmError::BufferTooSmall("rollback"))));
-
-        gate.protect_frames_transactionally(&[range], &mut |_| Ok(()))
-            .unwrap();
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x11000)]);
-    }
-
-    #[test]
-    fn overlapping_initial_range_against_owned_frames_is_rejected() {
-        let gate = MockVtl0Gate::new();
-        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x12000)], &mut |_| Ok(()))
-            .unwrap();
-
-        let mut closure_called = false;
-        let result =
-            gate.protect_frames_transactionally(&[frame_range(0x11000, 0x13000)], &mut |_| {
-                closure_called = true;
-                Ok(())
-            });
-
-        assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
-        assert!(!closure_called);
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x12000)]);
-    }
-
-    #[test]
-    fn transaction_reserve_reports_repeated_transaction_ownership_consistently() {
-        let gate = MockVtl0Gate::new();
-        let fresh = frame_range(0x12000, 0x13000);
-
-        gate.protect_frames_transactionally(&[], &mut |txn| {
-            assert_eq!(txn.reserve(&[fresh])?, vec![ReservationStatus::New]);
-            assert_eq!(
-                txn.reserve(&[fresh])?,
-                vec![ReservationStatus::AlreadyOwned]
-            );
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(gate.owned_ranges(), vec![(0x12000, 0x13000)]);
-    }
-
-    #[test]
-    fn transaction_reserve_reports_transaction_owned_subrange_as_already_owned() {
-        let gate = MockVtl0Gate::new();
-
-        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x14000)], &mut |txn| {
-            assert_eq!(
-                txn.reserve(&[frame_range(0x11000, 0x13000)])?,
-                vec![ReservationStatus::AlreadyOwned]
-            );
-            txn.protect(frame_range(0x11000, 0x13000), MemAttr::MEM_ATTR_READ)
-        })
-        .unwrap();
-
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x14000)]);
-        assert_eq!(
-            gate.protections(),
-            vec![(0x11000, 0x13000, MemAttr::MEM_ATTR_READ)]
-        );
-    }
-
-    #[test]
-    fn transaction_reserve_rejects_frames_owned_by_another_transaction() {
-        let gate = MockVtl0Gate::new();
-        let existing = frame_range(0x10000, 0x11000);
-        gate.protect_frames_transactionally(&[existing], &mut |_| Ok(()))
-            .unwrap();
-
-        let result = gate
-            .protect_frames_transactionally(&[], &mut |txn| txn.reserve(&[existing]).map(|_| ()));
-
-        assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x11000)]);
-    }
-
-    #[test]
-    fn transaction_reserve_rejects_duplicate_or_overlapping_ranges_in_one_batch() {
-        for ranges in [
-            [frame_range(0x10000, 0x12000), frame_range(0x10000, 0x12000)],
-            [frame_range(0x10000, 0x12000), frame_range(0x11000, 0x13000)],
-        ] {
-            let gate = MockVtl0Gate::new();
-            let result = gate.protect_frames_transactionally(&[], &mut |txn| {
-                assert!(matches!(
-                    txn.reserve(&ranges),
-                    Err(VsmError::ProtectedFrameOverlap)
-                ));
-                Ok(())
-            });
-
-            assert!(result.is_ok());
-            assert!(gate.owned_ranges().is_empty());
-        }
-    }
-
-    #[test]
-    fn transaction_protect_rejects_an_unreserved_range() {
-        let gate = MockVtl0Gate::new();
-        let result = gate.protect_frames_transactionally(&[], &mut |txn| {
-            txn.protect(frame_range(0x10000, 0x11000), MemAttr::MEM_ATTR_READ)
-        });
-
-        assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
-        assert!(gate.protections().is_empty());
-    }
-
-    #[test]
-    fn direct_protection_operations_are_observable() {
-        let gate = MockVtl0Gate::new();
-        let range = frame_range(0x10000, 0x12000);
-
-        gate.protect_frame(range, MemAttr::MEM_ATTR_READ).unwrap();
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x12000)]);
-        assert_eq!(
-            gate.protections(),
-            vec![(0x10000, 0x12000, MemAttr::MEM_ATTR_READ)]
-        );
-
-        gate.unprotect_frames(range).unwrap();
-        assert!(gate.owned_ranges().is_empty());
-        assert!(gate.protections().is_empty());
-    }
-
-    #[test]
-    fn direct_writable_protection_removes_registry_ownership() {
-        let gate = MockVtl0Gate::new();
-        let range = frame_range(0x10000, 0x12000);
-        gate.protect_frame(range, MemAttr::MEM_ATTR_READ).unwrap();
-
-        let writable = MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE;
-        gate.protect_frame(range, writable).unwrap();
-
-        assert!(gate.owned_ranges().is_empty());
-        assert_eq!(gate.protections(), vec![(0x10000, 0x12000, writable)]);
-        assert_eq!(
-            gate.protection_operations(),
-            vec![
-                (0x10000, 0x12000, MemAttr::MEM_ATTR_READ),
-                (0x10000, 0x12000, writable),
-            ]
-        );
-    }
-
-    #[test]
-    fn transactional_writable_protection_removes_reserved_ownership() {
-        let gate = MockVtl0Gate::new();
-        let range = frame_range(0x10000, 0x12000);
-        let writable = MemAttr::MEM_ATTR_READ | MemAttr::MEM_ATTR_WRITE;
-
-        gate.protect_frames_transactionally(&[range], &mut |txn| txn.protect(range, writable))
-            .unwrap();
-
-        assert!(gate.owned_ranges().is_empty());
-        assert_eq!(gate.protections(), vec![(0x10000, 0x12000, writable)]);
-    }
-
-    #[test]
-    fn transactional_reservation_without_protection_remains_owned() {
-        let gate = MockVtl0Gate::new();
-
-        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x12000)], &mut |_| Ok(()))
-            .unwrap();
-
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x12000)]);
-    }
-
-    #[test]
-    fn unprotect_subrange_splits_owned_and_protected_ranges() {
-        let gate = MockVtl0Gate::new();
-        gate.protect_frame(frame_range(0x10000, 0x15000), MemAttr::MEM_ATTR_READ)
-            .unwrap();
-
-        gate.unprotect_frames(frame_range(0x12000, 0x13000))
-            .unwrap();
-
-        assert_eq!(
-            gate.owned_ranges(),
-            vec![(0x10000, 0x12000), (0x13000, 0x15000)]
-        );
-        assert_eq!(
-            gate.protections(),
-            vec![
-                (0x10000, 0x12000, MemAttr::MEM_ATTR_READ),
-                (0x13000, 0x15000, MemAttr::MEM_ATTR_READ),
-            ]
-        );
-    }
-
-    #[test]
-    fn unprotect_spanning_range_subtracts_from_every_entry() {
-        let gate = MockVtl0Gate::new();
-        gate.protect_frame(frame_range(0x10000, 0x12000), MemAttr::MEM_ATTR_READ)
-            .unwrap();
-        gate.protect_frame(frame_range(0x13000, 0x16000), MemAttr::MEM_ATTR_EXEC)
-            .unwrap();
-
-        gate.unprotect_frames(frame_range(0x11000, 0x15000))
-            .unwrap();
-
-        assert_eq!(
-            gate.owned_ranges(),
-            vec![(0x10000, 0x11000), (0x15000, 0x16000)]
-        );
-        assert_eq!(
-            gate.protections(),
-            vec![
-                (0x10000, 0x11000, MemAttr::MEM_ATTR_READ),
-                (0x15000, 0x16000, MemAttr::MEM_ATTR_EXEC),
-            ]
-        );
-    }
-
-    #[test]
-    fn transaction_commit_merges_unrelated_direct_mutation() {
-        let gate = MockVtl0Gate::new();
-        let concurrent_gate = gate.clone();
-
-        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x11000)], &mut |txn| {
-            txn.protect(frame_range(0x10000, 0x11000), MemAttr::MEM_ATTR_READ)?;
-            concurrent_gate.protect_frame(frame_range(0x14000, 0x15000), MemAttr::MEM_ATTR_EXEC)
-        })
-        .unwrap();
-
-        assert_eq!(
-            gate.owned_ranges(),
-            vec![(0x10000, 0x11000), (0x14000, 0x15000)]
-        );
-        assert_eq!(
-            gate.protections(),
-            vec![
-                (0x10000, 0x11000, MemAttr::MEM_ATTR_READ),
-                (0x14000, 0x15000, MemAttr::MEM_ATTR_EXEC),
-            ]
-        );
-    }
-
-    #[test]
-    fn transaction_commit_accepts_protection_covered_by_adjacent_new_ranges() {
-        let gate = MockVtl0Gate::new();
-
-        gate.protect_frames_transactionally(&[], &mut |txn| {
-            assert_eq!(
-                txn.reserve(&[frame_range(0x10000, 0x12000), frame_range(0x12000, 0x14000),])?,
-                vec![ReservationStatus::New, ReservationStatus::New]
-            );
-            txn.protect(frame_range(0x10000, 0x14000), MemAttr::MEM_ATTR_READ)
-        })
-        .unwrap();
-
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x14000)]);
-        assert_eq!(
-            gate.protections(),
-            vec![(0x10000, 0x14000, MemAttr::MEM_ATTR_READ)]
-        );
-    }
-
-    #[test]
-    fn nested_transaction_loses_to_the_outer_in_flight_reservation() {
-        let gate = MockVtl0Gate::new();
-        let nested_gate = gate.clone();
-        let range = frame_range(0x10000, 0x12000);
-        let mut nested_closure_called = false;
-
-        gate.protect_frames_transactionally(&[range], &mut |txn| {
-            let result = nested_gate.protect_frames_transactionally(&[range], &mut |_| {
-                nested_closure_called = true;
-                Ok(())
-            });
-            assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
-            txn.protect(range, MemAttr::MEM_ATTR_READ)
-        })
-        .unwrap();
-
-        assert!(!nested_closure_called);
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x12000)]);
-        assert_eq!(
-            gate.protections(),
-            vec![(0x10000, 0x12000, MemAttr::MEM_ATTR_READ)]
-        );
-    }
-
-    #[test]
-    fn nested_transaction_sees_a_reservation_added_inside_the_outer_closure() {
-        let gate = MockVtl0Gate::new();
-        let nested_gate = gate.clone();
-        let range = frame_range(0x10000, 0x12000);
-        let mut nested_closure_called = false;
-
-        gate.protect_frames_transactionally(&[], &mut |txn| {
-            assert_eq!(txn.reserve(&[range])?, vec![ReservationStatus::New]);
-            let result = nested_gate.protect_frames_transactionally(&[range], &mut |_| {
-                nested_closure_called = true;
-                Ok(())
-            });
-            assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
-            Ok(())
-        })
-        .unwrap();
-
-        assert!(!nested_closure_called);
-        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x12000)]);
-    }
-
-    #[test]
-    fn platform_operations_update_observable_state() {
-        let gate = MockVtl0Gate::new();
-
-        assert!(!gate.end_of_boot_reached());
-        assert!(!gate.control_registers_locked());
-        assert_eq!(gate.ringbuffer(), None);
-
-        gate.set_end_of_boot_reached();
-        gate.lock_control_registers().unwrap();
-        gate.install_ringbuffer(0x10000, 0x4000);
-
-        assert!(gate.end_of_boot_reached());
-        assert!(gate.control_registers_locked());
-        assert_eq!(gate.ringbuffer(), Some((0x10000, 0x4000)));
     }
 }

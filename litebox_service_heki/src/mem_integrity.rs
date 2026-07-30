@@ -729,32 +729,3 @@ pub(crate) enum KernelElfError {
     #[error("unsupported relocation type")]
     UnsupportedRelocation,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn patch(pa: [u64; 2], code: &[u8]) -> HekiPatch {
-        let mut patch = HekiPatch::default();
-        patch.pa = pa;
-        patch.size = u8::try_from(code.len()).expect("test patch code is too length");
-        patch.code[..code.len()].copy_from_slice(code);
-        patch
-    }
-
-    #[test]
-    fn validate_text_poke_bp_batch_accepts_step_2_starting_on_second_page() {
-        let precomputed = patch([0x1fff, 0x2000], &[0xe9, 0x01, 0x02, 0x03, 0x04]);
-        let patch_data = patch([precomputed.pa[1], 0], &[0x01, 0x02, 0x03, 0x04]);
-
-        assert!(validate_text_poke_bp_batch(&patch_data, &precomputed));
-    }
-
-    #[test]
-    fn validate_text_poke_bp_batch_rejects_straddling_step_2_wrong_pa_1() {
-        let precomputed = patch([0x1ffe, 0x2000], &[0xe9, 0x01, 0x02]);
-        let patch_data = patch([precomputed.pa[0] + 1, 0x3000], &[0x01, 0x02]);
-
-        assert!(!validate_text_poke_bp_batch(&patch_data, &precomputed));
-    }
-}

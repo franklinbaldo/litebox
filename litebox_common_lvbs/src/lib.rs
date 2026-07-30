@@ -616,7 +616,7 @@ impl core::fmt::Debug for HekiRange {
 pub const HEKI_MAX_RANGES: usize =
     ((PAGE_SIZE as u32 - u64::BITS * 3 / 8) / core::mem::size_of::<HekiRange>() as u32) as usize;
 
-#[derive(Clone, Copy, FromBytes, Immutable, KnownLayout)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(align(4096))]
 #[repr(C)]
 pub struct HekiPage {
