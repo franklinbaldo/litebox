@@ -281,7 +281,11 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                     // All-zero is the kernel's terminating `_aarch64_ctx`
                     // record (`magic == 0 && size == 0`), i.e. "no extra
                     // context". FP/SIMD state is not saved.
-                    // TODO: save and restore the guest FP/SIMD context.
+                    // TODO: save and restore the guest FP/SIMD context. Note
+                    // the gap starts earlier than signal delivery: the
+                    // transition path preserves only GPRs, so V registers are
+                    // already clobbered by the time a frame is built. See
+                    // `run_thread_arch` in `litebox_platform_linux_userland`.
                     __reserved: [0; _],
                 },
             },
@@ -323,7 +327,9 @@ pub(super) fn restore_sigcontext(ctx: &mut PtRegs, sigctx: &Sigcontext) -> usize
         pstate,
         __reserved_pad: _,
         // TODO: restore the guest FP/SIMD context from the extra context
-        // records the kernel would have placed here.
+        // records the kernel would have placed here. Requires the transition
+        // path to preserve V registers first; see `run_thread_arch` in
+        // `litebox_platform_linux_userland`.
         __reserved: _,
     } = sigctx;
 

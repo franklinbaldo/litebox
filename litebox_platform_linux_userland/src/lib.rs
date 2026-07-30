@@ -1384,6 +1384,34 @@ interrupt_callback:
     );
 }
 
+/// # Only general-purpose registers are preserved
+///
+/// The guest context is [`litebox_common_linux::PtRegs`], which holds `x0`-`x30`, `SP`, `PC` and
+/// `PSTATE` and nothing else. FP/SIMD is deliberately out of scope for now, so
+/// `V0`-`V31`, `FPSR` and `FPCR` are **not** saved here and **not** restored by
+/// [`switch_to_guest`].
+///
+/// The consequence is broader than it first looks, and is not confined to
+/// signal delivery: host code runs between the guest's `SVC` and its resume,
+/// and it uses SIMD freely (`memcpy` alone will), so a guest value live in a
+/// caller-saved V register across *any* syscall is silently lost. A real kernel
+/// preserves all of them. `V8`-`V15` survive only by accident, because AAPCS
+/// makes them callee-saved and the intervening host frames therefore restore
+/// them.
+///
+/// Reproduction, with no signal involved:
+///
+/// ```text
+/// fmov d0, #1.0 ; fmov d8, #2.0 ; svc #0 (getpid) ; read d0/d8
+/// native:  d0 = 1.0, d8 = 2.0
+/// LiteBox: d0 = 0.0, d8 = 2.0
+/// ```
+///
+/// This is also why a guest signal handler perturbs the interrupted context:
+/// the handler runs on real hardware, and `rt_sigreturn` has no saved FP state
+/// to put back. See the `fpsimd_context` TODOs in `litebox_shim_linux`'s
+/// AArch64 signal code.
+///
 /// Runs the guest thread until it terminates.
 ///
 /// Parallels the x86-64 version above: it saves the callee-saved registers,

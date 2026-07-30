@@ -454,6 +454,27 @@ page-granular rule until the trampoline gets a `PT_LOAD` of its own.
 Threads, dynamic linking and guest signal delivery are all implemented and
 covered by `tests/run.rs` on AArch64. What remains out of scope here:
 
+- FP/SIMD state. The guest context is `PtRegs`, which carries only `x0`-`x30`,
+  `SP`, `PC` and `PSTATE`, so `V0`-`V31`, `FPSR` and `FPCR` are neither saved on
+  entry nor restored on resume. Deliberate for now, but worth stating precisely
+  because the effect is wider than "signal delivery is incomplete": host code
+  runs between a guest `SVC` and its resume and uses SIMD freely, so a guest
+  value live in a caller-saved V register across *any* syscall is silently lost.
+  A real kernel preserves all of them. `V8`-`V15` survive only because AAPCS
+  makes them callee-saved and the intervening host frames restore them.
+
+  Reproduced with no signal involved -- `fmov d0, #1.0 ; fmov d8, #2.0 ;
+  svc #0` (getpid), then read them back: native gives `d0 = 1.0, d8 = 2.0`,
+  LiteBox gives `d0 = 0.0, d8 = 2.0`.
+
+  It is also the reason a guest signal handler perturbs the interrupted
+  context: the handler runs on real hardware, and `rt_sigreturn` has no saved
+  FP state to restore. Fixing it means saving 32 V registers plus `FPSR`/`FPCR`
+  on every transition -- 512 bytes and ~32 `stp`/`ldp` in the hot path -- and
+  then emitting a real `fpsimd_context` record into the signal frame's
+  `__reserved` area. x86-64 appears to have the same shape (`fpstate: 0, //
+  TODO` in its `write_signal_frame`), unverified.
+
 - Giving the appended trampoline its own `PT_LOAD`, which would let
   `trampoline_addr_for`'s `e_machine` gate go away (§8).
 - AArch64 hosts other than Linux userland; the local-exec anchor and the
