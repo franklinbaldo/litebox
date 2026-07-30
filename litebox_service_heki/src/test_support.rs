@@ -94,7 +94,8 @@ impl MockVtl0Gate {
 
 struct MockFrameTxn {
     owned_ranges: BTreeSet<(u64, u64)>,
-    protections: BTreeMap<(u64, u64), MemAttr>,
+    new_ranges: Vec<(u64, u64)>,
+    protection_updates: BTreeMap<(u64, u64), MemAttr>,
 }
 
 fn normalized_range(range: PhysFrameRange<Size4KiB>) -> (u64, u64) {
@@ -104,22 +105,82 @@ fn normalized_range(range: PhysFrameRange<Size4KiB>) -> (u64, u64) {
     )
 }
 
-fn reserve_range(
-    owned_ranges: &mut BTreeSet<(u64, u64)>,
-    range: PhysFrameRange<Size4KiB>,
-) -> Result<ReservationStatus, VsmError> {
-    let requested = normalized_range(range);
-    if owned_ranges.contains(&requested) || requested.0 >= requested.1 {
-        return Ok(ReservationStatus::AlreadyOwned);
+fn ranges_cover(ranges: &BTreeSet<(u64, u64)>, requested: (u64, u64)) -> bool {
+    let mut covered_until = requested.0;
+    for &(start, end) in ranges {
+        if end <= covered_until {
+            continue;
+        }
+        if start > covered_until {
+            return false;
+        }
+        covered_until = end;
+        if covered_until >= requested.1 {
+            return true;
+        }
     }
-    if owned_ranges
+    requested.0 >= requested.1
+}
+
+fn ranges_overlap(ranges: &BTreeSet<(u64, u64)>, requested: (u64, u64)) -> bool {
+    ranges
         .iter()
         .any(|&(start, end)| requested.0 < end && start < requested.1)
-    {
-        return Err(VsmError::ProtectedFrameOverlap);
+}
+
+fn insert_range(ranges: &mut BTreeSet<(u64, u64)>, mut inserted: (u64, u64)) {
+    let merged: Vec<_> = ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| inserted.0 <= end && start <= inserted.1)
+        .collect();
+    for range in merged {
+        ranges.remove(&range);
+        inserted.0 = inserted.0.min(range.0);
+        inserted.1 = inserted.1.max(range.1);
     }
-    owned_ranges.insert(requested);
-    Ok(ReservationStatus::New)
+    if inserted.0 < inserted.1 {
+        ranges.insert(inserted);
+    }
+}
+
+fn subtract_ranges(ranges: &mut BTreeSet<(u64, u64)>, removed: (u64, u64)) {
+    let overlapping: Vec<_> = ranges
+        .iter()
+        .copied()
+        .filter(|&(start, end)| removed.0 < end && start < removed.1)
+        .collect();
+    for (start, end) in overlapping {
+        ranges.remove(&(start, end));
+        insert_range(ranges, (start, removed.0.min(end)));
+        insert_range(ranges, (removed.1.max(start), end));
+    }
+}
+
+fn apply_protection(
+    protections: &mut BTreeMap<(u64, u64), MemAttr>,
+    range: (u64, u64),
+    attr: MemAttr,
+) {
+    subtract_protections(protections, range);
+    protections.insert(range, attr);
+}
+
+fn subtract_protections(protections: &mut BTreeMap<(u64, u64), MemAttr>, removed: (u64, u64)) {
+    let overlapping: Vec<_> = protections
+        .iter()
+        .filter(|&(&(start, end), _)| removed.0 < end && start < removed.1)
+        .map(|(&range, &attr)| (range, attr))
+        .collect();
+    for ((start, end), attr) in overlapping {
+        protections.remove(&(start, end));
+        if start < removed.0 {
+            protections.insert((start, removed.0.min(end)), attr);
+        }
+        if removed.1 < end {
+            protections.insert((removed.1.max(start), end), attr);
+        }
+    }
 }
 
 impl FrameTxn for MockFrameTxn {
@@ -127,24 +188,47 @@ impl FrameTxn for MockFrameTxn {
         &mut self,
         ranges: &[PhysFrameRange<Size4KiB>],
     ) -> Result<Vec<ReservationStatus>, VsmError> {
-        let previous = self.owned_ranges.clone();
-        let result: Result<Vec<_>, _> = ranges
-            .iter()
-            .copied()
-            .map(|range| reserve_range(&mut self.owned_ranges, range))
-            .collect();
-        if result.is_err() {
-            self.owned_ranges = previous;
+        let owned_before = self.owned_ranges.clone();
+        let new_ranges_before = self.new_ranges.len();
+        let mut seen = BTreeSet::new();
+        let mut statuses = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let requested = normalized_range(*range);
+            let status = if requested.0 >= requested.1 {
+                Ok(ReservationStatus::AlreadyOwned)
+            } else if ranges_overlap(&seen, requested) {
+                Err(VsmError::ProtectedFrameOverlap)
+            } else if ranges_cover(&owned_before, requested) {
+                Ok(ReservationStatus::AlreadyOwned)
+            } else if ranges_overlap(&owned_before, requested) {
+                Err(VsmError::ProtectedFrameOverlap)
+            } else {
+                Ok(ReservationStatus::New)
+            };
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => {
+                    self.owned_ranges = owned_before;
+                    self.new_ranges.truncate(new_ranges_before);
+                    return Err(error);
+                }
+            };
+            insert_range(&mut seen, requested);
+            if status == ReservationStatus::New {
+                insert_range(&mut self.owned_ranges, requested);
+                self.new_ranges.push(requested);
+            }
+            statuses.push(status);
         }
-        result
+        Ok(statuses)
     }
 
     fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
         let range = normalized_range(range);
-        if !self.owned_ranges.contains(&range) {
+        if !ranges_cover(&self.owned_ranges, range) {
             return Err(VsmError::ProtectedFrameOverlap);
         }
-        self.protections.insert(range, attr);
+        apply_protection(&mut self.protection_updates, range, attr);
         Ok(())
     }
 }
@@ -189,16 +273,16 @@ impl Vtl0Gate for MockVtl0Gate {
     ) -> Result<(), VsmError> {
         let mut state = self.state.lock().unwrap();
         let range = normalized_range(range);
-        state.owned_ranges.insert(range);
-        state.protections.insert(range, attr);
+        insert_range(&mut state.owned_ranges, range);
+        apply_protection(&mut state.protections, range, attr);
         Ok(())
     }
 
     fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
         let mut state = self.state.lock().unwrap();
         let range = normalized_range(range);
-        state.owned_ranges.remove(&range);
-        state.protections.remove(&range);
+        subtract_ranges(&mut state.owned_ranges, range);
+        subtract_protections(&mut state.protections, range);
         Ok(())
     }
 
@@ -207,20 +291,39 @@ impl Vtl0Gate for MockVtl0Gate {
         initial: &[PhysFrameRange<Size4KiB>],
         f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
     ) -> Result<(), VsmError> {
-        let (owned_ranges, protections) = {
+        let owned_ranges = {
             let state = self.state.lock().unwrap();
-            (state.owned_ranges.clone(), state.protections.clone())
+            state.owned_ranges.clone()
         };
         let mut txn = MockFrameTxn {
             owned_ranges,
-            protections,
+            new_ranges: Vec::new(),
+            protection_updates: BTreeMap::new(),
         };
         txn.reserve(initial)?;
         f(&mut txn)?;
 
         let mut state = self.state.lock().unwrap();
-        state.owned_ranges = txn.owned_ranges;
-        state.protections = txn.protections;
+        if txn
+            .new_ranges
+            .iter()
+            .any(|&range| ranges_overlap(&state.owned_ranges, range))
+            || txn.protection_updates.keys().any(|&range| {
+                !ranges_cover(&state.owned_ranges, range)
+                    && !txn
+                        .new_ranges
+                        .iter()
+                        .any(|&new| new.0 <= range.0 && range.1 <= new.1)
+            })
+        {
+            return Err(VsmError::ProtectedFrameOverlap);
+        }
+        for range in txn.new_ranges {
+            insert_range(&mut state.owned_ranges, range);
+        }
+        for (range, attr) in txn.protection_updates {
+            apply_protection(&mut state.protections, range, attr);
+        }
         Ok(())
     }
 
@@ -394,6 +497,48 @@ mod tests {
     }
 
     #[test]
+    fn transaction_reserve_reports_covered_subrange_as_already_owned() {
+        let gate = MockVtl0Gate::new();
+        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x14000)], &mut |_| Ok(()))
+            .unwrap();
+
+        gate.protect_frames_transactionally(&[], &mut |txn| {
+            assert_eq!(
+                txn.reserve(&[frame_range(0x11000, 0x13000)])?,
+                vec![ReservationStatus::AlreadyOwned]
+            );
+            txn.protect(frame_range(0x11000, 0x13000), MemAttr::MEM_ATTR_READ)
+        })
+        .unwrap();
+
+        assert_eq!(gate.owned_ranges(), vec![(0x10000, 0x14000)]);
+        assert_eq!(
+            gate.protections(),
+            vec![(0x11000, 0x13000, MemAttr::MEM_ATTR_READ)]
+        );
+    }
+
+    #[test]
+    fn transaction_reserve_rejects_duplicate_or_overlapping_ranges_in_one_batch() {
+        for ranges in [
+            [frame_range(0x10000, 0x12000), frame_range(0x10000, 0x12000)],
+            [frame_range(0x10000, 0x12000), frame_range(0x11000, 0x13000)],
+        ] {
+            let gate = MockVtl0Gate::new();
+            let result = gate.protect_frames_transactionally(&[], &mut |txn| {
+                assert!(matches!(
+                    txn.reserve(&ranges),
+                    Err(VsmError::ProtectedFrameOverlap)
+                ));
+                Ok(())
+            });
+
+            assert!(result.is_ok());
+            assert!(gate.owned_ranges().is_empty());
+        }
+    }
+
+    #[test]
     fn transaction_protect_rejects_an_unreserved_range() {
         let gate = MockVtl0Gate::new();
         let result = gate.protect_frames_transactionally(&[], &mut |txn| {
@@ -419,6 +564,95 @@ mod tests {
         gate.unprotect_frames(range).unwrap();
         assert!(gate.owned_ranges().is_empty());
         assert!(gate.protections().is_empty());
+    }
+
+    #[test]
+    fn unprotect_subrange_splits_owned_and_protected_ranges() {
+        let gate = MockVtl0Gate::new();
+        gate.protect_frame(frame_range(0x10000, 0x15000), MemAttr::MEM_ATTR_READ)
+            .unwrap();
+
+        gate.unprotect_frames(frame_range(0x12000, 0x13000))
+            .unwrap();
+
+        assert_eq!(
+            gate.owned_ranges(),
+            vec![(0x10000, 0x12000), (0x13000, 0x15000)]
+        );
+        assert_eq!(
+            gate.protections(),
+            vec![
+                (0x10000, 0x12000, MemAttr::MEM_ATTR_READ),
+                (0x13000, 0x15000, MemAttr::MEM_ATTR_READ),
+            ]
+        );
+    }
+
+    #[test]
+    fn unprotect_spanning_range_subtracts_from_every_entry() {
+        let gate = MockVtl0Gate::new();
+        gate.protect_frame(frame_range(0x10000, 0x12000), MemAttr::MEM_ATTR_READ)
+            .unwrap();
+        gate.protect_frame(frame_range(0x13000, 0x16000), MemAttr::MEM_ATTR_EXEC)
+            .unwrap();
+
+        gate.unprotect_frames(frame_range(0x11000, 0x15000))
+            .unwrap();
+
+        assert_eq!(
+            gate.owned_ranges(),
+            vec![(0x10000, 0x11000), (0x15000, 0x16000)]
+        );
+        assert_eq!(
+            gate.protections(),
+            vec![
+                (0x10000, 0x11000, MemAttr::MEM_ATTR_READ),
+                (0x15000, 0x16000, MemAttr::MEM_ATTR_EXEC),
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_commit_merges_unrelated_direct_mutation() {
+        let gate = MockVtl0Gate::new();
+        let concurrent_gate = gate.clone();
+
+        gate.protect_frames_transactionally(&[frame_range(0x10000, 0x11000)], &mut |txn| {
+            txn.protect(frame_range(0x10000, 0x11000), MemAttr::MEM_ATTR_READ)?;
+            concurrent_gate.protect_frame(frame_range(0x14000, 0x15000), MemAttr::MEM_ATTR_EXEC)
+        })
+        .unwrap();
+
+        assert_eq!(
+            gate.owned_ranges(),
+            vec![(0x10000, 0x11000), (0x14000, 0x15000)]
+        );
+        assert_eq!(
+            gate.protections(),
+            vec![
+                (0x10000, 0x11000, MemAttr::MEM_ATTR_READ),
+                (0x14000, 0x15000, MemAttr::MEM_ATTR_EXEC),
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_commit_rejects_new_conflict_without_partial_merge() {
+        let gate = MockVtl0Gate::new();
+        let concurrent_gate = gate.clone();
+
+        let result =
+            gate.protect_frames_transactionally(&[frame_range(0x10000, 0x12000)], &mut |txn| {
+                txn.protect(frame_range(0x10000, 0x12000), MemAttr::MEM_ATTR_READ)?;
+                concurrent_gate.protect_frame(frame_range(0x11000, 0x13000), MemAttr::MEM_ATTR_EXEC)
+            });
+
+        assert!(matches!(result, Err(VsmError::ProtectedFrameOverlap)));
+        assert_eq!(gate.owned_ranges(), vec![(0x11000, 0x13000)]);
+        assert_eq!(
+            gate.protections(),
+            vec![(0x11000, 0x13000, MemAttr::MEM_ATTR_EXEC)]
+        );
     }
 
     #[test]
