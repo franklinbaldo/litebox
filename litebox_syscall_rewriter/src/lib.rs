@@ -59,9 +59,13 @@ pub use arm64::MAX_GUEST_TPIDR_OFFSET as AARCH64_MAX_GUEST_TPIDR_OFFSET;
 /// Fails if `offset` is not a multiple of
 /// [`AARCH64_GUEST_TPIDR_OFFSET_ALIGN`] or exceeds
 /// [`AARCH64_MAX_GUEST_TPIDR_OFFSET`], or if `trampoline` is not a well-formed
-/// blob this crate emitted. A loader must treat either as fatal for the binary:
-/// an unpatched gate does not fault, it silently redirects the guest's thread
-/// pointer into host memory 32KB past the anchor.
+/// blob this crate emitted. A loader must treat either as fatal for the binary.
+/// An unpatched gate does **not** fault: it reads and writes the same address
+/// 32KB past the host anchor, so it is self-consistent and the guest goes on
+/// producing correct results while silently corrupting eight bytes of host
+/// memory. There is no symptom to notice later, so the absence of placeholders
+/// must be proved with [`aarch64_find_guest_tpidr_placeholder`] before the
+/// trampoline is made executable.
 pub fn aarch64_patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
     arm64::patch_guest_tpidr_offset(trampoline, offset)
 }

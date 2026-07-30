@@ -41,12 +41,9 @@ const ENDIAN: LittleEndian = LittleEndian;
 /// and the offset is patched in here, on the staging buffer, before the region
 /// is written let alone made executable.
 ///
-/// Both failures below are fatal for the object, and deliberately so. An
-/// unpatched gate does not trap: it reads and writes the *same* address 32KB
-/// past the host thread pointer, so it is self-consistent, and a guest running
-/// on it produces entirely correct results while corrupting eight bytes of
-/// whatever the host has mapped there. There is no symptom to notice later,
-/// which is why this is checked here and refused rather than warned about.
+/// Both failures below are fatal for the object, and deliberately so: an
+/// unpatched gate does not trap, so there is no symptom to notice later. See
+/// `litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset`.
 ///
 /// # Errors
 ///
@@ -1396,12 +1393,11 @@ mod tests {
     /// The loader's gate-finalization step: what it accepts, and what it must
     /// refuse rather than map.
     ///
-    /// The refusals matter more than the acceptance. A trampoline that keeps
-    /// the rewriter's placeholder runs *correctly* — each gate reads and writes
-    /// the guest thread pointer at the same bogus address 32KB past the host
-    /// anchor, so the guest is self-consistent and only host memory suffers.
-    /// Nothing downstream can notice, so this is the only place the mistake can
-    /// be caught.
+    /// The refusals matter more than the acceptance: a trampoline that keeps
+    /// the rewriter's placeholder runs *correctly*, so nothing downstream can
+    /// catch it. See
+    /// `litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset`. This is
+    /// the only place the mistake can be caught.
     #[cfg(target_arch = "aarch64")]
     mod aarch64_trampoline_gates {
         use litebox::platform::SystemInfoProvider;

@@ -540,11 +540,7 @@ pub trait SystemInfoProvider {
     /// Returns `None` when the platform does no such virtualization, which is
     /// the default and is correct for every platform that leaves the guest
     /// thread pointer alone. For a platform that *does* virtualize it, `None`
-    /// is a configuration error rather than a valid state, and the loader
-    /// treats it as fatal for the binary: an unpatched gate does *not* fault.
-    /// It reads and writes the same address, so it is self-consistent and the
-    /// guest goes on producing correct results while silently corrupting eight
-    /// bytes of host memory.
+    /// is a configuration error rather than a valid state.
     fn guest_thread_pointer_offset(&self) -> Option<u16> {
         None
     }

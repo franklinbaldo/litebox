@@ -171,12 +171,10 @@
 //! produce is rejected rather than silently mangled.
 //!
 //! The placeholder saturates the immediate to make that scan exact, and for no
-//! other reason. An *unpatched* gate does not fault: it reads and writes the
-//! guest thread pointer at the same address 32KB past the host anchor, so it is
-//! self-consistent and a guest running on it behaves correctly while corrupting
-//! eight bytes of host memory. A loader therefore cannot rely on noticing the
-//! mistake later; it must call [`find_guest_tpidr_placeholder`] and refuse to
-//! map the trampoline if anything is left.
+//! other reason — it buys no run-time safety, because an unpatched gate does
+//! not fault. See [`GUEST_TPIDR_OFFSET_PLACEHOLDER`]. A loader must therefore
+//! call [`find_guest_tpidr_placeholder`] and refuse to map the trampoline if
+//! anything is left.
 //!
 //! ## Signal returns
 //!
@@ -930,28 +928,9 @@ enum GateBuild {
 /// ## The outbound stub
 ///
 /// The stub is emitted immediately after the gate and is the runtime's normal
-/// way back into the guest:
-///
-/// ```text
-/// outbound:
-///     ldr x16, [sp, #0]     // restore guest X16
-///     add sp, sp, #32       // pop the gate frame
-///     b   site+4            // static direct branch: needs no scratch register
-/// ```
-///
-/// This is what lets `X16` be *fully restored* across an `SVC`, which the Linux
-/// syscall ABI requires — see the module docs, "Callback register contract:
-/// `X16` is preserved across an `SVC`". The runtime does not depend on the
-/// frame's contents surviving its round trip: `switch_to_guest` re-materializes
-/// `[SP, #0]` from `PtRegs::regs[16]` and sets `SP` to
-/// `PtRegs::sp - SVC_FRAME_BYTES` before branching here, so a shim that
-/// legitimately edits `regs[16]` is honoured.
-///
-/// The stub is only valid for resuming at the original syscall site. When the
-/// shim redirects `PtRegs::pc` (signal delivery, `execve`, ...) the runtime
-/// falls back to branching to the new PC through `X16`, clobbering it — which is
-/// harmless, because in that case the guest is not resuming the interrupted
-/// instruction stream anyway.
+/// way back into the guest. Its listing, why it exists, and the limits of its
+/// validity are in the module docs, "Callback register contract: `X16` is
+/// preserved across an `SVC`".
 fn emit_svc_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
@@ -1304,11 +1283,9 @@ fn placeholder_imm_field() -> u32 {
 /// Byte offset of the first instruction in `trampoline` that still carries
 /// [`GUEST_TPIDR_OFFSET_PLACEHOLDER`], or `None` if no gate is left unpatched.
 ///
-/// This is the loader's proof obligation. An unpatched gate does *not* fault:
-/// it reads and writes the same bogus address, so it is self-consistent and the
-/// guest keeps working while corrupting eight bytes of host memory 32KB past
-/// the thread pointer. Nothing observable goes wrong, which is exactly why the
-/// absence of placeholders has to be checked rather than assumed.
+/// This is the loader's proof obligation: an unpatched gate does not fault, so
+/// its absence has to be checked rather than assumed. See
+/// [`GUEST_TPIDR_OFFSET_PLACEHOLDER`].
 ///
 /// Like [`patch_guest_tpidr_offset`] this skips the header's callback slot,
 /// which is a 64-bit address and could bit-for-bit resemble a gate
@@ -2067,9 +2044,8 @@ mod tests {
     }
 
     /// The check a loader needs: an unpatched gate is *detectable*, because it
-    /// is not detectable any other way. It does not fault when executed — it
-    /// reads and writes the same address 32KB past the thread pointer, so the
-    /// guest behaves correctly and quietly corrupts host memory.
+    /// is not detectable any other way — it does not fault when executed. See
+    /// [`GUEST_TPIDR_OFFSET_PLACEHOLDER`].
     #[test]
     fn find_placeholder_reports_gates_before_patching_and_none_after() {
         let (_p, mut tramp) = hook_words(

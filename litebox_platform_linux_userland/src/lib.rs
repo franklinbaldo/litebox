@@ -101,6 +101,11 @@ macro_rules! saved_tls_seg {
 /// `dlopen`ed LiteBox would need initial-exec instead.
 ///
 /// Takes the register name as a string, e.g. `tls_anchor!("x16")`.
+///
+/// **Seven copies of this sequence are hand-inlined** in the `naked_asm!`
+/// bodies below (`run_thread_arch`, `switch_to_guest` and the signal-handler
+/// fragments), because the macro cannot expand inside a `naked_asm!` string
+/// literal. Any change here must be mirrored in all of them.
 #[cfg(target_arch = "aarch64")]
 macro_rules! tls_anchor {
     ($reg:literal) => {
@@ -837,10 +842,8 @@ mod tls_offset {
     pub(super) const IN_GUEST: usize = 24;
     pub(super) const INTERRUPT: usize = 25;
     /// Set for a thread's whole guest lifetime, not just while guest code is
-    /// executing. This is the AArch64 analogue of x86-64's `gsbase != 0`
-    /// probe; see [`super::interrupt_signal_handler`] for why `IN_GUEST` is
-    /// not a substitute. Lives in what used to be alignment padding, so it
-    /// perturbs no other offset.
+    /// executing; see [`super::GuestThreadMarker`]. Lives in what used to be
+    /// alignment padding, so it perturbs no other offset.
     pub(super) const IS_GUEST_THREAD: usize = 26;
     pub(super) const PENDING_HOST_SIGNALS: usize = 28;
     pub(super) const WAIT_WAKER_ADDR: usize = 32;
@@ -1120,11 +1123,8 @@ fn set_guest_tpidr(value: usize) {
 /// Marks (or unmarks) the current thread as a guest thread for the whole of
 /// its guest lifetime.
 ///
-/// This is the AArch64 stand-in for x86-64's `gsbase != 0` probe. On x86-64,
-/// `gsbase` is non-zero from the moment a thread enters guest execution until
-/// it leaves, which makes it a *thread-lifetime* property. AArch64 has no such
-/// incidentally-repurposed register — `TPIDR_EL0` is valid on every thread in
-/// the process, guest or not — so the property is recorded explicitly.
+/// The AArch64 stand-in for x86-64's `gsbase != 0` probe; see
+/// [`GuestThreadMarker`], which is what callers should use.
 ///
 /// Deliberately a plain byte and not an atomic RMW: only the owning thread
 /// ever writes this slot, and it is read either by that same thread or by a
@@ -1505,9 +1505,7 @@ syscall_callback:
     // statement that no instruction above it has cleared `in_guest` yet, so
     // the check can never drift out of sync with this code again.
     // See `in_syscall_callback_prologue`.
-    // Anchor x16 on the TLS control block. Three instructions, one
-    // register: see the `tls_anchor!` macro for why the block base is a
-    // link-time relocation rather than a literal offset.
+    // TLS block anchor; see `tls_anchor!`.
     mrs  x16, tpidr_el0
     add  x16, x16, #:tprel_hi12:litebox_tls_block, lsl #12
     add  x16, x16, #:tprel_lo12_nc:litebox_tls_block
@@ -1555,9 +1553,7 @@ syscall_callback_in_guest_cleared:
     // below the guest SP and nothing guarantees it survives the round trip
     // through the shim. x17 is already spilled to regs[17], so it is free.
     ldr  x0,  [sp,  #{SVC_FRAME_OFF_STUB}]
-    // Anchor x17 on the TLS control block. Three instructions, one
-    // register: see the `tls_anchor!` macro for why the block base is a
-    // link-time relocation rather than a literal offset.
+    // TLS block anchor; see `tls_anchor!`.
     mrs  x17, tpidr_el0
     add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
     add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
@@ -1583,9 +1579,7 @@ syscall_callback_in_guest_cleared:
     // `bl`, or the `.cfi_def_cfa x29, 96` rule would resolve against guest
     // memory if `syscall_handler` unwinds. `host_sp` is the frame base minus
     // the 16-byte `thread_ctx` slot, so the host `x29` is `host_sp + 16`.
-    // Anchor x17 on the TLS control block. Three instructions, one
-    // register: see the `tls_anchor!` macro for why the block base is a
-    // link-time relocation rather than a literal offset.
+    // TLS block anchor; see `tls_anchor!`.
     mrs  x17, tpidr_el0
     add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
     add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
@@ -1608,9 +1602,7 @@ syscall_callback_in_guest_cleared:
     // `.cfi_def_cfa x29, 96` invariant above.
     .globl exception_callback
 exception_callback:
-    // Anchor x9 on the TLS control block. Three instructions, one
-    // register: see the `tls_anchor!` macro for why the block base is a
-    // link-time relocation rather than a literal offset.
+    // TLS block anchor; see `tls_anchor!`.
     mrs x9, tpidr_el0
     add x9, x9, #:tprel_hi12:litebox_tls_block, lsl #12
     add x9, x9, #:tprel_lo12_nc:litebox_tls_block
@@ -1630,9 +1622,7 @@ exception_callback:
     // before the `bl`; see the `.cfi_def_cfa x29, 96` invariant above.
     .globl interrupt_callback
 interrupt_callback:
-    // Anchor x9 on the TLS control block. Three instructions, one
-    // register: see the `tls_anchor!` macro for why the block base is a
-    // link-time relocation rather than a literal offset.
+    // TLS block anchor; see `tls_anchor!`.
     mrs x9, tpidr_el0
     add x9, x9, #:tprel_hi12:litebox_tls_block, lsl #12
     add x9, x9, #:tprel_lo12_nc:litebox_tls_block
@@ -1737,28 +1727,14 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 ///
 /// # Returning to the guest: the rewriter's per-site outbound stub
 ///
-/// AArch64 has no memory-indirect branch: there is no `BR [mem]`, so a branch
-/// target must first be materialized into a general-purpose register. That
-/// register is by definition one that would otherwise hold restored guest
-/// state, so restoring all 31 GPRs *and* branching is impossible **from here**.
+/// Restoring all 31 GPRs *and* branching is impossible from here, so the final
+/// hop into the guest is made by a per-site stub the rewriter emits. Why that
+/// is necessary and what the stub contains are documented once, on
+/// `litebox_syscall_rewriter::arm64`'s module docs under "Callback register
+/// contract: `X16` is preserved across an `SVC`". What follows is only this
+/// function's side of that contract.
 ///
-/// That matters because the Linux AArch64 syscall ABI preserves every GPR but
-/// `x0` across an `SVC` — including `x16`/`x17`. `svc` is not a function call,
-/// so the AAPCS allowance for veneers clobbering IP0/IP1 does not apply, and a
-/// compiler may keep a live value in `x16` across an inlined `svc`.
-///
-/// The way out is to move the final hop into guest-adjacent code the rewriter
-/// emits, where the branch target is a *static* address and so needs no
-/// register at all. Each rewritten `SVC` site has an outbound stub:
-///
-/// ```text
-/// outbound_N:
-///     ldr x16, [sp, #0]     // restore guest x16
-///     add sp, sp, #32       // pop the gate frame
-///     b   site+4            // static direct branch
-/// ```
-///
-/// `syscall_callback` copied that stub's address, and the resume PC it branches
+/// `syscall_callback` copied the stub's address, and the resume PC it branches
 /// to, out of the gate frame into [`tls_offset::OUTBOUND_STUB`] /
 /// [`tls_offset::OUTBOUND_PC`]. This function stages what the stub reads:
 ///
@@ -1772,15 +1748,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 ///
 /// ## The fallback path
 ///
-/// The stub is only valid for **resuming at the original syscall site**. If the
-/// shim redirected `PtRegs::pc` — signal delivery, `execve`, and so on — the
-/// stub would branch to the wrong place, so this function compares
-/// `PtRegs::pc` against the recorded resume PC and, on a mismatch (or when no
-/// stub has been recorded, e.g. a thread's first guest entry), falls back to
-/// materializing the PC into `x16` and `br x16`. That clobbers guest `x16`,
-/// which is acceptable precisely because the guest is not resuming the
-/// interrupted instruction stream: restoring an arbitrary PC *with* full
-/// register state is what an `rt_sigreturn` frame is for.
+/// The stub is only valid for resuming at the original syscall site, so this
+/// function compares `PtRegs::pc` against the recorded resume PC and, on a
+/// mismatch (or when no stub has been recorded, e.g. a thread's first guest
+/// entry), falls back to materializing the PC into `x16` and `br x16`. That
+/// clobbers guest `x16`, which the module docs cited above explain is harmless
+/// in exactly this case.
 ///
 /// The recorded pair is deliberately *not* invalidated after use. It is always
 /// consistent — `OUTBOUND_STUB` branches to `OUTBOUND_PC` by construction — so a
@@ -1789,9 +1762,6 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 /// that `x16` also survives. Clearing it would instead open a window in which an
 /// interrupt between the clear and the `br` silently downgrades to the
 /// clobbering path.
-///
-/// This matches the rewriter's contract: see `litebox_syscall_rewriter::arm64`,
-/// "Callback register contract: `X16` is preserved across an `SVC`".
 ///
 /// Note there is no thread-pointer restore here: `TPIDR_EL0` keeps holding the
 /// host anchor while the guest runs, and the rewriter redirects guest
@@ -1821,9 +1791,7 @@ switch_to_guest_start:
     // arrives after the check, the signal handler sees that the PC is between
     // `switch_to_guest_start` and `switch_to_guest_end` and jumps to
     // `interrupt_callback` itself.
-    // Anchor x17 on the TLS control block. Three instructions, one
-    // register: see the `tls_anchor!` macro for why the block base is a
-    // link-time relocation rather than a literal offset.
+    // TLS block anchor; see `tls_anchor!`.
     mrs  x17, tpidr_el0
     add  x17, x17, #:tprel_hi12:litebox_tls_block, lsl #12
     add  x17, x17, #:tprel_lo12_nc:litebox_tls_block
@@ -2063,13 +2031,12 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
         // AArch64 needs no thread-pointer mirroring: there is no second
         // thread-pointer register, and `TPIDR_EL0` already holds the host
-        // anchor on every thread. What the x86-64 mirroring *also* achieves,
-        // incidentally, is making a test thread pass the `gsbase != 0`
-        // guest-thread probe in `interrupt_signal_handler`. That part does
-        // need an explicit equivalent, or test threads would re-raise
-        // process-wide instead of recording pending signals locally, diverging
-        // from x86-64 behaviour. `GuestThreadMarker` is that equivalent (and
-        // is a no-op on x86-64, where the mirroring above already did it).
+        // anchor on every thread. But the x86-64 mirroring incidentally makes
+        // a test thread pass the guest-thread probe in
+        // `interrupt_signal_handler`, and that part does need an explicit
+        // equivalent, or test threads would re-raise process-wide instead of
+        // recording pending signals locally. See `GuestThreadMarker` (a no-op
+        // on x86-64, where the mirroring above already did it).
         let _guest_thread = GuestThreadMarker::enter();
 
         ThreadHandle::run_with_handle(f)
@@ -3924,15 +3891,12 @@ mod tests {
     /// The load-time gate patching actually happens, and lands on *this*
     /// runtime's `guest_tpidr` slot.
     ///
-    /// This exists because nothing else can catch the patching being skipped.
-    /// An unpatched gate performs both the guest's thread-pointer read and its
-    /// write at the placeholder offset, so it is self-consistent: a guest built
-    /// on `__thread` variables and `errno` produces entirely correct results
-    /// while silently corrupting eight bytes of host memory 32KB past the
-    /// thread pointer. There is no wrong answer to observe. So this asserts on
-    /// the state instead — that no gate keeps the placeholder, and that the
-    /// address a patched gate dereferences is inside the runtime's own TLS
-    /// control block.
+    /// This exists because nothing else can catch the patching being skipped:
+    /// an unpatched gate does not fault (see
+    /// `litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset`), so there
+    /// is no wrong answer to observe. It asserts on the state instead — that no
+    /// gate keeps the placeholder, and that the address a patched gate
+    /// dereferences is inside the runtime's own TLS control block.
     ///
     /// It goes through [`litebox::platform::SystemInfoProvider`] rather than
     /// [`super::guest_tpidr_tp_offset`] on purpose: that trait method is the
@@ -3972,8 +3936,7 @@ mod tests {
         let platform = LinuxUserland::new(None);
         let offset = platform.guest_thread_pointer_offset().expect(
             "an AArch64 platform must supply a guest thread-pointer offset; without one the \
-             loader leaves every gate on the placeholder, which does not fault — it silently \
-             redirects the guest's thread pointer into host memory",
+             loader leaves every gate on the placeholder, which does not fault",
         );
         assert_eq!(
             litebox_syscall_rewriter::aarch64_patch_guest_tpidr_offset(&mut tramp, offset).unwrap(),

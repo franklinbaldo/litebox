@@ -151,12 +151,10 @@ not a thing — but an exotic link now fails legibly at startup instead of
 faulting inside a guest gate.
 
 The placeholder saturates the immediate for the scan's benefit and for nothing
-else. In particular an **unpatched gate does not fault**. It reads *and* writes
-the guest thread pointer at the same address 32KB past the host anchor, so it is
-self-consistent: a guest exercising `__thread` variables and `errno` produces
-entirely correct results while quietly corrupting eight bytes of whatever the
-host has mapped there. There is no symptom to notice, so the absence of
-placeholders is *checked* rather than trusted. The loader's
+else. In particular an **unpatched gate does not fault** — it is self-consistent
+and only host memory suffers, so there is no symptom to notice (the canonical
+account is on `GUEST_TPIDR_OFFSET_PLACEHOLDER`). The absence of placeholders is
+therefore *checked* rather than trusted. The loader's
 `finalize_aarch64_trampoline_gates` treats three things as fatal for the binary,
 unmapping the staged trampoline and refusing the mapping:
 

@@ -614,13 +614,10 @@ pub trait MapMemory {
     /// leaves the contents entirely to the mapper. Set this when the mapper has
     /// its own hook that already performs the whole job, because otherwise this
     /// loader would map the raw file bytes over the top *afterwards* and
-    /// silently discard everything that hook wrote.
-    ///
-    /// `litebox_shim_linux` sets this: its `mmap` hook
-    /// (`do_mmap_file` -> `maybe_patch_exec_segment`) sets up the trampoline for
-    /// every object it maps — the initial executable, the interpreter and every
-    /// shared library the guest's own dynamic linker loads — over the
-    /// `PROT_NONE` range reserved here.
+    /// silently discard everything that hook wrote. A mapper that sets this
+    /// takes on the whole obligation: mapping the trampoline over the reserved
+    /// range, writing the syscall entry point, applying any
+    /// architecture-specific fixups, and making it executable.
     const POPULATES_TRAMPOLINE: bool = false;
 
     /// Reserve a region of memory with the given length and alignment,

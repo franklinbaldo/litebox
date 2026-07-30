@@ -3475,14 +3475,7 @@ impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<U
 mod aarch64_tests {
     use super::PtRegs;
 
-    /// Argument 0 comes from `orig_x0`, not `regs[0]`.
-    ///
-    /// On arm64 the kernel clobbers `regs[0]` with `-ENOSYS` on syscall entry
-    /// and stashes the real first argument in `orig_x0`; `syscall_get_arguments`
-    /// in `arch/arm64/include/asm/syscall.h` reads `orig_x0` for `args[0]` and
-    /// `regs[1..=5]` for the rest. `syscall_callback` reproduces that entry
-    /// state, so reading `regs[0]` here would hand every syscall `-ENOSYS` as
-    /// its first argument.
+    /// Argument 0 comes from `orig_x0`, not `regs[0]`; see [`PtRegs::syscall_arg`].
     #[test]
     fn test_syscall_arg0_is_orig_x0() {
         let mut regs = PtRegs::default();
