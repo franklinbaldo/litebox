@@ -219,6 +219,35 @@ _Noreturn void exit_group(int code)
             : "%eax", "%ebx");
     }
 }
+#elif defined(__aarch64__)
+int write(int fd, const char *buf, int length)
+{
+    register long x8 asm("x8") = 64; // #define SYS_write 64
+    register long x0 asm("x0") = fd;
+    register long x1 asm("x1") = (long)buf;
+    register long x2 asm("x2") = length;
+
+    asm volatile("svc #0"
+        : "+r" (x0)
+        : "r" (x8), "r" (x1), "r" (x2)
+        : "memory");
+
+    return (int)x0;
+}
+
+_Noreturn void exit_group(int code)
+{
+    /* Infinite for-loop since this function can't return */
+    for (;;) {
+        register long x8 asm("x8") = 94; // #define SYS_exit_group 94
+        register long x0 asm("x0") = code;
+
+        asm volatile("svc #0"
+            :
+            : "r" (x8), "r" (x0)
+            : "memory");
+    }
+}
 #else
 #error "Unsupported architecture"
 #endif
