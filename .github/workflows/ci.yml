@@ -96,15 +96,41 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Set up tun
+        run: |
+          sudo ./litebox_platform_linux_userland/scripts/tun-setup.sh
+      - name: Install iperf3
+        run: |
+          sudo apt install -y iperf3
       - name: Install diod
         run: |
           sudo apt install -y diod
       - uses: Swatinem/rust-cache@v2
+      - name: Cache custom out directories
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/*/build/litebox_runner_linux_userland-*/out
+          key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux
-          ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux
-          ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
+          # Same exclusions as the x86-64 job: `litebox_runner_lvbs` needs a custom
+          # target and nightly, and `litebox_runner_optee_on_linux_userland` conflicts
+          # with `litebox_runner_linux_userland` through feature unification. Both are
+          # x86-64-only crates, so unlike on x86-64 there is nothing to check here
+          # separately -- they compile away on AArch64.
+      - run: ./.github/tools/github_actions_run_cargo build
+      - run: ./.github/tools/github_actions_run_cargo nextest
+      - run: |
+          ./.github/tools/github_actions_run_cargo test --doc
+          # We need to run `cargo test --doc` separately because doc tests
+          # aren't included in nextest at the moment. See relevant discussion at
+          # https://github.com/nextest-rs/nextest/issues/16
+      - name: Build documentation (fail on warnings)
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
 
   build_and_test_lvbs:
     name: Build and Test LVBS
