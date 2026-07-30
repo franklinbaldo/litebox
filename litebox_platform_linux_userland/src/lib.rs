@@ -2992,7 +2992,7 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn guest_tpidr_offset(&self) -> Option<u16> {
+    fn guest_thread_pointer_offset(&self) -> Option<u16> {
         Some(guest_tpidr_tp_offset())
     }
 }
@@ -3970,7 +3970,7 @@ mod tests {
         );
 
         let platform = LinuxUserland::new(None);
-        let offset = platform.guest_tpidr_offset().expect(
+        let offset = platform.guest_thread_pointer_offset().expect(
             "an AArch64 platform must supply a guest thread-pointer offset; without one the \
              loader leaves every gate on the placeholder, which does not fault — it silently \
              redirects the guest's thread pointer into host memory",

@@ -36,7 +36,7 @@ const ENDIAN: LittleEndian = LittleEndian;
 /// AArch64-rewritten guests have no thread pointer of their own: the host owns
 /// the hardware `TPIDR_EL0` anchor, and every guest `MRS`/`MSR TPIDR_EL0` was
 /// rewritten into a load/store of a runtime-owned slot at
-/// `[TPIDR_EL0 + guest_tpidr_offset]`. The rewriter cannot know that offset —
+/// `[TPIDR_EL0 + guest_thread_pointer_offset]`. The rewriter cannot know that offset —
 /// it is a property of the *host* binary's link — so it emits a placeholder
 /// and the offset is patched in here, on the staging buffer, before the region
 /// is written let alone made executable.
@@ -61,7 +61,7 @@ fn finalize_aarch64_trampoline_gates(
 ) -> Result<(), alloc::string::String> {
     use alloc::format;
 
-    let Some(offset) = platform.guest_tpidr_offset() else {
+    let Some(offset) = platform.guest_thread_pointer_offset() else {
         return Err(alloc::string::String::from(
             "platform supplied no guest thread-pointer offset, so every gate in this trampoline \
              would keep the rewriter's placeholder and redirect the guest's thread pointer into \
@@ -1252,7 +1252,7 @@ mod tests {
             fn get_vdso_address(&self) -> Option<usize> {
                 None
             }
-            fn guest_tpidr_offset(&self) -> Option<u16> {
+            fn guest_thread_pointer_offset(&self) -> Option<u16> {
                 self.0
             }
         }

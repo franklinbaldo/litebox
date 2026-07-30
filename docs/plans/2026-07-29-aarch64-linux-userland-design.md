@@ -28,7 +28,7 @@ State on entry to the callback:
 | `sp` | guest SP minus 32 (gate frame is live) |
 | `x0`–`x15`, `x17`–`x30`, NZCV | pristine guest values |
 | `TPIDR_EL0` | the **host** anchor |
-| `[TPIDR_EL0 + guest_tpidr_offset]` | the **guest** thread pointer (offset patched in at load time) |
+| `[TPIDR_EL0 + guest_thread_pointer_offset]` | the **guest** thread pointer (offset patched in at load time) |
 
 The rewriter also gates guest `MSR TPIDR_EL0` and `MRS TPIDR_EL0` so that every
 guest read or write of the thread pointer is redirected to that slot. The
@@ -158,8 +158,8 @@ placeholders is *checked* rather than trusted. The loader's
 `finalize_aarch64_trampoline_gates` treats three things as fatal for the binary,
 unmapping the staged trampoline and refusing the mapping:
 
-1. the platform supplying no `guest_tpidr_offset()`, which on a host that runs
-   AArch64 guests is a configuration error rather than a valid state;
+1. the platform supplying no `guest_thread_pointer_offset()`, which on a host
+   that runs AArch64 guests is a configuration error rather than a valid state;
 2. the rewriter rejecting the blob or the offset; and
 3. any placeholder surviving the patch pass, per
    `aarch64_find_guest_tpidr_placeholder`.

@@ -523,26 +523,29 @@ pub trait SystemInfoProvider {
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
 
-    /// AArch64 only: the byte offset from the host thread-pointer anchor
-    /// (`TPIDR_EL0`) at which this platform keeps each thread's *guest* thread
-    /// pointer.
+    /// The byte offset from the host thread-pointer anchor at which this
+    /// platform keeps each thread's *guest* thread pointer.
     ///
-    /// AArch64-rewritten guest binaries virtualize every `MRS`/`MSR TPIDR_EL0`
-    /// into a load/store of that slot. The rewriter cannot bake the offset in —
-    /// it is a property of the *host* binary's link, and one rewritten binary
-    /// has to run under any host build — so it emits a placeholder and the
-    /// loader patches in the value returned here before the trampoline becomes
-    /// executable.
+    /// Applies to platforms that virtualize the guest thread pointer: the host
+    /// owns the hardware thread-pointer register, so a rewritten guest's reads
+    /// and writes of it are redirected to a runtime-owned per-thread slot at
+    /// this offset. The rewriter cannot bake the offset in — it is a property
+    /// of the *host* binary's link, and one rewritten binary has to run under
+    /// any host build — so it emits a placeholder and the loader patches in the
+    /// value returned here before the trampoline becomes executable.
     ///
-    /// Returns `None` when the platform needs no such patching, i.e. every
-    /// non-AArch64 platform. On an AArch64 platform that runs rewritten guests
-    /// `None` is a configuration error rather than a valid state, and the
-    /// loader treats it as fatal for the binary: an unpatched gate does *not*
-    /// fault. It reads and writes the same address 32KB past the thread
-    /// pointer, so it is self-consistent and the guest goes on producing
-    /// correct results while silently corrupting eight bytes of host memory.
-    /// The default is `None`.
-    fn guest_tpidr_offset(&self) -> Option<u16> {
+    /// Concretely, on AArch64 the anchor is `TPIDR_EL0` and every guest
+    /// `MRS`/`MSR TPIDR_EL0` becomes a load/store of `[TPIDR_EL0 + offset]`.
+    ///
+    /// Returns `None` when the platform does no such virtualization, which is
+    /// the default and is correct for every platform that leaves the guest
+    /// thread pointer alone. For a platform that *does* virtualize it, `None`
+    /// is a configuration error rather than a valid state, and the loader
+    /// treats it as fatal for the binary: an unpatched gate does *not* fault.
+    /// It reads and writes the same address, so it is self-consistent and the
+    /// guest goes on producing correct results while silently corrupting eight
+    /// bytes of host memory.
+    fn guest_thread_pointer_offset(&self) -> Option<u16> {
         None
     }
 }
