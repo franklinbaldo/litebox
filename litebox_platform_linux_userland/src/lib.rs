@@ -135,7 +135,7 @@ macro_rules! tls_anchor {
 ///
 /// AArch64 has no segment-relative addressing; it anchors a scratch register on
 /// the TLS control block with `tls_anchor!` and applies a literal offset from
-/// [`tls_offset`] instead.
+/// `tls_offset` instead.
 #[cfg(target_arch = "x86_64")]
 macro_rules! tls {
     ($var:literal) => {
