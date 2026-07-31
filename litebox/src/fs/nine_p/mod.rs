@@ -3,9 +3,9 @@
 
 //! A network file system, using the 9P2000.L protocol
 //!
-//! This module provides a [`FileSystem`] implementation that accesses files over a 9P2000.L
-//! network connection. The 9P protocol is a simple, message-based protocol originally designed
-//! for Plan 9 from Bell Labs. 9P2000.L is a Linux-specific variant that provides better
+//! This module provides a [`NineP`] [`Backend`](super::backend::Backend) that accesses files over
+//! a 9P2000.L network connection. The 9P protocol is a simple, message-based protocol originally
+//! designed for Plan 9 from Bell Labs. 9P2000.L is a Linux-specific variant that provides better
 //! compatibility with POSIX semantics.
 
 use alloc::string::String;
@@ -26,7 +26,7 @@ use crate::fs::errors::{
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
-use crate::{LiteBox, sync};
+use crate::sync;
 
 mod client;
 mod fcall;
@@ -596,8 +596,6 @@ where
     }
 }
 
-const DEVICE_ID: usize = u32::from_le_bytes(*b"NINE") as usize;
-
 /// The 9P server is authoritative for permissions, so every component the backend reports is left
 /// for it to check.
 fn backend_checked_components(count: usize) -> Vec<WalkedComponent> {
@@ -630,7 +628,7 @@ fn assert_supported_oflags(flags: OFlags) {
     }
 }
 
-/// Convert FileSystem OFlags to 9P LOpenFlags
+/// Convert [`OFlags`] to 9P `LOpenFlags`
 fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
     let mut lflags = fcall::LOpenFlags::empty();
 
@@ -1002,246 +1000,4 @@ impl From<Rlerror> for Error {
     fn from(err: Rlerror) -> Self {
         Error::Remote(err.ecode)
     }
-}
-
-/// A backing implementation for [`FileSystem`](super::FileSystem) using a 9P2000.L-based network
-/// file system.
-///
-/// This is a thin wrapper that resolves paths and manages fd state via a
-/// [`Resolver`](super::resolver::Resolver) over the [`NineP`] backend. Will disappear shortly.
-///
-/// # Type Parameters
-///
-/// - `Platform`: The platform provider that supplies synchronization primitives and other
-///   platform-specific functionality.
-/// - `T`: The transport type that implements both `Read` and `Write` traits.
-pub struct FileSystem<Platform, T>
-where
-    Platform: sync::RawSyncPrimitivesProvider + 'static,
-    T: transport::Read + transport::Write + Send + 'static,
-{
-    /// Reference to the LiteBox instance
-    litebox: LiteBox<Platform>,
-    resolver: super::resolver::Resolver<Platform, NineP<Platform, T>>,
-}
-
-impl<Platform, T> FileSystem<Platform, T>
-where
-    Platform: sync::RawSyncPrimitivesProvider + 'static,
-    T: transport::Read + transport::Write + Send + 'static,
-{
-    /// Construct a new `FileSystem` instance
-    ///
-    /// This function is expected to only be invoked once per platform, as an initialization step,
-    /// and the created `FileSystem` handle is expected to be shared across all usage over the
-    /// system.
-    ///
-    /// # Arguments
-    ///
-    /// * `litebox` - Reference to the LiteBox instance for platform access
-    /// * `transport` - The transport for 9P communication
-    /// * `msize` - Maximum message size to negotiate
-    /// * `username` - Username for authentication
-    /// * `path` - Attach path (typically the root directory path)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if version negotiation or attach fails.
-    pub fn new(
-        litebox: &LiteBox<Platform>,
-        transport: T,
-        msize: u32,
-        username: &str,
-        path: &str,
-    ) -> Result<Self, Error> {
-        let backend = NineP::new(
-            transport,
-            msize,
-            username,
-            path,
-            super::inode_allocator::InodeAllocator::for_device(DEVICE_ID as u64),
-        )?;
-        Ok(Self {
-            litebox: litebox.clone(),
-            resolver: super::resolver::Resolver::new(litebox, backend),
-        })
-    }
-}
-
-impl<Platform, T> super::private::Sealed for FileSystem<Platform, T>
-where
-    Platform: sync::RawSyncPrimitivesProvider + 'static,
-    T: transport::Read + transport::Write + Send + 'static,
-{
-}
-
-impl<Platform, T> super::FileSystem for FileSystem<Platform, T>
-where
-    Platform: sync::RawSyncPrimitivesProvider + 'static,
-    T: transport::Read + transport::Write + Send + 'static,
-{
-    fn open(
-        &self,
-        path: impl crate::path::Arg,
-        flags: super::OFlags,
-        mode: super::Mode,
-    ) -> Result<FileFd<Platform, T>, OpenError> {
-        let fd = super::FileSystem::open(&self.resolver, path, flags, mode)?;
-        Ok(self
-            .litebox
-            .descriptor_table_mut()
-            .insert(Descriptor { fd }))
-    }
-
-    fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
-        let Some(descriptor) = self.litebox.descriptor_table_mut().remove(fd) else {
-            return Ok(());
-        };
-        super::FileSystem::close(&self.resolver, &descriptor.entry.fd)
-    }
-
-    fn read(
-        &self,
-        fd: &FileFd<Platform, T>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::read(&self.resolver, &descriptor.entry.fd, buf, offset)
-        })
-    }
-
-    fn write(
-        &self,
-        fd: &FileFd<Platform, T>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(WriteError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::write(&self.resolver, &descriptor.entry.fd, buf, offset)
-        })
-    }
-
-    fn seek(
-        &self,
-        fd: &FileFd<Platform, T>,
-        offset: isize,
-        whence: super::SeekWhence,
-    ) -> Result<usize, SeekError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(SeekError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::seek(&self.resolver, &descriptor.entry.fd, offset, whence)
-        })
-    }
-
-    fn truncate(
-        &self,
-        fd: &FileFd<Platform, T>,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(TruncateError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::truncate(&self.resolver, &descriptor.entry.fd, length, reset_offset)
-        })
-    }
-
-    fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
-        super::FileSystem::chmod(&self.resolver, path, mode)
-    }
-
-    fn chown(
-        &self,
-        path: impl crate::path::Arg,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        super::FileSystem::chown(&self.resolver, path, user, group)
-    }
-
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
-        super::FileSystem::unlink(&self.resolver, path)
-    }
-
-    fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
-        super::FileSystem::mkdir(&self.resolver, path, mode)
-    }
-
-    fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        super::FileSystem::rmdir(&self.resolver, path)
-    }
-
-    fn read_dir(&self, fd: &FileFd<Platform, T>) -> Result<Vec<crate::fs::DirEntry>, ReadDirError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadDirError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::read_dir(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-
-    fn file_status(
-        &self,
-        path: impl crate::path::Arg,
-    ) -> Result<super::FileStatus, FileStatusError> {
-        super::FileSystem::file_status(&self.resolver, path)
-    }
-
-    fn fd_file_status(
-        &self,
-        fd: &FileFd<Platform, T>,
-    ) -> Result<super::FileStatus, FileStatusError> {
-        let descriptor = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(FileStatusError::ClosedFd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::fd_file_status(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-
-    fn get_static_backing_data(&self, fd: &FileFd<Platform, T>) -> Option<&'static [u8]> {
-        let descriptor = self.litebox.descriptor_table().entry_handle(fd)?;
-        descriptor.with_entry(|descriptor| {
-            super::FileSystem::get_static_backing_data(&self.resolver, &descriptor.entry.fd)
-        })
-    }
-}
-
-// TODO(jayb): migrate away from these as soon as the wrapper is cleaned up
-struct Descriptor<Platform, T>
-where
-    Platform: sync::RawSyncPrimitivesProvider + 'static,
-    T: transport::Read + transport::Write + Send + 'static,
-{
-    fd: super::resolver::ResolverFd<Platform, NineP<Platform, T>>,
-}
-
-crate::fd::enable_fds_for_subsystem! {
-    @Platform: { sync::RawSyncPrimitivesProvider + 'static }, T: { transport::Read + transport::Write + Send + 'static };
-    FileSystem<Platform, T>;
-    @Platform: { sync::RawSyncPrimitivesProvider + 'static }, T: { transport::Read + transport::Write + Send + 'static };
-    Descriptor<Platform, T>;
-    -> FileFd<Platform, T>;
 }

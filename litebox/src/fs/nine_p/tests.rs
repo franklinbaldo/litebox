@@ -12,10 +12,33 @@ use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
 };
+use crate::fs::inode_allocator::InodeAllocator;
+use crate::fs::resolver::Resolver;
 use crate::fs::{FileSystem as _, Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
-use super::transport;
+use super::{NineP, transport};
+
+type NinePFs<T> = Resolver<MockPlatform, NineP<MockPlatform, T>>;
+
+/// Attach to `server` over `transport`, building the backend the tests resolve paths through.
+fn attach<T: transport::Read + transport::Write>(
+    transport: T,
+    server: &DiodServer,
+) -> NineP<MockPlatform, T> {
+    let aname = server.export_path().to_str().unwrap();
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| std::string::String::from("nobody"));
+    NineP::new(
+        transport,
+        65536,
+        &username,
+        aname,
+        InodeAllocator::standalone(),
+    )
+    .expect("failed to create 9P filesystem")
+}
 
 /// A wrapper around `TcpStream` that implements the litebox 9P transport traits.
 struct TcpTransport {
@@ -174,14 +197,9 @@ impl Drop for DiodServer {
 fn connect_9p(
     litebox: &crate::LiteBox<MockPlatform>,
     server: &DiodServer,
-) -> super::FileSystem<MockPlatform, TcpTransport> {
+) -> NinePFs<TcpTransport> {
     let transport = TcpTransport::connect(&server.addr());
-    let aname = server.export_path().to_str().unwrap();
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| std::string::String::from("nobody"));
-    super::FileSystem::new(litebox, transport, 65536, &username, aname)
-        .expect("failed to create 9P filesystem")
+    Resolver::new(litebox, attach(transport, server))
 }
 
 // ---------------------------------------------------------------------------
@@ -507,15 +525,12 @@ fn connect_9p_broken(
     litebox: &crate::LiteBox<MockPlatform>,
     server: &DiodServer,
     allowed_writes: usize,
-) -> super::FileSystem<MockPlatform, BrokenTransport> {
+) -> NinePFs<BrokenTransport> {
     let tcp = TcpTransport::connect(&server.addr());
-    let transport = BrokenTransport::new(tcp, allowed_writes);
-    let aname = server.export_path().to_str().unwrap();
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| std::string::String::from("nobody"));
-    super::FileSystem::new(litebox, transport, 65536, &username, aname)
-        .expect("failed to create 9P filesystem (broken transport)")
+    Resolver::new(
+        litebox,
+        attach(BrokenTransport::new(tcp, allowed_writes), server),
+    )
 }
 
 // ---------------------------------------------------------------------------
