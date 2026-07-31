@@ -27,26 +27,38 @@
 use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
 
+use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use int_enum::IntEnum;
 use litebox::LiteBox;
+use litebox::event::{
+    Events,
+    polling::{Pollee, TryOpError},
+};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
 use litebox::fs::{FileSystem as _, FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::sync::Mutex;
 use litebox::utils::TruncateExt;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, raw_handle_entry};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
+};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, UnicodeString, read_object_attributes};
+use crate::nt_types::{
+    AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
+    read_unicode_string_at,
+};
 
 type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     Platform,
@@ -77,8 +89,11 @@ pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
     fs: RegistryFileSystem<Platform>,
+    notification_state: Mutex<Platform, RegistryNotificationState>,
+    notification_pollee: Pollee<Platform>,
 }
 
+/// Reserved backing-store directory that contains a registry key's value files.
 const VALUES_DIR_NAME: &str = ".values";
 const DEFAULT_CODE_PAGE_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
@@ -139,15 +154,94 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryOpenOptions: u32 {
+        const BACKUP_RESTORE = 0x0000_0004;
+        const OPEN_LINK = 0x0000_0008;
+        const DONT_VIRTUALIZE = 0x0000_0010;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryCreateOptions: u32 {
+        const VOLATILE = 0x0000_0001;
+        const CREATE_LINK = 0x0000_0002;
+        const BACKUP_RESTORE = 0x0000_0004;
+        const OPEN_LINK = 0x0000_0008;
+        const DONT_VIRTUALIZE = 0x0000_0010;
+    }
+}
+
+bitflags::bitflags! {
+    /// Changes accepted by `NtNotifyChangeKey`.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct RegistryNotifyFilter: u32 {
+        const NAME = 0x0000_0001;
+        const ATTRIBUTES = 0x0000_0002;
+        const LAST_SET = 0x0000_0004;
+        const SECURITY = 0x0000_0008;
+        const THREAD_AGNOSTIC = 0x1000_0000;
+    }
+}
+
+fn registry_notify_filter_indices(filter: RegistryNotifyFilter) -> impl Iterator<Item = usize> {
+    [
+        (RegistryNotifyFilter::NAME, 0),
+        (RegistryNotifyFilter::ATTRIBUTES, 1),
+        (RegistryNotifyFilter::LAST_SET, 2),
+        (RegistryNotifyFilter::SECURITY, 3),
+    ]
+    .into_iter()
+    .filter_map(move |(flag, index)| filter.contains(flag).then_some(index))
+}
+
+#[derive(Default)]
+struct RegistryNotificationState {
+    generation: u64,
+    keys: BTreeMap<String, RegistryKeyChangeState>,
+}
+
+#[derive(Default)]
+struct RegistryKeyChangeState {
+    direct: [u64; 4],
+    subtree: [u64; 4],
+}
+
+pub(crate) struct NtNotifyChangeKeyRequest<Platform: litebox::platform::RawPointerProvider> {
+    pub(crate) key_handle: Handle,
+    pub(crate) event: Handle,
+    pub(crate) apc_routine: Option<ConstPtr<Platform, u8>>,
+    pub(crate) apc_context: Option<ConstPtr<Platform, u8>>,
+    pub(crate) io_status_block: MutPtr<Platform, IoStatusBlock>,
+    pub(crate) completion_filter: u32,
+    pub(crate) watch_tree: bool,
+    pub(crate) buffer: Option<MutPtr<Platform, u8>>,
+    pub(crate) buffer_size: u32,
+    pub(crate) asynchronous: bool,
+}
+
 impl RegistryKeyAccess {
     fn from_desired_access(desired_access: u32) -> Self {
-        Self::from_bits_retain(AccessMask::expand_generic_access(
-            desired_access,
+        // MAXIMUM_ALLOWED requests every right the (unrestricted) key grants, so
+        // expand it to ALL_ACCESS — mirroring the token/file/handle subsystems.
+        // Without this a MAXIMUM_ALLOWED open (e.g. 7za's) would grant no usable
+        // rights and later NtQueryKey access checks would spuriously fail.
+        let maximum_allowed = desired_access & AccessMask::MAXIMUM_ALLOWED.bits() != 0;
+        let explicit_access = desired_access & !AccessMask::MAXIMUM_ALLOWED.bits();
+        let normalized = AccessMask::expand_generic_access(
+            explicit_access,
             Self::READ.bits(),
             Self::WRITE.bits(),
             Self::EXECUTE.bits(),
             Self::ALL_ACCESS.bits(),
-        ))
+        );
+        Self::from_bits_retain(if maximum_allowed {
+            normalized | Self::ALL_ACCESS.bits()
+        } else {
+            normalized
+        })
     }
 }
 
@@ -203,6 +297,105 @@ enum KeyValueInformationClass {
     Partial = 2,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum KeyInformationClass {
+    Basic = 0,
+    Node = 1,
+    Full = 2,
+    Name = 3,
+    Cached = 4,
+    Flags = 5,
+    Virtualization = 6,
+    HandleTags = 7,
+    Trust = 8,
+    Layer = 9,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum RegistryKeyDisposition {
+    CreatedNewKey = 1,
+    OpenedExistingKey = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyBasicInformation {
+    last_write_time: [u8; 8],
+    /// Legacy registry title index. Reserved; callers should ignore this field.
+    title_index: u32,
+    name_length: u32,
+    name: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyNodeInformation {
+    last_write_time: [u8; 8],
+    /// Legacy registry title index. Reserved; callers should ignore this field.
+    title_index: u32,
+    class_offset: u32,
+    class_length: u32,
+    name_length: u32,
+    name: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyFullInformation {
+    last_write_time: [u8; 8],
+    /// Legacy registry title index. Reserved; callers should ignore this field.
+    title_index: u32,
+    class_offset: u32,
+    class_length: u32,
+    sub_keys: u32,
+    max_name_len: u32,
+    max_class_len: u32,
+    values: u32,
+    max_value_name_len: u32,
+    max_value_data_len: u32,
+    class: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyNameInformation {
+    name_length: u32,
+    name: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyCachedInformation {
+    last_write_time: [u8; 8],
+    /// Legacy registry title index. Reserved; callers should ignore this field.
+    title_index: u32,
+    sub_keys: u32,
+    max_name_len: u32,
+    values: u32,
+    max_value_name_len: u32,
+    max_value_data_len: u32,
+    name_length: u32,
+    // LARGE_INTEGER gives the Windows structure 8-byte alignment and a 40-byte size.
+    padding: [u8; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct KeyHandleTagsInformation {
+    handle_tags: u32,
+}
+
+#[derive(Default)]
+struct KeySummary {
+    sub_keys: usize,
+    max_name_len: usize,
+    values: usize,
+    max_value_name_len: usize,
+    max_value_data_len: usize,
+}
+
 /// The `KEY_VALUE_BASIC_INFORMATION` structure defines a subset of the full
 /// information available for a value entry of a registry key.
 ///
@@ -211,6 +404,7 @@ enum KeyValueInformationClass {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct KeyValueBasicInformation {
+    /// Legacy registry title index. Reserved; callers should ignore this field.
     title_index: u32,
     value_type: u32,
     name_length: u32,
@@ -227,6 +421,7 @@ struct KeyValueBasicInformation {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct KeyValueFullInformation {
+    /// Legacy registry title index. Reserved; callers should ignore this field.
     title_index: u32,
     value_type: u32,
     data_offset: u32,
@@ -247,6 +442,7 @@ struct KeyValueFullInformation {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct KeyValuePartialInformation {
+    /// Legacy registry title index. Reserved; callers should ignore this field.
     title_index: u32,
     value_type: u32,
     data_length: u32,
@@ -255,7 +451,7 @@ struct KeyValuePartialInformation {
 }
 
 struct RegistryValue {
-    value_type: RegistryValueType,
+    value_type: u32,
     data: Vec<u8>,
 }
 
@@ -307,7 +503,11 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
-        Self { fs }
+        Self {
+            fs,
+            notification_state: Mutex::new(RegistryNotificationState::default()),
+            notification_pollee: Pollee::new(),
+        }
     }
 
     fn open_key(
@@ -351,15 +551,134 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             return Err(NtStatus::UNSUCCESSFUL);
         }
 
-        let value_type = RegistryValueType::try_from(u32::from_le_bytes(
+        let value_type = u32::from_le_bytes(
             data[..REGISTRY_VALUE_TYPE_SIZE]
                 .try_into()
                 .map_err(|_| NtStatus::UNSUCCESSFUL)?,
-        ))
-        .map_err(|_| NtStatus::UNSUCCESSFUL)?;
+        );
         data.drain(..REGISTRY_VALUE_TYPE_SIZE);
 
         Ok(RegistryValue { value_type, data })
+    }
+
+    fn write_value_at_path(
+        &self,
+        key_path: &str,
+        value_name: &str,
+        value_type: u32,
+        value: &[u8],
+    ) -> Result<(), NtStatus> {
+        write_value_at_path(&self.fs, key_path, value_name, value_type, value)?;
+        self.record_change(key_path, RegistryNotifyFilter::LAST_SET);
+        Ok(())
+    }
+
+    fn record_key_created(&self, path: &str) {
+        let Some((parent, _)) = path.rsplit_once('/') else {
+            return;
+        };
+        if parent.is_empty() {
+            return;
+        }
+        self.record_change(parent, RegistryNotifyFilter::NAME);
+    }
+
+    fn notification_generation(
+        &self,
+        path: &str,
+        filter: RegistryNotifyFilter,
+        watch_tree: bool,
+    ) -> u64 {
+        let state = self.notification_state.lock();
+        let Some(changes) = state.keys.get(path) else {
+            return 0;
+        };
+        let generations = if watch_tree {
+            &changes.subtree
+        } else {
+            &changes.direct
+        };
+        registry_notify_filter_indices(filter)
+            .map(|index| generations[index])
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn record_change(&self, path: &str, filter: RegistryNotifyFilter) {
+        let mut state = self.notification_state.lock();
+        state.generation = state.generation.wrapping_add(1);
+        if state.generation == 0 {
+            state.generation = 1;
+        }
+        let generation = state.generation;
+        let direct = state.keys.entry(String::from(path)).or_default();
+        for index in registry_notify_filter_indices(filter) {
+            direct.direct[index] = generation;
+        }
+
+        let mut ancestor = Some(path);
+        while let Some(path) = ancestor {
+            let changes = state.keys.entry(String::from(path)).or_default();
+            for index in registry_notify_filter_indices(filter) {
+                changes.subtree[index] = generation;
+            }
+            ancestor = path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .filter(|parent| !parent.is_empty());
+        }
+        drop(state);
+        self.notification_pollee.notify_observers(Events::IN);
+    }
+
+    fn key_summary(&self, key: &RegistryKeyObject<Platform>) -> Result<KeySummary, NtStatus> {
+        let mut summary = KeySummary::default();
+        for entry in self.fs.read_dir(&key.fd).map_err(map_read_dir_error)? {
+            if entry.file_type == FileType::Directory
+                && entry.name != "."
+                && entry.name != ".."
+                && entry.name != VALUES_DIR_NAME
+            {
+                summary.sub_keys += 1;
+                summary.max_name_len = summary
+                    .max_name_len
+                    .max(entry.name.encode_utf16().count() * size_of::<u16>());
+            }
+        }
+
+        let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
+        let values_fd = self
+            .fs
+            .open(
+                &*values_path,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )
+            .map_err(map_open_error)?;
+        let values = self.fs.read_dir(&values_fd).map_err(map_read_dir_error);
+        let _ = self.fs.close(&values_fd);
+        for entry in values? {
+            if entry.file_type != FileType::RegularFile {
+                continue;
+            }
+            summary.values += 1;
+            summary.max_value_name_len = summary
+                .max_value_name_len
+                .max(entry.name.encode_utf16().count() * size_of::<u16>());
+            let path = format!("{values_path}/{}", entry.name);
+            let size = self
+                .fs
+                .file_status(&*path)
+                .map_err(map_file_status_error)?
+                .size;
+            if size < REGISTRY_VALUE_TYPE_SIZE {
+                return Err(NtStatus::UNSUCCESSFUL);
+            }
+            summary.max_value_data_len = summary
+                .max_value_data_len
+                .max(size - REGISTRY_VALUE_TYPE_SIZE);
+        }
+        Ok(summary)
     }
 }
 
@@ -406,6 +725,28 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         desired_access: u32,
         object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
     ) -> NtStatus {
+        self.sys_nt_open_key_ex(key_handle, desired_access, object_attributes, 0)
+    }
+
+    pub(crate) fn sys_nt_open_key_ex(
+        &self,
+        key_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        open_options: u32,
+    ) -> NtStatus {
+        let Some(open_options) = RegistryOpenOptions::from_bits(open_options) else {
+            return NtStatus::INVALID_PARAMETER_4;
+        };
+        // TODO(registry-symlink): Honor OPEN_LINK once registry symbolic links are modeled.
+        // TODO(registry-backup): Apply backup/restore privileges once the security model exists.
+        // TODO(registry-virtualization): Honor DONT_VIRTUALIZE once registry virtualization exists.
+        if !open_options.is_empty() {
+            litebox_util_log::debug!(
+                open_options:? = open_options;
+                "NtOpenKeyEx options have no effect in the current registry model"
+            );
+        }
         let Some(object_attributes) = object_attributes else {
             return NtStatus::INVALID_PARAMETER;
         };
@@ -426,29 +767,122 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "preserves the seven-argument NtCreateKey ABI"
+    )]
+    pub(crate) fn sys_nt_create_key(
+        &self,
+        key_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        title_index: u32,
+        class: Option<ConstPtr<Platform, UnicodeString>>,
+        create_options: u32,
+        disposition: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        let Some(create_options) = RegistryCreateOptions::from_bits(create_options) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if create_options
+            .intersects(RegistryCreateOptions::VOLATILE | RegistryCreateOptions::CREATE_LINK)
+        {
+            // TODO(registry-volatile): Model volatile key lifetime and symbolic-link keys.
+            return NtStatus::NOT_SUPPORTED;
+        }
+        if create_options.contains(RegistryCreateOptions::BACKUP_RESTORE) {
+            // TODO(registry-backup): Apply backup/restore privileges to access checks.
+            return NtStatus::NOT_SUPPORTED;
+        }
+
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
+        };
+        if let Some(class) = class {
+            let Some(class) = class.read_at_offset(0) else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            if let Err(status) = class.read_string::<Platform>() {
+                return status;
+            }
+            // TODO(registry-class): Persist this optional legacy class string so
+            // NtQueryKey can return it in key node and full information.
+        }
+        if title_index != 0
+            || create_options.intersects(
+                RegistryCreateOptions::OPEN_LINK | RegistryCreateOptions::DONT_VIRTUALIZE,
+            )
+        {
+            // TODO(registry-metadata): Preserve title indices and virtualization/open-link options.
+            litebox_util_log::debug!(
+                title_index,
+                create_options:? = create_options;
+                "NtCreateKey metadata has no effect in the current registry model"
+            );
+        }
+
+        match self.do_nt_create_key(desired_access, object_attributes) {
+            Ok((handle, key_disposition)) => {
+                if let Some(disposition) = disposition
+                    && disposition
+                        .write_at_offset(0, u32::from(key_disposition))
+                        .is_none()
+                {
+                    self.close_registry_key_handle(handle);
+                    return NtStatus::ACCESS_VIOLATION;
+                }
+                if key_handle.write_at_offset(0, handle).is_none() {
+                    self.close_registry_key_handle(handle);
+                    return NtStatus::ACCESS_VIOLATION;
+                }
+                NtStatus::SUCCESS
+            }
+            Err(status) => status,
+        }
+    }
+
+    fn do_nt_create_key(
+        &self,
+        desired_access: u32,
+        object_attributes: ObjectAttributes,
+    ) -> Result<(Handle, RegistryKeyDisposition), NtStatus> {
+        let path = self.registry_key_path(object_attributes)?;
+        let disposition = match self.global.registry.fs.file_status(&path) {
+            Ok(status) if status.file_type == FileType::Directory => {
+                RegistryKeyDisposition::OpenedExistingKey
+            }
+            Ok(_) => return Err(NtStatus::OBJECT_TYPE_MISMATCH),
+            Err(FileStatusError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            )) => {
+                for created_path in create_key_path_in_fs(&self.global.registry.fs, &path)? {
+                    self.global.registry.record_key_created(&created_path);
+                }
+                RegistryKeyDisposition::CreatedNewKey
+            }
+            Err(FileStatusError::PathError(error)) => {
+                return Err(map_path_error(error, NtStatus::OBJECT_NAME_NOT_FOUND));
+            }
+            Err(_) => return Err(NtStatus::UNSUCCESSFUL),
+        };
+
+        let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
+        let fd = self.global.registry.open_key(&path, desired_access)?;
+        let handle =
+            self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)?;
+        Ok((handle, disposition))
+    }
+
     fn do_nt_open_key(
         &self,
         desired_access: u32,
         object_attributes: ObjectAttributes,
     ) -> Result<Handle, NtStatus> {
-        if object_attributes.object_name == 0 {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-
-        let object_name_ptr =
-            ConstPtr::<Platform, UnicodeString>::from_usize(object_attributes.object_name);
-        let object_name = object_name_ptr
-            .read_at_offset(0)
-            .ok_or(NtStatus::ACCESS_VIOLATION)?;
-        let key_name = object_name.read_string::<Platform>()?;
-        let path = if object_attributes.root_directory.is_null() || key_name.starts_with('\\') {
-            absolute_nt_key_name_to_fs_path(&key_name)?
-        } else {
-            let root_key = self.registry_key_entry(object_attributes.root_directory)?;
-            root_key
-                .with_entry(|root_key| relative_nt_key_name_to_fs_path(&root_key.path, &key_name))?
-        };
-
+        let path = self.registry_key_path(object_attributes)?;
         let desired_access = RegistryKeyAccess::from_desired_access(desired_access);
         let fd = self
             .global
@@ -458,8 +892,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 if *status != NtStatus::OBJECT_NAME_NOT_FOUND {
                     litebox_util_log::debug!(
                         desired_access:? = desired_access,
-                        root_directory:% = format_args!("{:#x}", object_attributes.root_directory.as_raw()),
-                        name:% = key_name,
                         path:% = path,
                         status:? = status;
                         "NtOpenKey failed"
@@ -467,6 +899,22 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             })?;
         self.insert_registry_key_handle(RegistryKeyObject { path, fd }, desired_access)
+    }
+
+    fn registry_key_path(&self, object_attributes: ObjectAttributes) -> Result<String, NtStatus> {
+        if object_attributes.object_name == 0 {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+
+        let key_name = read_unicode_string_at::<Platform>(object_attributes.object_name)?;
+        let path = if object_attributes.root_directory.is_null() || key_name.starts_with('\\') {
+            absolute_nt_key_name_to_fs_path(&key_name)?
+        } else {
+            let root_key = self.registry_key_entry(object_attributes.root_directory)?;
+            root_key
+                .with_entry(|root_key| relative_nt_key_name_to_fs_path(&root_key.path, &key_name))?
+        };
+        Ok(path)
     }
 
     pub(crate) fn sys_nt_query_value_key(
@@ -503,6 +951,390 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn sys_nt_set_value_key(
+        &self,
+        key_handle: Handle,
+        value_name: ConstPtr<Platform, UnicodeString>,
+        title_index: u32,
+        value_type: u32,
+        data: Option<ConstPtr<Platform, u8>>,
+        data_size: u32,
+    ) -> NtStatus {
+        let key = match self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            key_handle,
+            RegistryKeyAccess::SET_VALUE.bits(),
+        ) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        let Some(value_name) = value_name.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let value_name = match value_name.read_string::<Platform>() {
+            Ok(value_name) => value_name,
+            Err(status) => return status,
+        };
+        let data = match (data, data_size) {
+            (None, 0) => Vec::new(),
+            (Some(data), data_size) => {
+                let Some(data) = data.to_owned_slice(data_size as usize) else {
+                    return NtStatus::ACCESS_VIOLATION;
+                };
+                data.into_vec()
+            }
+            (None, _) => return NtStatus::ACCESS_VIOLATION,
+        };
+
+        if title_index != 0 {
+            // TODO(registry-metadata): Persist value title indices.
+            litebox_util_log::debug!(
+                title_index;
+                "NtSetValueKey title index has no effect in the current registry model"
+            );
+        }
+        match key.with_entry(|key| {
+            self.global
+                .registry
+                .write_value_at_path(&key.path, &value_name, value_type, &data)
+        }) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    pub(crate) fn sys_nt_notify_change_key(
+        &self,
+        params: NtNotifyChangeKeyRequest<Platform>,
+    ) -> NtStatus {
+        let key = match self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            params.key_handle,
+            RegistryKeyAccess::NOTIFY.bits(),
+        ) {
+            Ok(key) => key,
+            Err(status) => return status,
+        };
+        let Some(completion_filter) = RegistryNotifyFilter::from_bits(params.completion_filter)
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(params.io_status_block)
+            .is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if !params.asynchronous {
+            let path = key.with_entry(|key| key.path.clone());
+            let generation = self.global.registry.notification_generation(
+                &path,
+                completion_filter,
+                params.watch_tree,
+            );
+            let wait_cx = self.wait_cx();
+            let wait_result =
+                self.global
+                    .registry
+                    .notification_pollee
+                    .wait(&wait_cx, false, Events::IN, || {
+                        if self.global.registry.notification_generation(
+                            &path,
+                            completion_filter,
+                            params.watch_tree,
+                        ) == generation
+                        {
+                            Err(TryOpError::<NtStatus>::TryAgain)
+                        } else {
+                            Ok(())
+                        }
+                    });
+            let status = match wait_result {
+                Ok(()) => NtStatus::NOTIFY_ENUM_DIR,
+                Err(TryOpError::WaitError(litebox::event::wait::WaitError::Interrupted)) => {
+                    NtStatus::ALERTED
+                }
+                Err(TryOpError::WaitError(litebox::event::wait::WaitError::TimedOut)) => {
+                    unreachable!("synchronous registry notifications have no timeout")
+                }
+                Err(TryOpError::TryAgain) => {
+                    unreachable!("blocking registry notification cannot return TryAgain")
+                }
+                Err(TryOpError::Other(status)) => status,
+            };
+            if status == NtStatus::NOTIFY_ENUM_DIR
+                && params
+                    .io_status_block
+                    .write_at_offset(0, IoStatusBlock::new(status, 0))
+                    .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            return status;
+        }
+        if !params.event.is_null()
+            && let Err(status) = self.check_event_modify_access(params.event)
+        {
+            return status;
+        }
+        if !params.event.is_null()
+            && let Err(status) = self.clear_event(params.event)
+        {
+            return status;
+        }
+        if params
+            .io_status_block
+            .write_at_offset(0, IoStatusBlock::new(NtStatus::PENDING, 0))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        if params.apc_routine.is_some()
+            || params.apc_context.is_some()
+            || params.buffer.is_some()
+            || params.buffer_size != 0
+        {
+            litebox_util_log::warn!(
+                key_handle = params.key_handle.as_raw(),
+                apc_routine = params.apc_routine.is_some(),
+                apc_context = params.apc_context.is_some(),
+                buffer = params.buffer.is_some(),
+                buffer_size = params.buffer_size;
+                "NtNotifyChangeKey completion data cannot be delivered without registry change subscriptions"
+            );
+        }
+        litebox_util_log::debug!(
+            key_handle = params.key_handle.as_raw(),
+            completion_filter = completion_filter.bits(),
+            watch_tree = params.watch_tree,
+            asynchronous = params.asynchronous;
+            "Registered pending NtNotifyChangeKey request without a change subscription"
+        );
+        // TODO(registry-notify): Retain the request and complete it when a matching key changes.
+        NtStatus::PENDING
+    }
+
+    pub(crate) fn sys_nt_query_key(
+        &self,
+        key_handle: Handle,
+        key_information_class: u32,
+        key_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        let Ok(key_information_class) = KeyInformationClass::try_from(key_information_class) else {
+            litebox_util_log::debug!(
+                key_information_class = key_information_class;
+                "Unsupported NtQueryKey class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        if matches!(
+            key_information_class,
+            KeyInformationClass::Flags
+                | KeyInformationClass::Virtualization
+                | KeyInformationClass::Trust
+                | KeyInformationClass::Layer
+        ) {
+            // TODO(registry-key-info): Model the extended key information classes.
+            litebox_util_log::debug!(
+                key_information_class:? = key_information_class;
+                "Unsupported NtQueryKey class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+
+        match self.do_nt_query_key(
+            key_handle,
+            key_information_class,
+            key_information,
+            length,
+            result_length,
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
+    fn do_nt_query_key(
+        &self,
+        key_handle: Handle,
+        key_information_class: KeyInformationClass,
+        key_information: MutPtr<Platform, u8>,
+        length: u32,
+        result_length: MutPtr<Platform, u32>,
+    ) -> Result<(), NtStatus> {
+        let key = if key_information_class == KeyInformationClass::Name {
+            // Windows permits KeyNameInformation with any nonzero granted access.
+            self.typed_handle_entry_with_any_access::<RegistryKeySubsystem<Platform>>(key_handle)?
+        } else {
+            self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+                key_handle,
+                RegistryKeyAccess::QUERY_VALUE.bits(),
+            )?
+        };
+        let path = key.with_entry(|key| key.path.clone());
+        let summary = if matches!(
+            key_information_class,
+            KeyInformationClass::Full | KeyInformationClass::Cached
+        ) {
+            key.with_entry(|key| self.global.registry.key_summary(key))?
+        } else {
+            KeySummary::default()
+        };
+        let leaf = path.rsplit('/').next().ok_or(NtStatus::UNSUCCESSFUL)?;
+        let leaf_name = utf16le(leaf);
+
+        match key_information_class {
+            KeyInformationClass::Basic => {
+                let header_len = offset_of!(KeyBasicInformation, name);
+                let required_length = header_len
+                    .checked_add(leaf_name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyBasicInformation {
+                    // TODO(registry-time): Track registry key last-write timestamps.
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    name_length: leaf_name.len().trunc(),
+                    name: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, leaf_name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Node => {
+                let header_len = offset_of!(KeyNodeInformation, name);
+                let required_length = header_len
+                    .checked_add(leaf_name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyNodeInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    class_offset: u32::MAX,
+                    class_length: 0,
+                    name_length: leaf_name.len().trunc(),
+                    name: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, leaf_name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Full => {
+                let required_length = offset_of!(KeyFullInformation, class);
+                let information = KeyFullInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    class_offset: u32::MAX,
+                    class_length: 0,
+                    sub_keys: summary.sub_keys.trunc(),
+                    max_name_len: summary.max_name_len.trunc(),
+                    max_class_len: 0,
+                    values: summary.values.trunc(),
+                    max_value_name_len: summary.max_value_name_len.trunc(),
+                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    class: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            KeyInformationClass::Name => {
+                // TODO(registry-case): Preserve original subkey casing in the registry store.
+                let name = utf16le(&format!(
+                    "\\{}",
+                    path.trim_start_matches('/')
+                        .replace('/', "\\")
+                        .to_ascii_uppercase()
+                ));
+                let header_len = offset_of!(KeyNameInformation, name);
+                let required_length = header_len
+                    .checked_add(name.len())
+                    .ok_or(NtStatus::UNSUCCESSFUL)?;
+                let information = KeyNameInformation {
+                    name_length: name.len().trunc(),
+                    name: [],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    header_len,
+                    required_length,
+                    information.as_bytes(),
+                    &[(header_len, name.as_slice())],
+                )?;
+            }
+            KeyInformationClass::Cached => {
+                let required_length = size_of::<KeyCachedInformation>();
+                let information = KeyCachedInformation {
+                    last_write_time: [0; 8],
+                    title_index: 0,
+                    sub_keys: summary.sub_keys.trunc(),
+                    max_name_len: summary.max_name_len.trunc(),
+                    values: summary.values.trunc(),
+                    max_value_name_len: summary.max_value_name_len.trunc(),
+                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    name_length: leaf_name.len().trunc(),
+                    padding: [0; 4],
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            KeyInformationClass::HandleTags => {
+                let required_length = size_of::<KeyHandleTagsInformation>();
+                let information = KeyHandleTagsInformation {
+                    // Non-virtualized keys have no tags.
+                    // TODO(registry-virtualization): Reflect tags once virtualization is modeled.
+                    handle_tags: 0,
+                };
+                write_query_information::<Platform>(
+                    result_length,
+                    key_information,
+                    length,
+                    required_length,
+                    required_length,
+                    information.as_bytes(),
+                    &[],
+                )?;
+            }
+            KeyInformationClass::Flags
+            | KeyInformationClass::Virtualization
+            | KeyInformationClass::Trust
+            | KeyInformationClass::Layer => return Err(NtStatus::INVALID_INFO_CLASS),
+        }
+
+        litebox_util_log::debug!(
+            handle:% = format_args!("{:#x}", key_handle.as_raw()),
+            key_information_class:? = key_information_class,
+            length = length;
+            "Handled NtQueryKey syscall"
+        );
+        Ok(())
+    }
+
     fn do_nt_query_value_key(
         &self,
         key_handle: Handle,
@@ -531,13 +1363,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(NtStatus::UNSUCCESSFUL)?;
                 let information = KeyValueBasicInformation {
                     title_index: 0,
-                    value_type: value.value_type.into(),
+                    value_type: value.value_type,
                     name_length: name.len().trunc(),
                     name: [0u8; 0],
                 };
-                write_query_result_length::<Platform>(result_length, length, required_length)?;
                 write_query_information::<Platform>(
+                    result_length,
                     key_value_information,
+                    length,
+                    offset_of!(KeyValueBasicInformation, name),
+                    required_length,
                     information.as_bytes(),
                     &[(offset_of!(KeyValueBasicInformation, name), name.as_slice())],
                 )?;
@@ -552,10 +1387,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let required_length = data_offset
                     .checked_add(value.data.len())
                     .ok_or(NtStatus::UNSUCCESSFUL)?;
-                write_query_result_length::<Platform>(result_length, length, required_length)?;
                 let information = KeyValueFullInformation {
                     title_index: 0,
-                    value_type: value.value_type.into(),
+                    value_type: value.value_type,
                     data_offset: data_offset.trunc(),
                     data_length: value.data.len().trunc(),
                     name_length: name.len().trunc(),
@@ -563,7 +1397,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
 
                 write_query_information::<Platform>(
+                    result_length,
                     key_value_information,
+                    length,
+                    offset_of!(KeyValueFullInformation, name),
+                    required_length,
                     information.as_bytes(),
                     &[
                         (offset_of!(KeyValueFullInformation, name), name.as_slice()),
@@ -575,16 +1413,19 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let required_length = size_of::<KeyValuePartialInformation>()
                     .checked_add(value.data.len())
                     .ok_or(NtStatus::UNSUCCESSFUL)?;
-                write_query_result_length::<Platform>(result_length, length, required_length)?;
                 let information = KeyValuePartialInformation {
                     title_index: 0,
-                    value_type: value.value_type.into(),
+                    value_type: value.value_type,
                     data_length: value.data.len().trunc(),
                     data: [0u8; 0],
                 };
 
                 write_query_information::<Platform>(
+                    result_length,
                     key_value_information,
+                    length,
+                    offset_of!(KeyValuePartialInformation, data),
+                    required_length,
                     information.as_bytes(),
                     &[(
                         offset_of!(KeyValuePartialInformation, data),
@@ -606,32 +1447,36 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn write_query_result_length<Platform: litebox::platform::RawPointerProvider>(
+fn write_query_information<Platform: litebox::platform::RawPointerProvider>(
     result_length: MutPtr<Platform, u32>,
+    information: MutPtr<Platform, u8>,
     buffer_length: u32,
+    header_length: usize,
     required_length: usize,
+    header: &[u8],
+    trailing_slices: &[(usize, &[u8])],
 ) -> Result<(), NtStatus> {
     result_length
         .write_at_offset(0, required_length.trunc())
         .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    if (buffer_length as usize) < required_length {
-        return Err(NtStatus::BUFFER_OVERFLOW);
+    let buffer_length = buffer_length as usize;
+    if buffer_length < header_length {
+        return Err(NtStatus::BUFFER_TOO_SMALL);
     }
-    Ok(())
-}
-
-fn write_query_information<Platform: litebox::platform::RawPointerProvider>(
-    key_value_information: MutPtr<Platform, u8>,
-    header: &[u8],
-    trailing_slices: &[(usize, &[u8])],
-) -> Result<(), NtStatus> {
-    key_value_information
+    information
         .write_slice_at_offset(0, header)
         .ok_or(NtStatus::ACCESS_VIOLATION)?;
     for &(offset, bytes) in trailing_slices {
-        key_value_information
-            .write_slice_at_offset(offset.cast_signed(), bytes)
+        let write_length = bytes.len().min(buffer_length.saturating_sub(offset));
+        if write_length == 0 {
+            continue;
+        }
+        information
+            .write_slice_at_offset(offset.cast_signed(), &bytes[..write_length])
             .ok_or(NtStatus::ACCESS_VIOLATION)?;
+    }
+    if buffer_length < required_length {
+        return Err(NtStatus::BUFFER_OVERFLOW);
     }
     Ok(())
 }
@@ -694,7 +1539,17 @@ fn write_value_in_fs<FS: litebox::fs::FileSystem>(
     value: &[u8],
 ) -> Result<(), NtStatus> {
     let key_path = create_key_in_fs(fs, key_nt_path)?;
-    let value_path = value_path(&key_path, value_name)?;
+    write_value_at_path(fs, &key_path, value_name, value_type.into(), value)
+}
+
+fn write_value_at_path<FS: litebox::fs::FileSystem>(
+    fs: &FS,
+    key_path: &str,
+    value_name: &str,
+    value_type: u32,
+    value: &[u8],
+) -> Result<(), NtStatus> {
+    let value_path = value_path(key_path, value_name)?;
     let fd = fs
         .open(
             &*value_path,
@@ -703,7 +1558,7 @@ fn write_value_in_fs<FS: litebox::fs::FileSystem>(
         )
         .map_err(map_open_error)?;
     let written = fs
-        .write(&fd, &u32::from(value_type).to_le_bytes(), Some(0))
+        .write(&fd, &value_type.to_le_bytes(), Some(0))
         .map_err(map_write_error)?;
     if written != REGISTRY_VALUE_TYPE_SIZE {
         return Err(NtStatus::DISK_FULL);
@@ -727,30 +1582,36 @@ fn create_key_in_fs<FS: litebox::fs::FileSystem>(
     Ok(path)
 }
 
-fn create_key_path_in_fs<FS: litebox::fs::FileSystem>(fs: &FS, path: &str) -> Result<(), NtStatus> {
+fn create_key_path_in_fs<FS: litebox::fs::FileSystem>(
+    fs: &FS,
+    path: &str,
+) -> Result<Vec<String>, NtStatus> {
     let mut current = String::new();
+    let mut created_keys = Vec::new();
     for component in path.trim_start_matches('/').split('/') {
         if component.is_empty() {
             continue;
         }
         current.push('/');
         current.push_str(component);
-        ensure_directory_in_fs(fs, &current)?;
+        if ensure_directory_in_fs(fs, &current)? {
+            created_keys.push(current.clone());
+        }
 
         let mut values_dir = current.clone();
         values_dir.push('/');
         values_dir.push_str(VALUES_DIR_NAME);
         ensure_directory_in_fs(fs, &values_dir)?;
     }
-    Ok(())
+    Ok(created_keys)
 }
 
 fn ensure_directory_in_fs<FS: litebox::fs::FileSystem>(
     fs: &FS,
     path: &str,
-) -> Result<(), NtStatus> {
+) -> Result<bool, NtStatus> {
     match fs.file_status(path) {
-        Ok(status) if status.file_type == FileType::Directory => Ok(()),
+        Ok(status) if status.file_type == FileType::Directory => Ok(false),
         Ok(_) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
         Err(FileStatusError::PathError(
             PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
@@ -758,7 +1619,8 @@ fn ensure_directory_in_fs<FS: litebox::fs::FileSystem>(
             path,
             Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::ROTH | Mode::WOTH | Mode::XOTH,
         ) {
-            Ok(()) | Err(MkdirError::AlreadyExists) => Ok(()),
+            Ok(()) => Ok(true),
+            Err(MkdirError::AlreadyExists) => Ok(false),
             Err(error) => Err(map_mkdir_error(error)),
         },
         Err(FileStatusError::PathError(error)) => {
@@ -839,6 +1701,13 @@ fn map_read_error(error: ReadError) -> NtStatus {
     match error {
         ReadError::NotForReading => NtStatus::ACCESS_DENIED,
         ReadError::NotAFile => NtStatus::OBJECT_TYPE_MISMATCH,
+        _ => NtStatus::UNSUCCESSFUL,
+    }
+}
+
+fn map_read_dir_error(error: ReadDirError) -> NtStatus {
+    match error {
+        ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }
@@ -927,6 +1796,10 @@ mod tests {
         task.do_nt_open_key(RegistryKeyAccess::READ.bits(), object_attributes)
     }
 
+    fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
     fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
@@ -995,10 +1868,7 @@ mod tests {
         let status = unsafe { RegCloseKey(key) };
         assert_eq!(status, ERROR_SUCCESS, "failed to close host registry key");
 
-        RegistryValue {
-            value_type: RegistryValueType::try_from(value_type).expect("known registry value type"),
-            data,
-        }
+        RegistryValue { value_type, data }
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -1099,13 +1969,236 @@ mod tests {
             REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
         );
         let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
-        assert_eq!(value.value_type, RegistryValueType::Sz);
+        assert_eq!(value.value_type, u32::from(RegistryValueType::Sz));
         assert_eq!(value.data, DEFAULT_ACP_VALUE);
 
         let values_dir = absolute_nt_key_name_to_fs_path(
             "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage\\.values",
         );
         assert_eq!(values_dir, Err(NtStatus::INVALID_PARAMETER));
+    }
+
+    #[test]
+    fn nt_create_key_reports_disposition_and_created_key_is_queryable() {
+        let task = crate::tests::test_task();
+        let key_name = r"\Registry\Machine\Software\LiteBoxCreatedKey";
+        let key_name_utf16 = utf16(key_name);
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut handle = Handle::default();
+        let mut disposition = 0;
+
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                Some(mut_ptr(&mut disposition)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            disposition,
+            u32::from(RegistryKeyDisposition::CreatedNewKey)
+        );
+
+        let mut information = [0u8; 128];
+        let mut result_length = 0;
+        assert_eq!(
+            task.sys_nt_query_key(
+                handle,
+                u32::from(KeyInformationClass::Name),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        let expected_name = utf16le(r"\REGISTRY\MACHINE\SOFTWARE\LITEBOXCREATEDKEY");
+        let header_len = offset_of!(KeyNameInformation, name);
+        assert_eq!(
+            &information[header_len..header_len + expected_name.len()],
+            expected_name.as_slice()
+        );
+        task.close_registry_key_handle(handle);
+
+        let mut second_handle = Handle::default();
+        disposition = 0;
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut second_handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                Some(mut_ptr(&mut disposition)),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            disposition,
+            u32::from(RegistryKeyDisposition::OpenedExistingKey)
+        );
+        task.close_registry_key_handle(second_handle);
+
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0x20,
+                None,
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                RegistryCreateOptions::VOLATILE.bits(),
+                None,
+            ),
+            NtStatus::NOT_SUPPORTED
+        );
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                RegistryKeyAccess::READ.bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                RegistryCreateOptions::CREATE_LINK.bits(),
+                None,
+            ),
+            NtStatus::NOT_SUPPORTED
+        );
+    }
+
+    fn notify_params(
+        key_handle: Handle,
+        io_status_block: &mut IoStatusBlock,
+        completion_filter: u32,
+        asynchronous: bool,
+    ) -> NtNotifyChangeKeyRequest<TestPlatform> {
+        NtNotifyChangeKeyRequest {
+            key_handle,
+            event: Handle::default(),
+            apc_routine: None,
+            apc_context: None,
+            io_status_block: mut_ptr(io_status_block),
+            completion_filter,
+            watch_tree: false,
+            buffer: None,
+            buffer_size: 0,
+            asynchronous,
+        }
+    }
+
+    #[test]
+    fn nt_set_value_key_replaces_and_round_trips_raw_types_and_empty_data() {
+        let task = crate::tests::test_task();
+        let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSetValueKey");
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut handle),
+                (RegistryKeyAccess::QUERY_VALUE | RegistryKeyAccess::SET_VALUE).bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let value_name_utf16 = utf16("Value");
+        let value_name = unicode_string(&value_name_utf16);
+        let initial_data = [1u8, 2, 3, 4, 5];
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                handle,
+                const_ptr(&value_name),
+                0,
+                u32::from(RegistryValueType::Binary),
+                Some(const_byte_ptr(&initial_data)),
+                initial_data.len().trunc(),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let replacement_data = [9u8, 8];
+        let custom_type = 0xfeed_beefu32;
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                handle,
+                const_ptr(&value_name),
+                0,
+                custom_type,
+                Some(const_byte_ptr(&replacement_data)),
+                replacement_data.len().trunc(),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let mut information = [0u8; 64];
+        let mut result_length = 0;
+        assert_eq!(
+            task.sys_nt_query_value_key(
+                handle,
+                const_ptr(&value_name),
+                u32::from(KeyValueInformationClass::Partial),
+                mut_byte_ptr(&mut information),
+                information.len().trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        let (information, data) =
+            KeyValuePartialInformation::read_from_prefix(&information[..result_length as usize])
+                .unwrap();
+        assert_eq!(information.value_type, custom_type);
+        assert_eq!(data, replacement_data);
+
+        let empty_name_utf16 = utf16("Empty");
+        let empty_name = unicode_string(&empty_name_utf16);
+        assert_eq!(
+            task.sys_nt_set_value_key(handle, const_ptr(&empty_name), 0, custom_type, None, 0,),
+            NtStatus::SUCCESS
+        );
+        let empty_value = task
+            .global
+            .registry
+            .read_value_at_path("/registry/machine/software/liteboxsetvaluekey", "Empty")
+            .unwrap();
+        assert_eq!(empty_value.value_type, custom_type);
+        assert!(empty_value.data.is_empty());
+
+        task.close_registry_key_handle(handle);
+        let read_only_handle = open_key(&task, object_attributes).unwrap();
+        assert_eq!(
+            task.sys_nt_set_value_key(
+                read_only_handle,
+                const_ptr(&value_name),
+                0,
+                custom_type,
+                None,
+                0,
+            ),
+            NtStatus::ACCESS_DENIED
+        );
+        task.close_registry_key_handle(read_only_handle);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -1137,8 +2230,8 @@ mod tests {
             let (information, data) =
                 KeyValuePartialInformation::read_from_prefix(information).unwrap();
 
-            assert_eq!(host_value.value_type, RegistryValueType::Sz);
-            assert_eq!(information.value_type, host_value.value_type.into());
+            assert_eq!(host_value.value_type, u32::from(RegistryValueType::Sz));
+            assert_eq!(information.value_type, host_value.value_type);
             assert_eq!(information.data_length as usize, host_value.data.len());
             assert_eq!(data, host_value.data.as_slice());
         }
@@ -1172,6 +2265,116 @@ mod tests {
             open_key(&task, object_attributes).unwrap_err(),
             NtStatus::OBJECT_NAME_NOT_FOUND
         );
+    }
+
+    #[test]
+    fn synchronous_nt_notify_change_key_completes_after_matching_mutation() {
+        use std::time::Duration;
+
+        let task = crate::tests::test_task();
+        let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSynchronousNotify");
+        let key_name = unicode_string(&key_name_utf16);
+        let object_attributes = object_attributes(&key_name, 0);
+        let mut key = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut key),
+                (RegistryKeyAccess::NOTIFY | RegistryKeyAccess::SET_VALUE).bits(),
+                Some(const_ptr(&object_attributes)),
+                0,
+                None,
+                0,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let writer = task.clone_for_test().expect("process is live");
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let value_name_utf16 = utf16("Changed");
+            let value_name = unicode_string(&value_name_utf16);
+            let value = 1u32;
+            writer.sys_nt_set_value_key(
+                key,
+                const_ptr(&value_name),
+                0,
+                u32::from(RegistryValueType::Dword),
+                Some(const_byte_ptr(&value)),
+                size_of::<u32>().trunc(),
+            )
+        });
+
+        let mut io_status = IoStatusBlock::new(NtStatus::PENDING, usize::MAX);
+        assert_eq!(
+            task.sys_nt_notify_change_key(notify_params(
+                key,
+                &mut io_status,
+                RegistryNotifyFilter::LAST_SET.bits(),
+                false,
+            )),
+            NtStatus::NOTIFY_ENUM_DIR
+        );
+        assert_eq!(thread.join().unwrap(), NtStatus::SUCCESS);
+        assert_eq!(io_status.status, NtStatus::NOTIFY_ENUM_DIR.as_raw());
+        assert_eq!(io_status.information, 0);
+    }
+
+    #[test]
+    fn synchronous_nt_notify_change_key_completes_after_subkey_creation() {
+        use std::time::Duration;
+
+        let task = crate::tests::test_task();
+        let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSynchronousNameNotify");
+        let key_name = unicode_string(&key_name_utf16);
+        let parent_attributes = object_attributes(&key_name, 0);
+        let mut key = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_key(
+                mut_ptr(&mut key),
+                RegistryKeyAccess::NOTIFY.bits(),
+                Some(const_ptr(&parent_attributes)),
+                0,
+                None,
+                0,
+                None,
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let writer = task.clone_for_test().expect("process is live");
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let child_name_utf16 = utf16(
+                r"\Registry\Machine\Software\LiteBoxSynchronousNameNotify\Intermediate\Child",
+            );
+            let child_name = unicode_string(&child_name_utf16);
+            let child_attributes = object_attributes(&child_name, 0);
+            let mut child = Handle::default();
+            writer.sys_nt_create_key(
+                mut_ptr(&mut child),
+                RegistryKeyAccess::QUERY_VALUE.bits(),
+                Some(const_ptr(&child_attributes)),
+                0,
+                None,
+                0,
+                None,
+            )
+        });
+
+        let mut io_status = IoStatusBlock::new(NtStatus::PENDING, usize::MAX);
+        assert_eq!(
+            task.sys_nt_notify_change_key(notify_params(
+                key,
+                &mut io_status,
+                RegistryNotifyFilter::NAME.bits(),
+                false,
+            )),
+            NtStatus::NOTIFY_ENUM_DIR
+        );
+        assert_eq!(thread.join().unwrap(), NtStatus::SUCCESS);
+        assert_eq!(io_status.status, NtStatus::NOTIFY_ENUM_DIR.as_raw());
+        assert_eq!(io_status.information, 0);
     }
 
     #[test]
@@ -1385,7 +2588,7 @@ mod tests {
         let missing_value_name = utf16("Missing");
         let missing_value_name = unicode_string(&missing_value_name);
         let mut information = [0u8; 64];
-        let mut short_information = [0u8; KEY_VALUE_PARTIAL_INFORMATION_DATA_OFFSET - 1];
+        let mut short_information = [0xa5; KEY_VALUE_PARTIAL_INFORMATION_DATA_OFFSET - 1];
         let mut result_length = 0;
 
         assert_eq!(
@@ -1436,8 +2639,77 @@ mod tests {
                 mut_ptr(&mut result_length),
             )
             .unwrap_err(),
-            NtStatus::BUFFER_OVERFLOW
+            NtStatus::BUFFER_TOO_SMALL
         );
         assert_eq!(result_length, 22);
+        assert_eq!(
+            short_information,
+            [0xa5; KEY_VALUE_PARTIAL_INFORMATION_DATA_OFFSET - 1]
+        );
+
+        let header_len = offset_of!(KeyValueBasicInformation, name);
+        information.fill(0xa5);
+        assert_eq!(
+            task.do_nt_query_value_key(
+                key_handle,
+                value_name,
+                KeyValueInformationClass::Basic,
+                mut_byte_ptr(&mut information),
+                (header_len + 1).trunc(),
+                mut_ptr(&mut result_length),
+            ),
+            Err(NtStatus::BUFFER_OVERFLOW)
+        );
+        assert_eq!(result_length as usize, header_len + utf16le("ACP").len());
+        assert_eq!(information[header_len], b'A');
+        assert_eq!(information[header_len + 1], 0xa5);
+    }
+
+    #[test]
+    fn nt_query_key_reports_full_and_cached_information() {
+        let task = crate::tests::test_task();
+        let key_handle = open_code_page_key(&task);
+
+        let mut full_bytes = [0u8; 64];
+        let mut result_length = 0;
+        assert!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::Full,
+                mut_byte_ptr(&mut full_bytes),
+                full_bytes.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            result_length as usize,
+            offset_of!(KeyFullInformation, class)
+        );
+        let full = KeyFullInformation::read_from_prefix(&full_bytes).unwrap().0;
+        assert_eq!(full.sub_keys, 0);
+        assert_eq!(full.max_name_len, 0);
+        assert_eq!(full.values, 3);
+        assert_eq!(full.max_value_name_len, utf16le("oemcp").len().trunc());
+        assert_eq!(full.max_value_data_len, DEFAULT_MACCP_VALUE.len().trunc());
+        assert_eq!(full.class_offset, u32::MAX);
+        assert_eq!(full.class_length, 0);
+
+        let mut cached_bytes = [0u8; size_of::<KeyCachedInformation>()];
+        assert!(
+            task.do_nt_query_key(
+                key_handle,
+                KeyInformationClass::Cached,
+                mut_byte_ptr(&mut cached_bytes),
+                cached_bytes.len().trunc(),
+                mut_ptr(&mut result_length),
+            )
+            .is_ok()
+        );
+        let cached = KeyCachedInformation::read_from_bytes(&cached_bytes).unwrap();
+        assert_eq!(cached.values, full.values);
+        assert_eq!(cached.max_value_name_len, full.max_value_name_len);
+        assert_eq!(cached.max_value_data_len, full.max_value_data_len);
+        assert_eq!(cached.name_length, utf16le("codepage").len().trunc());
     }
 }

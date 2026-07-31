@@ -39,7 +39,9 @@ use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
-use crate::syscalls::registry::{RegistryKeyObject, RegistryKeySubsystem};
+use crate::syscalls::registry::{
+    NtNotifyChangeKeyRequest, RegistryKeyObject, RegistryKeySubsystem,
+};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
@@ -800,8 +802,33 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     where
         Subsystem: WindowsHandleSubsystem,
     {
+        self.typed_handle_entry_with_access_check(handle, |granted_access| {
+            granted_access & required_access == required_access
+        })
+    }
+
+    fn typed_handle_entry_with_any_access<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        self.typed_handle_entry_with_access_check(handle, |granted_access| granted_access != 0)
+    }
+
+    fn typed_handle_entry_with_access_check<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        access_check: impl FnOnce(u32) -> bool,
+    ) -> Result<litebox::fd::EntryHandle<Platform, Subsystem>, NtStatus>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
         let typed = self.typed_handle::<Subsystem>(handle)?;
-        self.require_typed_handle_access(&typed, required_access)?;
+        if !access_check(self.typed_handle_metadata(&typed)?.granted_access) {
+            return Err(NtStatus::ACCESS_DENIED);
+        }
         self.global
             .litebox
             .descriptor_table()
@@ -1400,11 +1427,49 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 service_class,
                 service_data,
             ),
+            SyscallRequest::NtCreateKey {
+                key_handle,
+                desired_access,
+                object_attributes,
+                title_index,
+                class,
+                create_options,
+                disposition,
+            } => self.sys_nt_create_key(
+                key_handle,
+                desired_access,
+                object_attributes,
+                title_index,
+                class,
+                create_options,
+                disposition,
+            ),
             SyscallRequest::NtOpenKey {
                 key_handle,
                 desired_access,
                 object_attributes,
             } => self.sys_nt_open_key(key_handle, desired_access, object_attributes),
+            SyscallRequest::NtOpenKeyEx {
+                key_handle,
+                desired_access,
+                object_attributes,
+                open_options,
+            } => {
+                self.sys_nt_open_key_ex(key_handle, desired_access, object_attributes, open_options)
+            }
+            SyscallRequest::NtQueryKey {
+                key_handle,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            } => self.sys_nt_query_key(
+                key_handle,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            ),
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,
@@ -1420,6 +1485,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 result_length,
             ),
+            SyscallRequest::NtSetValueKey {
+                key_handle,
+                value_name,
+                title_index,
+                value_type,
+                data,
+                data_size,
+            } => self.sys_nt_set_value_key(
+                key_handle,
+                value_name,
+                title_index,
+                value_type,
+                data,
+                data_size,
+            ),
+            SyscallRequest::NtNotifyChangeKey {
+                key_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                completion_filter,
+                watch_tree,
+                buffer,
+                buffer_size,
+                asynchronous,
+            } => self.sys_nt_notify_change_key(NtNotifyChangeKeyRequest {
+                key_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                completion_filter,
+                watch_tree,
+                buffer,
+                buffer_size,
+                asynchronous,
+            }),
             SyscallRequest::NtGetNlsSectionPtr {
                 section_type,
                 section_data,
