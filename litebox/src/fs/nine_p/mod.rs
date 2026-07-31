@@ -26,7 +26,6 @@ use crate::fs::errors::{
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
-use crate::path::Arg;
 use crate::{LiteBox, sync};
 
 mod client;
@@ -1008,32 +1007,28 @@ impl From<Rlerror> for Error {
 /// A backing implementation for [`FileSystem`](super::FileSystem) using a 9P2000.L-based network
 /// file system.
 ///
-/// This filesystem implementation communicates with a 9P server to provide access to remote files.
-/// All file operations are translated into 9P protocol messages that are sent to the server.
+/// This is a thin wrapper that resolves paths and manages fd state via a
+/// [`Resolver`](super::resolver::Resolver) over the [`NineP`] backend. Will disappear shortly.
 ///
 /// # Type Parameters
 ///
 /// - `Platform`: The platform provider that supplies synchronization primitives and other
 ///   platform-specific functionality.
 /// - `T`: The transport type that implements both `Read` and `Write` traits.
-pub struct FileSystem<
-    Platform: sync::RawSyncPrimitivesProvider,
-    T: transport::Read + transport::Write,
-> {
+pub struct FileSystem<Platform, T>
+where
+    Platform: sync::RawSyncPrimitivesProvider + 'static,
+    T: transport::Read + transport::Write + Send + 'static,
+{
     /// Reference to the LiteBox instance
     litebox: LiteBox<Platform>,
-    /// 9P client for protocol operations
-    client: client::Client<Platform, T>,
-    /// Root (attached to the root of the remote filesystem)
-    root: (fcall::Qid, client::Fid<Platform>, String),
-    // cwd invariant: always ends with a `/`
-    current_working_dir: String,
-    /// Whether `unlinkat` is supported by the server
-    unlinkat_supported: AtomicBool,
+    resolver: super::resolver::Resolver<Platform, NineP<Platform, T>>,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    FileSystem<Platform, T>
+impl<Platform, T> FileSystem<Platform, T>
+where
+    Platform: sync::RawSyncPrimitivesProvider + 'static,
+    T: transport::Read + transport::Write + Send + 'static,
 {
     /// Construct a new `FileSystem` instance
     ///
@@ -1059,184 +1054,50 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         username: &str,
         path: &str,
     ) -> Result<Self, Error> {
-        let client = client::Client::new(transport, msize)?;
-        let (qid, fid) = client.attach(username, path)?;
-
+        let backend = NineP::new(
+            transport,
+            msize,
+            username,
+            path,
+            super::inode_allocator::InodeAllocator::for_device(DEVICE_ID as u64),
+        )?;
         Ok(Self {
             litebox: litebox.clone(),
-            client,
-            root: (qid, fid, String::from(path)),
-            current_working_dir: String::from("/"),
-            unlinkat_supported: AtomicBool::new(true),
+            resolver: super::resolver::Resolver::new(litebox, backend),
         })
     }
-
-    /// Gives the absolute path for `path`, resolving any `.` or `..`s, and making sure to account
-    /// for any relative paths from current working directory.
-    ///
-    /// Note: does NOT account for symlinks.
-    fn absolute_path(&self, path: impl crate::path::Arg) -> Result<String, PathError> {
-        assert!(self.current_working_dir.ends_with('/'));
-        let path = path.as_rust_str()?;
-        if path.starts_with('/') {
-            // Absolute path
-            Ok(path.normalized()?)
-        } else {
-            // Relative path
-            Ok((self.current_working_dir.clone() + path.as_rust_str()?).normalized()?)
-        }
-    }
-
-    /// Walk to a path and return the fid
-    fn walk_to(&self, path: &str) -> Result<client::Fid<Platform>, Error> {
-        let components: Vec<&str> = path
-            .normalized_components()
-            .map_err(|_| Error::InvalidPathname)?
-            .collect();
-        if components.is_empty() {
-            // Clone the root fid
-            self.client.clone_fid(&self.root.1)
-        } else {
-            self.client
-                .walk(&self.root.1, &components)?
-                .into_complete_fid()
-        }
-    }
-
-    /// Walk to the parent of a path and return the parent fid and the name of the final component
-    fn walk_to_parent<'a>(&self, path: &'a str) -> Result<(client::Fid<Platform>, &'a str), Error> {
-        let components: Vec<&str> = path
-            .normalized_components()
-            .map_err(|_| Error::InvalidPathname)?
-            .collect();
-        if components.is_empty() {
-            return Err(Error::InvalidPathname);
-        }
-
-        let name = components.last().unwrap();
-        let parent_components = &components[..components.len() - 1];
-
-        if parent_components.is_empty() {
-            let parent_fid = self.client.clone_fid(&self.root.1)?;
-            Ok((parent_fid, name))
-        } else {
-            let parent_fid = self
-                .client
-                .walk(&self.root.1, parent_components)?
-                .into_complete_fid()?;
-            Ok((parent_fid, name))
-        }
-    }
-
-    fn remove_file_or_dir(&self, path: impl crate::path::Arg, is_file: bool) -> Result<(), Error> {
-        const AT_REMOVEDIR: u32 = 0x200;
-
-        let path = self
-            .absolute_path(path)
-            .map_err(|_| Error::InvalidPathname)?;
-        if self.unlinkat_supported.load(Ordering::SeqCst) {
-            let (parent_fid, name) = self.walk_to_parent(&path)?;
-
-            let result =
-                self.client
-                    .unlinkat(&parent_fid, name, if is_file { 0 } else { AT_REMOVEDIR });
-            self.client.clunk(parent_fid);
-            if let Err(Error::Remote(ENOSYS | EOPNOTSUPP)) = &result {
-                self.unlinkat_supported.store(false, Ordering::SeqCst);
-                // fall back to `remove`
-            } else {
-                return result;
-            }
-        }
-
-        let fid = self.walk_to(&path)?;
-        self.client.remove(fid)
-    }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write> Drop
-    for FileSystem<Platform, T>
-{
-    fn drop(&mut self) {
-        self.client.clunk(self.root.1.clone());
-    }
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::private::Sealed for FileSystem<Platform, T>
+impl<Platform, T> super::private::Sealed for FileSystem<Platform, T>
+where
+    Platform: sync::RawSyncPrimitivesProvider + 'static,
+    T: transport::Read + transport::Write + Send + 'static,
 {
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::FileSystem for FileSystem<Platform, T>
+impl<Platform, T> super::FileSystem for FileSystem<Platform, T>
+where
+    Platform: sync::RawSyncPrimitivesProvider + 'static,
+    T: transport::Read + transport::Write + Send + 'static,
 {
-    #[allow(clippy::similar_names)]
     fn open(
         &self,
         path: impl crate::path::Arg,
         flags: super::OFlags,
         mode: super::Mode,
-    ) -> Result<FileFd<Platform, T>, super::errors::OpenError> {
-        // TODO: we don't support non-blocking, so ignore that flag instead of returning an error
-        let flags = flags - OFlags::NONBLOCK;
-        let currently_supported_oflags: OFlags = OFlags::RDONLY
-            | OFlags::WRONLY
-            | OFlags::RDWR
-            | OFlags::CREAT
-            | OFlags::NOCTTY
-            | OFlags::EXCL
-            | OFlags::DIRECTORY
-            | OFlags::LARGEFILE;
-        if flags.intersects(currently_supported_oflags.complement()) {
-            unimplemented!("{flags:?}")
-        }
-
-        let path = self.absolute_path(path)?;
-        let components: Vec<&str> = path
-            .normalized_components()
-            .map_err(|_| OpenError::PathError(PathError::InvalidPathname))?
-            .collect();
-        let lflags = oflags_to_lopen(flags);
-        let needs_create = flags.contains(super::OFlags::CREAT);
-
-        let (new_qid, new_fid) = if needs_create {
-            let dfid = self
-                .client
-                .walk(&self.root.1, &components[..components.len() - 1])?
-                .into_complete_fid()?;
-            self.client
-                .create(dfid, components.last().unwrap(), lflags, mode.bits(), 0)?
-        } else {
-            let new_fid = self
-                .client
-                .walk(&self.root.1, &components)?
-                .into_complete_fid()?;
-            let qid = match self.client.open(&new_fid, lflags) {
-                Ok(qid) => qid,
-                Err(err) => {
-                    self.client.clunk(new_fid);
-                    return Err(err.into());
-                }
-            };
-            (qid, new_fid)
-        };
-
-        let descriptor = Descriptor {
-            fid: new_fid,
-            offset: Arc::new(sync::Mutex::new(0)),
-            qid: new_qid,
-        };
-
-        let fd = self.litebox.descriptor_table_mut().insert(descriptor);
-        Ok(fd)
+    ) -> Result<FileFd<Platform, T>, OpenError> {
+        let fd = super::FileSystem::open(&self.resolver, path, flags, mode)?;
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert(Descriptor { fd }))
     }
 
     fn close(&self, fd: &FileFd<Platform, T>) -> Result<(), super::errors::CloseError> {
-        let entry = self.litebox.descriptor_table_mut().remove(fd);
-        if let Some(entry) = entry {
-            self.client.clunk(entry.entry.fid);
-        }
-        Ok(())
+        let Some(descriptor) = self.litebox.descriptor_table_mut().remove(fd) else {
+            return Ok(());
+        };
+        super::FileSystem::close(&self.resolver, &descriptor.entry.fd)
     }
 
     fn read(
@@ -1244,29 +1105,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         fd: &FileFd<Platform, T>,
         buf: &mut [u8],
         offset: Option<usize>,
-    ) -> Result<usize, super::errors::ReadError> {
-        // Clone the fid and offset lock out of the descriptor and release the
-        // table lock before issuing the potentially blocking 9P call. The fid
-        // keeps the pool slot reserved while the offset lock serializes
-        // implicit-offset I/O on this descriptor.
-        let (fid, descriptor_offset) = self
+    ) -> Result<usize, ReadError> {
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| {
-                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
-            })
-            .ok_or(super::errors::ReadError::ClosedFd)?;
-
-        if let Some(read_offset) = offset {
-            return Ok(self.client.read(&fid, read_offset as u64, buf)?);
-        }
-
-        let mut current_offset = descriptor_offset.lock();
-        let bytes_read = self.client.read(&fid, *current_offset as u64, buf)?;
-        *current_offset = current_offset
-            .checked_add(bytes_read)
-            .ok_or(super::errors::ReadError::Io)?;
-        Ok(bytes_read)
+            .entry_handle(fd)
+            .ok_or(ReadError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::read(&self.resolver, &descriptor.entry.fd, buf, offset)
+        })
     }
 
     fn write(
@@ -1274,25 +1121,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         fd: &FileFd<Platform, T>,
         buf: &[u8],
         offset: Option<usize>,
-    ) -> Result<usize, super::errors::WriteError> {
-        let (fid, descriptor_offset) = self
+    ) -> Result<usize, WriteError> {
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| {
-                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
-            })
-            .ok_or(super::errors::WriteError::ClosedFd)?;
-
-        if let Some(write_offset) = offset {
-            return Ok(self.client.write(&fid, write_offset as u64, buf)?);
-        }
-
-        let mut current_offset = descriptor_offset.lock();
-        let bytes_written = self.client.write(&fid, *current_offset as u64, buf)?;
-        *current_offset = current_offset
-            .checked_add(bytes_written)
-            .ok_or(super::errors::WriteError::Io)?;
-        Ok(bytes_written)
+            .entry_handle(fd)
+            .ok_or(WriteError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::write(&self.resolver, &descriptor.entry.fd, buf, offset)
+        })
     }
 
     fn seek(
@@ -1301,34 +1138,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        let (fid, descriptor_offset) = self
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| {
-                (desc.entry.fid.clone(), Arc::clone(&desc.entry.offset))
-            })
+            .entry_handle(fd)
             .ok_or(SeekError::ClosedFd)?;
-
-        let new_offset = match whence {
-            super::SeekWhence::RelativeToBeginning => 0,
-            super::SeekWhence::RelativeToCurrentOffset => {
-                let mut current_offset = descriptor_offset.lock();
-                let new_offset = current_offset
-                    .checked_add_signed(offset)
-                    .ok_or(SeekError::InvalidOffset)?;
-                *current_offset = new_offset;
-                return Ok(new_offset);
-            }
-            super::SeekWhence::RelativeToEnd => {
-                let attr = self.client.getattr(&fid, fcall::GetattrMask::SIZE)?;
-                usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
-            }
-        }
-        .checked_add_signed(offset)
-        .ok_or(SeekError::InvalidOffset)?;
-
-        *descriptor_offset.lock() = new_offset;
-        Ok(new_offset)
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::seek(&self.resolver, &descriptor.entry.fd, offset, whence)
+        })
     }
 
     fn truncate(
@@ -1336,57 +1153,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         fd: &FileFd<Platform, T>,
         length: usize,
         reset_offset: bool,
-    ) -> Result<(), super::errors::TruncateError> {
-        let (fid, qid, descriptor_offset) = self
+    ) -> Result<(), TruncateError> {
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| {
-                (
-                    desc.entry.fid.clone(),
-                    desc.entry.qid,
-                    Arc::clone(&desc.entry.offset),
-                )
-            })
-            .ok_or(super::errors::TruncateError::ClosedFd)?;
-
-        if qid.typ.contains(fcall::QidType::DIR) {
-            return Err(super::errors::TruncateError::IsDirectory);
-        }
-
-        let stat = fcall::SetAttr {
-            mode: 0,
-            uid: 0,
-            gid: 0,
-            size: length as u64,
-            ..Default::default()
-        };
-
-        self.client.setattr(&fid, fcall::SetattrMask::SIZE, stat)?;
-
-        if reset_offset {
-            *descriptor_offset.lock() = 0;
-        }
-
-        Ok(())
+            .entry_handle(fd)
+            .ok_or(TruncateError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::truncate(&self.resolver, &descriptor.entry.fd, length, reset_offset)
+        })
     }
 
-    fn chmod(
-        &self,
-        path: impl crate::path::Arg,
-        mode: super::Mode,
-    ) -> Result<(), super::errors::ChmodError> {
-        let path = self.absolute_path(path)?;
-        let fid = self.walk_to(&path)?;
-
-        let stat = fcall::SetAttr {
-            mode: mode.bits(),
-            ..Default::default()
-        };
-
-        let result = self.client.setattr(&fid, fcall::SetattrMask::MODE, stat);
-        self.client.clunk(fid);
-
-        result.map_err(ChmodError::from)
+    fn chmod(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), ChmodError> {
+        super::FileSystem::chmod(&self.resolver, path, mode)
     }
 
     fn chown(
@@ -1394,147 +1173,75 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
         path: impl crate::path::Arg,
         user: Option<u16>,
         group: Option<u16>,
-    ) -> Result<(), super::errors::ChownError> {
-        let path = self.absolute_path(path)?;
-        let fid = self.walk_to(&path)?;
-
-        let mut valid = fcall::SetattrMask::empty();
-        let uid = match user {
-            Some(u) => {
-                valid |= fcall::SetattrMask::UID;
-                u32::from(u)
-            }
-            None => 0,
-        };
-        let gid = match group {
-            Some(g) => {
-                valid |= fcall::SetattrMask::GID;
-                u32::from(g)
-            }
-            None => 0,
-        };
-        let stat = fcall::SetAttr {
-            uid,
-            gid,
-            ..Default::default()
-        };
-
-        let result = self.client.setattr(&fid, valid, stat);
-        self.client.clunk(fid);
-
-        result.map_err(ChownError::from)
+    ) -> Result<(), ChownError> {
+        super::FileSystem::chown(&self.resolver, path, user, group)
     }
 
-    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), super::errors::UnlinkError> {
-        self.remove_file_or_dir(path, true)
-            .map_err(UnlinkError::from)
+    fn unlink(&self, path: impl crate::path::Arg) -> Result<(), UnlinkError> {
+        super::FileSystem::unlink(&self.resolver, path)
     }
 
     fn mkdir(&self, path: impl crate::path::Arg, mode: super::Mode) -> Result<(), MkdirError> {
-        let path = self.absolute_path(path)?;
-
-        let (parent_fid, name) = self.walk_to_parent(&path)?;
-
-        let result = self.client.mkdir(&parent_fid, name, mode.bits(), 0);
-        self.client.clunk(parent_fid);
-
-        result.map(|_| ()).map_err(MkdirError::from)
+        super::FileSystem::mkdir(&self.resolver, path, mode)
     }
 
     fn rmdir(&self, path: impl crate::path::Arg) -> Result<(), RmdirError> {
-        self.remove_file_or_dir(path, false)
-            .map_err(RmdirError::from)
+        super::FileSystem::rmdir(&self.resolver, path)
     }
 
-    fn read_dir(
-        &self,
-        fd: &FileFd<Platform, T>,
-    ) -> Result<Vec<crate::fs::DirEntry>, super::errors::ReadDirError> {
-        let (fid, qid) = self
+    fn read_dir(&self, fd: &FileFd<Platform, T>) -> Result<Vec<crate::fs::DirEntry>, ReadDirError> {
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| (desc.entry.fid.clone(), desc.entry.qid))
-            .ok_or(super::errors::ReadDirError::ClosedFd)?;
-
-        if !qid.typ.contains(fcall::QidType::DIR) {
-            return Err(super::errors::ReadDirError::NotADirectory);
-        }
-
-        let entries = self.client.readdir_all(&fid)?;
-
-        let dir_entries: Vec<super::DirEntry> = entries
-            .into_iter()
-            .map(|e| {
-                // XXX(jayb): `e.typ` is the readdir dirent type (`DT_*`, `DT_DIR == 4`), not a qid
-                // type, so this never matches `QidType::DIR` (0x80) and every entry is reported as
-                // a regular file. The fix is `e.qid.typ`, as the `NineP` backend correctly does.
-                let file_type = if e.typ == fcall::QidType::DIR.bits() {
-                    super::FileType::Directory
-                } else {
-                    super::FileType::RegularFile
-                };
-
-                Ok(super::DirEntry {
-                    name: String::from_utf8_lossy(&e.name).into_owned(),
-                    file_type,
-                    ino_info: Some(super::NodeInfo {
-                        dev: DEVICE_ID,
-                        ino: usize::try_from(e.qid.path).map_err(|_| Error::InvalidResponse)?,
-                        rdev: None,
-                    }),
-                })
-            })
-            .collect::<Result<_, Error>>()?;
-
-        Ok(dir_entries)
+            .entry_handle(fd)
+            .ok_or(ReadDirError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::read_dir(&self.resolver, &descriptor.entry.fd)
+        })
     }
 
     fn file_status(
         &self,
         path: impl crate::path::Arg,
     ) -> Result<super::FileStatus, FileStatusError> {
-        let path = self.absolute_path(path)?;
-        let fid = self.walk_to(&path)?;
-
-        let result = self.client.getattr(&fid, fcall::GetattrMask::ALL);
-        self.client.clunk(fid);
-
-        result
-            .and_then(|attr| rgetattr_to_file_status(&attr, DEVICE_ID))
-            .map_err(FileStatusError::from)
+        super::FileSystem::file_status(&self.resolver, path)
     }
 
     fn fd_file_status(
         &self,
         fd: &FileFd<Platform, T>,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
-        let fid = self
+    ) -> Result<super::FileStatus, FileStatusError> {
+        let descriptor = self
             .litebox
             .descriptor_table()
-            .with_entry(fd, |desc| desc.entry.fid.clone())
-            .ok_or(super::errors::FileStatusError::ClosedFd)?;
+            .entry_handle(fd)
+            .ok_or(FileStatusError::ClosedFd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::fd_file_status(&self.resolver, &descriptor.entry.fd)
+        })
+    }
 
-        let attr = self.client.getattr(&fid, fcall::GetattrMask::ALL)?;
-
-        Ok(rgetattr_to_file_status(&attr, DEVICE_ID)?)
+    fn get_static_backing_data(&self, fd: &FileFd<Platform, T>) -> Option<&'static [u8]> {
+        let descriptor = self.litebox.descriptor_table().entry_handle(fd)?;
+        descriptor.with_entry(|descriptor| {
+            super::FileSystem::get_static_backing_data(&self.resolver, &descriptor.entry.fd)
+        })
     }
 }
 
-/// Internal descriptor state for a 9P file descriptor
-struct Descriptor<Platform: sync::RawSyncPrimitivesProvider> {
-    /// The 9P fid for this file. Refcounted so concurrent in-flight
-    /// operations keep the pool slot reserved across `close`.
-    fid: client::Fid<Platform>,
-    /// Current file offset (9P doesn't track this server-side)
-    offset: Arc<sync::Mutex<Platform, usize>>,
-    /// The qid of the file (contains type and unique ID)
-    qid: fcall::Qid,
+// TODO(jayb): migrate away from these as soon as the wrapper is cleaned up
+struct Descriptor<Platform, T>
+where
+    Platform: sync::RawSyncPrimitivesProvider + 'static,
+    T: transport::Read + transport::Write + Send + 'static,
+{
+    fd: super::resolver::ResolverFd<Platform, NineP<Platform, T>>,
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { sync::RawSyncPrimitivesProvider }, T: { transport::Read + transport::Write };
+    @Platform: { sync::RawSyncPrimitivesProvider + 'static }, T: { transport::Read + transport::Write + Send + 'static };
     FileSystem<Platform, T>;
-    @Platform: { sync::RawSyncPrimitivesProvider };
-    Descriptor<Platform>;
+    @Platform: { sync::RawSyncPrimitivesProvider + 'static }, T: { transport::Read + transport::Write + Send + 'static };
+    Descriptor<Platform, T>;
     -> FileFd<Platform, T>;
 }

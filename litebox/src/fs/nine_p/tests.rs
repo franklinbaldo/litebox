@@ -579,8 +579,9 @@ fn test_nine_p_broken_write() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // 4 writes: version + attach + walk + lopen. Then write will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
+    // parent directory's fid + create. Then write will fail.
+    let fs = connect_9p_broken(&litebox, &server, 5);
     let fd = fs
         .open("/write_me.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
         .expect("create should succeed before break");
