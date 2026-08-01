@@ -807,6 +807,19 @@ fn decode_section_instructions(
     let mut instructions = Vec::new();
     let mut offset = 0usize;
 
+    // Precondition: Every IP computed below is within `[base, base + len]`,
+    // so checking the end once keeps the loop overflow-free.
+    if section_base_addr
+        .checked_add(section_data.len() as u64)
+        .is_none()
+    {
+        return Err(Error::AddressOverflow(format!(
+            "decoded section runs off the address space: base {section_base_addr:#x}, \
+             length {len:#x}",
+            len = section_data.len()
+        )));
+    }
+
     while offset < section_data.len() {
         let remaining = &section_data[offset..];
         let boundary_cap = remaining
