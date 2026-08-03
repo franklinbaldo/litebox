@@ -13,21 +13,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use litebox_broker_core::socket::{PlatformSocket, SocketOutcome, SocketProvider};
+use litebox_broker_core::socket::{PlatformSocket, SocketProvider};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    AddressFamily, CreateSocketRequest, IpProtocol, ReceiveFlags, ReceiveSocketResponse, SendFlags,
-    ShutdownMode, SocketAddressV4, SocketConnectionStatus, SocketError, SocketType,
+    AddressFamily, CreateSocketRequest, IpProtocol, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE,
+    ReceiveFlags, ReceiveSocketResponse, SendFlags, ShutdownMode, SocketAddressV4,
+    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse, SocketType,
 };
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, epoll, eventfd};
-use rustix::io::{Errno, read, write};
+use rustix::io::{Errno, ioctl_fionread, read, write};
 use rustix::net::{
     AddressFamily as LinuxAddressFamily, RecvFlags as LinuxRecvFlags, SendFlags as LinuxSendFlags,
     Shutdown as LinuxShutdown, SocketFlags as LinuxSocketFlags, SocketType as LinuxSocketType,
-    connect, getpeername, ipproto, recv, send, shutdown, socket_with, sockopt,
+    connect, getpeername, getsockname, ipproto, recv, send, shutdown, socket_with, sockopt,
 };
 
 use litebox_broker_core::readiness::ReadinessRegistration;
@@ -135,16 +137,19 @@ impl PlatformSocket for LinuxSocket {
         &self,
         data: &mut [u8],
         flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
     ) -> BrokerResult<SocketOutcome<ReceiveSocketResponse>> {
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        owned.resize(data.len(), 0);
+        let peek_offset =
+            usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
+        let peek_length =
+            usize::try_from(peek_length).map_err(|_| BrokerError::UnsupportedOperation)?;
         match self.reactor.request(|response| ReactorCommand::Receive {
             id: self.id,
-            data: owned,
+            length: data.len(),
             flags,
+            peek_offset,
+            peek_length,
             response,
         })? {
             ReactorReceiveOutcome::Received(received) => {
@@ -171,12 +176,11 @@ impl PlatformSocket for LinuxSocket {
         })
     }
 
-    fn status(&self) -> BrokerResult<SocketConnectionStatus> {
-        Ok(self
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .status)
+    fn status(&self) -> BrokerResult<SocketStatusResponse> {
+        self.reactor.request(|response| ReactorCommand::Status {
+            id: self.id,
+            response,
+        })
     }
 
     fn readiness(&self) -> ReadinessFlags {
@@ -235,6 +239,7 @@ impl ReactorClient {
                     commands: receiver,
                     sockets,
                     max_sockets,
+                    peek_cache: None,
                     events,
                 };
                 if started.send(true).is_err() {
@@ -369,14 +374,20 @@ enum ReactorCommand {
     },
     Receive {
         id: u64,
-        data: Vec<u8>,
+        length: usize,
         flags: ReceiveFlags,
+        peek_offset: usize,
+        peek_length: usize,
         response: SyncSender<BrokerResult<ReactorReceiveOutcome>>,
     },
     Shutdown {
         id: u64,
         mode: ShutdownMode,
         response: SyncSender<BrokerResult<SocketOutcome<()>>>,
+    },
+    Status {
+        id: u64,
+        response: SyncSender<BrokerResult<SocketStatusResponse>>,
     },
     Close {
         id: u64,
@@ -401,7 +412,14 @@ struct Reactor {
     commands: Receiver<ReactorCommand>,
     sockets: HashMap<u64, SocketEntry>,
     max_sockets: usize,
+    peek_cache: Option<PeekCache>,
     events: Vec<epoll::Event>,
+}
+
+struct PeekCache {
+    socket_id: u64,
+    requested_length: usize,
+    data: Vec<u8>,
 }
 
 /// Reactor-owned descriptor and its broker-facing readiness state.
@@ -411,6 +429,7 @@ struct SocketEntry {
     snapshot: Arc<Mutex<SocketSnapshot>>,
     read_shutdown: bool,
     write_shutdown: bool,
+    peek_waitall_threshold: Option<usize>,
 }
 
 /// Cached connection and readiness state shared with the broker-facing handle.
@@ -422,6 +441,8 @@ struct SocketEntry {
 struct SocketSnapshot {
     status: SocketConnectionStatus,
     readiness: ReadinessFlags,
+    local_address: Option<SocketAddressV4>,
+    pending_error: Option<SocketError>,
 }
 
 impl Default for SocketSnapshot {
@@ -429,6 +450,8 @@ impl Default for SocketSnapshot {
         Self {
             status: SocketConnectionStatus::Unconnected,
             readiness: ReadinessFlags::default(),
+            local_address: None,
+            pending_error: None,
         }
     }
 }
@@ -546,18 +569,34 @@ impl Reactor {
                 }
                 ReactorCommand::Receive {
                     id,
-                    data,
+                    length,
                     flags,
+                    peek_offset,
+                    peek_length,
                     response,
                 } => {
-                    let outcome = self
-                        .sockets
-                        .get_mut(&id)
-                        .ok_or(BrokerError::Internal)
-                        .and_then(|socket| receive_socket(socket, data, flags));
+                    let outcome = match self.sockets.get_mut(&id) {
+                        Some(socket) => receive_socket(
+                            socket,
+                            &mut self.peek_cache,
+                            id,
+                            length,
+                            flags,
+                            peek_offset,
+                            peek_length,
+                        ),
+                        None => Err(BrokerError::Internal),
+                    };
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Shutdown { id, mode, response } => {
+                    if self
+                        .peek_cache
+                        .as_ref()
+                        .is_some_and(|cache| cache.socket_id == id)
+                    {
+                        self.peek_cache = None;
+                    }
                     let outcome = self
                         .sockets
                         .get_mut(&id)
@@ -565,7 +604,22 @@ impl Reactor {
                         .and_then(|socket| shutdown_socket(socket, mode));
                     let _ = response.send(outcome);
                 }
+                ReactorCommand::Status { id, response } => {
+                    let outcome = self
+                        .sockets
+                        .get_mut(&id)
+                        .ok_or(BrokerError::Internal)
+                        .and_then(status_socket);
+                    let _ = response.send(outcome);
+                }
                 ReactorCommand::Close { id, response } => {
+                    if self
+                        .peek_cache
+                        .as_ref()
+                        .is_some_and(|cache| cache.socket_id == id)
+                    {
+                        self.peek_cache = None;
+                    }
                     self.sockets.remove(&id);
                     let _ = response.send(());
                 }
@@ -623,6 +677,7 @@ impl Reactor {
                 snapshot,
                 read_shutdown: false,
                 write_shutdown: false,
+                peek_waitall_threshold: None,
             },
         );
         Ok(())
@@ -690,11 +745,21 @@ fn connect_socket(
         }
     };
     let readiness = match status {
-        SocketConnectionStatus::Connected => ReadinessFlags::WRITE,
-        SocketConnectionStatus::Failed(_) => ReadinessFlags::ERROR,
-        SocketConnectionStatus::Connecting | SocketConnectionStatus::Unconnected => {
-            ReadinessFlags::default()
+        SocketConnectionStatus::Connected | SocketConnectionStatus::Connecting => {
+            let local_address = local_socket_address(&socket.socket)?;
+            socket
+                .snapshot
+                .lock()
+                .expect("Linux socket snapshot mutex poisoned")
+                .local_address = Some(local_address);
+            if status == SocketConnectionStatus::Connected {
+                ReadinessFlags::WRITE
+            } else {
+                ReadinessFlags::default()
+            }
         }
+        SocketConnectionStatus::Failed(_) => ReadinessFlags::ERROR,
+        SocketConnectionStatus::Unconnected => ReadinessFlags::default(),
         _ => return Err(BrokerError::Internal),
     };
     update_snapshot(socket, Some(status), readiness)?;
@@ -715,7 +780,7 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
             }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
-                set_error_readiness(socket)?;
+                consume_synchronous_error(socket)?;
                 return Ok(SocketOutcome::Failed(error));
             }
         }
@@ -724,14 +789,126 @@ fn send_socket(socket: &mut SocketEntry, data: &[u8]) -> BrokerResult<SocketOutc
 
 fn receive_socket(
     socket: &mut SocketEntry,
-    mut data: Vec<u8>,
+    peek_cache: &mut Option<PeekCache>,
+    socket_id: u64,
+    length: usize,
     flags: ReceiveFlags,
+    peek_offset: usize,
+    peek_length: usize,
 ) -> BrokerResult<ReactorReceiveOutcome> {
-    let flags = if flags.contains(ReceiveFlags::PEEK) {
-        LinuxRecvFlags::PEEK
-    } else {
-        LinuxRecvFlags::empty()
-    };
+    let peek = flags.contains(ReceiveFlags::PEEK);
+    if !peek {
+        if peek_offset != 0 || peek_length != 0 {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        if peek_cache
+            .as_ref()
+            .is_some_and(|cache| cache.socket_id == socket_id)
+        {
+            *peek_cache = None;
+        }
+        return receive_socket_once(socket, zeroed_vec(length)?, LinuxRecvFlags::empty());
+    }
+
+    let peek_end = peek_offset
+        .checked_add(length)
+        .ok_or(BrokerError::UnsupportedOperation)?;
+    let canonical_length = peek_length
+        .checked_sub(peek_offset)
+        .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE as usize));
+    if !peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE as usize)
+        || canonical_length != Some(length)
+        || peek_length < peek_end
+        || peek_length > MAX_SOCKET_PEEK_SIZE as usize
+    {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    if flags.contains(ReceiveFlags::WAITALL) {
+        let snapshot = *socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned");
+        let terminal = socket.read_shutdown
+            || snapshot.readiness.contains(ReadinessFlags::HANGUP)
+            || snapshot.readiness.contains(ReadinessFlags::ERROR);
+        if snapshot.status == SocketConnectionStatus::Connected
+            && !terminal
+            && ioctl_fionread(&socket.socket).map_err(broker_error_from_errno)?
+                < peek_length.try_into().map_err(|_| BrokerError::Internal)?
+        {
+            socket.peek_waitall_threshold = Some(
+                socket
+                    .peek_waitall_threshold
+                    .map_or(peek_length, |threshold| threshold.min(peek_length)),
+            );
+            return Err(BrokerError::WouldBlock);
+        }
+    }
+
+    let refresh = peek_offset == 0
+        || !peek_cache.as_ref().is_some_and(|cache| {
+            cache.socket_id == socket_id && cache.requested_length == peek_length
+        });
+    if refresh {
+        *peek_cache = None;
+        let flags = if flags.contains(ReceiveFlags::WAITALL) {
+            LinuxRecvFlags::PEEK | LinuxRecvFlags::WAITALL
+        } else {
+            LinuxRecvFlags::PEEK
+        };
+        match receive_socket_once(socket, zeroed_vec(peek_length)?, flags)? {
+            ReactorReceiveOutcome::Received(data) => {
+                *peek_cache = Some(PeekCache {
+                    socket_id,
+                    requested_length: peek_length,
+                    data,
+                });
+            }
+            outcome => return Ok(outcome),
+        }
+    }
+
+    let cache = peek_cache.as_ref().ok_or(BrokerError::Internal)?;
+    if cache.data.len() <= peek_offset {
+        let readiness = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned")
+            .readiness;
+        let terminal = socket.read_shutdown
+            || readiness.contains(ReadinessFlags::HANGUP)
+            || readiness.contains(ReadinessFlags::ERROR);
+        *peek_cache = None;
+        return if terminal {
+            Ok(ReactorReceiveOutcome::EndOfStream)
+        } else {
+            Err(BrokerError::WouldBlock)
+        };
+    }
+    let end = peek_end.min(cache.data.len());
+    let mut data = Vec::new();
+    data.try_reserve_exact(end - peek_offset)
+        .map_err(|_| BrokerError::OutOfMemory)?;
+    data.extend_from_slice(&cache.data[peek_offset..end]);
+    if end < peek_end || end == peek_length {
+        *peek_cache = None;
+    }
+    Ok(ReactorReceiveOutcome::Received(data))
+}
+
+fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(length)
+        .map_err(|_| BrokerError::OutOfMemory)?;
+    data.resize(length, 0);
+    Ok(data)
+}
+
+fn receive_socket_once(
+    socket: &mut SocketEntry,
+    mut data: Vec<u8>,
+    flags: LinuxRecvFlags,
+) -> BrokerResult<ReactorReceiveOutcome> {
     loop {
         match recv(&socket.socket, data.as_mut_slice(), flags) {
             Ok((_buffer, 0)) => {
@@ -754,7 +931,7 @@ fn receive_socket(
             }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
-                set_error_readiness(socket)?;
+                consume_synchronous_error(socket)?;
                 return Ok(ReactorReceiveOutcome::Failed(error));
             }
         }
@@ -765,6 +942,11 @@ fn shutdown_socket(
     socket: &mut SocketEntry,
     mode: ShutdownMode,
 ) -> BrokerResult<SocketOutcome<()>> {
+    if mode == ShutdownMode::Abort {
+        sockopt::set_socket_linger(&socket.socket, Some(Duration::ZERO))
+            .map_err(broker_error_from_errno)?;
+        return Ok(SocketOutcome::Completed(()));
+    }
     let (mode, add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
             LinuxShutdown::Read,
@@ -794,11 +976,21 @@ fn shutdown_socket(
             Ok(()) => {
                 socket.read_shutdown |= shuts_down_read;
                 socket.write_shutdown |= shuts_down_write;
+                let republish_readiness =
+                    shuts_down_read && socket.peek_waitall_threshold.take().is_some();
                 if clear.0 != 0 {
                     clear_readiness(socket, clear)?;
                 }
                 if add.0 != 0 {
                     add_readiness(socket, add)?;
+                }
+                if republish_readiness {
+                    let readiness = socket
+                        .snapshot
+                        .lock()
+                        .expect("Linux socket snapshot mutex poisoned")
+                        .readiness;
+                    socket.readiness.republish(readiness)?;
                 }
                 return Ok(SocketOutcome::Completed(()));
             }
@@ -811,7 +1003,6 @@ fn shutdown_socket(
             }
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
-                set_error_readiness(socket)?;
                 return Ok(SocketOutcome::Failed(error));
             }
         }
@@ -819,12 +1010,26 @@ fn shutdown_socket(
 }
 
 fn handle_socket_event(socket: &mut SocketEntry, events: epoll::EventFlags) -> BrokerResult<()> {
+    let republish_readiness = if events.contains(epoll::EventFlags::IN)
+        && let Some(threshold) = socket.peek_waitall_threshold
+    {
+        let threshold_reached = ioctl_fionread(&socket.socket)
+            .ok()
+            .and_then(|available| usize::try_from(available).ok())
+            .is_none_or(|available| available >= threshold);
+        if threshold_reached {
+            socket.peek_waitall_threshold = None;
+        }
+        threshold_reached
+    } else {
+        false
+    };
     let status = socket
         .snapshot
         .lock()
         .expect("Linux socket snapshot mutex poisoned")
         .status;
-    match status {
+    let result = match status {
         SocketConnectionStatus::Unconnected => Ok(()),
         SocketConnectionStatus::Connecting => complete_connect(socket, events),
         SocketConnectionStatus::Connected => {
@@ -832,13 +1037,31 @@ fn handle_socket_event(socket: &mut SocketEntry, events: epoll::EventFlags) -> B
         }
         SocketConnectionStatus::Failed(_) => update_snapshot(socket, None, ReadinessFlags::ERROR),
         _ => Err(BrokerError::Internal),
+    };
+    result?;
+    if republish_readiness {
+        let readiness = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned")
+            .readiness;
+        socket.readiness.republish(readiness)?;
     }
+    Ok(())
 }
 
 fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> BrokerResult<()> {
     let status = match sockopt::socket_error(&socket.socket) {
         Ok(Ok(())) => match getpeername(&socket.socket) {
-            Ok(Some(_)) => SocketConnectionStatus::Connected,
+            Ok(Some(_)) => {
+                let local_address = local_socket_address(&socket.socket)?;
+                socket
+                    .snapshot
+                    .lock()
+                    .expect("Linux socket snapshot mutex poisoned")
+                    .local_address = Some(local_address);
+                SocketConnectionStatus::Connected
+            }
             Ok(None) | Err(Errno::NOTCONN) => SocketConnectionStatus::Connecting,
             Err(error) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
         },
@@ -855,6 +1078,65 @@ fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> Brok
         _ => return Err(BrokerError::Internal),
     };
     update_snapshot(socket, Some(status), readiness)
+}
+
+fn take_socket_error(socket: &SocketEntry) -> BrokerResult<Option<SocketError>> {
+    match sockopt::socket_error(&socket.socket) {
+        Ok(Ok(())) => Ok(None),
+        Ok(Err(error)) | Err(error) => socket_operation_error_from_errno(error).map(Some),
+    }
+}
+
+fn local_socket_address(socket: &OwnedFd) -> BrokerResult<SocketAddressV4> {
+    match getsockname(socket) {
+        Ok(address) => {
+            let address = SocketAddrV4::try_from(address).map_err(|_| BrokerError::Internal)?;
+            Ok(SocketAddressV4 {
+                address: litebox_broker_protocol::socket::Ipv4Address(address.ip().octets()),
+                port: litebox_broker_protocol::socket::Port(address.port()),
+            })
+        }
+        Err(_) => Err(BrokerError::Internal),
+    }
+}
+
+fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse> {
+    let query_socket_error = {
+        let snapshot = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned");
+        snapshot.pending_error.is_none()
+            && snapshot.status == SocketConnectionStatus::Connected
+            && snapshot.readiness.contains(ReadinessFlags::ERROR)
+    };
+    let socket_error = if query_socket_error {
+        take_socket_error(socket)?
+    } else {
+        None
+    };
+    let (response, readiness) = {
+        let mut snapshot = socket
+            .snapshot
+            .lock()
+            .expect("Linux socket snapshot mutex poisoned");
+        let pending_error = snapshot.pending_error.take().or(socket_error);
+        if pending_error.is_some() {
+            snapshot.readiness = ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
+        }
+        (
+            SocketStatusResponse {
+                status: snapshot.status,
+                local_address: snapshot.local_address,
+                pending_error,
+            },
+            snapshot.readiness,
+        )
+    };
+    if response.pending_error.is_some() {
+        socket.readiness.publish(readiness)?;
+    }
+    Ok(response)
 }
 
 fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> ReadinessFlags {
@@ -934,8 +1216,13 @@ fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerRes
     update_snapshot(socket, None, ReadinessFlags(current.0 & !readiness.0))
 }
 
-fn set_error_readiness(socket: &SocketEntry) -> BrokerResult<()> {
-    add_readiness(socket, ReadinessFlags::ERROR)
+fn consume_synchronous_error(socket: &SocketEntry) -> BrokerResult<()> {
+    socket
+        .snapshot
+        .lock()
+        .expect("Linux socket snapshot mutex poisoned")
+        .pending_error = None;
+    clear_readiness(socket, ReadinessFlags::ERROR)
 }
 
 const fn socket_error_from_errno(error: Errno) -> SocketError {
@@ -1011,6 +1298,10 @@ mod tests {
                 .map_err(|_| BrokerError::Internal)
         }
 
+        fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
+            self.publish(handle, readiness)
+        }
+
         fn retire(&self, handle: ObjectHandle) {
             let _ = self.retired.send(handle);
         }
@@ -1045,12 +1336,29 @@ mod tests {
         });
         let read_shutdown_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let read_shutdown_address = read_shutdown_listener.local_addr().unwrap();
+        let (allow_read_shutdown_data, read_shutdown_data_allowed) = channel();
+        let (read_shutdown_data_sent, read_shutdown_data_received) = channel();
         let (release_read_shutdown_server, read_shutdown_server_released) = channel();
         let read_shutdown_server = thread::spawn(move || {
-            let (_stream, _) = read_shutdown_listener.accept().unwrap();
+            let (mut stream, _) = read_shutdown_listener.accept().unwrap();
+            read_shutdown_data_allowed
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap();
+            stream.write_all(b"x").unwrap();
+            read_shutdown_data_sent.send(()).unwrap();
             read_shutdown_server_released
                 .recv_timeout(TEST_TIMEOUT)
                 .unwrap();
+        });
+        let abort_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let abort_address = abort_listener.local_addr().unwrap();
+        let (abort_accepted, wait_for_abort_accept) = channel();
+        let abort_server = thread::spawn(move || {
+            let (mut stream, _) = abort_listener.accept().unwrap();
+            stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+            abort_accepted.send(()).unwrap();
+            let error = stream.read(&mut [0]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
         });
 
         let provider = Arc::new(LinuxSocketProvider::new(8).unwrap());
@@ -1084,6 +1392,14 @@ mod tests {
             )
         ));
         wait_until_connected(&session, handle, &publications);
+        let status = litebox_broker_core::socket::status(&session, handle).unwrap();
+        assert_eq!(status.status, SocketConnectionStatus::Connected);
+        let local_address = status
+            .local_address
+            .expect("connected socket must expose its local address");
+        assert_eq!(local_address.address, Ipv4Address([127, 0, 0, 1]));
+        assert_ne!(local_address.port, Port(0));
+        assert_eq!(status.pending_error, None);
 
         let mut unavailable = [0_u8; 1];
         assert_eq!(
@@ -1092,6 +1408,8 @@ mod tests {
                 handle,
                 &mut unavailable,
                 ReceiveFlags::NONE,
+                0,
+                0,
             ),
             Err(BrokerError::WouldBlock)
         );
@@ -1115,7 +1433,14 @@ mod tests {
 
         let mut first = [0_u8; 1];
         assert_eq!(
-            litebox_broker_core::socket::receive(&session, handle, &mut first, ReceiveFlags::NONE,),
+            litebox_broker_core::socket::receive(
+                &session,
+                handle,
+                &mut first,
+                ReceiveFlags::NONE,
+                0,
+                0,
+            ),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
         );
         assert_eq!(&first, b"p");
@@ -1127,7 +1452,14 @@ mod tests {
         );
         let mut peeked = [0_u8; 3];
         assert_eq!(
-            litebox_broker_core::socket::receive(&session, handle, &mut peeked, ReceiveFlags::PEEK,),
+            litebox_broker_core::socket::receive(
+                &session,
+                handle,
+                &mut peeked,
+                ReceiveFlags::PEEK,
+                0,
+                3,
+            ),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(3)))
         );
         assert_eq!(&peeked, b"ong");
@@ -1138,6 +1470,8 @@ mod tests {
                 handle,
                 &mut received,
                 ReceiveFlags::NONE,
+                0,
+                0,
             ),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(3)))
         );
@@ -1148,6 +1482,8 @@ mod tests {
                 handle,
                 &mut unavailable,
                 ReceiveFlags::NONE,
+                0,
+                0,
             ),
             Err(BrokerError::WouldBlock)
         );
@@ -1177,6 +1513,23 @@ mod tests {
             )
         ));
         wait_until_connected(&session, read_shutdown_handle, &publications);
+        allow_read_shutdown_data.send(()).unwrap();
+        read_shutdown_data_received
+            .recv_timeout(TEST_TIMEOUT)
+            .unwrap();
+        wait_for_readiness(&publications, read_shutdown_handle, ReadinessFlags::READ);
+        let mut read_shutdown_peek = [0_u8; 2];
+        assert_eq!(
+            litebox_broker_core::socket::receive(
+                &session,
+                read_shutdown_handle,
+                &mut read_shutdown_peek,
+                ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+                0,
+                2,
+            ),
+            Err(BrokerError::WouldBlock)
+        );
         assert_eq!(
             litebox_broker_core::socket::shutdown(
                 &session,
@@ -1185,12 +1538,40 @@ mod tests {
             ),
             Ok(SocketOutcome::Completed(()))
         );
+        wait_for_readiness(&publications, read_shutdown_handle, ReadinessFlags::READ);
         assert_eq!(
             litebox_broker_core::socket::receive(
                 &session,
                 read_shutdown_handle,
-                &mut unavailable,
+                &mut read_shutdown_peek,
+                ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+                0,
+                2,
+            ),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
+        );
+        assert_eq!(read_shutdown_peek[0], b'x');
+        let mut queued_after_shutdown = [0_u8; 1];
+        assert_eq!(
+            litebox_broker_core::socket::receive(
+                &session,
+                read_shutdown_handle,
+                &mut queued_after_shutdown,
                 ReceiveFlags::NONE,
+                0,
+                0,
+            ),
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
+        );
+        assert_eq!(queued_after_shutdown, [b'x']);
+        assert_eq!(
+            litebox_broker_core::socket::receive(
+                &session,
+                read_shutdown_handle,
+                &mut queued_after_shutdown,
+                ReceiveFlags::NONE,
+                0,
+                0,
             ),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
         );
@@ -1200,6 +1581,17 @@ mod tests {
         assert!(!read_shutdown_readiness.contains(ReadinessFlags::ERROR));
 
         let unconnected_handle = create_socket(&session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::receive(
+                &session,
+                unconnected_handle,
+                &mut unavailable,
+                ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+                0,
+                1,
+            ),
+            Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        );
         assert_eq!(
             litebox_broker_core::socket::shutdown(&session, unconnected_handle, ShutdownMode::Both,),
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
@@ -1214,7 +1606,7 @@ mod tests {
         let refused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let refused_address = refused_listener.local_addr().unwrap();
         drop(refused_listener);
-        let refused_handle = create_socket(&session, readiness);
+        let refused_handle = create_socket(&session, readiness.clone());
         let refused_connect = litebox_broker_core::socket::connect(
             &session,
             refused_handle,
@@ -1240,6 +1632,35 @@ mod tests {
                 .unwrap()
                 .contains(ReadinessFlags::ERROR)
         );
+
+        let abort_handle = create_socket(&session, readiness);
+        let abort_connect = litebox_broker_core::socket::connect(
+            &session,
+            abort_handle,
+            SocketAddressV4 {
+                address: Ipv4Address([127, 0, 0, 1]),
+                port: Port(abort_address.port()),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            abort_connect,
+            SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            )
+        ));
+        wait_until_connected(&session, abort_handle, &publications);
+        wait_for_abort_accept.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert_eq!(
+            litebox_broker_core::socket::shutdown(&session, abort_handle, ShutdownMode::Abort),
+            Ok(SocketOutcome::Completed(()))
+        );
+        session.close_object_reference(abort_handle).unwrap();
+        assert_eq!(
+            retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+            abort_handle
+        );
+        abort_server.join().unwrap();
 
         session.close_object_reference(handle).unwrap();
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), handle);
@@ -1288,7 +1709,10 @@ mod tests {
     ) {
         let deadline = Instant::now() + TEST_TIMEOUT;
         loop {
-            match litebox_broker_core::socket::status(session, handle).unwrap() {
+            match litebox_broker_core::socket::status(session, handle)
+                .unwrap()
+                .status
+            {
                 SocketConnectionStatus::Connected => return,
                 SocketConnectionStatus::Connecting => {
                     wait_for_readiness_until(
@@ -1310,7 +1734,10 @@ mod tests {
     ) -> SocketError {
         let deadline = Instant::now() + TEST_TIMEOUT;
         loop {
-            match litebox_broker_core::socket::status(session, handle).unwrap() {
+            match litebox_broker_core::socket::status(session, handle)
+                .unwrap()
+                .status
+            {
                 SocketConnectionStatus::Connecting => {
                     wait_for_readiness_until(publications, handle, ReadinessFlags::ERROR, deadline);
                 }
@@ -1333,6 +1760,8 @@ mod tests {
                 handle,
                 &mut byte,
                 ReceiveFlags::NONE,
+                0,
+                0,
             ) {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream)) => return,
                 Err(BrokerError::WouldBlock) => {

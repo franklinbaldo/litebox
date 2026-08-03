@@ -38,6 +38,7 @@ const IP_PROTOCOL_TAG_TCP: u8 = 0;
 const SHUTDOWN_TAG_READ: u8 = 0;
 const SHUTDOWN_TAG_WRITE: u8 = 1;
 const SHUTDOWN_TAG_BOTH: u8 = 2;
+const SHUTDOWN_TAG_ABORT: u8 = 3;
 
 const CONNECTION_STATUS_TAG_UNCONNECTED: u8 = 0;
 const CONNECTION_STATUS_TAG_CONNECTING: u8 = 1;
@@ -77,6 +78,8 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encoder.handle(request.handle);
             encode_shared_buffer_descriptor(encoder, request.buffer);
             encoder.u32(request.flags.0);
+            encoder.u32(request.peek_offset);
+            encoder.u32(request.peek_length);
         }
         SocketRequest::Shutdown(request) => {
             encoder.u8(SOCKET_REQUEST_TAG_SHUTDOWN);
@@ -85,6 +88,7 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
                 ShutdownMode::Read => SHUTDOWN_TAG_READ,
                 ShutdownMode::Write => SHUTDOWN_TAG_WRITE,
                 ShutdownMode::Both => SHUTDOWN_TAG_BOTH,
+                ShutdownMode::Abort => SHUTDOWN_TAG_ABORT,
             });
         }
         SocketRequest::Status(request) => {
@@ -123,6 +127,8 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
             handle: decoder.handle()?,
             buffer: decode_shared_buffer_descriptor(decoder)?,
             flags: ReceiveFlags(decoder.u32()?),
+            peek_offset: decoder.u32()?,
+            peek_length: decoder.u32()?,
         })),
         SOCKET_REQUEST_TAG_SHUTDOWN => Ok(SocketRequest::Shutdown(ShutdownSocketRequest {
             handle: decoder.handle()?,
@@ -130,6 +136,7 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
                 SHUTDOWN_TAG_READ => ShutdownMode::Read,
                 SHUTDOWN_TAG_WRITE => ShutdownMode::Write,
                 SHUTDOWN_TAG_BOTH => ShutdownMode::Both,
+                SHUTDOWN_TAG_ABORT => ShutdownMode::Abort,
                 _ => return Err(WireError::InvalidTag),
             },
         })),
@@ -170,6 +177,8 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
         SocketResponse::Status(response) => {
             encoder.u8(SOCKET_RESPONSE_TAG_STATUS);
             encode_connection_status(encoder, response.status);
+            encode_optional_address(encoder, response.local_address);
+            encode_optional_socket_error(encoder, response.pending_error);
         }
         SocketResponse::Failed(error) => {
             encoder.u8(SOCKET_RESPONSE_TAG_FAILED);
@@ -199,6 +208,8 @@ pub(super) fn decode_socket_response(
         SOCKET_RESPONSE_TAG_SHUTDOWN => Ok(SocketResponse::Shutdown),
         SOCKET_RESPONSE_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {
             status: decode_connection_status(decoder)?,
+            local_address: decode_optional_address(decoder)?,
+            pending_error: decode_optional_socket_error(decoder)?,
         })),
         SOCKET_RESPONSE_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
         _ => Err(WireError::InvalidTag),
@@ -255,6 +266,40 @@ fn decode_address(decoder: &mut Decoder<'_>) -> Result<SocketAddressV4, WireErro
         address: Ipv4Address(octets),
         port: Port(decoder.u16()?),
     })
+}
+
+fn encode_optional_address(encoder: &mut Encoder, address: Option<SocketAddressV4>) {
+    encoder.u8(u8::from(address.is_some()));
+    if let Some(address) = address {
+        encode_address(encoder, address);
+    }
+}
+
+fn decode_optional_address(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<SocketAddressV4>, WireError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_address(decoder).map(Some),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+fn encode_optional_socket_error(encoder: &mut Encoder, error: Option<SocketError>) {
+    encoder.u8(u8::from(error.is_some()));
+    if let Some(error) = error {
+        encode_socket_error(encoder, error);
+    }
+}
+
+fn decode_optional_socket_error(
+    decoder: &mut Decoder<'_>,
+) -> Result<Option<SocketError>, WireError> {
+    match decoder.u8()? {
+        0 => Ok(None),
+        1 => decode_socket_error(decoder).map(Some),
+        _ => Err(WireError::InvalidTag),
+    }
 }
 
 fn encode_shared_buffer_descriptor(encoder: &mut Encoder, descriptor: SharedBufferDescriptor) {

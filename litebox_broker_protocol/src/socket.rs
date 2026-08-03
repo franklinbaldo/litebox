@@ -15,6 +15,8 @@ use thiserror::Error;
 
 /// Maximum socket bytes transferred by one broker request.
 pub const MAX_SOCKET_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
+/// Maximum stream prefix addressable by offset-based peek requests.
+pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
 
 /// Address family of a broker socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +42,7 @@ pub enum IpProtocol {
     Tcp,
 }
 
-/// Which directions of a socket to shut down.
+/// How to stop I/O on a socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ShutdownMode {
@@ -50,6 +52,8 @@ pub enum ShutdownMode {
     Write,
     /// Both directions.
     Both,
+    /// The final close discards queued data and resets the connection.
+    Abort,
 }
 
 /// IPv4 address in network byte order.
@@ -119,9 +123,11 @@ impl ReceiveFlags {
     pub const NONE: Self = Self(0);
     /// Return data without consuming it.
     pub const PEEK: Self = Self(1 << 0);
+    /// Wait for the requested amount of peeked data when the operation may block.
+    pub const WAITALL: Self = Self(1 << 1);
 
     /// Every receive flag this protocol version defines.
-    pub const SUPPORTED: Self = Self(Self::PEEK.0);
+    pub const SUPPORTED: Self = Self(Self::PEEK.0 | Self::WAITALL.0);
 
     /// Returns whether any bit outside [`Self::SUPPORTED`] is set.
     #[must_use]
@@ -223,6 +229,16 @@ impl SocketError {
     }
 }
 
+/// Result of a socket operation that can fail with an ordinary network outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub enum SocketOutcome<T> {
+    /// The operation completed successfully.
+    Completed(T),
+    /// The host network stack reported an ordinary socket failure.
+    Failed(SocketError),
+}
+
 /// Request to create a broker-owned socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreateSocketRequest {
@@ -306,6 +322,10 @@ pub struct ReceiveSocketRequest {
     pub buffer: SharedBufferDescriptor,
     /// Receive flags.
     pub flags: ReceiveFlags,
+    /// Byte offset from the start of the stream for a peek request.
+    pub peek_offset: u32,
+    /// Total stream prefix covered by this logical peek.
+    pub peek_length: u32,
 }
 
 /// Response to a socket receive request.
@@ -344,4 +364,8 @@ pub struct SocketStatusRequest {
 pub struct SocketStatusResponse {
     /// Current connection state.
     pub status: SocketConnectionStatus,
+    /// Local endpoint assigned by the host network stack, if any.
+    pub local_address: Option<SocketAddressV4>,
+    /// Pending asynchronous socket error, consumed by this status query.
+    pub pending_error: Option<SocketError>,
 }

@@ -13,6 +13,11 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::socket::{
+    MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse,
+    SendFlags as BrokerSendFlags, ShutdownMode, SocketAddressV4, SocketConnectionStatus,
+    SocketOutcome, SocketStatusResponse,
+};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::event::{Events, polling::Pollee};
@@ -34,6 +39,42 @@ use shared_buffer::{SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
+    fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn connect_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddressV4,
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+
+    fn socket_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketStatusResponse, BrokerControlError>;
+
+    fn send_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: BrokerSendFlags,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
+
+    fn receive_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: BrokerReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
+        discard: bool,
+    ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
+
+    fn shutdown_socket(
+        &self,
+        handle: ObjectHandle,
+        mode: ShutdownMode,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
     fn create_event_with_count(
         &self,
         initial_count: u64,
@@ -107,9 +148,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         Platform: TimeProvider,
     {
         let events = readiness_events(readiness);
-        if events.is_empty() {
-            return;
-        }
         let pollee = {
             let mut pollables = self.pollables.lock();
             let pollee = pollables.get(&handle).and_then(Weak::upgrade);
@@ -119,7 +157,11 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
             pollee
         };
         if let Some(pollee) = pollee {
-            pollee.notify_observers(events);
+            if events.is_empty() {
+                pollee.wake_observers();
+            } else {
+                pollee.notify_observers(events);
+            }
         }
     }
 
@@ -210,6 +252,94 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
+    fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::create_tcp_socket)
+    }
+
+    fn connect_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddressV4,
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
+        self.request(|local| local.connect_socket(handle, address))
+            .map(|result| match result {
+                Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn socket_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketStatusResponse, BrokerControlError> {
+        self.request(|local| local.socket_status(handle))
+    }
+
+    fn send_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: BrokerSendFlags,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
+        if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length = u32::try_from(data.len())
+            .expect("validated shared socket transfer length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.send_socket(handle, lease.descriptor(), data, flags))
+            .map(|result| match result {
+                Ok(sent) => SocketOutcome::Completed(sent),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn receive_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: BrokerReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
+        discard: bool,
+    ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError> {
+        if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length = u32::try_from(data.len())
+            .expect("validated shared socket transfer length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| {
+            local.receive_socket(
+                litebox_broker_protocol::socket::ReceiveSocketRequest {
+                    handle,
+                    buffer: lease.descriptor(),
+                    flags,
+                    peek_offset,
+                    peek_length,
+                },
+                data,
+                !discard,
+            )
+        })
+        .map(|result| match result {
+            Ok(received) => SocketOutcome::Completed(received),
+            Err(error) => SocketOutcome::Failed(error),
+        })
+    }
+
+    fn shutdown_socket(
+        &self,
+        handle: ObjectHandle,
+        mode: ShutdownMode,
+    ) -> core::result::Result<SocketOutcome<()>, BrokerControlError> {
+        self.request(|local| local.shutdown_socket(handle, mode))
+            .map(|result| match result {
+                Ok(()) => SocketOutcome::Completed(()),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
     fn create_event_with_count(
         &self,
         initial_count: u64,
