@@ -25,6 +25,7 @@ mod policy;
 pub mod readiness;
 mod session;
 pub mod socket;
+pub mod timerfd;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -41,6 +42,7 @@ pub use policy::{
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
 use socket::SocketProvider;
+use timerfd::{TimerfdProvider, UnsupportedTimerfdProvider};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -117,6 +119,7 @@ pub struct BrokerCore {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    pub(crate) timerfd_provider: Arc<dyn TimerfdProvider>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
@@ -147,7 +150,19 @@ impl BrokerCore {
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             socket_provider,
+            timerfd_provider: Arc::new(UnsupportedTimerfdProvider),
         })
+    }
+
+    /// Installs a broker-wide timerfd provider.
+    ///
+    /// The core defaults to [`UnsupportedTimerfdProvider`]; deployments that
+    /// support timers install a host provider (e.g. the Linux-userland one)
+    /// with this builder after construction.
+    #[must_use]
+    pub fn with_timerfd_provider(mut self, timerfd_provider: Arc<dyn TimerfdProvider>) -> Self {
+        self.timerfd_provider = timerfd_provider;
+        self
     }
 
     /// Returns the configured authority-state limits.

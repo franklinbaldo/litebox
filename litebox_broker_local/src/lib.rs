@@ -24,6 +24,7 @@ mod error;
 mod event;
 mod pipe;
 mod socket;
+mod timerfd;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -182,6 +183,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             result @ (BrokerResult::Event(_)
             | BrokerResult::Pipe(_)
             | BrokerResult::Socket(_)
+            | BrokerResult::Timerfd(_)
             | BrokerResult::ObjectClosed
             | BrokerResult::Readiness(_)) => Ok(result),
         }
@@ -214,6 +216,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response @ (BrokerResult::Event(_)
             | BrokerResult::Pipe(_)
             | BrokerResult::Socket(_)
+            | BrokerResult::Timerfd(_)
             | BrokerResult::Readiness(_)) => {
                 panic!("broker returned unexpected close response: {response:?}");
             }
