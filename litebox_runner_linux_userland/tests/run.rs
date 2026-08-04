@@ -10,7 +10,7 @@ use std::{
 };
 
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c", "tcp_broker.c"];
+const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c", "tcp_broker.c", "timerfd.c"];
 
 #[must_use]
 struct Runner {
@@ -364,7 +364,13 @@ fn spawn_test_broker(
                     .expect("failed to create broker test socket provider"),
                 ),
             )
-            .expect("failed to create broker core");
+            .expect("failed to create broker core")
+            .with_timer_provider(std::sync::Arc::new(
+                litebox_broker_platform_linux_userland::LinuxTimerProvider::new(
+                    limits.max_references,
+                )
+                .expect("failed to create broker test timer provider"),
+            ));
             ready_tx.send(()).expect("failed to report broker ready");
 
             for _ in 0..connection_count {
@@ -534,6 +540,44 @@ console.log(content);
         })
         .run();
     assert!(broker_thread.next_close_object_count() > 0);
+
+    broker_thread.join();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_broker_timerfd_with_rewriter() {
+    let target = common::compile("./tests/timerfd.c", "broker_timerfd_rewriter", false, false);
+
+    // Gold standard: the same self-validating binary must pass on the native
+    // baseline, so its assertions are known to match real Linux timerfd
+    // semantics before we require Litebox to reproduce them.
+    let native = std::process::Command::new(&target)
+        .status()
+        .expect("failed to run timerfd.c on the native baseline");
+    assert!(
+        native.success(),
+        "timerfd.c failed on the native baseline: {native}"
+    );
+
+    // The same binary under Litebox, backed by a broker-owned host timer, must
+    // reach the identical exit-0 outcome.
+    let control_socket_path = unique_test_socket_path("runner-broker-timerfd");
+    let broker_thread = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        ),
+        1,
+    );
+
+    Runner::new(&target, "broker_timerfd_rewriter")
+        .broker_socket(&control_socket_path)
+        .run();
+    // timerfd.c creates eight timer objects: one per phase that reaches
+    // timerfd_create. The invalid-clock phase creates none, and the dup phase
+    // shares the original object, so neither adds to the count.
+    assert_eq!(broker_thread.next_close_object_count(), 8);
 
     broker_thread.join();
 }
