@@ -18,6 +18,7 @@ use litebox_broker_protocol::socket::{
     SendFlags as BrokerSendFlags, ShutdownMode, SocketAddressV4, SocketConnectionStatus,
     SocketOutcome, SocketStatusResponse,
 };
+use litebox_broker_protocol::timerfd::TimerfdSpec;
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::event::{Events, polling::Pollee};
@@ -96,6 +97,28 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
+
+    fn create_timerfd(
+        &self,
+        clock_id: i32,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn set_timerfd(
+        &self,
+        handle: ObjectHandle,
+        specification: TimerfdSpec,
+        flags: u32,
+    ) -> core::result::Result<(TimerfdSpec, ReadinessFlags), BrokerControlError>;
+
+    fn get_timerfd(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<TimerfdSpec, BrokerControlError>;
+
+    fn read_timerfd(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<(u64, ReadinessFlags), BrokerControlError>;
 
     fn create_pipe(
         &self,
@@ -368,6 +391,36 @@ where
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
         self.request(|local| local.consume_event(handle, mode))
+    }
+
+    fn create_timerfd(
+        &self,
+        clock_id: i32,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_timerfd(clock_id))
+    }
+
+    fn set_timerfd(
+        &self,
+        handle: ObjectHandle,
+        specification: TimerfdSpec,
+        flags: u32,
+    ) -> core::result::Result<(TimerfdSpec, ReadinessFlags), BrokerControlError> {
+        self.request(|local| local.set_timerfd(handle, specification, flags))
+    }
+
+    fn get_timerfd(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<TimerfdSpec, BrokerControlError> {
+        self.request(|local| local.get_timerfd(handle))
+    }
+
+    fn read_timerfd(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<(u64, ReadinessFlags), BrokerControlError> {
+        self.request(|local| local.read_timerfd(handle))
     }
 
     fn create_pipe(
