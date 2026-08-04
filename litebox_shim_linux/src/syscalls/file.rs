@@ -178,6 +178,10 @@ impl FsPath {
 }
 
 fn itimerspec_to_spec(value: Itimerspec) -> Result<litebox::event::timer::TimerSpec, Errno> {
+    const NANOS_PER_SEC: u64 = 1_000_000_000;
+    if value.it_value.tv_nsec >= NANOS_PER_SEC || value.it_interval.tv_nsec >= NANOS_PER_SEC {
+        return Err(Errno::EINVAL);
+    }
     Ok(litebox::event::timer::TimerSpec {
         value_seconds: u64::try_from(value.it_value.tv_sec).map_err(|_| Errno::EINVAL)?,
         value_nanoseconds: value.it_value.tv_nsec,
@@ -2797,6 +2801,71 @@ mod tests {
     use litebox::fs::Mode;
 
     extern crate std;
+
+    #[test]
+    fn itimerspec_rejects_out_of_range_nanoseconds() {
+        use litebox_common_linux::Timespec;
+
+        let bad_value = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: Timespec {
+                tv_sec: 1,
+                tv_nsec: 1_000_000_000,
+            },
+        };
+        assert_eq!(itimerspec_to_spec(bad_value), Err(Errno::EINVAL));
+
+        let bad_interval = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 2_000_000_000,
+            },
+            it_value: Timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+        };
+        assert_eq!(itimerspec_to_spec(bad_interval), Err(Errno::EINVAL));
+
+        let negative_seconds = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: Timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            },
+        };
+        assert_eq!(itimerspec_to_spec(negative_seconds), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn itimerspec_round_trips_valid_values() {
+        use litebox_common_linux::Timespec;
+
+        let value = Itimerspec {
+            it_interval: Timespec {
+                tv_sec: 7,
+                tv_nsec: 123,
+            },
+            it_value: Timespec {
+                tv_sec: 3,
+                tv_nsec: 999_999_999,
+            },
+        };
+        let spec = itimerspec_to_spec(value).unwrap();
+        assert_eq!(spec.value_seconds, 3);
+        assert_eq!(spec.value_nanoseconds, 999_999_999);
+        assert_eq!(spec.interval_seconds, 7);
+        assert_eq!(spec.interval_nanoseconds, 123);
+
+        let restored = spec_to_itimerspec(spec).unwrap();
+        assert_eq!(restored, value);
+    }
 
     #[test]
     fn write_to_iovec_returns_partial_after_later_error() {

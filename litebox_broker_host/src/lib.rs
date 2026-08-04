@@ -580,11 +580,11 @@ fn handle_timer_request(
             Ok(TimerResponse::Get(GetTimerResponse { current }))
         }
         TimerRequest::Read(request) => {
-            let (expirations, readiness) =
-                litebox_broker_core::timer::read(session, request.handle)
-                    .map_err(RequestFailure::from)?;
+            let (outcome, readiness) = litebox_broker_core::timer::read(session, request.handle)
+                .map_err(RequestFailure::from)?;
             Ok(TimerResponse::Read(ReadTimerResponse {
-                expirations,
+                expirations: outcome.expirations,
+                cancelled: outcome.cancelled,
                 readiness,
             }))
         }

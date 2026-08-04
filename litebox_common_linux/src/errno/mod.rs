@@ -597,6 +597,7 @@ impl From<litebox::event::timer::TimerError> for Errno {
             litebox::event::timer::TimerError::WouldBlock
             | litebox::event::timer::TimerError::ResourceExhausted => Errno::EAGAIN,
             litebox::event::timer::TimerError::PermissionDenied => Errno::EACCES,
+            litebox::event::timer::TimerError::Cancelled => Errno::ECANCELED,
             litebox::event::timer::TimerError::Io
             | litebox::event::timer::TimerError::Unavailable => Errno::EIO,
             _ => Errno::EIO,

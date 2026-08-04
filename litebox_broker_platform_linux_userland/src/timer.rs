@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
-use litebox_broker_core::timer::{PlatformTimer, TimerProvider};
+use litebox_broker_core::timer::{PlatformTimer, TimerProvider, TimerRead};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::timer::{CreateTimerRequest, TimerSpec};
@@ -110,7 +110,7 @@ impl PlatformTimer for LinuxTimer {
         })
     }
 
-    fn read(&self) -> BrokerResult<u64> {
+    fn read(&self) -> BrokerResult<TimerRead> {
         self.reactor.request(|response| ReactorCommand::Read {
             id: self.id,
             response,
@@ -301,7 +301,7 @@ enum ReactorCommand {
     },
     Read {
         id: u64,
-        response: SyncSender<BrokerResult<u64>>,
+        response: SyncSender<BrokerResult<TimerRead>>,
     },
     Close {
         id: u64,
@@ -512,7 +512,7 @@ impl TimerReactor {
         Ok(spec_from_itimerspec(&current))
     }
 
-    fn read_timer(&mut self, id: u64) -> BrokerResult<u64> {
+    fn read_timer(&mut self, id: u64) -> BrokerResult<TimerRead> {
         let timer = self.timers.get(&id).ok_or(BrokerError::Internal)?;
         let mut buffer = [0_u8; size_of::<u64>()];
         match read(&timer.timer, &mut buffer) {
@@ -523,10 +523,26 @@ impl TimerReactor {
                     .snapshot
                     .lock()
                     .expect("Linux timerfd snapshot mutex poisoned") = ReadinessFlags::default();
-                Ok(u64::from_ne_bytes(buffer))
+                Ok(TimerRead {
+                    expirations: u64::from_ne_bytes(buffer),
+                    cancelled: false,
+                })
             }
             Ok(_) => Err(BrokerError::Internal),
             Err(Errno::AGAIN) => Err(BrokerError::WouldBlock),
+            // A CANCEL_ON_SET timer whose backing clock was set discontinuously
+            // reports ECANCELED once and disarms. Consume the notification and
+            // surface it so the guest read returns ECANCELED.
+            Err(Errno::CANCELED) => {
+                *timer
+                    .snapshot
+                    .lock()
+                    .expect("Linux timerfd snapshot mutex poisoned") = ReadinessFlags::default();
+                Ok(TimerRead {
+                    expirations: 0,
+                    cancelled: true,
+                })
+            }
             Err(error) => Err(broker_error_from_errno(error)),
         }
     }

@@ -33,6 +33,8 @@ pub enum TimerError {
     ResourceExhausted,
     #[error("timer permission denied")]
     PermissionDenied,
+    #[error("timer was cancelled by a clock change")]
+    Cancelled,
     #[error("timer I/O failed")]
     Io,
     #[error("timer backing authority unavailable")]
@@ -129,12 +131,15 @@ where
         nonblock: bool,
     ) -> Result<u64, TryOpError<TimerError>> {
         self.pollee.wait(cx, nonblock, Events::IN, || {
-            let (expirations, _readiness) = self.drain()?;
+            let (expirations, cancelled, _readiness) = self.drain()?;
+            if cancelled {
+                return Err(TryOpError::Other(TimerError::Cancelled));
+            }
             Ok(expirations)
         })
     }
 
-    fn drain(&self) -> Result<(u64, ReadinessFlags), BrokerObjectError> {
+    fn drain(&self) -> Result<(u64, bool, ReadinessFlags), BrokerObjectError> {
         self.broker
             .read_timer(self.handle)
             .map_err(|error| self.broker_request_error(error))

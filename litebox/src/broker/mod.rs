@@ -116,7 +116,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn read_timer(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<(u64, ReadinessFlags), BrokerControlError>;
+    ) -> core::result::Result<(u64, bool, ReadinessFlags), BrokerControlError>;
 
     fn create_pipe(
         &self,
@@ -417,7 +417,7 @@ where
     fn read_timer(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<(u64, ReadinessFlags), BrokerControlError> {
+    ) -> core::result::Result<(u64, bool, ReadinessFlags), BrokerControlError> {
         self.request(|local| local.read_timer(handle))
     }
 

@@ -87,8 +87,12 @@ pub struct ReadTimerRequest {
 /// Response to a timerfd read request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadTimerResponse {
-    /// Number of expirations since the last successful read (always `>= 1`).
+    /// Number of expirations since the last successful read (`>= 1` for a real
+    /// expiration, `0` when the read was cancelled).
     pub expirations: u64,
+    /// Set when the timer was cancelled by a discontinuous clock change
+    /// (`CANCEL_ON_SET`); the guest maps this to `ECANCELED`.
+    pub cancelled: bool,
     /// Readiness state after draining.
     pub readiness: ReadinessFlags,
 }

@@ -40,6 +40,17 @@ pub trait TimerProvider: Send + Sync {
     fn close_session(&self, session_id: SessionId);
 }
 
+/// Outcome of draining a host timerfd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimerRead {
+    /// Number of expirations drained (`>= 1` for a real expiration, `0` when
+    /// the read was cancelled).
+    pub expirations: u64,
+    /// Set when a `CANCEL_ON_SET` timer was cancelled by a discontinuous clock
+    /// change; the guest maps this to `ECANCELED`.
+    pub cancelled: bool,
+}
+
 /// One host timerfd resource created by [`TimerProvider`].
 ///
 /// The broker retains this resource in an `Arc`, allowing an operation already
@@ -59,7 +70,7 @@ pub trait PlatformTimer: Send + Sync {
     ///
     /// A timer that has not expired since the last read returns
     /// [`BrokerError::WouldBlock`]. A successful read always returns `>= 1`.
-    fn read(&self) -> Result<u64>;
+    fn read(&self) -> Result<TimerRead>;
 
     /// Returns the current readiness snapshot.
     fn readiness(&self) -> ReadinessFlags;
@@ -139,10 +150,10 @@ pub fn get(session: &BrokerSession, handle: ObjectHandle) -> Result<TimerSpec> {
 }
 
 /// Drains a broker-owned timerfd's accumulated expiration count.
-pub fn read(session: &BrokerSession, handle: ObjectHandle) -> Result<(u64, ReadinessFlags)> {
+pub fn read(session: &BrokerSession, handle: ObjectHandle) -> Result<(TimerRead, ReadinessFlags)> {
     let resource = timer_resource(session, handle, ObjectRights::WAIT)?;
-    let expirations = resource.read()?;
-    Ok((expirations, resource.readiness()))
+    let outcome = resource.read()?;
+    Ok((outcome, resource.readiness()))
 }
 
 fn timer_resource(
@@ -194,7 +205,7 @@ impl TimerResource {
         self.platform_timer().get()
     }
 
-    fn read(&self) -> Result<u64> {
+    fn read(&self) -> Result<TimerRead> {
         self.platform_timer().read()
     }
 
@@ -331,12 +342,15 @@ pub(crate) mod tests {
             Ok(*self.setting.lock().unwrap())
         }
 
-        fn read(&self) -> Result<u64> {
+        fn read(&self) -> Result<TimerRead> {
             let pending = self.pending.swap(0, Ordering::Relaxed);
             if pending == 0 {
                 return Err(BrokerError::WouldBlock);
             }
-            Ok(pending)
+            Ok(TimerRead {
+                expirations: pending,
+                cancelled: false,
+            })
         }
 
         fn readiness(&self) -> ReadinessFlags {
@@ -396,8 +410,9 @@ pub(crate) mod tests {
             session.check_readiness(handle).unwrap(),
             ReadinessFlags::READ
         );
-        let (expirations, readiness) = read(&session, handle).unwrap();
-        assert_eq!(expirations, 1);
+        let (outcome, readiness) = read(&session, handle).unwrap();
+        assert_eq!(outcome.expirations, 1);
+        assert!(!outcome.cancelled);
         assert_eq!(readiness, ReadinessFlags::default());
         assert!(!sink.published.lock().unwrap().is_empty());
 

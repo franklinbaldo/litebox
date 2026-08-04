@@ -293,7 +293,11 @@ fn exercise_timerfd<Channel: litebox_broker_transport::channel::LocalCallChannel
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let (expirations, _readiness) = local.read_timer(timer).unwrap();
+    let (expirations, cancelled, _readiness) = local.read_timer(timer).unwrap();
+    assert!(
+        !cancelled,
+        "a normally expired timer must not report cancellation"
+    );
     assert!(
         expirations >= 1,
         "expected at least one expiration, got {expirations}"

@@ -723,6 +723,7 @@ mod tests {
             })),
             BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
                 expirations: 42,
+                cancelled: false,
                 readiness: ReadinessFlags::default(),
             })),
             BrokerResult::Error(ErrorCode::PolicyDenied),

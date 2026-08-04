@@ -107,6 +107,7 @@ pub(super) fn encode_timer_response(encoder: &mut Encoder, response: TimerRespon
         TimerResponse::Read(response) => {
             encoder.u8(TIMERFD_RESPONSE_TAG_READ);
             encoder.u64(response.expirations);
+            encoder.u8(u8::from(response.cancelled));
             encoder.u32(response.readiness.0);
         }
     }
@@ -129,6 +130,7 @@ pub(super) fn decode_timer_response(decoder: &mut Decoder<'_>) -> Result<TimerRe
         }),
         TIMERFD_RESPONSE_TAG_READ => TimerResponse::Read(ReadTimerResponse {
             expirations: decoder.u64()?,
+            cancelled: decoder.u8()? != 0,
             readiness: ReadinessFlags(decoder.u32()?),
         }),
         _ => return Err(WireError::InvalidTag),

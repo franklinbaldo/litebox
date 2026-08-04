@@ -70,12 +70,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_timer(
         &self,
         handle: ObjectHandle,
-    ) -> Result<(u64, ReadinessFlags), Channel::Error> {
+    ) -> Result<(u64, bool, ReadinessFlags), Channel::Error> {
         let response = self.request_timer(TimerRequest::Read(ReadTimerRequest { handle }))?;
         let TimerResponse::Read(response) = response else {
             panic!("broker returned unexpected timerfd read response: {response:?}");
         };
-        Ok((response.expirations, response.readiness))
+        Ok((response.expirations, response.cancelled, response.readiness))
     }
 
     fn request_timer(&self, request: TimerRequest) -> Result<TimerResponse, Channel::Error> {
