@@ -26,7 +26,7 @@ pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<
     let mut object = object.write();
     match &mut *object {
         ObjectEntry::Event(event) => event.add(value),
-        ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) | ObjectEntry::Timerfd(_) => {
+        ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) | ObjectEntry::Timer(_) => {
             Err(BrokerError::InvalidRights)
         }
         ObjectEntry::Reserved => Err(BrokerError::Internal),
@@ -43,7 +43,7 @@ pub fn consume(
     let mut object = object.write();
     match &mut *object {
         ObjectEntry::Event(event) => event.consume(mode),
-        ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) | ObjectEntry::Timerfd(_) => {
+        ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) | ObjectEntry::Timer(_) => {
             Err(BrokerError::InvalidRights)
         }
         ObjectEntry::Reserved => Err(BrokerError::Internal),

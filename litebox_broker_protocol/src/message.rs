@@ -16,9 +16,9 @@ use crate::socket::{
     ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
     ShutdownSocketRequest, SocketError, SocketStatusRequest, SocketStatusResponse,
 };
-use crate::timerfd::{
-    CreateTimerfdRequest, CreateTimerfdResponse, GetTimerfdRequest, GetTimerfdResponse,
-    ReadTimerfdRequest, ReadTimerfdResponse, SetTimerfdRequest, SetTimerfdResponse,
+use crate::timer::{
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse,
 };
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
@@ -42,8 +42,8 @@ pub enum BrokerOperation {
     Pipe(PipeRequest),
     /// Socket object request family.
     Socket(SocketRequest),
-    /// Timerfd object request family.
-    Timerfd(TimerfdRequest),
+    /// Timer object request family.
+    Timer(TimerRequest),
 }
 
 /// Request sent over an active broker control channel.
@@ -120,15 +120,15 @@ pub enum SocketRequest {
 
 /// Broker-owned timerfd object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TimerfdRequest {
+pub enum TimerRequest {
     /// Create a broker-owned timerfd.
-    Create(CreateTimerfdRequest),
+    Create(CreateTimerRequest),
     /// Arm or disarm a timerfd.
-    Set(SetTimerfdRequest),
+    Set(SetTimerRequest),
     /// Read a timerfd's current setting.
-    Get(GetTimerfdRequest),
+    Get(GetTimerRequest),
     /// Drain a timerfd's expiration count.
-    Read(ReadTimerfdRequest),
+    Read(ReadTimerRequest),
 }
 
 /// Result returned for an active broker operation.
@@ -144,8 +144,8 @@ pub enum BrokerResult {
     Pipe(PipeResponse),
     /// Socket object response family.
     Socket(SocketResponse),
-    /// Timerfd object response family.
-    Timerfd(TimerfdResponse),
+    /// Timer object response family.
+    Timer(TimerResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -209,15 +209,15 @@ pub enum SocketResponse {
 
 /// Broker-owned timerfd object response.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TimerfdResponse {
+pub enum TimerResponse {
     /// Create operation response.
-    Create(CreateTimerfdResponse),
+    Create(CreateTimerResponse),
     /// Set-time operation response.
-    Set(SetTimerfdResponse),
+    Set(SetTimerResponse),
     /// Get-time operation response.
-    Get(GetTimerfdResponse),
+    Get(GetTimerResponse),
     /// Read operation response.
-    Read(ReadTimerfdResponse),
+    Read(ReadTimerResponse),
 }
 
 /// Broker-initiated asynchronous notification.

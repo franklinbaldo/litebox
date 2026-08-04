@@ -13,7 +13,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
-use litebox_broker_protocol::timerfd::TimerfdSpec;
+use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 
@@ -253,7 +253,7 @@ fn exercise_timerfd<Channel: litebox_broker_transport::channel::LocalCallChannel
 {
     const CLOCK_MONOTONIC: i32 = 1;
 
-    let timer = local.create_timerfd(CLOCK_MONOTONIC).unwrap();
+    let timer = local.create_timer(CLOCK_MONOTONIC).unwrap();
     // A freshly created, disarmed timer never fires, so it is not yet readable.
     assert!(
         !local
@@ -262,13 +262,13 @@ fn exercise_timerfd<Channel: litebox_broker_transport::channel::LocalCallChannel
             .contains(ReadinessFlags::READ)
     );
 
-    let specification = TimerfdSpec {
+    let specification = TimerSpec {
         value_seconds: 0,
         value_nanoseconds: 5_000_000,
         interval_seconds: 0,
         interval_nanoseconds: 0,
     };
-    let (previous, _readiness) = local.set_timerfd(timer, specification, 0).unwrap();
+    let (previous, _readiness) = local.set_timer(timer, specification, 0).unwrap();
     // Arming a previously disarmed timer reports an all-zero prior setting.
     assert_eq!(previous.value_seconds, 0);
     assert_eq!(previous.value_nanoseconds, 0);
@@ -293,7 +293,7 @@ fn exercise_timerfd<Channel: litebox_broker_transport::channel::LocalCallChannel
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let (expirations, _readiness) = local.read_timerfd(timer).unwrap();
+    let (expirations, _readiness) = local.read_timer(timer).unwrap();
     assert!(
         expirations >= 1,
         "expected at least one expiration, got {expirations}"

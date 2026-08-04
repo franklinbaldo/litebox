@@ -1,17 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::message::{TimerfdRequest, TimerfdResponse};
+use crate::message::{TimerRequest, TimerResponse};
 use crate::readiness::ReadinessFlags;
-use crate::timerfd::{
-    CreateTimerfdRequest, CreateTimerfdResponse, GetTimerfdRequest, GetTimerfdResponse,
-    ReadTimerfdRequest, ReadTimerfdResponse, SetTimerfdRequest, SetTimerfdResponse, TimerfdSpec,
+use crate::timer::{
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
 };
 
 use super::WireError;
 use super::primitive::{Decoder, Encoder};
 
-// Timerfd operation tags live with the timerfd family. Future timerfd
+// Timer operation tags live with the timerfd family. Future timerfd
 // operations should add tags here; unrelated object families get their own
 // module.
 const TIMERFD_REQUEST_TAG_CREATE: u8 = 0;
@@ -24,15 +24,15 @@ const TIMERFD_RESPONSE_TAG_SET: u8 = 1;
 const TIMERFD_RESPONSE_TAG_GET: u8 = 2;
 const TIMERFD_RESPONSE_TAG_READ: u8 = 3;
 
-fn encode_spec(encoder: &mut Encoder, spec: TimerfdSpec) {
+fn encode_spec(encoder: &mut Encoder, spec: TimerSpec) {
     encoder.u64(spec.value_seconds);
     encoder.u64(spec.value_nanoseconds);
     encoder.u64(spec.interval_seconds);
     encoder.u64(spec.interval_nanoseconds);
 }
 
-fn decode_spec(decoder: &mut Decoder<'_>) -> Result<TimerfdSpec, WireError> {
-    Ok(TimerfdSpec {
+fn decode_spec(decoder: &mut Decoder<'_>) -> Result<TimerSpec, WireError> {
+    Ok(TimerSpec {
         value_seconds: decoder.u64()?,
         value_nanoseconds: decoder.u64()?,
         interval_seconds: decoder.u64()?,
@@ -40,49 +40,47 @@ fn decode_spec(decoder: &mut Decoder<'_>) -> Result<TimerfdSpec, WireError> {
     })
 }
 
-pub(super) fn encode_timerfd_request(encoder: &mut Encoder, request: TimerfdRequest) {
+pub(super) fn encode_timer_request(encoder: &mut Encoder, request: TimerRequest) {
     match request {
-        TimerfdRequest::Create(request) => {
+        TimerRequest::Create(request) => {
             encoder.u8(TIMERFD_REQUEST_TAG_CREATE);
             encoder.u32(request.clock_id.cast_unsigned());
         }
-        TimerfdRequest::Set(request) => {
+        TimerRequest::Set(request) => {
             encoder.u8(TIMERFD_REQUEST_TAG_SET);
             encoder.handle(request.handle);
             encoder.u32(request.flags);
             encode_spec(encoder, request.specification);
         }
-        TimerfdRequest::Get(request) => {
+        TimerRequest::Get(request) => {
             encoder.u8(TIMERFD_REQUEST_TAG_GET);
             encoder.handle(request.handle);
         }
-        TimerfdRequest::Read(request) => {
+        TimerRequest::Read(request) => {
             encoder.u8(TIMERFD_REQUEST_TAG_READ);
             encoder.handle(request.handle);
         }
     }
 }
 
-pub(super) fn decode_timerfd_request(
-    decoder: &mut Decoder<'_>,
-) -> Result<TimerfdRequest, WireError> {
+pub(super) fn decode_timer_request(decoder: &mut Decoder<'_>) -> Result<TimerRequest, WireError> {
     let request = match decoder.u8()? {
-        TIMERFD_REQUEST_TAG_CREATE => TimerfdRequest::Create(CreateTimerfdRequest {
+        TIMERFD_REQUEST_TAG_CREATE => TimerRequest::Create(CreateTimerRequest {
             clock_id: decoder.u32()?.cast_signed(),
         }),
         TIMERFD_REQUEST_TAG_SET => {
             let handle = decoder.handle()?;
             let flags = decoder.u32()?;
-            TimerfdRequest::Set(SetTimerfdRequest {
+            TimerRequest::Set(SetTimerRequest {
                 handle,
                 flags,
                 specification: decode_spec(decoder)?,
             })
         }
-        TIMERFD_REQUEST_TAG_GET => TimerfdRequest::Get(GetTimerfdRequest {
+        TIMERFD_REQUEST_TAG_GET => TimerRequest::Get(GetTimerRequest {
             handle: decoder.handle()?,
         }),
-        TIMERFD_REQUEST_TAG_READ => TimerfdRequest::Read(ReadTimerfdRequest {
+        TIMERFD_REQUEST_TAG_READ => TimerRequest::Read(ReadTimerRequest {
             handle: decoder.handle()?,
         }),
         _ => return Err(WireError::InvalidTag),
@@ -91,22 +89,22 @@ pub(super) fn decode_timerfd_request(
     Ok(request)
 }
 
-pub(super) fn encode_timerfd_response(encoder: &mut Encoder, response: TimerfdResponse) {
+pub(super) fn encode_timer_response(encoder: &mut Encoder, response: TimerResponse) {
     match response {
-        TimerfdResponse::Create(response) => {
+        TimerResponse::Create(response) => {
             encoder.u8(TIMERFD_RESPONSE_TAG_CREATE);
             encoder.handle(response.handle);
         }
-        TimerfdResponse::Set(response) => {
+        TimerResponse::Set(response) => {
             encoder.u8(TIMERFD_RESPONSE_TAG_SET);
             encoder.u32(response.readiness.0);
             encode_spec(encoder, response.previous);
         }
-        TimerfdResponse::Get(response) => {
+        TimerResponse::Get(response) => {
             encoder.u8(TIMERFD_RESPONSE_TAG_GET);
             encode_spec(encoder, response.current);
         }
-        TimerfdResponse::Read(response) => {
+        TimerResponse::Read(response) => {
             encoder.u8(TIMERFD_RESPONSE_TAG_READ);
             encoder.u64(response.expirations);
             encoder.u32(response.readiness.0);
@@ -114,24 +112,22 @@ pub(super) fn encode_timerfd_response(encoder: &mut Encoder, response: TimerfdRe
     }
 }
 
-pub(super) fn decode_timerfd_response(
-    decoder: &mut Decoder<'_>,
-) -> Result<TimerfdResponse, WireError> {
+pub(super) fn decode_timer_response(decoder: &mut Decoder<'_>) -> Result<TimerResponse, WireError> {
     let response = match decoder.u8()? {
-        TIMERFD_RESPONSE_TAG_CREATE => TimerfdResponse::Create(CreateTimerfdResponse {
+        TIMERFD_RESPONSE_TAG_CREATE => TimerResponse::Create(CreateTimerResponse {
             handle: decoder.handle()?,
         }),
         TIMERFD_RESPONSE_TAG_SET => {
             let readiness = ReadinessFlags(decoder.u32()?);
-            TimerfdResponse::Set(SetTimerfdResponse {
+            TimerResponse::Set(SetTimerResponse {
                 readiness,
                 previous: decode_spec(decoder)?,
             })
         }
-        TIMERFD_RESPONSE_TAG_GET => TimerfdResponse::Get(GetTimerfdResponse {
+        TIMERFD_RESPONSE_TAG_GET => TimerResponse::Get(GetTimerResponse {
             current: decode_spec(decoder)?,
         }),
-        TIMERFD_RESPONSE_TAG_READ => TimerfdResponse::Read(ReadTimerfdResponse {
+        TIMERFD_RESPONSE_TAG_READ => TimerResponse::Read(ReadTimerResponse {
             expirations: decoder.u64()?,
             readiness: ReadinessFlags(decoder.u32()?),
         }),

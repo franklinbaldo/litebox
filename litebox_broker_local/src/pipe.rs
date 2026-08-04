@@ -131,7 +131,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             | BrokerResult::Readiness(_)
             | BrokerResult::Event(_)
             | BrokerResult::Socket(_)
-            | BrokerResult::Timerfd(_)) => {
+            | BrokerResult::Timer(_)) => {
                 panic!("broker returned unexpected pipe response: {response:?}");
             }
         }

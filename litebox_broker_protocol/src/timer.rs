@@ -18,7 +18,7 @@ use crate::readiness::ReadinessFlags;
 /// Seconds and nanoseconds are carried verbatim so the broker core can validate
 /// nanosecond ranges rather than trusting the local endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TimerfdSpec {
+pub struct TimerSpec {
     /// Seconds until the initial expiration (`it_value.tv_sec`).
     pub value_seconds: u64,
     /// Nanoseconds until the initial expiration (`it_value.tv_nsec`).
@@ -31,62 +31,62 @@ pub struct TimerfdSpec {
 
 /// Request to create a broker-owned timerfd object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateTimerfdRequest {
+pub struct CreateTimerRequest {
     /// Clock the timer is measured against (`CLOCK_MONOTONIC` / `CLOCK_REALTIME`).
     pub clock_id: i32,
 }
 
 /// Response to a timerfd create request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateTimerfdResponse {
+pub struct CreateTimerResponse {
     /// Created timerfd handle.
     pub handle: ObjectHandle,
 }
 
 /// Request to arm or disarm a broker-owned timerfd.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetTimerfdRequest {
-    /// Timerfd handle.
+pub struct SetTimerRequest {
+    /// Timer handle.
     pub handle: ObjectHandle,
     /// New timer setting; an all-zero `value` disarms the timer.
-    pub specification: TimerfdSpec,
+    pub specification: TimerSpec,
     /// Set-time flags (`TFD_TIMER_ABSTIME`, `TFD_TIMER_CANCEL_ON_SET`).
     pub flags: u32,
 }
 
 /// Response to a timerfd set-time request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetTimerfdResponse {
+pub struct SetTimerResponse {
     /// The timer setting that was in effect before this call.
-    pub previous: TimerfdSpec,
+    pub previous: TimerSpec,
     /// Readiness state after re-arming.
     pub readiness: ReadinessFlags,
 }
 
 /// Request to read a broker-owned timerfd's current setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetTimerfdRequest {
-    /// Timerfd handle.
+pub struct GetTimerRequest {
+    /// Timer handle.
     pub handle: ObjectHandle,
 }
 
 /// Response to a timerfd get-time request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetTimerfdResponse {
+pub struct GetTimerResponse {
     /// The time remaining until the next expiration and the current interval.
-    pub current: TimerfdSpec,
+    pub current: TimerSpec,
 }
 
 /// Request to drain a broker-owned timerfd's expiration count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadTimerfdRequest {
-    /// Timerfd handle.
+pub struct ReadTimerRequest {
+    /// Timer handle.
     pub handle: ObjectHandle,
 }
 
 /// Response to a timerfd read request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReadTimerfdResponse {
+pub struct ReadTimerResponse {
     /// Number of expirations since the last successful read (always `>= 1`).
     pub expirations: u64,
     /// Readiness state after draining.

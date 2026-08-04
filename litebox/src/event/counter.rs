@@ -488,7 +488,7 @@ mod tests {
                 request @ (BrokerOperation::Event(_)
                 | BrokerOperation::Pipe(_)
                 | BrokerOperation::Socket(_)
-                | BrokerOperation::Timerfd(_)) => {
+                | BrokerOperation::Timer(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };

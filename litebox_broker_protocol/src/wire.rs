@@ -31,7 +31,7 @@ mod event;
 mod pipe;
 mod primitive;
 mod socket;
-mod timerfd;
+mod timer;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -148,10 +148,10 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_request(&mut encoder, request);
         }
-        BrokerOperation::Timerfd(request) => {
+        BrokerOperation::Timer(request) => {
             encoder.u8(REQUEST_TAG_TIMERFD);
             encoder.request_id(request_id);
-            timerfd::encode_timerfd_request(&mut encoder, request);
+            timer::encode_timer_request(&mut encoder, request);
         }
     }
     encoder.finish()
@@ -178,9 +178,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
-        REQUEST_TAG_TIMERFD => {
-            BrokerOperation::Timerfd(timerfd::decode_timerfd_request(&mut decoder)?)
-        }
+        REQUEST_TAG_TIMERFD => BrokerOperation::Timer(timer::decode_timer_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -279,10 +277,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_response(&mut encoder, response);
         }
-        BrokerResult::Timerfd(response) => {
+        BrokerResult::Timer(response) => {
             encoder.u8(RESPONSE_TAG_TIMERFD);
             encoder.request_id(request_id);
-            timerfd::encode_timerfd_response(&mut encoder, response);
+            timer::encode_timer_response(&mut encoder, response);
         }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -315,9 +313,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_EVENT => BrokerResult::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
-        RESPONSE_TAG_TIMERFD => {
-            BrokerResult::Timerfd(timerfd::decode_timerfd_response(&mut decoder)?)
-        }
+        RESPONSE_TAG_TIMERFD => BrokerResult::Timer(timer::decode_timer_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => {
             let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
             BrokerResult::Error(error)
@@ -370,7 +366,7 @@ mod tests {
     };
     use crate::message::{
         EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
-        TimerfdRequest, TimerfdResponse,
+        TimerRequest, TimerResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -384,10 +380,9 @@ mod tests {
         ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
         SocketStatusRequest, SocketStatusResponse, SocketType,
     };
-    use crate::timerfd::{
-        CreateTimerfdRequest, CreateTimerfdResponse, GetTimerfdRequest, GetTimerfdResponse,
-        ReadTimerfdRequest, ReadTimerfdResponse, SetTimerfdRequest, SetTimerfdResponse,
-        TimerfdSpec,
+    use crate::timer::{
+        CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
+        ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
@@ -501,19 +496,19 @@ mod tests {
                 mode: ShutdownMode::Abort,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
-            BrokerOperation::Timerfd(TimerfdRequest::Create(CreateTimerfdRequest { clock_id: 1 })),
-            BrokerOperation::Timerfd(TimerfdRequest::Set(SetTimerfdRequest {
+            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest { clock_id: 1 })),
+            BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
                 handle,
                 flags: 1,
-                specification: TimerfdSpec {
+                specification: TimerSpec {
                     value_seconds: 0x0102_0304_0506_0708,
                     value_nanoseconds: 999_999_999,
                     interval_seconds: 0x1112_1314_1516_1718,
                     interval_nanoseconds: 123_456_789,
                 },
             })),
-            BrokerOperation::Timerfd(TimerfdRequest::Get(GetTimerfdRequest { handle })),
-            BrokerOperation::Timerfd(TimerfdRequest::Read(ReadTimerfdRequest { handle })),
+            BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
+            BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle })),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -708,25 +703,25 @@ mod tests {
                 SocketConnectionStatus::Failed(SocketError::TimedOut),
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
-            BrokerResult::Timerfd(TimerfdResponse::Create(CreateTimerfdResponse { handle })),
-            BrokerResult::Timerfd(TimerfdResponse::Set(SetTimerfdResponse {
+            BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })),
+            BrokerResult::Timer(TimerResponse::Set(SetTimerResponse {
                 readiness: ReadinessFlags::READ,
-                previous: TimerfdSpec {
+                previous: TimerSpec {
                     value_seconds: 7,
                     value_nanoseconds: 8,
                     interval_seconds: 9,
                     interval_nanoseconds: 10,
                 },
             })),
-            BrokerResult::Timerfd(TimerfdResponse::Get(GetTimerfdResponse {
-                current: TimerfdSpec {
+            BrokerResult::Timer(TimerResponse::Get(GetTimerResponse {
+                current: TimerSpec {
                     value_seconds: 1,
                     value_nanoseconds: 2,
                     interval_seconds: 3,
                     interval_nanoseconds: 4,
                 },
             })),
-            BrokerResult::Timerfd(TimerfdResponse::Read(ReadTimerfdResponse {
+            BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
                 expirations: 42,
                 readiness: ReadinessFlags::default(),
             })),

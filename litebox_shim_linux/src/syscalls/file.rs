@@ -177,8 +177,8 @@ impl FsPath {
     }
 }
 
-fn itimerspec_to_spec(value: Itimerspec) -> Result<litebox::event::timer::TimerfdSpec, Errno> {
-    Ok(litebox::event::timer::TimerfdSpec {
+fn itimerspec_to_spec(value: Itimerspec) -> Result<litebox::event::timer::TimerSpec, Errno> {
+    Ok(litebox::event::timer::TimerSpec {
         value_seconds: u64::try_from(value.it_value.tv_sec).map_err(|_| Errno::EINVAL)?,
         value_nanoseconds: value.it_value.tv_nsec,
         interval_seconds: u64::try_from(value.it_interval.tv_sec).map_err(|_| Errno::EINVAL)?,
@@ -186,7 +186,7 @@ fn itimerspec_to_spec(value: Itimerspec) -> Result<litebox::event::timer::Timerf
     })
 }
 
-fn spec_to_itimerspec(value: litebox::event::timer::TimerfdSpec) -> Result<Itimerspec, Errno> {
+fn spec_to_itimerspec(value: litebox::event::timer::TimerSpec) -> Result<Itimerspec, Errno> {
     Ok(Itimerspec {
         it_interval: litebox_common_linux::Timespec {
             tv_sec: i64::try_from(value.interval_seconds).map_err(|_| Errno::EOVERFLOW)?,

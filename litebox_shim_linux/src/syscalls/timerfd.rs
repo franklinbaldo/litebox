@@ -46,13 +46,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFile<Platform> {
 
     pub(crate) fn settime(
         &self,
-        spec: litebox::event::timer::TimerfdSpec,
+        spec: litebox::event::timer::TimerSpec,
         flags: u32,
-    ) -> Result<litebox::event::timer::TimerfdSpec, Errno> {
+    ) -> Result<litebox::event::timer::TimerSpec, Errno> {
         self.timer.set_time(spec, flags).map_err(Errno::from)
     }
 
-    pub(crate) fn gettime(&self) -> Result<litebox::event::timer::TimerfdSpec, Errno> {
+    pub(crate) fn gettime(&self) -> Result<litebox::event::timer::TimerSpec, Errno> {
         self.timer.get_time().map_err(Errno::from)
     }
 

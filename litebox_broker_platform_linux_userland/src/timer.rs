@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
-use litebox_broker_core::timerfd::{PlatformTimerfd, TimerfdProvider};
+use litebox_broker_core::timer::{PlatformTimer, TimerProvider};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::timerfd::{CreateTimerfdRequest, TimerfdSpec};
+use litebox_broker_protocol::timer::{CreateTimerRequest, TimerSpec};
 use rustix::event::{EventfdFlags, epoll, eventfd};
 use rustix::io::{Errno, read, write};
 use rustix::time::{
@@ -41,32 +41,32 @@ const MAX_EPOLL_EVENTS: usize = 64;
 /// One reactor thread owns every timer descriptor and all epoll state. Broker
 /// request workers submit bounded commands and wait only for one immediate
 /// nonblocking operation, never for a timer to expire.
-pub struct LinuxTimerfdProvider {
-    reactor: Arc<TimerfdReactorClient>,
+pub struct LinuxTimerProvider {
+    reactor: Arc<TimerReactorClient>,
 }
 
-impl LinuxTimerfdProvider {
+impl LinuxTimerProvider {
     /// Starts a provider whose reactor tracks at most `max_timers` resources.
     pub fn new(max_timers: usize) -> IoResult<Self> {
         Ok(Self {
-            reactor: Arc::new(TimerfdReactorClient::start(max_timers)?),
+            reactor: Arc::new(TimerReactorClient::start(max_timers)?),
         })
     }
 }
 
-impl TimerfdProvider for LinuxTimerfdProvider {
+impl TimerProvider for LinuxTimerProvider {
     fn create(
         &self,
         _session_id: SessionId,
-        request: CreateTimerfdRequest,
+        request: CreateTimerRequest,
         readiness: ReadinessRegistration,
-    ) -> BrokerResult<Arc<dyn PlatformTimerfd>> {
+    ) -> BrokerResult<Arc<dyn PlatformTimer>> {
         let clock = clock_from_raw(request.clock_id)?;
         let id = self.reactor.allocate_timer_id()?;
         let snapshot = Arc::new(Mutex::new(ReadinessFlags::default()));
         // Allocate the provider object before the reactor creates an external
         // resource, so successful creation has no remaining Arc allocation.
-        let timer = Arc::new(LinuxTimerfd {
+        let timer = Arc::new(LinuxTimer {
             id,
             reactor: Arc::clone(&self.reactor),
             snapshot: Arc::clone(&snapshot),
@@ -85,14 +85,14 @@ impl TimerfdProvider for LinuxTimerfdProvider {
 }
 
 /// Broker-core-facing handle for a reactor-owned timerfd.
-struct LinuxTimerfd {
+struct LinuxTimer {
     id: u64,
-    reactor: Arc<TimerfdReactorClient>,
+    reactor: Arc<TimerReactorClient>,
     snapshot: Arc<Mutex<ReadinessFlags>>,
 }
 
-impl PlatformTimerfd for LinuxTimerfd {
-    fn set(&self, specification: TimerfdSpec, flags: u32) -> BrokerResult<TimerfdSpec> {
+impl PlatformTimer for LinuxTimer {
+    fn set(&self, specification: TimerSpec, flags: u32) -> BrokerResult<TimerSpec> {
         let timer_flags = timer_flags_from_raw(flags)?;
         let new_value = itimerspec_from_spec(specification)?;
         self.reactor.request(|response| ReactorCommand::Set {
@@ -103,7 +103,7 @@ impl PlatformTimerfd for LinuxTimerfd {
         })
     }
 
-    fn get(&self) -> BrokerResult<TimerfdSpec> {
+    fn get(&self) -> BrokerResult<TimerSpec> {
         self.reactor.request(|response| ReactorCommand::Get {
             id: self.id,
             response,
@@ -125,21 +125,21 @@ impl PlatformTimerfd for LinuxTimerfd {
     }
 }
 
-impl Drop for LinuxTimerfd {
+impl Drop for LinuxTimer {
     fn drop(&mut self) {
         self.reactor.close_timer(self.id);
     }
 }
 
 /// Thread-safe command, wake, and lifecycle handle for the timerfd reactor.
-struct TimerfdReactorClient {
+struct TimerReactorClient {
     commands: SyncSender<ReactorCommand>,
     wake: Arc<OwnedFd>,
     next_timer_id: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl TimerfdReactorClient {
+impl TimerReactorClient {
     fn start(max_timers: usize) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
@@ -165,7 +165,7 @@ impl TimerfdReactorClient {
                     let _ = started.send(false);
                     return;
                 }
-                let mut reactor = TimerfdReactor {
+                let mut reactor = TimerReactor {
                     epoll: epoll_fd,
                     wake: reactor_wake,
                     commands: receiver,
@@ -259,7 +259,7 @@ impl TimerfdReactorClient {
     }
 }
 
-impl Drop for TimerfdReactorClient {
+impl Drop for TimerReactorClient {
     fn drop(&mut self) {
         let (response, receive) = sync_channel(1);
         if self
@@ -293,11 +293,11 @@ enum ReactorCommand {
         id: u64,
         new_value: Itimerspec,
         flags: TimerfdTimerFlags,
-        response: SyncSender<BrokerResult<TimerfdSpec>>,
+        response: SyncSender<BrokerResult<TimerSpec>>,
     },
     Get {
         id: u64,
-        response: SyncSender<BrokerResult<TimerfdSpec>>,
+        response: SyncSender<BrokerResult<TimerSpec>>,
     },
     Read {
         id: u64,
@@ -335,7 +335,7 @@ impl fmt::Display for ReactorFailure {
     }
 }
 
-struct TimerfdReactor {
+struct TimerReactor {
     epoll: OwnedFd,
     wake: Arc<OwnedFd>,
     commands: Receiver<ReactorCommand>,
@@ -344,7 +344,7 @@ struct TimerfdReactor {
     events: Vec<epoll::Event>,
 }
 
-impl TimerfdReactor {
+impl TimerReactor {
     fn run(&mut self) -> core::result::Result<(), ReactorFailure> {
         loop {
             let mut events = core::mem::take(&mut self.events);
@@ -493,7 +493,7 @@ impl TimerfdReactor {
         id: u64,
         new_value: &Itimerspec,
         flags: TimerfdTimerFlags,
-    ) -> BrokerResult<TimerfdSpec> {
+    ) -> BrokerResult<TimerSpec> {
         let timer = self.timers.get(&id).ok_or(BrokerError::Internal)?;
         let previous =
             timerfd_settime(&timer.timer, flags, new_value).map_err(broker_error_from_errno)?;
@@ -506,7 +506,7 @@ impl TimerfdReactor {
         Ok(spec_from_itimerspec(&previous))
     }
 
-    fn get_timer(&self, id: u64) -> BrokerResult<TimerfdSpec> {
+    fn get_timer(&self, id: u64) -> BrokerResult<TimerSpec> {
         let timer = self.timers.get(&id).ok_or(BrokerError::Internal)?;
         let current = timerfd_gettime(&timer.timer).map_err(broker_error_from_errno)?;
         Ok(spec_from_itimerspec(&current))
@@ -567,7 +567,7 @@ fn timer_flags_from_raw(flags: u32) -> BrokerResult<TimerfdTimerFlags> {
     Ok(TimerfdTimerFlags::from_bits_truncate(flags))
 }
 
-fn itimerspec_from_spec(spec: TimerfdSpec) -> BrokerResult<Itimerspec> {
+fn itimerspec_from_spec(spec: TimerSpec) -> BrokerResult<Itimerspec> {
     Ok(Itimerspec {
         it_interval: timespec_from_parts(spec.interval_seconds, spec.interval_nanoseconds)?,
         it_value: timespec_from_parts(spec.value_seconds, spec.value_nanoseconds)?,
@@ -581,8 +581,8 @@ fn timespec_from_parts(seconds: u64, nanoseconds: u64) -> BrokerResult<Timespec>
     })
 }
 
-fn spec_from_itimerspec(value: &Itimerspec) -> TimerfdSpec {
-    TimerfdSpec {
+fn spec_from_itimerspec(value: &Itimerspec) -> TimerSpec {
+    TimerSpec {
         value_seconds: value.it_value.tv_sec.unsigned_abs(),
         value_nanoseconds: value.it_value.tv_nsec.unsigned_abs(),
         interval_seconds: value.it_interval.tv_sec.unsigned_abs(),
@@ -629,7 +629,7 @@ mod tests {
 
     #[test]
     fn itimerspec_round_trips_through_spec() {
-        let spec = TimerfdSpec {
+        let spec = TimerSpec {
             value_seconds: 3,
             value_nanoseconds: 250_000_000,
             interval_seconds: 1,
@@ -645,9 +645,9 @@ mod tests {
 
     #[test]
     fn oversized_spec_is_rejected() {
-        let spec = TimerfdSpec {
+        let spec = TimerSpec {
             value_seconds: u64::MAX,
-            ..TimerfdSpec::default()
+            ..TimerSpec::default()
         };
         assert_eq!(
             itimerspec_from_spec(spec).err(),

@@ -5,7 +5,7 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-pub use litebox_broker_protocol::timerfd::TimerfdSpec;
+pub use litebox_broker_protocol::timer::TimerSpec;
 use thiserror::Error;
 
 use crate::{
@@ -87,7 +87,7 @@ where
             return Err(TimerError::Unavailable);
         };
         let handle = broker
-            .create_timerfd(clock_id)
+            .create_timer(clock_id)
             .map_err(BrokerObjectError::from)
             .map_err(TimerError::from)?;
         let pollable_registry = litebox.broker_pollable_registry();
@@ -102,14 +102,10 @@ where
     }
 
     /// Arms or disarms the timer, returning the setting previously in effect.
-    pub fn set_time(
-        &self,
-        specification: TimerfdSpec,
-        flags: u32,
-    ) -> Result<TimerfdSpec, TimerError> {
+    pub fn set_time(&self, specification: TimerSpec, flags: u32) -> Result<TimerSpec, TimerError> {
         let (previous, readiness) = self
             .broker
-            .set_timerfd(self.handle, specification, flags)
+            .set_timer(self.handle, specification, flags)
             .map_err(|error| self.broker_request_error(error))?;
         // Re-arming clears any prior pending expiration; wake observers so a
         // level-triggered poller re-checks the newly authoritative readiness.
@@ -118,9 +114,9 @@ where
     }
 
     /// Returns the time remaining until the next expiration and the interval.
-    pub fn get_time(&self) -> Result<TimerfdSpec, TimerError> {
+    pub fn get_time(&self) -> Result<TimerSpec, TimerError> {
         self.broker
-            .get_timerfd(self.handle)
+            .get_timer(self.handle)
             .map_err(|error| self.broker_request_error(error))
             .map_err(TimerError::from)
     }
@@ -140,7 +136,7 @@ where
 
     fn drain(&self) -> Result<(u64, ReadinessFlags), BrokerObjectError> {
         self.broker
-            .read_timerfd(self.handle)
+            .read_timer(self.handle)
             .map_err(|error| self.broker_request_error(error))
     }
 

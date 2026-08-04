@@ -5,7 +5,7 @@
 //!
 //! A broker timerfd delegates timekeeping to a host-owned Linux `timerfd`
 //! descriptor. The broker core owns the object reference and readiness
-//! registration; the host platform (via [`TimerfdProvider`]) owns the real
+//! registration; the host platform (via [`TimerProvider`]) owns the real
 //! descriptor and publishes readiness when the timer expires, exactly like
 //! broker sockets.
 
@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::timerfd::{CreateTimerfdRequest, TimerfdSpec};
+use litebox_broker_protocol::timer::{CreateTimerRequest, TimerSpec};
 use spin::Once;
 
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
@@ -22,38 +22,38 @@ use crate::{BrokerError, BrokerSession, Result, SessionId};
 
 /// Broker-wide timerfd provider supplied by the host platform.
 ///
-/// The provider creates per-timer [`PlatformTimerfd`] resources and owns any
+/// The provider creates per-timer [`PlatformTimer`] resources and owns any
 /// bookkeeping shared across a session's timers. Operations on an individual
-/// timer belong to [`PlatformTimerfd`], not this shared provider.
-pub trait TimerfdProvider: Send + Sync {
+/// timer belong to [`PlatformTimer`], not this shared provider.
+pub trait TimerProvider: Send + Sync {
     /// Creates one host timerfd resource for an authenticated session.
     ///
     /// The returned timer must not retain authority beyond its `Arc` lifetime.
     fn create(
         &self,
         session_id: SessionId,
-        request: CreateTimerfdRequest,
+        request: CreateTimerRequest,
         readiness: ReadinessRegistration,
-    ) -> Result<Arc<dyn PlatformTimerfd>>;
+    ) -> Result<Arc<dyn PlatformTimer>>;
 
     /// Releases provider state associated with a session after its references close.
     fn close_session(&self, session_id: SessionId);
 }
 
-/// One host timerfd resource created by [`TimerfdProvider`].
+/// One host timerfd resource created by [`TimerProvider`].
 ///
 /// The broker retains this resource in an `Arc`, allowing an operation already
 /// in flight to finish after its object handle closes. Dropping the final `Arc`
 /// releases the host descriptor.
-pub trait PlatformTimerfd: Send + Sync {
+pub trait PlatformTimer: Send + Sync {
     /// Arms or disarms the timer, returning the setting previously in effect.
     ///
     /// An all-zero `value` in `specification` disarms the timer. Unsupported
     /// `flags` are rejected with [`BrokerError::UnsupportedOperation`].
-    fn set(&self, specification: TimerfdSpec, flags: u32) -> Result<TimerfdSpec>;
+    fn set(&self, specification: TimerSpec, flags: u32) -> Result<TimerSpec>;
 
     /// Returns the time remaining until the next expiration and the interval.
-    fn get(&self) -> Result<TimerfdSpec>;
+    fn get(&self) -> Result<TimerSpec>;
 
     /// Drains and returns the accumulated expiration count.
     ///
@@ -66,15 +66,15 @@ pub trait PlatformTimerfd: Send + Sync {
 }
 
 /// Placeholder provider for broker configurations that deliberately disable timers.
-pub struct UnsupportedTimerfdProvider;
+pub struct UnsupportedTimerProvider;
 
-impl TimerfdProvider for UnsupportedTimerfdProvider {
+impl TimerProvider for UnsupportedTimerProvider {
     fn create(
         &self,
         _session_id: SessionId,
-        _request: CreateTimerfdRequest,
+        _request: CreateTimerRequest,
         _readiness: ReadinessRegistration,
-    ) -> Result<Arc<dyn PlatformTimerfd>> {
+    ) -> Result<Arc<dyn PlatformTimer>> {
         Err(BrokerError::UnsupportedOperation)
     }
 
@@ -87,7 +87,7 @@ impl TimerfdProvider for UnsupportedTimerfdProvider {
 /// limit; timers do not carry a separate per-resource quota.
 pub fn create(
     session: &BrokerSession,
-    request: CreateTimerfdRequest,
+    request: CreateTimerRequest,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
     let rights = session
@@ -95,14 +95,14 @@ pub fn create(
         .policy
         .principal_object_rights(session.caller_credential)?;
     let reference = session.reserve_object_reference(rights)?;
-    let guard = Arc::new(TimerfdReservation);
+    let guard = Arc::new(TimerReservation);
     let readiness =
         ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, guard);
-    let resource = Arc::new(TimerfdResource {
-        platform_timerfd: Once::new(),
+    let resource = Arc::new(TimerResource {
+        platform_timer: Once::new(),
         readiness,
     });
-    let platform_timerfd = match session.core.timerfd_provider.create(
+    let platform_timer = match session.core.timer_provider.create(
         session.session_id,
         request,
         resource.readiness.clone(),
@@ -115,8 +115,8 @@ pub fn create(
             return Err(error);
         }
     };
-    resource.platform_timerfd.call_once(|| platform_timerfd);
-    let handle = reference.commit(ObjectEntry::Timerfd(TimerfdObject::new(resource)))?;
+    resource.platform_timer.call_once(|| platform_timer);
+    let handle = reference.commit(ObjectEntry::Timer(TimerObject::new(resource)))?;
     Ok(handle)
 }
 
@@ -124,86 +124,86 @@ pub fn create(
 pub fn set(
     session: &BrokerSession,
     handle: ObjectHandle,
-    specification: TimerfdSpec,
+    specification: TimerSpec,
     flags: u32,
-) -> Result<(TimerfdSpec, ReadinessFlags)> {
-    let resource = timerfd_resource(session, handle, ObjectRights::WRITE)?;
+) -> Result<(TimerSpec, ReadinessFlags)> {
+    let resource = timer_resource(session, handle, ObjectRights::WRITE)?;
     let previous = resource.set(specification, flags)?;
     Ok((previous, resource.readiness()))
 }
 
 /// Returns a broker-owned timerfd's current setting.
-pub fn get(session: &BrokerSession, handle: ObjectHandle) -> Result<TimerfdSpec> {
-    let resource = timerfd_resource(session, handle, ObjectRights::WAIT)?;
+pub fn get(session: &BrokerSession, handle: ObjectHandle) -> Result<TimerSpec> {
+    let resource = timer_resource(session, handle, ObjectRights::WAIT)?;
     resource.get()
 }
 
 /// Drains a broker-owned timerfd's accumulated expiration count.
 pub fn read(session: &BrokerSession, handle: ObjectHandle) -> Result<(u64, ReadinessFlags)> {
-    let resource = timerfd_resource(session, handle, ObjectRights::WAIT)?;
+    let resource = timer_resource(session, handle, ObjectRights::WAIT)?;
     let expirations = resource.read()?;
     Ok((expirations, resource.readiness()))
 }
 
-fn timerfd_resource(
+fn timer_resource(
     session: &BrokerSession,
     handle: ObjectHandle,
     required_rights: ObjectRights,
-) -> Result<Arc<TimerfdResource>> {
+) -> Result<Arc<TimerResource>> {
     let object = session.authorized_object(handle, required_rights)?;
     let object = object.read();
-    let ObjectEntry::Timerfd(timerfd) = &*object else {
+    let ObjectEntry::Timer(timerfd) = &*object else {
         return Err(BrokerError::InvalidRights);
     };
     Ok(timerfd.resource())
 }
 
 /// A broker-owned timerfd reference.
-pub(crate) struct TimerfdObject {
-    resource: Arc<TimerfdResource>,
+pub(crate) struct TimerObject {
+    resource: Arc<TimerResource>,
 }
 
-impl TimerfdObject {
-    fn new(resource: Arc<TimerfdResource>) -> Self {
+impl TimerObject {
+    fn new(resource: Arc<TimerResource>) -> Self {
         Self { resource }
     }
 
-    pub(crate) fn resource(&self) -> Arc<TimerfdResource> {
+    pub(crate) fn resource(&self) -> Arc<TimerResource> {
         Arc::clone(&self.resource)
     }
 }
 
-pub(crate) struct TimerfdResource {
-    platform_timerfd: Once<Arc<dyn PlatformTimerfd>>,
+pub(crate) struct TimerResource {
+    platform_timer: Once<Arc<dyn PlatformTimer>>,
     readiness: ReadinessRegistration,
 }
 
-impl TimerfdResource {
-    fn platform_timerfd(&self) -> &dyn PlatformTimerfd {
-        self.platform_timerfd
+impl TimerResource {
+    fn platform_timer(&self) -> &dyn PlatformTimer {
+        self.platform_timer
             .get()
             .expect("committed timerfd resources are initialized")
             .as_ref()
     }
 
-    fn set(&self, specification: TimerfdSpec, flags: u32) -> Result<TimerfdSpec> {
-        self.platform_timerfd().set(specification, flags)
+    fn set(&self, specification: TimerSpec, flags: u32) -> Result<TimerSpec> {
+        self.platform_timer().set(specification, flags)
     }
 
-    fn get(&self) -> Result<TimerfdSpec> {
-        self.platform_timerfd().get()
+    fn get(&self) -> Result<TimerSpec> {
+        self.platform_timer().get()
     }
 
     fn read(&self) -> Result<u64> {
-        self.platform_timerfd().read()
+        self.platform_timer().read()
     }
 
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        self.platform_timerfd().readiness()
+        self.platform_timer().readiness()
     }
 }
 
-impl Drop for TimerfdResource {
+impl Drop for TimerResource {
     fn drop(&mut self) {
         self.readiness.retire();
     }
@@ -214,7 +214,7 @@ impl Drop for TimerfdResource {
 /// Timers are bounded by the shared object-reference limit rather than a
 /// dedicated quota, so this guard carries no reservation state; it exists only
 /// to satisfy the readiness registration's deferred-retirement contract.
-struct TimerfdReservation;
+struct TimerReservation;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -227,14 +227,14 @@ pub(crate) mod tests {
 
     const TEST_CLOCK_MONOTONIC: i32 = 1;
 
-    fn create_request() -> CreateTimerfdRequest {
-        CreateTimerfdRequest {
+    fn create_request() -> CreateTimerRequest {
+        CreateTimerRequest {
             clock_id: TEST_CLOCK_MONOTONIC,
         }
     }
 
-    fn armed_spec() -> TimerfdSpec {
-        TimerfdSpec {
+    fn armed_spec() -> TimerSpec {
+        TimerSpec {
             value_seconds: 0,
             value_nanoseconds: 500_000,
             interval_seconds: 0,
@@ -243,20 +243,20 @@ pub(crate) mod tests {
     }
 
     #[derive(Clone, Default)]
-    pub(crate) struct TestTimerfdProvider {
-        state: Arc<TestTimerfdState>,
+    pub(crate) struct TestTimerProvider {
+        state: Arc<TestTimerState>,
     }
 
     #[derive(Default)]
-    struct TestTimerfdState {
-        creates: StdMutex<std::vec::Vec<(SessionId, CreateTimerfdRequest)>>,
+    struct TestTimerState {
+        creates: StdMutex<std::vec::Vec<(SessionId, CreateTimerRequest)>>,
         closed_sessions: StdMutex<std::vec::Vec<SessionId>>,
         dropped_timers: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
-        live_timer: StdMutex<Option<Weak<TestPlatformTimerfd>>>,
+        live_timer: StdMutex<Option<Weak<TestPlatformTimer>>>,
     }
 
-    impl TestTimerfdProvider {
+    impl TestTimerProvider {
         pub(crate) fn fail_next_create(&self) {
             self.state.fail_create.store(true, Ordering::Relaxed);
         }
@@ -274,13 +274,13 @@ pub(crate) mod tests {
         }
     }
 
-    impl TimerfdProvider for TestTimerfdProvider {
+    impl TimerProvider for TestTimerProvider {
         fn create(
             &self,
             session_id: SessionId,
-            request: CreateTimerfdRequest,
+            request: CreateTimerRequest,
             readiness: ReadinessRegistration,
-        ) -> Result<Arc<dyn PlatformTimerfd>> {
+        ) -> Result<Arc<dyn PlatformTimer>> {
             self.state
                 .creates
                 .lock()
@@ -289,10 +289,10 @@ pub(crate) mod tests {
             if self.state.fail_create.swap(false, Ordering::Relaxed) {
                 return Err(BrokerError::OutOfMemory);
             }
-            let timer = Arc::new(TestPlatformTimerfd {
+            let timer = Arc::new(TestPlatformTimer {
                 state: Arc::clone(&self.state),
                 readiness,
-                setting: StdMutex::new(TimerfdSpec::default()),
+                setting: StdMutex::new(TimerSpec::default()),
                 pending: AtomicU64::new(0),
             });
             *self.state.live_timer.lock().unwrap() = Some(Arc::downgrade(&timer));
@@ -304,14 +304,14 @@ pub(crate) mod tests {
         }
     }
 
-    struct TestPlatformTimerfd {
-        state: Arc<TestTimerfdState>,
+    struct TestPlatformTimer {
+        state: Arc<TestTimerState>,
         readiness: ReadinessRegistration,
-        setting: StdMutex<TimerfdSpec>,
+        setting: StdMutex<TimerSpec>,
         pending: AtomicU64,
     }
 
-    impl TestPlatformTimerfd {
+    impl TestPlatformTimer {
         /// Simulates a host expiration: accrues a count and publishes readiness.
         fn fire(&self) {
             self.pending.fetch_add(1, Ordering::Relaxed);
@@ -319,15 +319,15 @@ pub(crate) mod tests {
         }
     }
 
-    impl PlatformTimerfd for TestPlatformTimerfd {
-        fn set(&self, specification: TimerfdSpec, _flags: u32) -> Result<TimerfdSpec> {
+    impl PlatformTimer for TestPlatformTimer {
+        fn set(&self, specification: TimerSpec, _flags: u32) -> Result<TimerSpec> {
             let mut setting = self.setting.lock().unwrap();
             let previous = *setting;
             *setting = specification;
             Ok(previous)
         }
 
-        fn get(&self) -> Result<TimerfdSpec> {
+        fn get(&self) -> Result<TimerSpec> {
             Ok(*self.setting.lock().unwrap())
         }
 
@@ -348,19 +348,19 @@ pub(crate) mod tests {
         }
     }
 
-    impl Drop for TestPlatformTimerfd {
+    impl Drop for TestPlatformTimer {
         fn drop(&mut self) {
             self.state.dropped_timers.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    pub(crate) fn check_timerfd_lifecycle(broker: &BrokerCore, provider: &TestTimerfdProvider) {
+    pub(crate) fn check_timer_lifecycle(broker: &BrokerCore, provider: &TestTimerProvider) {
         check_failed_create_rolls_back(broker, provider);
-        check_timerfd_operations(broker, provider);
+        check_timer_operations(broker, provider);
         check_wrong_object_type_is_rejected(broker, provider);
     }
 
-    fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestTimerfdProvider) {
+    fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestTimerProvider) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -373,7 +373,7 @@ pub(crate) mod tests {
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
     }
 
-    fn check_timerfd_operations(broker: &BrokerCore, provider: &TestTimerfdProvider) {
+    fn check_timer_operations(broker: &BrokerCore, provider: &TestTimerProvider) {
         let dropped_before = provider.state.dropped_timers.load(Ordering::Relaxed);
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
@@ -383,7 +383,7 @@ pub(crate) mod tests {
 
         // set returns the previous (zero) setting and re-arms.
         let (previous, _readiness) = set(&session, handle, armed_spec(), 0).unwrap();
-        assert_eq!(previous, TimerfdSpec::default());
+        assert_eq!(previous, TimerSpec::default());
         assert_eq!(get(&session, handle).unwrap(), armed_spec());
 
         // A timer that has not expired reads as WouldBlock.
@@ -408,7 +408,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn check_wrong_object_type_is_rejected(broker: &BrokerCore, _provider: &TestTimerfdProvider) {
+    fn check_wrong_object_type_is_rejected(broker: &BrokerCore, _provider: &TestTimerProvider) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
