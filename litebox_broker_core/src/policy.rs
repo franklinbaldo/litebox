@@ -9,8 +9,8 @@ use litebox_broker_protocol::socket::{
 };
 use thiserror::Error;
 
-/// Maximum number of TCP destination rules in one socket policy.
-pub const MAX_TCP_DESTINATION_RULES: usize = 64;
+/// Maximum number of destination rules in one transport policy.
+pub const MAX_DESTINATION_RULES: usize = 64;
 
 /// An IPv4 network in canonical CIDR form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,15 +62,15 @@ const fn ipv4_prefix_mask(prefix_length: u8) -> u32 {
     }
 }
 
-/// Inclusive nonzero TCP destination-port range.
+/// Inclusive nonzero transport destination-port range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpPortRange {
+pub struct DestinationPortRange {
     start: Port,
     end: Port,
 }
 
-impl TcpPortRange {
-    /// Creates a nonempty range of valid TCP destination ports.
+impl DestinationPortRange {
+    /// Creates a nonempty range of valid transport destination ports.
     #[must_use]
     pub const fn new(start: Port, end: Port) -> Option<Self> {
         if start.0 == 0 || start.0 > end.0 {
@@ -96,21 +96,21 @@ impl TcpPortRange {
     }
 }
 
-/// One static IPv4 TCP destination authorization rule.
+/// One static IPv4 destination authorization rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpDestinationRule {
+pub struct DestinationRule {
     caller_credential: CallerCredential,
     destination: Ipv4Cidr,
-    ports: TcpPortRange,
+    ports: DestinationPortRange,
 }
 
-impl TcpDestinationRule {
+impl DestinationRule {
     /// Creates a rule for one caller, destination network, and port range.
     #[must_use]
     pub const fn new(
         caller_credential: CallerCredential,
         destination: Ipv4Cidr,
-        ports: TcpPortRange,
+        ports: DestinationPortRange,
     ) -> Self {
         Self {
             caller_credential,
@@ -133,7 +133,7 @@ impl TcpDestinationRule {
 
     /// Returns the authorized destination-port range.
     #[must_use]
-    pub const fn ports(self) -> TcpPortRange {
+    pub const fn ports(self) -> DestinationPortRange {
         self.ports
     }
 
@@ -146,13 +146,13 @@ impl TcpDestinationRule {
     }
 }
 
-const EMPTY_TCP_DESTINATION_RULE: TcpDestinationRule = TcpDestinationRule {
+const EMPTY_DESTINATION_RULE: DestinationRule = DestinationRule {
     caller_credential: CallerCredential::Unauthenticated,
     destination: Ipv4Cidr {
         network: Ipv4Address([0, 0, 0, 0]),
         prefix_length: 0,
     },
-    ports: TcpPortRange {
+    ports: DestinationPortRange {
         start: Port(1),
         end: Port(1),
     },
@@ -162,8 +162,8 @@ const EMPTY_TCP_DESTINATION_RULE: TcpDestinationRule = TcpDestinationRule {
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SocketPolicyError {
-    /// The configured rule count exceeds [`MAX_TCP_DESTINATION_RULES`].
-    #[error("TCP destination policy has {actual} rules; maximum is {maximum}")]
+    /// The configured rule count exceeds [`MAX_DESTINATION_RULES`].
+    #[error("destination policy has {actual} rules; maximum is {maximum}")]
     TooManyRules {
         /// Maximum supported rule count.
         maximum: usize,
@@ -172,33 +172,32 @@ pub enum SocketPolicyError {
     },
 }
 
-/// Bounded static IPv4 TCP destination rules.
+/// Bounded static IPv4 destination rules for one transport protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TcpDestinationPolicy {
-    tcp_destination_rules: [TcpDestinationRule; MAX_TCP_DESTINATION_RULES],
-    tcp_destination_rule_count: usize,
+pub struct DestinationPolicy {
+    destination_rules: [DestinationRule; MAX_DESTINATION_RULES],
+    destination_rule_count: usize,
 }
 
-impl TcpDestinationPolicy {
+impl DestinationPolicy {
     const fn empty() -> Self {
         Self {
-            tcp_destination_rules: [EMPTY_TCP_DESTINATION_RULE; MAX_TCP_DESTINATION_RULES],
-            tcp_destination_rule_count: 0,
+            destination_rules: [EMPTY_DESTINATION_RULE; MAX_DESTINATION_RULES],
+            destination_rule_count: 0,
         }
     }
 
-    /// Returns the configured TCP destination rules.
+    /// Returns the configured destination rules.
     #[must_use]
-    pub fn rules(&self) -> &[TcpDestinationRule] {
-        &self.tcp_destination_rules[..self.tcp_destination_rule_count]
+    pub fn rules(&self) -> &[DestinationRule] {
+        &self.destination_rules[..self.destination_rule_count]
     }
 }
 
 /// Socket creation and outbound destination access available to broker-owned sockets.
 ///
-/// Listener authority is separate from egress destination rules: any principal
-/// permitted to create an IPv4 TCP socket may bind it only within the IPv4
-/// loopback network.
+/// Local bind authority is separate from egress destination rules: an admitted
+/// IPv4 TCP or UDP socket may bind only within the IPv4 loopback network.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 #[expect(
@@ -209,43 +208,85 @@ pub enum SocketPolicy {
     /// Deny all socket creation and connection attempts.
     #[default]
     Deny,
-    /// Allow IPv4 TCP sockets to connect only to the IPv4 loopback network.
-    Ipv4LoopbackTcp,
-    /// Apply bounded caller, IPv4 CIDR, and destination-port rules.
-    TcpDestinationRules(TcpDestinationPolicy),
+    /// Allow IPv4 TCP and UDP sockets to use only the IPv4 loopback network.
+    Ipv4Loopback,
+    /// Apply bounded TCP destination rules.
+    TcpDestinationRules(DestinationPolicy),
+    /// Apply bounded UDP destination rules.
+    UdpDestinationRules(DestinationPolicy),
+    /// Apply independent bounded TCP and UDP destination rules.
+    TcpUdpDestinationRules {
+        /// TCP destination policy.
+        tcp: DestinationPolicy,
+        /// UDP destination policy.
+        udp: DestinationPolicy,
+    },
 }
 
 impl SocketPolicy {
     /// Creates a bounded policy from static IPv4 TCP destination rules.
     pub fn from_tcp_destination_rules(
-        rules: &[TcpDestinationRule],
+        rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        if rules.len() > MAX_TCP_DESTINATION_RULES {
-            return Err(SocketPolicyError::TooManyRules {
-                maximum: MAX_TCP_DESTINATION_RULES,
-                actual: rules.len(),
-            });
-        }
-        let mut policy = TcpDestinationPolicy::empty();
-        policy.tcp_destination_rules[..rules.len()].copy_from_slice(rules);
-        policy.tcp_destination_rule_count = rules.len();
-        Ok(Self::TcpDestinationRules(policy))
+        Ok(Self::TcpDestinationRules(copy_destination_rules(rules)?))
+    }
+
+    /// Creates a bounded policy from static IPv4 UDP destination rules.
+    pub fn from_udp_destination_rules(
+        rules: &[DestinationRule],
+    ) -> Result<Self, SocketPolicyError> {
+        let policy = copy_destination_rules(rules)?;
+        Ok(Self::UdpDestinationRules(policy))
+    }
+
+    /// Creates a policy with independent static IPv4 TCP and UDP rules.
+    pub fn from_tcp_udp_destination_rules(
+        tcp_rules: &[DestinationRule],
+        udp_rules: &[DestinationRule],
+    ) -> Result<Self, SocketPolicyError> {
+        let tcp = copy_destination_rules(tcp_rules)?;
+        let udp = copy_destination_rules(udp_rules)?;
+        Ok(Self::TcpUdpDestinationRules { tcp, udp })
     }
 
     /// Returns the configured rules for a bounded destination policy.
     #[must_use]
-    pub fn tcp_destination_rules(&self) -> Option<&[TcpDestinationRule]> {
+    pub fn tcp_destination_rules(&self) -> Option<&[DestinationRule]> {
         match self {
-            Self::TcpDestinationRules(policy) => Some(policy.rules()),
-            Self::Deny | Self::Ipv4LoopbackTcp => None,
+            Self::TcpDestinationRules(policy)
+            | Self::TcpUdpDestinationRules { tcp: policy, .. } => Some(policy.rules()),
+            Self::Deny | Self::Ipv4Loopback | Self::UdpDestinationRules(_) => None,
+        }
+    }
+
+    /// Returns the configured UDP rules for a bounded destination policy.
+    #[must_use]
+    pub fn udp_destination_rules(&self) -> Option<&[DestinationRule]> {
+        match self {
+            Self::UdpDestinationRules(policy)
+            | Self::TcpUdpDestinationRules { udp: policy, .. } => Some(policy.rules()),
+            Self::Deny | Self::Ipv4Loopback | Self::TcpDestinationRules(_) => None,
         }
     }
 
     fn permits_tcp_socket(self, caller_credential: CallerCredential) -> bool {
         match self {
-            Self::Deny => false,
-            Self::Ipv4LoopbackTcp => true,
-            Self::TcpDestinationRules(policy) => policy
+            Self::Deny | Self::UdpDestinationRules(_) => false,
+            Self::Ipv4Loopback => true,
+            Self::TcpDestinationRules(policy)
+            | Self::TcpUdpDestinationRules { tcp: policy, .. } => policy
+                .rules()
+                .iter()
+                .any(|rule| rule.caller_credential == caller_credential),
+        }
+    }
+
+    fn permits_udp_socket(self, caller_credential: CallerCredential) -> bool {
+        match self {
+            Self::Deny | Self::TcpDestinationRules(_) => false,
+            Self::Ipv4Loopback => true,
+            Self::UdpDestinationRules(policy)
+            | Self::TcpUdpDestinationRules { udp: policy, .. } => policy
                 .rules()
                 .iter()
                 .any(|rule| rule.caller_credential == caller_credential),
@@ -258,14 +299,46 @@ impl SocketPolicy {
         address: SocketAddrV4,
     ) -> bool {
         match self {
-            Self::Deny => false,
-            Self::Ipv4LoopbackTcp => address.ip().is_loopback(),
-            Self::TcpDestinationRules(policy) => policy
+            Self::Deny | Self::UdpDestinationRules(_) => false,
+            Self::Ipv4Loopback => address.ip().is_loopback(),
+            Self::TcpDestinationRules(policy)
+            | Self::TcpUdpDestinationRules { tcp: policy, .. } => policy
                 .rules()
                 .iter()
                 .any(|rule| rule.permits(caller_credential, address)),
         }
     }
+
+    fn permits_udp_destination(
+        self,
+        caller_credential: CallerCredential,
+        address: SocketAddrV4,
+    ) -> bool {
+        match self {
+            Self::Deny | Self::TcpDestinationRules(_) => false,
+            Self::Ipv4Loopback => address.ip().is_loopback(),
+            Self::UdpDestinationRules(policy)
+            | Self::TcpUdpDestinationRules { udp: policy, .. } => policy
+                .rules()
+                .iter()
+                .any(|rule| rule.permits(caller_credential, address)),
+        }
+    }
+}
+
+fn copy_destination_rules(
+    rules: &[DestinationRule],
+) -> Result<DestinationPolicy, SocketPolicyError> {
+    if rules.len() > MAX_DESTINATION_RULES {
+        return Err(SocketPolicyError::TooManyRules {
+            maximum: MAX_DESTINATION_RULES,
+            actual: rules.len(),
+        });
+    }
+    let mut policy = DestinationPolicy::empty();
+    policy.destination_rules[..rules.len()].copy_from_slice(rules);
+    policy.destination_rule_count = rules.len();
+    Ok(policy)
 }
 
 /// Configured broker policy.
@@ -347,11 +420,16 @@ impl PolicyEngine {
         request: CreateSocketRequest,
     ) -> Result<ObjectRights, BrokerError> {
         let rights = self.principal_object_rights(caller_credential)?;
-        if request.address_family == AddressFamily::Ipv4
-            && request.socket_type == SocketType::Stream
-            && request.protocol == IpProtocol::Tcp
-            && self.socket_policy.permits_tcp_socket(caller_credential)
-        {
+        let permitted = match (request.socket_type, request.protocol) {
+            (SocketType::Stream, IpProtocol::Tcp) => {
+                self.socket_policy.permits_tcp_socket(caller_credential)
+            }
+            (SocketType::Datagram, IpProtocol::Udp) => {
+                self.socket_policy.permits_udp_socket(caller_credential)
+            }
+            _ => false,
+        };
+        if request.address_family == AddressFamily::Ipv4 && permitted {
             Ok(rights)
         } else {
             Err(BrokerError::PolicyDenied)
@@ -365,13 +443,16 @@ impl PolicyEngine {
         address: SocketAddrV4,
     ) -> Result<(), BrokerError> {
         self.principal_object_rights(caller_credential)?;
-        if request.address_family == AddressFamily::Ipv4
-            && request.socket_type == SocketType::Stream
-            && request.protocol == IpProtocol::Tcp
-            && self
+        let permitted = match (request.socket_type, request.protocol) {
+            (SocketType::Stream, IpProtocol::Tcp) => self
                 .socket_policy
-                .permits_tcp_destination(caller_credential, address)
-        {
+                .permits_tcp_destination(caller_credential, address),
+            (SocketType::Datagram, IpProtocol::Udp) => self
+                .socket_policy
+                .permits_udp_destination(caller_credential, address),
+            _ => false,
+        };
+        if request.address_family == AddressFamily::Ipv4 && permitted {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)
@@ -387,9 +468,12 @@ impl PolicyEngine {
         self.principal_object_rights(caller_credential)?;
         // Egress rules do not describe local listener authority. Socket
         // creation admission plus this fixed loopback boundary governs binds.
+        let supported_socket = matches!(
+            (request.socket_type, request.protocol),
+            (SocketType::Stream, IpProtocol::Tcp) | (SocketType::Datagram, IpProtocol::Udp)
+        );
         if request.address_family == AddressFamily::Ipv4
-            && request.socket_type == SocketType::Stream
-            && request.protocol == IpProtocol::Tcp
+            && supported_socket
             && address.ip().is_loopback()
         {
             Ok(())
@@ -415,13 +499,18 @@ mod tests {
         socket_type: SocketType::Stream,
         protocol: IpProtocol::Tcp,
     };
+    const IPV4_UDP: CreateSocketRequest = CreateSocketRequest {
+        address_family: AddressFamily::Ipv4,
+        socket_type: SocketType::Datagram,
+        protocol: IpProtocol::Udp,
+    };
 
     fn cidr(address: [u8; 4], prefix_length: u8) -> Ipv4Cidr {
         Ipv4Cidr::new(Ipv4Address(address), prefix_length).unwrap()
     }
 
-    fn ports(start: u16, end: u16) -> TcpPortRange {
-        TcpPortRange::new(Port(start), Port(end)).unwrap()
+    fn ports(start: u16, end: u16) -> DestinationPortRange {
+        DestinationPortRange::new(Port(start), Port(end)).unwrap()
     }
 
     fn address(address: [u8; 4], port: u16) -> SocketAddrV4 {
@@ -491,8 +580,8 @@ mod tests {
 
     #[test]
     fn port_ranges_are_nonzero_ordered_and_inclusive() {
-        assert_eq!(TcpPortRange::new(Port(0), Port(80)), None);
-        assert_eq!(TcpPortRange::new(Port(81), Port(80)), None);
+        assert_eq!(DestinationPortRange::new(Port(0), Port(80)), None);
+        assert_eq!(DestinationPortRange::new(Port(81), Port(80)), None);
 
         let range = ports(443, 444);
         assert!(!range.contains(Port(442)));
@@ -503,12 +592,12 @@ mod tests {
 
     #[test]
     fn destination_policy_is_bounded() {
-        let rule = TcpDestinationRule::new(
+        let rule = DestinationRule::new(
             CallerCredential::Unauthenticated,
             cidr([127, 0, 0, 0], 8),
             ports(1, u16::MAX),
         );
-        let maximum = [rule; MAX_TCP_DESTINATION_RULES];
+        let maximum = [rule; MAX_DESTINATION_RULES];
         assert_eq!(
             SocketPolicy::from_tcp_destination_rules(&maximum)
                 .unwrap()
@@ -517,12 +606,38 @@ mod tests {
             &maximum
         );
 
-        let excessive = [rule; MAX_TCP_DESTINATION_RULES + 1];
+        let excessive = [rule; MAX_DESTINATION_RULES + 1];
         assert_eq!(
             SocketPolicy::from_tcp_destination_rules(&excessive),
             Err(SocketPolicyError::TooManyRules {
-                maximum: MAX_TCP_DESTINATION_RULES,
-                actual: MAX_TCP_DESTINATION_RULES + 1,
+                maximum: MAX_DESTINATION_RULES,
+                actual: MAX_DESTINATION_RULES + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn udp_destination_policy_is_bounded() {
+        let rule = DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            cidr([127, 0, 0, 0], 8),
+            ports(1, u16::MAX),
+        );
+        let maximum = [rule; MAX_DESTINATION_RULES];
+        assert_eq!(
+            SocketPolicy::from_udp_destination_rules(&maximum)
+                .unwrap()
+                .udp_destination_rules()
+                .unwrap(),
+            &maximum
+        );
+
+        let excessive = [rule; MAX_DESTINATION_RULES + 1];
+        assert_eq!(
+            SocketPolicy::from_udp_destination_rules(&excessive),
+            Err(SocketPolicyError::TooManyRules {
+                maximum: MAX_DESTINATION_RULES,
+                actual: MAX_DESTINATION_RULES + 1,
             })
         );
     }
@@ -530,12 +645,12 @@ mod tests {
     #[test]
     fn destination_rules_enforce_principal_cidr_and_port() {
         let socket_policy = SocketPolicy::from_tcp_destination_rules(&[
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::Unauthenticated,
                 cidr([10, 8, 0, 0], 13),
                 ports(443, 444),
             ),
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 cidr([192, 0, 2, 7], 32),
                 ports(8443, 8443),
@@ -574,9 +689,9 @@ mod tests {
     }
 
     #[test]
-    fn loopback_policy_preserves_initial_production_scope() {
+    fn loopback_policy_allows_tcp_and_udp_only_within_loopback() {
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4LoopbackTcp);
+            .with_socket_policy(SocketPolicy::Ipv4Loopback);
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
@@ -600,6 +715,77 @@ mod tests {
                 address([127, 0, 0, 1], 0),
             ),
             Ok(())
+        );
+        assert_eq!(
+            policy.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IPV4_UDP,
+                address([127, 0, 0, 1], 53),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IPV4_UDP,
+                address([10, 0, 0, 1], 53),
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn mixed_policy_authorizes_udp_independently_from_tcp() {
+        let tcp_rule = DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            cidr([192, 0, 2, 0], 24),
+            ports(443, 443),
+        );
+        let udp_rule = DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            cidr([127, 0, 0, 0], 8),
+            ports(53, 53),
+        );
+        let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(
+                SocketPolicy::from_tcp_udp_destination_rules(&[tcp_rule], &[udp_rule]).unwrap(),
+            );
+
+        assert_eq!(
+            policy.authorize_socket_create(CallerCredential::Unauthenticated, IPV4_UDP),
+            Ok(ObjectRights::all())
+        );
+        assert_eq!(
+            policy.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IPV4_UDP,
+                address([127, 0, 0, 1], 53),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IPV4_UDP,
+                address([192, 0, 2, 1], 443),
+            ),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            policy.authorize_socket_bind(
+                CallerCredential::Unauthenticated,
+                IPV4_UDP,
+                address([127, 0, 0, 1], 0),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_socket_bind(
+                CallerCredential::Unauthenticated,
+                IPV4_UDP,
+                address([0, 0, 0, 0], 0),
+            ),
+            Err(BrokerError::PolicyDenied)
         );
     }
 }
