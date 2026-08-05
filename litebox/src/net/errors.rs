@@ -45,6 +45,8 @@ pub enum CloseError {
 pub enum ShutdownError {
     #[error("Not a valid open file descriptor")]
     InvalidFd,
+    #[error("Socket is listening for connections")]
+    Listening,
     #[error("Shutdown is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
@@ -105,6 +107,8 @@ pub enum BindError {
     AlreadyBound,
     #[error("Binding is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::listen`]
@@ -121,6 +125,8 @@ pub enum ListenError {
     NoAvailableFreeEphemeralPorts,
     #[error("Listening is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::accept`]
@@ -135,6 +141,8 @@ pub enum AcceptError {
     NoConnectionsReady,
     #[error("Accepting connections is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::send`]
@@ -200,6 +208,8 @@ crate::utilities::macros::repr_enum! {
         UnsupportedOperation = 12,
         /// The broker association or host socket failed.
         BackendFailure = 13,
+        /// An argument or socket state is invalid for the operation.
+        InvalidArgument = 14,
     }
 }
 

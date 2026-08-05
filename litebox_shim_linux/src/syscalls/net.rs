@@ -752,7 +752,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd
             | AcceptError::NotListening
-            | AcceptError::UnsupportedOperation => TryOpError::Other(e.into()),
+            | AcceptError::UnsupportedOperation
+            | AcceptError::OperationFailed(_) => TryOpError::Other(e.into()),
             _ => unimplemented!(),
         })
     }
@@ -1218,6 +1219,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         }
         result
     }
+
+    fn close_unpublished_socket(&self, fd: &SocketFd<Platform>) {
+        self.close_network_socket(fd, CloseBehavior::Immediate)
+            .expect("closing an unpublished socket must succeed");
+    }
 }
 
 fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Errno> {
@@ -1278,10 +1284,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
-                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
-                    unimplemented!()
-                };
-                raw_fd
+                files.insert_raw_fd(socket).map_err(|socket| {
+                    self.global.close_unpublished_socket(&socket);
+                    Errno::EMFILE
+                })?
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1606,9 +1612,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
-                let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
-                    unimplemented!()
-                };
+                let raw_fd = files
+                    .insert_raw_fd(accepted_file)
+                    .map_err(|accepted_file| {
+                        self.global.close_unpublished_socket(&accepted_file);
+                        Errno::EMFILE
+                    })?;
                 Ok((raw_fd, peer_addr))
             },
             |file| {
@@ -2603,11 +2612,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ShutdownHow::Write => litebox::net::ShutdownDirection::Write,
                     ShutdownHow::Both => litebox::net::ShutdownDirection::Both,
                 };
-                self.global
-                    .net
-                    .lock()
-                    .shutdown(fd, direction)
-                    .map_err(Errno::from)
+                let network = self.global.net.lock();
+                match network.shutdown(fd, direction) {
+                    Err(litebox::net::errors::ShutdownError::Listening) => match how {
+                        ShutdownHow::Read | ShutdownHow::Both => {
+                            network.stop_listening(fd).map_err(Errno::from)
+                        }
+                        ShutdownHow::Write => Ok(()),
+                    },
+                    result => result.map_err(Errno::from),
+                }
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
@@ -2690,6 +2704,20 @@ mod tests {
 
         drop(socket);
         assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn inet_socket_returns_emfile_at_raw_fd_limit() {
+        let task = init_platform(None);
+        let fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        task.files.borrow().set_max_fd(fd as usize);
+        assert_eq!(
+            task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0),
+            Err(Errno::EMFILE)
+        );
+        close_socket(&task, fd);
     }
 
     /// Helper to read SO_ERROR from a socket via getsockopt.

@@ -38,7 +38,8 @@ use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{
-    ConnectSocketResponse, CreateSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE,
+    AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
+    ListenSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     ReceiveFlags, ReceiveSocketResponse, SendSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
@@ -99,6 +100,9 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             | BrokerOperation::Socket(
                 SocketRequest::Create(_)
                 | SocketRequest::Connect(_)
+                | SocketRequest::Bind(_)
+                | SocketRequest::Listen(_)
+                | SocketRequest::Accept(_)
                 | SocketRequest::Shutdown(_)
                 | SocketRequest::Status(_),
             ) => None,
@@ -371,6 +375,49 @@ fn handle_socket_request<Memory: SharedMemory>(
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
             }
         }
+        SocketRequest::Bind(request) => {
+            match litebox_broker_core::socket::bind(session, request.handle, request.address)
+                .map_err(RequestFailure::from)?
+            {
+                SocketOutcome::Completed(local_address) => {
+                    Ok(SocketResponse::Bind(BindSocketResponse { local_address }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::Listen(request) => {
+            if request.backlog > MAX_TCP_LISTEN_BACKLOG {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            match litebox_broker_core::socket::listen(session, request.handle, request.backlog)
+                .map_err(RequestFailure::from)?
+            {
+                SocketOutcome::Completed(local_address) => {
+                    Ok(SocketResponse::Listen(ListenSocketResponse {
+                        local_address,
+                    }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::Accept(request) => {
+            match litebox_broker_core::socket::accept(
+                session,
+                request.handle,
+                Arc::clone(readiness_sink),
+            )
+            .map_err(RequestFailure::from)?
+            {
+                SocketOutcome::Completed(accepted) => {
+                    Ok(SocketResponse::Accept(AcceptSocketResponse {
+                        handle: accepted.handle,
+                        local_address: accepted.local_address,
+                        remote_address: accepted.remote_address,
+                    }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
         SocketRequest::Send(request) => {
             if request.flags.has_unsupported_bits()
                 || request.buffer.length > MAX_SOCKET_TRANSFER_SIZE
@@ -555,8 +602,9 @@ pub enum ConnectionTermination {
 mod tests {
     use super::*;
     use core::cell::Cell;
+    use core::net::{Ipv4Addr, SocketAddrV4};
     use litebox_broker_core::readiness::ReadinessRegistration;
-    use litebox_broker_core::socket::{PlatformSocket, SocketProvider};
+    use litebox_broker_core::socket::{AcceptedPlatformSocket, PlatformSocket, SocketProvider};
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -568,10 +616,9 @@ mod tests {
         SharedBufferDescriptor,
     };
     use litebox_broker_protocol::socket::{
-        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Ipv4Address, Port,
-        ReceiveFlags, ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode,
-        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-        SocketStatusRequest, SocketStatusResponse, SocketType,
+        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
+        ReceiveSocketRequest, SendFlags, SendSocketRequest, ShutdownMode, ShutdownSocketRequest,
+        SocketConnectionStatus, SocketError, SocketStatusRequest, SocketStatusResponse, SocketType,
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
@@ -629,9 +676,38 @@ mod tests {
     }
 
     impl PlatformSocket for TestPlatformSocket {
+        fn bind(
+            &self,
+            address: SocketAddrV4,
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            let address = if address.port() == 0 {
+                SocketAddrV4::new(*address.ip(), 49152)
+            } else {
+                address
+            };
+            Ok(SocketOutcome::Completed(address))
+        }
+
+        fn listen(
+            &self,
+            _backlog: u32,
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            Ok(SocketOutcome::Completed(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                49152,
+            )))
+        }
+
+        fn accept(
+            &self,
+            _readiness: ReadinessRegistration,
+        ) -> litebox_broker_core::Result<SocketOutcome<AcceptedPlatformSocket>> {
+            Err(litebox_broker_core::BrokerError::WouldBlock)
+        }
+
         fn connect(
             &self,
-            _address: SocketAddressV4,
+            _address: SocketAddrV4,
         ) -> litebox_broker_core::Result<SocketConnectionStatus> {
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)?;
@@ -1115,10 +1191,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: response.handle,
-                    address: SocketAddressV4 {
-                        address: Ipv4Address([10, 0, 0, 1]),
-                        port: Port(8080),
-                    },
+                    address: SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8080),
                 })),
                 &shared_buffers,
             ),
@@ -1129,10 +1202,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: response.handle,
-                    address: SocketAddressV4 {
-                        address: Ipv4Address([127, 0, 0, 1]),
-                        port: Port(8080),
-                    },
+                    address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080),
                 })),
                 &shared_buffers,
             ),

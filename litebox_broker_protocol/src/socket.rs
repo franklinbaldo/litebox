@@ -9,6 +9,8 @@
 //! integer, so a local endpoint cannot name an address family, type, protocol,
 //! or flag the broker has not agreed to support.
 
+use core::net::SocketAddrV4;
+
 use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 use thiserror::Error;
@@ -17,6 +19,8 @@ use thiserror::Error;
 pub const MAX_SOCKET_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE;
 /// Maximum stream prefix addressable by offset-based peek requests.
 pub const MAX_SOCKET_PEEK_SIZE: u32 = 0x80_000;
+/// Maximum TCP listen backlog accepted by the broker protocol.
+pub const MAX_TCP_LISTEN_BACKLOG: u32 = 4096;
 
 /// Address family of a broker socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +58,8 @@ pub enum ShutdownMode {
     Both,
     /// The final close discards queued data and resets the connection.
     Abort,
+    /// Stops accepting new connections while retaining the socket object.
+    StopListening,
 }
 
 /// IPv4 address in network byte order.
@@ -65,15 +71,6 @@ pub struct Ipv4Address(pub [u8; 4]);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Port(pub u16);
-
-/// IPv4 socket address.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SocketAddressV4 {
-    /// IPv4 address.
-    pub address: Ipv4Address,
-    /// Transport port.
-    pub port: Port,
-}
 
 /// Flags for a send operation.
 ///
@@ -181,6 +178,9 @@ pub enum SocketError {
     /// The operation requires a connected socket.
     #[error("socket is not connected")]
     NotConnected,
+    /// An argument or socket state is invalid for the operation.
+    #[error("invalid socket operation argument")]
+    InvalidArgument,
     /// The policy engine refused the destination.
     #[error("socket policy denied the operation")]
     PolicyDenied,
@@ -207,6 +207,7 @@ impl SocketError {
             9 => Some(Self::PolicyDenied),
             10 => Some(Self::Other),
             11 => Some(Self::NotConnected),
+            12 => Some(Self::InvalidArgument),
             _ => None,
         }
     }
@@ -225,6 +226,7 @@ impl SocketError {
             Self::PolicyDenied => 9,
             Self::Other => 10,
             Self::NotConnected => 11,
+            Self::InvalidArgument => 12,
         }
     }
 }
@@ -263,7 +265,7 @@ pub struct ConnectSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Remote address to connect to.
-    pub address: SocketAddressV4,
+    pub address: SocketAddrV4,
 }
 
 /// Response to a socket connect request.
@@ -271,6 +273,56 @@ pub struct ConnectSocketRequest {
 pub struct ConnectSocketResponse {
     /// Connection state after the nonblocking attempt.
     pub status: SocketConnectionStatus,
+}
+
+/// Request to bind a socket to a local IPv4 address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Requested local address. Port zero requests an ephemeral port.
+    pub address: SocketAddrV4,
+}
+
+/// Response to a socket bind request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BindSocketResponse {
+    /// Local address assigned by the host network stack.
+    pub local_address: SocketAddrV4,
+}
+
+/// Request to make a bound socket listen for connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenSocketRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Maximum pending connection backlog.
+    pub backlog: u32,
+}
+
+/// Response to a socket listen request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenSocketResponse {
+    /// Local address assigned by the host network stack.
+    pub local_address: SocketAddrV4,
+}
+
+/// Request to accept one pending connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptSocketRequest {
+    /// Listening socket handle.
+    pub handle: ObjectHandle,
+}
+
+/// Response containing one accepted broker socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptSocketResponse {
+    /// Handle naming the accepted socket.
+    pub handle: ObjectHandle,
+    /// Local endpoint of the accepted connection.
+    pub local_address: SocketAddrV4,
+    /// Remote endpoint of the accepted connection.
+    pub remote_address: SocketAddrV4,
 }
 
 /// Broker-authoritative socket connection state.
@@ -365,7 +417,7 @@ pub struct SocketStatusResponse {
     /// Current connection state.
     pub status: SocketConnectionStatus,
     /// Local endpoint assigned by the host network stack, if any.
-    pub local_address: Option<SocketAddressV4>,
+    pub local_address: Option<SocketAddrV4>,
     /// Pending asynchronous socket error, consumed by this status query.
     pub pending_error: Option<SocketError>,
 }

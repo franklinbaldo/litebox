@@ -359,9 +359,10 @@ impl From<litebox::net::errors::AcceptError> for Errno {
     fn from(value: litebox::net::errors::AcceptError) -> Self {
         match value {
             litebox::net::errors::AcceptError::InvalidFd => Errno::EBADF,
-            litebox::net::errors::AcceptError::NotListening => Errno::ENOTCONN,
+            litebox::net::errors::AcceptError::NotListening => Errno::EINVAL,
             litebox::net::errors::AcceptError::NoConnectionsReady => Errno::EAGAIN,
             litebox::net::errors::AcceptError::UnsupportedOperation => Errno::EOPNOTSUPP,
+            litebox::net::errors::AcceptError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -375,6 +376,7 @@ impl From<litebox::net::errors::BindError> for Errno {
             litebox::net::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
             litebox::net::errors::BindError::AlreadyBound => Errno::EINVAL,
             litebox::net::errors::BindError::UnsupportedOperation => Errno::EOPNOTSUPP,
+            litebox::net::errors::BindError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
         }
     }
@@ -408,6 +410,7 @@ impl From<litebox::net::errors::SocketAsyncError> for Errno {
             litebox::net::errors::SocketAsyncError::AddressInUse => Errno::EADDRINUSE,
             litebox::net::errors::SocketAsyncError::AddressNotAvailable => Errno::EADDRNOTAVAIL,
             litebox::net::errors::SocketAsyncError::NotConnected => Errno::ENOTCONN,
+            litebox::net::errors::SocketAsyncError::InvalidArgument => Errno::EINVAL,
             litebox::net::errors::SocketAsyncError::PolicyDenied => Errno::EACCES,
             litebox::net::errors::SocketAsyncError::ResourceExhausted => Errno::ENOBUFS,
             litebox::net::errors::SocketAsyncError::UnsupportedOperation => Errno::EOPNOTSUPP,
@@ -421,6 +424,7 @@ impl From<litebox::net::errors::ShutdownError> for Errno {
     fn from(value: litebox::net::errors::ShutdownError) -> Self {
         match value {
             litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ShutdownError::Listening => Errno::ENOTCONN,
             litebox::net::errors::ShutdownError::UnsupportedOperation => Errno::EOPNOTSUPP,
             litebox::net::errors::ShutdownError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
@@ -442,6 +446,7 @@ impl TryFrom<Errno> for litebox::net::errors::SocketAsyncError {
             Errno::EADDRINUSE => Ok(litebox::net::errors::SocketAsyncError::AddressInUse),
             Errno::EADDRNOTAVAIL => Ok(litebox::net::errors::SocketAsyncError::AddressNotAvailable),
             Errno::ENOTCONN => Ok(litebox::net::errors::SocketAsyncError::NotConnected),
+            Errno::EINVAL => Ok(litebox::net::errors::SocketAsyncError::InvalidArgument),
             Errno::EACCES => Ok(litebox::net::errors::SocketAsyncError::PolicyDenied),
             Errno::ENOBUFS => Ok(litebox::net::errors::SocketAsyncError::ResourceExhausted),
             Errno::EOPNOTSUPP => Ok(litebox::net::errors::SocketAsyncError::UnsupportedOperation),
@@ -478,6 +483,7 @@ impl From<litebox::net::errors::ListenError> for Errno {
             litebox::net::errors::ListenError::InvalidState => Errno::EINVAL,
             litebox::net::errors::ListenError::NoAvailableFreeEphemeralPorts => Errno::ENOSPC,
             litebox::net::errors::ListenError::UnsupportedOperation => Errno::EOPNOTSUPP,
+            litebox::net::errors::ListenError::OperationFailed(error) => error.into(),
 
             _ => unimplemented!(),
         }

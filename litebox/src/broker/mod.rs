@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -14,8 +15,8 @@ use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse,
-    SendFlags as BrokerSendFlags, ShutdownMode, SocketAddressV4, SocketConnectionStatus,
+    AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags as BrokerReceiveFlags,
+    ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode, SocketConnectionStatus,
     SocketOutcome, SocketStatusResponse,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -44,8 +45,25 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn connect_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+
+    fn bind_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError>;
+
+    fn listen_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError>;
+
+    fn accept_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError>;
 
     fn socket_status(
         &self,
@@ -259,11 +277,46 @@ where
     fn connect_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
         self.request(|local| local.connect_socket(handle, address))
             .map(|result| match result {
                 Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn bind_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError> {
+        self.request(|local| local.bind_socket(handle, address))
+            .map(|result| match result {
+                Ok(address) => SocketOutcome::Completed(address),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn listen_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError> {
+        self.request(|local| local.listen_socket(handle, backlog))
+            .map(|result| match result {
+                Ok(address) => SocketOutcome::Completed(address),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn accept_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError> {
+        self.request(|local| local.accept_socket(handle))
+            .map(|result| match result {
+                Ok(accepted) => SocketOutcome::Completed(accepted),
                 Err(error) => SocketOutcome::Failed(error),
             })
     }

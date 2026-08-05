@@ -9,15 +9,17 @@ use core::{
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::socket::{
-    Ipv4Address, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, Port,
+    AcceptSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse, SendFlags as BrokerSendFlags,
-    ShutdownMode, SocketAddressV4 as BrokerSocketAddressV4, SocketConnectionStatus,
-    SocketError as BrokerSocketError, SocketOutcome, SocketStatusResponse,
+    ShutdownMode, SocketConnectionStatus, SocketError as BrokerSocketError, SocketOutcome,
+    SocketStatusResponse,
 };
 
 use super::{
     ReceiveFlags,
-    errors::{ConnectError, RemoteAddrError, SocketAsyncError},
+    errors::{
+        AcceptError, BindError, ConnectError, ListenError, RemoteAddrError, SocketAsyncError,
+    },
     socket_channel::{ChannelReadError, ChannelWriteError, SocketState},
 };
 use crate::{
@@ -34,6 +36,7 @@ struct BrokerSocketState {
     local_address: Option<SocketAddrV4>,
     remote_address: Option<SocketAddrV4>,
     async_error: u32,
+    listening: bool,
 }
 
 impl BrokerSocketState {
@@ -80,6 +83,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 local_address: None,
                 remote_address: None,
                 async_error: 0,
+                listening: false,
             }),
             write_shutdown: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -90,17 +94,98 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         Ok(socket)
     }
 
+    fn from_accepted(
+        broker: Arc<dyn BrokerControl>,
+        pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+        accepted: AcceptSocketResponse,
+    ) -> Arc<Self> {
+        let socket = Arc::new(Self {
+            broker,
+            handle: accepted.handle,
+            pollable_registry,
+            pollee: Arc::new(Pollee::new()),
+            receive_lock: Mutex::new(()),
+            state: Mutex::new(BrokerSocketState {
+                connection: SocketConnectionStatus::Connected,
+                local_address: Some(accepted.local_address),
+                remote_address: Some(accepted.remote_address),
+                async_error: 0,
+                listening: false,
+            }),
+            write_shutdown: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        });
+        socket
+            .pollable_registry
+            .register_pollable(accepted.handle, &socket.pollee);
+        socket
+    }
+
+    pub(super) fn bind(&self, address: SocketAddrV4) -> Result<(), BindError> {
+        if self.state.lock().local_address.is_some() {
+            return Err(BindError::AlreadyBound);
+        }
+        let outcome = self
+            .broker
+            .bind_socket(self.handle, address)
+            .map_err(|error| BindError::OperationFailed(BrokerObjectError::from(error).into()))?;
+        match outcome {
+            SocketOutcome::Completed(local_address) => {
+                self.state.lock().local_address = Some(local_address);
+                Ok(())
+            }
+            SocketOutcome::Failed(error) => {
+                Err(BindError::OperationFailed(SocketAsyncError::from(error)))
+            }
+        }
+    }
+
+    pub(super) fn listen(&self, backlog: u32) -> Result<(), ListenError> {
+        let outcome = self
+            .broker
+            .listen_socket(self.handle, backlog)
+            .map_err(|error| ListenError::OperationFailed(BrokerObjectError::from(error).into()))?;
+        match outcome {
+            SocketOutcome::Completed(local_address) => {
+                let mut state = self.state.lock();
+                state.local_address = Some(local_address);
+                state.listening = true;
+                Ok(())
+            }
+            SocketOutcome::Failed(error) => Err(ListenError::OperationFailed(error.into())),
+        }
+    }
+
+    pub(super) fn accept(&self) -> Result<Arc<Self>, AcceptError> {
+        if !self.state.lock().listening {
+            return Err(AcceptError::NotListening);
+        }
+        let outcome = self.broker.accept_socket(self.handle).map_err(|error| {
+            let error = BrokerObjectError::from(error);
+            if error == BrokerObjectError::WouldBlock {
+                AcceptError::NoConnectionsReady
+            } else {
+                AcceptError::OperationFailed(error.into())
+            }
+        })?;
+        match outcome {
+            SocketOutcome::Completed(accepted) => Ok(Self::from_accepted(
+                Arc::clone(&self.broker),
+                Arc::clone(&self.pollable_registry),
+                accepted,
+            )),
+            SocketOutcome::Failed(BrokerSocketError::NotConnected) => {
+                Err(AcceptError::NotListening)
+            }
+            SocketOutcome::Failed(error) => Err(AcceptError::OperationFailed(error.into())),
+        }
+    }
+
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
         let previous = self.state.lock().connection;
         let outcome = self
             .broker
-            .connect_socket(
-                self.handle,
-                BrokerSocketAddressV4 {
-                    address: Ipv4Address(address.ip().octets()),
-                    port: Port(address.port()),
-                },
-            )
+            .connect_socket(self.handle, address)
             .map_err(|error| {
                 ConnectError::OperationFailed(BrokerObjectError::from(error).into())
             })?;
@@ -165,6 +250,30 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
     }
 
+    pub(super) fn is_listening(&self) -> bool {
+        self.state.lock().listening
+    }
+
+    pub(super) fn stop_listening(&self) -> Result<(), SocketAsyncError> {
+        match self
+            .broker
+            .shutdown_socket(self.handle, ShutdownMode::StopListening)
+            .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
+        {
+            SocketOutcome::Completed(()) => {
+                let mut state = self.state.lock();
+                state.listening = false;
+                state.update_connection(SocketConnectionStatus::Failed(
+                    BrokerSocketError::NotConnected,
+                ));
+                drop(state);
+                self.pollee.notify_observers(Events::OUT | Events::HUP);
+                Ok(())
+            }
+            SocketOutcome::Failed(error) => Err(error.into()),
+        }
+    }
+
     pub(super) fn set_state(&self, state: SocketState) {
         if state == SocketState::Closed {
             self.close(false);
@@ -178,7 +287,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketState::Connecting => SocketConnectionStatus::Connecting,
             SocketState::Connected => SocketConnectionStatus::Connected,
             SocketState::Error => self.state.lock().connection,
-            SocketState::Listening | SocketState::Closed => return,
+            SocketState::Listening => {
+                self.state.lock().listening = true;
+                return;
+            }
+            SocketState::Closed => return,
         };
         self.state.lock().update_connection(connection);
     }
@@ -391,10 +504,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             _ => None,
         };
         if let Some(address) = response.local_address {
-            state.local_address = Some(SocketAddrV4::new(
-                core::net::Ipv4Addr::from(address.address.0),
-                address.port.0,
-            ));
+            state.local_address = Some(address);
         }
 
         if let Some(error) = response.pending_error {
@@ -543,6 +653,7 @@ impl From<BrokerSocketError> for SocketAsyncError {
             BrokerSocketError::AddressInUse => Self::AddressInUse,
             BrokerSocketError::AddressNotAvailable => Self::AddressNotAvailable,
             BrokerSocketError::NotConnected => Self::NotConnected,
+            BrokerSocketError::InvalidArgument => Self::InvalidArgument,
             BrokerSocketError::PolicyDenied => Self::PolicyDenied,
             _ => Self::BackendFailure,
         }
