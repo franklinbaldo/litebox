@@ -1476,6 +1476,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 result_length,
             ),
+            SyscallRequest::NtEnumerateKey {
+                key_handle,
+                index,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            } => self.sys_nt_enumerate_key(
+                key_handle,
+                index,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            ),
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,
@@ -1486,6 +1501,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => self.sys_nt_query_value_key(
                 key_handle,
                 value_name,
+                key_value_information_class,
+                key_value_information,
+                length,
+                result_length,
+            ),
+            SyscallRequest::NtEnumerateValueKey {
+                key_handle,
+                index,
+                key_value_information_class,
+                key_value_information,
+                length,
+                result_length,
+            } => self.sys_nt_enumerate_value_key(
+                key_handle,
+                index,
                 key_value_information_class,
                 key_value_information,
                 length,
