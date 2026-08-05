@@ -1795,12 +1795,29 @@ mod tests {
     }
 
     fn api_set_default_value(bytes: &[u8], contract: &str) -> Option<String> {
+        api_set_value(bytes, contract, None)
+    }
+
+    fn api_set_value(bytes: &[u8], contract: &str, importing_dll: Option<&str>) -> Option<String> {
         let namespace = parse_api_set_namespace(bytes)?;
+        let requested_family = &contract[..contract.rfind('-')?];
         for index in 0..namespace.count {
             let entry = api_set_namespace_entry(namespace, bytes, index)?;
-            if api_set_namespace_entry_name(entry, bytes)?.eq_ignore_ascii_case(contract) {
-                let value = api_set_namespace_entry_value(entry, bytes, 0)?;
-                return api_set_value_entry_value(value, bytes);
+            let name = api_set_namespace_entry_name(entry, bytes)?;
+            let hashed_units = usize::try_from(entry.hashed_length / 2).ok()?;
+            let family = name.get(..hashed_units)?;
+            if family.eq_ignore_ascii_case(requested_family) {
+                let mut default = None;
+                for value_index in 0..entry.value_count {
+                    let value = api_set_namespace_entry_value(entry, bytes, value_index)?;
+                    let alias = api_set_value_entry_name(value, bytes)?;
+                    if alias.is_empty() {
+                        default = api_set_value_entry_value(value, bytes);
+                    } else if importing_dll.is_some_and(|dll| alias.eq_ignore_ascii_case(dll)) {
+                        return api_set_value_entry_value(value, bytes);
+                    }
+                }
+                return default;
             }
         }
         None
@@ -1906,9 +1923,11 @@ mod tests {
     fn api_set_namespace_matches_host_invariants() {
         let host_bytes = host_api_set_namespace_bytes();
         let host = parse_api_set_namespace(&host_bytes).expect("valid host API_SET_NAMESPACE");
-        let synthetic_bytes =
-            litebox_common_windows::loader::build_api_set_namespace(API_SET_MAPPINGS)
-                .expect("LiteBox API_SET_NAMESPACE builds");
+        let synthetic_bytes = litebox_common_windows::loader::build_api_set_namespace_with_aliases(
+            API_SET_MAPPINGS,
+            API_SET_ALIASES,
+        )
+        .expect("LiteBox API_SET_NAMESPACE builds");
         assert_eq!(
             synthetic_bytes, API_SET_NAMESPACE,
             "build.rs output must match API_SET_MAPPINGS"
@@ -1931,7 +1950,10 @@ mod tests {
                 Some(expected_host),
                 "synthetic mapping for {contract}"
             );
-            if let Some(host_value) = api_set_default_value(&host_bytes, contract) {
+            if let Some(host_value) = api_set_default_value(&host_bytes, contract)
+                && !expected_host.is_empty()
+                && !host_value.is_empty()
+            {
                 if !host_value.eq_ignore_ascii_case(expected_host) {
                     host_mismatches.push(std::format!(
                         "{contract}: expected {expected_host}, got {host_value}"
@@ -1947,34 +1969,44 @@ mod tests {
         );
         assert!(
             host_checked >= 3,
-            "expected at least three synthetic API-set contracts on the host, found {host_checked}"
+            "expected at least three concrete API-set mappings on the host, found {host_checked}"
         );
-
-        for (contract, expected_host) in [
-            ("api-ms-win-core-rtlsupport-l1-1-0", "ntdll.dll"),
-            ("api-ms-win-core-file-l1-2-3", "kernelbase.dll"),
-            ("api-ms-win-core-registry-l2-1-0", "advapi32.dll"),
-            ("api-ms-win-crt-string-l1-1-0", "ucrtbase.dll"),
-            ("api-ms-win-eventing-consumer-l1-1-0", "sechost.dll"),
-            ("api-ms-win-gdi-internal-uap-l1-1-0", "gdi32full.dll"),
-        ] {
+        for revision in ["0", "1", "2"] {
+            let contract = std::format!("api-ms-win-core-versionansi-l1-1-{revision}");
             assert_eq!(
-                api_set_default_value(&synthetic_bytes, contract).as_deref(),
-                Some(expected_host),
+                api_set_default_value(&synthetic_bytes, &contract).as_deref(),
+                Some("kernelbase.dll"),
                 "synthetic mapping for {contract}"
+            );
+        }
+        assert_eq!(
+            api_set_default_value(&synthetic_bytes, "api-ms-win-core-versionansi-l1-2-0"),
+            None,
+            "a different API-set minor version must not roll forward"
+        );
+        for &(contract, importing_dll, expected_host) in API_SET_ALIASES {
+            assert_eq!(
+                api_set_value(&synthetic_bytes, contract, Some(importing_dll)).as_deref(),
+                Some(expected_host),
+                "synthetic alias mapping for {importing_dll} importing {contract}"
             );
         }
     }
 
     #[test]
-    fn api_set_mappings_have_no_duplicate_contracts() {
-        // The namespace builder does no dedup (`count = mappings.len()`), so a duplicate
-        // contract would silently emit phantom namespace slots. Guard against that class of bug.
+    fn api_set_mappings_have_no_duplicate_families() {
         let mut seen = alloc::collections::BTreeSet::new();
         for (contract, _) in API_SET_MAPPINGS {
+            let (family, revision) = contract
+                .rsplit_once('-')
+                .expect("API-set contract has a revision");
             assert!(
-                seen.insert(*contract),
-                "duplicate API-set contract: {contract}"
+                revision.bytes().all(|byte| byte.is_ascii_digit()),
+                "API-set contract has a non-numeric revision: {contract}"
+            );
+            assert!(
+                seen.insert(family),
+                "duplicate API-set contract family: {family}"
             );
         }
         assert_eq!(seen.len(), API_SET_MAPPINGS.len());
