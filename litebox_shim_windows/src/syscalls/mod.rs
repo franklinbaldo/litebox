@@ -567,6 +567,26 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         buffer: Platform::RawMutPointer<u32>,
         buffer_size: u32,
     },
+    NtSetWnfProcessNotificationEvent {
+        notification_event: Handle,
+    },
+    NtGetCompleteWnfStateSubscription {
+        old_state_name: Option<Platform::RawConstPointer<u64>>,
+        old_subscription_id: Option<Platform::RawConstPointer<u64>>,
+        old_event_mask: u32,
+        old_status: i32,
+        delivery_descriptor: Platform::RawMutPointer<u8>,
+        descriptor_size: u32,
+    },
+    NtSubscribeWnfStateChange {
+        state_name: Platform::RawConstPointer<u64>,
+        change_stamp: u32,
+        event_mask: u32,
+        subscription_id: Option<Platform::RawMutPointer<u64>>,
+    },
+    NtUnsubscribeWnfStateChange {
+        state_name: Platform::RawConstPointer<u64>,
+    },
     NtQuerySection {
         section_handle: Handle,
         section_information_class: u32,
@@ -1222,6 +1242,30 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     buffer_size,
                 }))
             }
+            NtSysno::NtSetWnfProcessNotificationEvent => {
+                Some(sys_req!(NtSetWnfProcessNotificationEvent {
+                    notification_event: { Handle::from_raw },
+                }))
+            }
+            NtSysno::NtGetCompleteWnfStateSubscription => {
+                Some(sys_req!(NtGetCompleteWnfStateSubscription {
+                    old_state_name:*,
+                    old_subscription_id:*,
+                    old_event_mask,
+                    old_status,
+                    delivery_descriptor:*,
+                    descriptor_size,
+                }))
+            }
+            NtSysno::NtSubscribeWnfStateChange => Some(sys_req!(NtSubscribeWnfStateChange {
+                state_name:*,
+                change_stamp,
+                event_mask,
+                subscription_id:*,
+            })),
+            NtSysno::NtUnsubscribeWnfStateChange => Some(sys_req!(NtUnsubscribeWnfStateChange {
+                state_name:*,
+            })),
             NtSysno::NtQuerySection => Some(sys_req!(NtQuerySection {
                 section_handle: { Handle::from_raw },
                 section_information_class,
