@@ -1886,14 +1886,20 @@ where
         data: TcpOptionData,
     ) -> Result<(), errors::SetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let entry_handle = descriptor_table
+            .entry_handle(fd)
+            .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(errors::SetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        // Broker-owned TCP sockets have no smoltcp handle, and their TCP options are not exposed.
-        if matches!(&socket_handle.broker_socket, Some(BrokerSocket::Tcp(_))) {
-            return Err(errors::SetTcpOptionError::Unsupported);
+        if let Some(BrokerSocket::Tcp(socket)) = &socket_handle.broker_socket {
+            let socket = alloc::sync::Arc::clone(socket);
+            drop(table_entry);
+            drop(descriptor_table);
+            return socket.set_tcp_option(data);
         }
+        drop(entry_handle);
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self
@@ -1904,6 +1910,11 @@ where
                         tcp_socket.set_nagle_enabled(!nodelay);
                     }
                     TcpOptionData::KEEPALIVE(keepalive) => {
+                        tcp_socket.set_keep_alive(
+                            keepalive.then_some(smoltcp::time::Duration::from_secs(2 * 60 * 60)),
+                        );
+                    }
+                    TcpOptionData::KEEPINTVL(keepalive) => {
                         tcp_socket.set_keep_alive(keepalive.map(smoltcp::time::Duration::from));
                     }
                     TcpOptionData::CONGESTION(congestion) => match congestion {
@@ -1927,14 +1938,20 @@ where
         name: TcpOptionName,
     ) -> Result<TcpOptionData, errors::GetTcpOptionError> {
         let descriptor_table = self.litebox.descriptor_table();
+        let entry_handle = descriptor_table
+            .entry_handle(fd)
+            .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let mut table_entry = descriptor_table
             .get_entry_mut(fd)
             .ok_or(errors::GetTcpOptionError::InvalidFd)?;
         let socket_handle = &mut table_entry.entry;
-        // Broker-owned TCP sockets have no smoltcp handle, and their TCP options are not exposed.
-        if matches!(&socket_handle.broker_socket, Some(BrokerSocket::Tcp(_))) {
-            return Err(errors::GetTcpOptionError::Unsupported);
+        if let Some(BrokerSocket::Tcp(socket)) = &socket_handle.broker_socket {
+            let socket = alloc::sync::Arc::clone(socket);
+            drop(table_entry);
+            drop(descriptor_table);
+            return socket.get_tcp_option(name);
         }
+        drop(entry_handle);
         match socket_handle.protocol() {
             Protocol::Tcp => {
                 let tcp_socket = self
@@ -1944,7 +1961,10 @@ where
                     TcpOptionName::NODELAY => {
                         Ok(TcpOptionData::NODELAY(!tcp_socket.nagle_enabled()))
                     }
-                    TcpOptionName::KEEPALIVE => Ok(TcpOptionData::KEEPALIVE(
+                    TcpOptionName::KEEPALIVE => {
+                        Ok(TcpOptionData::KEEPALIVE(tcp_socket.keep_alive().is_some()))
+                    }
+                    TcpOptionName::KEEPINTVL => Ok(TcpOptionData::KEEPINTVL(
                         tcp_socket.keep_alive().map(core::time::Duration::from),
                     )),
                     TcpOptionName::CONGESTION => Ok(TcpOptionData::CONGESTION(
@@ -2023,6 +2043,8 @@ pub enum TcpOptionName {
     NODELAY,
     /// Enable sending of keep-alive messages.
     KEEPALIVE,
+    /// Interval between keep-alive probes.
+    KEEPINTVL,
     /// TCP congestion control algorithm
     CONGESTION,
 }
@@ -2034,7 +2056,8 @@ pub enum TcpOptionName {
 #[non_exhaustive]
 pub enum TcpOptionData {
     NODELAY(bool),
-    KEEPALIVE(Option<core::time::Duration>),
+    KEEPALIVE(bool),
+    KEEPINTVL(Option<core::time::Duration>),
     CONGESTION(CongestionControl),
 }
 

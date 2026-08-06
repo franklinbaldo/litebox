@@ -13,7 +13,7 @@ use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, ReceiveSocketResponse, SendFlags,
     ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
-    SocketType,
+    SocketType, TcpOptionName, TcpOptionValue,
 };
 use spin::Once;
 
@@ -156,6 +156,12 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Shuts down one or both socket directions.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
+
+    /// Sets a typed TCP socket option.
+    fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()>;
+
+    /// Reads a typed TCP socket option.
+    fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue>;
 
     /// Returns the authoritative connection status.
     ///
@@ -622,6 +628,40 @@ pub fn receive_from(
     Ok(outcome)
 }
 
+/// Sets a typed option on a broker-owned TCP socket.
+pub fn set_tcp_option(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    value: TcpOptionValue,
+) -> Result<()> {
+    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WRITE)?;
+    if !is_tcp(create_request) {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    resource.set_tcp_option(value)
+}
+
+/// Reads a typed option from a broker-owned TCP socket.
+pub fn get_tcp_option(
+    session: &BrokerSession,
+    handle: ObjectHandle,
+    name: TcpOptionName,
+) -> Result<TcpOptionValue> {
+    let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
+    if !is_tcp(create_request) {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    let value = resource.get_tcp_option(name)?;
+    if !matches!(
+        (name, value),
+        (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
+            | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
+    ) {
+        return Err(BrokerError::Internal);
+    }
+    Ok(value)
+}
+
 /// Shuts down one or both socket directions.
 pub fn shutdown(
     session: &BrokerSession,
@@ -1019,6 +1059,14 @@ impl SocketResource {
         self.platform_socket().shutdown(mode)
     }
 
+    fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()> {
+        self.platform_socket().set_tcp_option(value)
+    }
+
+    fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue> {
+        self.platform_socket().get_tcp_option(name)
+    }
+
     fn status(&self) -> Result<SocketStatusResponse> {
         self.platform_socket().status()
     }
@@ -1126,6 +1174,7 @@ pub(crate) mod tests {
         fail_connect: core::sync::atomic::AtomicBool,
         fail_connect_indeterminate: core::sync::atomic::AtomicBool,
         fail_shutdown: core::sync::atomic::AtomicBool,
+        tcp_option_sets: StdMutex<std::vec::Vec<TcpOptionValue>>,
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
         live_readiness: StdMutex<Option<ReadinessRegistration>>,
     }
@@ -1171,6 +1220,7 @@ pub(crate) mod tests {
                 state: Arc::clone(&self.state),
                 readiness,
                 create_request: request,
+                tcp_options: StdMutex::new(TestTcpOptions::default()),
             }))
         }
 
@@ -1183,6 +1233,13 @@ pub(crate) mod tests {
         state: Arc<TestSocketState>,
         readiness: ReadinessRegistration,
         create_request: CreateSocketRequest,
+        tcp_options: StdMutex<TestTcpOptions>,
+    }
+
+    #[derive(Default)]
+    struct TestTcpOptions {
+        no_delay: bool,
+        keep_alive: bool,
     }
 
     impl PlatformSocket for TestPlatformSocket {
@@ -1294,6 +1351,26 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(()))
         }
 
+        fn set_tcp_option(&self, value: TcpOptionValue) -> Result<()> {
+            self.state.tcp_option_sets.lock().unwrap().push(value);
+            let mut options = self.tcp_options.lock().unwrap();
+            match value {
+                TcpOptionValue::NoDelay(value) => options.no_delay = value,
+                TcpOptionValue::KeepAlive(value) => options.keep_alive = value,
+                _ => return Err(BrokerError::UnsupportedOperation),
+            }
+            Ok(())
+        }
+
+        fn get_tcp_option(&self, name: TcpOptionName) -> Result<TcpOptionValue> {
+            let options = self.tcp_options.lock().unwrap();
+            match name {
+                TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(options.no_delay)),
+                TcpOptionName::KeepAlive => Ok(TcpOptionValue::KeepAlive(options.keep_alive)),
+                _ => Err(BrokerError::UnsupportedOperation),
+            }
+        }
+
         fn status(&self) -> Result<SocketStatusResponse> {
             self.state.status_calls.fetch_add(1, Ordering::Relaxed);
             let response = self
@@ -1329,6 +1406,7 @@ pub(crate) mod tests {
     pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
+        check_tcp_option_state_is_per_socket(broker);
         check_udp_socket_operations(broker, provider);
         check_concurrent_udp_status_does_not_regress_connection(broker, provider);
         check_server_socket_operations(broker, provider);
@@ -1434,6 +1512,22 @@ pub(crate) mod tests {
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(
+            set_tcp_option(&session, handle, TcpOptionValue::NoDelay(true)),
+            Ok(())
+        );
+        assert_eq!(
+            get_tcp_option(&session, handle, TcpOptionName::NoDelay),
+            Ok(TcpOptionValue::NoDelay(true))
+        );
+        assert_eq!(
+            set_tcp_option(&session, handle, TcpOptionValue::KeepAlive(true)),
+            Ok(())
+        );
+        assert_eq!(
+            get_tcp_option(&session, handle, TcpOptionName::KeepAlive),
+            Ok(TcpOptionValue::KeepAlive(true))
+        );
+        assert_eq!(
             shutdown(&session, handle, ShutdownMode::Both),
             Ok(SocketOutcome::Completed(()))
         );
@@ -1454,6 +1548,13 @@ pub(crate) mod tests {
         assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.state.status_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.state.shutdown_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            provider.state.tcp_option_sets.lock().unwrap().as_slice(),
+            [
+                TcpOptionValue::NoDelay(true),
+                TcpOptionValue::KeepAlive(true),
+            ]
+        );
         let session_id = session.session_id;
         drop(other);
         drop(session);
@@ -1465,6 +1566,45 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains(&session_id)
         );
+    }
+
+    fn check_tcp_option_state_is_per_socket(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            set_tcp_option(&session, first, TcpOptionValue::NoDelay(true)),
+            Ok(())
+        );
+        assert_eq!(
+            set_tcp_option(&session, first, TcpOptionValue::KeepAlive(true)),
+            Ok(())
+        );
+        assert_eq!(session.close_object_reference(first), Ok(()));
+
+        let second = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            get_tcp_option(&session, second, TcpOptionName::NoDelay),
+            Ok(TcpOptionValue::NoDelay(false))
+        );
+        assert_eq!(
+            get_tcp_option(&session, second, TcpOptionName::KeepAlive),
+            Ok(TcpOptionValue::KeepAlive(false))
+        );
+
+        assert_eq!(session.close_object_reference(second), Ok(()));
     }
 
     fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
@@ -1480,6 +1620,14 @@ pub(crate) mod tests {
         };
         let handle = create(&session, request, readiness).unwrap();
 
+        assert_eq!(
+            set_tcp_option(&session, handle, TcpOptionValue::NoDelay(true)),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(
+            get_tcp_option(&session, handle, TcpOptionName::NoDelay),
+            Err(BrokerError::UnsupportedOperation)
+        );
         assert_eq!(
             send_to(&session, handle, b"x", SendFlags::NONE, None),
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
