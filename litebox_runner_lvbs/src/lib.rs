@@ -40,7 +40,8 @@ use litebox_platform_lvbs::{
 };
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
+    decode_ta_request, deferred_memrefs, handle_optee_msg_args, handle_optee_smc_args,
+    materialize_deferred_inputs, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
@@ -213,7 +214,7 @@ pub fn init(is_bsp: bool) -> Option<&'static Platform> {
     per_cpu_variables::allocate_xsave_area();
 
     if let Err(e) = hvcall::init(is_bsp) {
-        panic!("Err: {:?}", e);
+        panic!("Err: {e:?}");
     }
     gdt::init();
     interrupts::init_idt();
@@ -640,18 +641,20 @@ fn open_session_single_instance(
     let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
     // Load TA context with parameters for OpenSession - pass actual session_id
-    instance
+    let destinations = instance
         .loaded_program()
         .entrypoints
         .as_ref()
         .ok_or(OpteeSmcReturnCode::EBadCmd)?
         .load_ta_context(
             params,
+            &deferred_memrefs(ta_req_info),
             runner_session_id,
             UteeEntryFunc::OpenSession as u32,
             None,
         )
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+    materialize_deferred_inputs(ta_req_info, &destinations)?;
 
     // Run the TA's OpenSession entry point using reference-based reenter
     let mut ctx = litebox_common_linux::PtRegs::default();
@@ -867,12 +870,13 @@ fn open_session_new_instance(
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
-    loaded_program
+    let destinations = loaded_program
         .entrypoints
         .as_ref()
         .unwrap()
         .load_ta_context(
             params,
+            &deferred_memrefs(ta_req_info),
             runner_session_id,
             UteeEntryFunc::OpenSession as u32,
             None,
@@ -883,6 +887,12 @@ fn open_session_new_instance(
             unsafe { teardown_ta_page_table(&shim, task_pt_id) };
             OpteeSmcReturnCode::EBadCmd
         })?;
+    if let Err(error) = materialize_deferred_inputs(ta_req_info, &destinations) {
+        // Safety: We are about to tear down this TA instance;
+        // no references to user-space memory will be held afterwards.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+        return Err(error);
+    }
 
     // Run the TA entry function using reference-based reenter to avoid moving the shim
     let mut ctx = litebox_common_linux::PtRegs::default();
@@ -1039,14 +1049,16 @@ fn handle_invoke_command(
 
         // Set up the entry-point parameters for InvokeCommand.
         let entrypoints_ref = instance.loaded_program().entrypoints.as_ref().unwrap();
-        entrypoints_ref
+        let destinations = entrypoints_ref
             .load_ta_context(
                 params.as_slice(),
+                &deferred_memrefs(&ta_req_info),
                 session_id,
                 UteeEntryFunc::InvokeCommand as u32,
                 Some(cmd_id),
             )
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+        materialize_deferred_inputs(&ta_req_info, &destinations)?;
 
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
@@ -1147,18 +1159,20 @@ fn handle_close_session(
         let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
         // Set up the entry-point parameters for CloseSession.
-        instance
+        let destinations = instance
             .loaded_program()
             .entrypoints
             .as_ref()
             .unwrap()
             .load_ta_context(
                 &[],
+                &deferred_memrefs(&ta_req_info),
                 session_id,
                 UteeEntryFunc::CloseSession as u32,
                 None,
             )
             .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+        materialize_deferred_inputs(&ta_req_info, &destinations)?;
 
         // Run the TA entry function (TA_CloseSessionEntryPoint)
         let mut ctx = litebox_common_linux::PtRegs::default();

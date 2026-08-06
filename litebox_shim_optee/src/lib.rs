@@ -236,8 +236,43 @@ impl GlobalState {
     }
 }
 
-type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
+pub type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 pub type UserConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+
+/// A memref parameter whose payload is *not* carried in [`litebox_common_optee::UteeParamOwned`].
+///
+/// The buffer is reserved on the TA stack while the TA context is loaded, and the
+/// payload is copied into it directly from normal-world shared memory afterwards
+/// (see `msg_handler::materialize_deferred_inputs`). `len` is the byte size of
+/// the buffer to reserve.
+#[derive(Clone, Copy, Debug)]
+pub enum DeferredMemref {
+    Input { len: usize },
+    Inout { len: usize },
+}
+
+/// The TA-stack buffer reserved for a [`DeferredMemref`], as the copy destination.
+#[derive(Clone, Copy, Debug)]
+pub struct TaMemrefDestination {
+    address: usize,
+    len: usize,
+}
+
+impl TaMemrefDestination {
+    pub fn address(self) -> usize {
+        self.address
+    }
+
+    pub fn size(self) -> usize {
+        self.len
+    }
+}
+
+/// The [`TaMemrefDestination`]s reserved for one TA entry, indexed by parameter index.
+///
+/// An entry is `None` if the parameter is not a deferred memref.
+pub type TaMemrefDestinations =
+    [Option<TaMemrefDestination>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS];
 
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -332,15 +367,16 @@ impl OpteeShimEntrypoints {
     pub fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
+        deferred: &[Option<DeferredMemref>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
-    ) -> Result<(), loader::elf::ElfLoaderError> {
-        let init_state = self
+    ) -> Result<TaMemrefDestinations, loader::elf::ElfLoaderError> {
+        let (init_state, destinations) = self
             .task
-            .load_ta_context(params, session_id, func_id, cmd_id)?;
+            .load_ta_context(params, deferred, session_id, func_id, cmd_id)?;
         self.task.thread.init_state.set(init_state);
-        Ok(())
+        Ok(destinations)
     }
 }
 
@@ -787,10 +823,11 @@ impl Task {
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
+        deferred: &[Option<DeferredMemref>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
-    ) -> Result<ThreadInitState, ElfLoaderError> {
+    ) -> Result<(ThreadInitState, TaMemrefDestinations), ElfLoaderError> {
         if !self.ta_prepared.get() {
             let ta_bin = self
                 .global
@@ -812,18 +849,21 @@ impl Task {
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
             )?;
-        ta_stack
-            .init(self.global.platform, params)
+        let destinations = ta_stack
+            .init(self.global.platform, params, deferred)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
-        Ok(ThreadInitState::Ta {
-            cmd_id: cmd_id.unwrap_or(0) as usize,
-            params_address: ta_stack.get_params_address(),
-            session_id: session_id as usize,
-            func_id: func_id as usize,
-            entry_point: self.get_ta_entry_point(),
-            stack_top: ta_stack.get_cur_stack_top(),
-        })
+        Ok((
+            ThreadInitState::Ta {
+                cmd_id: cmd_id.unwrap_or(0) as usize,
+                params_address: ta_stack.get_params_address(),
+                session_id: session_id as usize,
+                func_id: func_id as usize,
+                entry_point: self.get_ta_entry_point(),
+                stack_top: ta_stack.get_cur_stack_top(),
+            },
+            destinations,
+        ))
     }
 
     /// The session id currently executing in this task (set per entry by

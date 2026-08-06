@@ -10,7 +10,7 @@ use litebox::{
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::{Platform, UserMutPtr};
+use crate::{DeferredMemref, Platform, TaMemrefDestination, TaMemrefDestinations, UserMutPtr};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -67,6 +67,7 @@ pub struct TaStack {
 impl TaStack {
     /// Stack alignment required by libc ABI (not for TAs but for compatibility)
     const STACK_ALIGNMENT: usize = 16;
+    const STACK_CANARY_SIZE: usize = 16;
 
     /// Create a new stack for the user process.
     ///
@@ -215,6 +216,26 @@ impl TaStack {
         Some(())
     }
 
+    fn reserve_param_memref(
+        &mut self,
+        param_type: TeeParamType,
+        len: usize,
+    ) -> Option<TaMemrefDestination> {
+        if self.num_params >= UteeParams::TEE_NUM_PARAMS {
+            return None;
+        }
+        // `scrub` initializes and validates the reserved region before this metadata-only path.
+        // `materialize_deferred_inputs` fills input and inout regions before TA entry.
+        self.pos = self.pos.checked_sub(len)?;
+        let address = self.get_cur_stack_top();
+        self.params
+            .set_values(self.num_params, address as u64, len as u64)
+            .ok()?;
+        self.params.set_type(self.num_params, param_type).ok()?;
+        self.num_params += 1;
+        Some(TaMemrefDestination { address, len })
+    }
+
     /// Set `UteeParams` on the stack.
     fn set_utee_params(&mut self) -> Option<()> {
         let size = core::mem::size_of::<UteeParams>();
@@ -223,14 +244,38 @@ impl TaStack {
         Some(())
     }
 
-    pub(crate) fn init(&mut self, platform: &Platform, params: &[UteeParamOwned]) -> Option<()> {
+    fn init_params(
+        &mut self,
+        params: &[UteeParamOwned],
+        deferred: &[Option<DeferredMemref>; UteeParams::TEE_NUM_PARAMS],
+    ) -> Option<TaMemrefDestinations> {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
+            return None;
+        }
+        // `destinations` is indexed by parameter index, which only matches the slot each
+        // parameter is pushed into because the loop below pushes exactly one parameter per
+        // index of `params`. A deferred memref past the end of `params` would therefore be
+        // silently dropped, so reject the inconsistency here instead.
+        if deferred.iter().skip(params.len()).any(Option::is_some) {
             return None;
         }
 
         self.scrub()?;
 
-        for param in params {
+        let mut destinations = [None; UteeParams::TEE_NUM_PARAMS];
+
+        for (index, param) in params.iter().enumerate() {
+            if let Some(deferred) = deferred[index] {
+                if !matches!(param, UteeParamOwned::None) {
+                    return None;
+                }
+                let (param_type, len) = match deferred {
+                    DeferredMemref::Input { len } => (TeeParamType::MemrefInput, len),
+                    DeferredMemref::Inout { len } => (TeeParamType::MemrefInout, len),
+                };
+                destinations[index] = Some(self.reserve_param_memref(param_type, len)?);
+                continue;
+            }
             match param {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInput, Some((*value_a, *value_b)))?;
@@ -255,11 +300,27 @@ impl TaStack {
         }
 
         self.set_utee_params()?;
+        Some(destinations)
+    }
+
+    pub(crate) fn init(
+        &mut self,
+        platform: &Platform,
+        params: &[UteeParamOwned],
+        deferred: &[Option<DeferredMemref>; UteeParams::TEE_NUM_PARAMS],
+    ) -> Option<TaMemrefDestinations> {
+        let destinations = self.init_params(params, deferred)?;
 
         // Random 16-byte stack canary
-        let mut canary = [0u8; 16];
+        let mut canary = [0u8; Self::STACK_CANARY_SIZE];
         <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut canary);
-        self.push_bytes(&canary)?;
+        self.finish_init(&canary)?;
+
+        Some(destinations)
+    }
+
+    fn finish_init(&mut self, canary: &[u8; Self::STACK_CANARY_SIZE]) -> Option<()> {
+        self.push_bytes(canary)?;
 
         // `reenter_thread` *jumps* into the TA entry point (which is a function) rather than
         // calls it. Adjust the stack pointer to ensure post-call stack alignment.
