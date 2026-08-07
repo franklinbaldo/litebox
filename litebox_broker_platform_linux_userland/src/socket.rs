@@ -16,16 +16,16 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, PlatformConnectError, PlatformSocket, ReceivedPlatformDatagram,
-    SocketProvider,
+    AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
+    PlatformStreamReceive, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE,
-    MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, ReceiveSocketResponse, SendFlags,
-    ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
-    SocketType, TcpOptionName, TcpOptionValue,
+    MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
+    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse, SocketType,
+    TcpOptionName, TcpOptionValue,
 };
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, epoll, eventfd, poll};
@@ -165,33 +165,23 @@ impl PlatformSocket for LinuxSocket {
         self.reactor.connect(self.id, address)
     }
 
-    fn send(&self, data: &[u8], _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        owned.extend_from_slice(data);
+    fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
         self.reactor.request(|response| ReactorCommand::Send {
             id: self.id,
-            data: owned,
+            data,
             response,
         })
     }
 
     fn send_to(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         _flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let mut owned = Vec::new();
-        owned
-            .try_reserve_exact(data.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        owned.extend_from_slice(data);
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
-            data: owned,
+            data,
             destination,
             response,
         })
@@ -199,34 +189,28 @@ impl PlatformSocket for LinuxSocket {
 
     fn receive(
         &self,
-        data: &mut [u8],
+        length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-    ) -> BrokerResult<SocketOutcome<ReceiveSocketResponse>> {
+    ) -> BrokerResult<SocketOutcome<PlatformStreamReceive>> {
         let peek_offset =
             usize::try_from(peek_offset).map_err(|_| BrokerError::UnsupportedOperation)?;
         let peek_length =
             usize::try_from(peek_length).map_err(|_| BrokerError::UnsupportedOperation)?;
         match self.reactor.request(|response| ReactorCommand::Receive {
             id: self.id,
-            length: data.len(),
+            length,
             flags,
             peek_offset,
             peek_length,
             response,
         })? {
-            ReactorReceiveOutcome::Received(received) => {
-                data[..received.len()].copy_from_slice(&received);
-                Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
-                    received
-                        .len()
-                        .try_into()
-                        .map_err(|_| BrokerError::Internal)?,
-                )))
-            }
+            ReactorReceiveOutcome::Received(received) => Ok(SocketOutcome::Completed(
+                PlatformStreamReceive::Received(received),
+            )),
             ReactorReceiveOutcome::EndOfStream => {
-                Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+                Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
             }
             ReactorReceiveOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
@@ -234,14 +218,14 @@ impl PlatformSocket for LinuxSocket {
 
     fn receive_from(
         &self,
-        data: &mut [u8],
+        length: usize,
         flags: ReceiveFromFlags,
-    ) -> BrokerResult<SocketOutcome<ReceivedPlatformDatagram>> {
+    ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
         match self
             .reactor
             .request(|response| ReactorCommand::ReceiveFrom {
                 id: self.id,
-                length: data.len(),
+                length,
                 flags,
                 response,
             })? {
@@ -249,14 +233,11 @@ impl PlatformSocket for LinuxSocket {
                 data: received,
                 datagram_length,
                 source_address,
-            } => {
-                data[..received.len()].copy_from_slice(&received);
-                Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                    received: received.len(),
-                    datagram_length,
-                    source_address,
-                }))
-            }
+            } => Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                data: received,
+                datagram_length,
+                source_address,
+            })),
             ReactorReceiveFromOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
     }
@@ -2053,13 +2034,90 @@ mod tests {
     use super::*;
     use litebox_broker_core::readiness::ReadinessSink;
     use litebox_broker_core::{
-        BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-        Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
+        BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
+        DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
     };
     use litebox_broker_protocol::ObjectHandle;
-    use litebox_broker_protocol::socket::{Ipv4Address, Port};
+    use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct ReceivedPlatformDatagram {
+        received: usize,
+        datagram_length: usize,
+        source_address: SocketAddrV4,
+    }
+
+    fn send_bytes(
+        session: &BrokerSession,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: SendFlags,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        litebox_broker_core::socket::send(session, handle, data.to_vec(), flags)
+    }
+
+    fn send_datagram(
+        session: &BrokerSession,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: SendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> BrokerResult<SocketOutcome<usize>> {
+        litebox_broker_core::socket::send_to(session, handle, data.to_vec(), flags, destination)
+    }
+
+    fn receive_into(
+        session: &BrokerSession,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: ReceiveFlags,
+        peek_offset: u32,
+        peek_length: u32,
+    ) -> BrokerResult<SocketOutcome<ReceiveSocketResponse>> {
+        match litebox_broker_core::socket::receive(
+            session,
+            handle,
+            data.len(),
+            flags,
+            peek_offset,
+            peek_length,
+        )? {
+            SocketOutcome::Completed(PlatformStreamReceive::Received(received)) => {
+                data[..received.len()].copy_from_slice(&received);
+                Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+                    received
+                        .len()
+                        .try_into()
+                        .map_err(|_| BrokerError::Internal)?,
+                )))
+            }
+            SocketOutcome::Completed(PlatformStreamReceive::EndOfStream) => {
+                Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+            }
+            SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        }
+    }
+
+    fn receive_datagram_into(
+        session: &BrokerSession,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: ReceiveFromFlags,
+    ) -> BrokerResult<SocketOutcome<ReceivedPlatformDatagram>> {
+        match litebox_broker_core::socket::receive_from(session, handle, data.len(), flags)? {
+            SocketOutcome::Completed(received) => {
+                data[..received.data.len()].copy_from_slice(&received.data);
+                Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                    received: received.data.len(),
+                    datagram_length: received.datagram_length,
+                    source_address: received.source_address,
+                }))
+            }
+            SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+        }
+    }
 
     #[test]
     fn cached_socket_error_precedes_a_new_kernel_error() {
@@ -2238,18 +2296,11 @@ mod tests {
 
         let mut unavailable = [0_u8; 1];
         assert_eq!(
-            litebox_broker_core::socket::receive(
-                &session,
-                handle,
-                &mut unavailable,
-                ReceiveFlags::NONE,
-                0,
-                0,
-            ),
+            receive_into(&session, handle, &mut unavailable, ReceiveFlags::NONE, 0, 0,),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(
-            litebox_broker_core::socket::send(&session, handle, b"ping", SendFlags::NONE,),
+            send_bytes(&session, handle, b"ping", SendFlags::NONE,),
             Ok(SocketOutcome::Completed(4))
         );
         assert_eq!(
@@ -2257,7 +2308,7 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         assert_eq!(
-            litebox_broker_core::socket::send(&session, handle, b"after shutdown", SendFlags::NONE),
+            send_bytes(&session, handle, b"after shutdown", SendFlags::NONE),
             Ok(SocketOutcome::Failed(SocketError::Other))
         );
         allow_response.send(()).unwrap();
@@ -2268,14 +2319,7 @@ mod tests {
 
         let mut first = [0_u8; 1];
         assert_eq!(
-            litebox_broker_core::socket::receive(
-                &session,
-                handle,
-                &mut first,
-                ReceiveFlags::NONE,
-                0,
-                0,
-            ),
+            receive_into(&session, handle, &mut first, ReceiveFlags::NONE, 0, 0,),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
         );
         assert_eq!(&first, b"p");
@@ -2287,27 +2331,13 @@ mod tests {
         );
         let mut peeked = [0_u8; 3];
         assert_eq!(
-            litebox_broker_core::socket::receive(
-                &session,
-                handle,
-                &mut peeked,
-                ReceiveFlags::PEEK,
-                0,
-                3,
-            ),
+            receive_into(&session, handle, &mut peeked, ReceiveFlags::PEEK, 0, 3,),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(3)))
         );
         assert_eq!(&peeked, b"ong");
         let mut received = [0_u8; 3];
         assert_eq!(
-            litebox_broker_core::socket::receive(
-                &session,
-                handle,
-                &mut received,
-                ReceiveFlags::NONE,
-                0,
-                0,
-            ),
+            receive_into(&session, handle, &mut received, ReceiveFlags::NONE, 0, 0,),
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(3)))
         );
         assert_eq!(&received, b"ong");
@@ -2318,14 +2348,7 @@ mod tests {
                 .contains(ReadinessFlags::READ)
         );
         assert_eq!(
-            litebox_broker_core::socket::receive(
-                &session,
-                handle,
-                &mut unavailable,
-                ReceiveFlags::NONE,
-                0,
-                0,
-            ),
+            receive_into(&session, handle, &mut unavailable, ReceiveFlags::NONE, 0, 0,),
             Err(BrokerError::WouldBlock)
         );
         assert!(
@@ -2358,7 +2381,7 @@ mod tests {
         wait_for_readiness(&publications, read_shutdown_handle, ReadinessFlags::READ);
         let mut read_shutdown_peek = [0_u8; 2];
         assert_eq!(
-            litebox_broker_core::socket::receive(
+            receive_into(
                 &session,
                 read_shutdown_handle,
                 &mut read_shutdown_peek,
@@ -2378,7 +2401,7 @@ mod tests {
         );
         wait_for_readiness(&publications, read_shutdown_handle, ReadinessFlags::READ);
         assert_eq!(
-            litebox_broker_core::socket::receive(
+            receive_into(
                 &session,
                 read_shutdown_handle,
                 &mut read_shutdown_peek,
@@ -2391,7 +2414,7 @@ mod tests {
         assert_eq!(read_shutdown_peek[0], b'x');
         let mut queued_after_shutdown = [0_u8; 1];
         assert_eq!(
-            litebox_broker_core::socket::receive(
+            receive_into(
                 &session,
                 read_shutdown_handle,
                 &mut queued_after_shutdown,
@@ -2409,7 +2432,7 @@ mod tests {
                 .contains(ReadinessFlags::READ)
         );
         assert_eq!(
-            litebox_broker_core::socket::receive(
+            receive_into(
                 &session,
                 read_shutdown_handle,
                 &mut queued_after_shutdown,
@@ -2426,7 +2449,7 @@ mod tests {
 
         let unconnected_handle = create_socket(&session, readiness.clone());
         assert_eq!(
-            litebox_broker_core::socket::receive(
+            receive_into(
                 &session,
                 unconnected_handle,
                 &mut unavailable,
@@ -2681,7 +2704,7 @@ mod tests {
         first_client.write_all(b"request").unwrap();
         let mut request = [0_u8; 7];
         loop {
-            match litebox_broker_core::socket::receive(
+            match receive_into(
                 &session,
                 first.handle,
                 &mut request,
@@ -2698,7 +2721,7 @@ mod tests {
         }
         assert_eq!(&request, b"request");
         assert_eq!(
-            litebox_broker_core::socket::send(&session, first.handle, b"response", SendFlags::NONE,),
+            send_bytes(&session, first.handle, b"response", SendFlags::NONE,),
             Ok(SocketOutcome::Completed(8))
         );
         let mut response = [0_u8; 8];
@@ -2795,7 +2818,7 @@ mod tests {
         assert!(shutdown_readiness.contains(ReadinessFlags::READ));
         assert!(!shutdown_readiness.contains(ReadinessFlags::WRITE));
         assert_eq!(
-            litebox_broker_core::socket::send_to(
+            send_datagram(
                 &session,
                 shutdown_handle,
                 b"after shutdown",
@@ -2806,7 +2829,7 @@ mod tests {
         );
         let mut shutdown_data = [0; 1];
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
+            receive_datagram_into(
                 &session,
                 shutdown_handle,
                 &mut shutdown_data,
@@ -2821,7 +2844,7 @@ mod tests {
         );
 
         assert_eq!(
-            litebox_broker_core::socket::send_to(
+            send_datagram(
                 &session,
                 handle,
                 b"denied",
@@ -2831,7 +2854,7 @@ mod tests {
             Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
         );
         assert_eq!(
-            litebox_broker_core::socket::send_to(
+            send_datagram(
                 &session,
                 handle,
                 b"implicit bind",
@@ -2848,16 +2871,11 @@ mod tests {
         assert_ne!(implicitly_bound.port(), 0);
         let mut no_data = [0; 1];
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
-                &session,
-                handle,
-                &mut no_data,
-                ReceiveFromFlags::NONE,
-            ),
+            receive_datagram_into(&session, handle, &mut no_data, ReceiveFromFlags::NONE,),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(
-            litebox_broker_core::socket::send_to(
+            send_datagram(
                 &session,
                 handle,
                 b"ping",
@@ -2880,12 +2898,7 @@ mod tests {
         wait_for_readiness(&publications, handle, ReadinessFlags::READ);
         let mut zero = [];
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
-                &session,
-                handle,
-                &mut zero,
-                ReceiveFromFlags::NONE,
-            ),
+            receive_datagram_into(&session, handle, &mut zero, ReceiveFromFlags::NONE,),
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
                 received: 0,
                 datagram_length: 0,
@@ -2893,12 +2906,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
-                &session,
-                handle,
-                &mut zero,
-                ReceiveFromFlags::NONE,
-            ),
+            receive_datagram_into(&session, handle, &mut zero, ReceiveFromFlags::NONE,),
             Err(BrokerError::WouldBlock)
         );
 
@@ -2906,12 +2914,7 @@ mod tests {
         wait_for_readiness(&publications, handle, ReadinessFlags::READ);
         let mut peeked = [0; 3];
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
-                &session,
-                handle,
-                &mut peeked,
-                ReceiveFromFlags::PEEK,
-            ),
+            receive_datagram_into(&session, handle, &mut peeked, ReceiveFromFlags::PEEK,),
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
                 received: 3,
                 datagram_length: 6,
@@ -2921,12 +2924,7 @@ mod tests {
         assert_eq!(&peeked, b"abc");
         let mut truncated = [0; 4];
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
-                &session,
-                handle,
-                &mut truncated,
-                ReceiveFromFlags::NONE,
-            ),
+            receive_datagram_into(&session, handle, &mut truncated, ReceiveFromFlags::NONE,),
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
                 received: 4,
                 datagram_length: 6,
@@ -2935,12 +2933,7 @@ mod tests {
         );
         assert_eq!(&truncated, b"abcd");
         assert_eq!(
-            litebox_broker_core::socket::receive_from(
-                &session,
-                handle,
-                &mut no_data,
-                ReceiveFromFlags::NONE,
-            ),
+            receive_datagram_into(&session, handle, &mut no_data, ReceiveFromFlags::NONE,),
             Err(BrokerError::WouldBlock)
         );
 
@@ -2953,7 +2946,7 @@ mod tests {
         assert_eq!(connected_status.local_address, Some(source));
         let maximum = vec![0x5a; MAX_UDP_DATAGRAM_SIZE as usize];
         assert_eq!(
-            litebox_broker_core::socket::send_to(&session, handle, &maximum, SendFlags::NONE, None,),
+            send_datagram(&session, handle, &maximum, SendFlags::NONE, None,),
             Ok(SocketOutcome::Completed(maximum.len()))
         );
         let (received, connected_source) = server.recv_from(&mut packet).unwrap();
@@ -2969,18 +2962,12 @@ mod tests {
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         );
         assert_eq!(
-            litebox_broker_core::socket::send_to(
-                &session,
-                handle,
-                b"refused",
-                SendFlags::NONE,
-                None,
-            ),
+            send_datagram(&session, handle, b"refused", SendFlags::NONE, None,),
             Ok(SocketOutcome::Completed(7))
         );
         wait_for_readiness(&publications, handle, ReadinessFlags::ERROR);
         assert_eq!(
-            litebox_broker_core::socket::send_to(
+            send_datagram(
                 &session,
                 handle,
                 b"broadcast",
@@ -3001,13 +2988,7 @@ mod tests {
                 .contains(ReadinessFlags::ERROR)
         );
         assert_eq!(
-            litebox_broker_core::socket::send_to(
-                &session,
-                handle,
-                b"refused again",
-                SendFlags::NONE,
-                None,
-            ),
+            send_datagram(&session, handle, b"refused again", SendFlags::NONE, None,),
             Ok(SocketOutcome::Completed(13))
         );
         wait_for_readiness(&publications, handle, ReadinessFlags::ERROR);
@@ -3050,13 +3031,7 @@ mod tests {
                 .contains(ReadinessFlags::WRITE)
         );
         assert_eq!(
-            litebox_broker_core::socket::send_to(
-                &session,
-                handle,
-                b"after shutdown",
-                SendFlags::NONE,
-                None,
-            ),
+            send_datagram(&session, handle, b"after shutdown", SendFlags::NONE, None,),
             Ok(SocketOutcome::Failed(SocketError::Other))
         );
 
@@ -3140,14 +3115,7 @@ mod tests {
         let deadline = Instant::now() + TEST_TIMEOUT;
         loop {
             let mut byte = [0_u8; 1];
-            match litebox_broker_core::socket::receive(
-                session,
-                handle,
-                &mut byte,
-                ReceiveFlags::NONE,
-                0,
-                0,
-            ) {
+            match receive_into(session, handle, &mut byte, ReceiveFlags::NONE, 0, 0) {
                 Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream)) => return,
                 Err(BrokerError::WouldBlock) => {
                     wait_for_readiness_until(

@@ -3,7 +3,7 @@
 
 //! Broker-owned platform socket authority.
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,9 +11,9 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
-    MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, ReceiveSocketResponse, SendFlags,
-    ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse,
-    SocketType, TcpOptionName, TcpOptionValue,
+    MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromFlags, SendFlags, ShutdownMode,
+    SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse, SocketType,
+    TcpOptionName, TcpOptionValue,
 };
 use spin::Once;
 
@@ -52,11 +52,20 @@ pub struct AcceptedBrokerSocket {
     pub remote_address: SocketAddrV4,
 }
 
-/// Platform result for one datagram receive.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceivedPlatformDatagram {
-    /// Number of bytes copied into the caller's buffer.
-    pub received: usize,
+/// Owned platform result for one stream receive.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PlatformStreamReceive {
+    /// Bytes received from the stream.
+    Received(Vec<u8>),
+    /// The stream's receive direction reached end of stream.
+    EndOfStream,
+}
+
+/// Owned platform result for one datagram receive.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlatformDatagramReceive {
+    /// Received datagram prefix, truncated to the requested capacity.
+    pub data: Vec<u8>,
     /// Original datagram length before truncation.
     pub datagram_length: usize,
     /// Source address of the datagram.
@@ -118,7 +127,7 @@ pub trait PlatformSocket: Send + Sync {
     ///
     /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Ordinary
     /// network failures return [`SocketOutcome::Failed`].
-    fn send(&self, data: &[u8], flags: SendFlags) -> Result<SocketOutcome<usize>>;
+    fn send(&self, data: Vec<u8>, flags: SendFlags) -> Result<SocketOutcome<usize>>;
 
     /// Sends one complete datagram without waiting for platform readiness.
     ///
@@ -126,7 +135,7 @@ pub trait PlatformSocket: Send + Sync {
     /// the socket's connected peer. Partial successful sends are invalid.
     fn send_to(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> Result<SocketOutcome<usize>>;
@@ -134,15 +143,15 @@ pub trait PlatformSocket: Send + Sync {
     /// Receives bytes without waiting for platform readiness.
     ///
     /// A temporarily empty socket returns [`BrokerError::WouldBlock`]. End of
-    /// stream returns [`ReceiveSocketResponse::EndOfStream`]; `Received(0)` is
-    /// reserved for a zero-length input buffer handled by the core.
+    /// stream returns [`PlatformStreamReceive::EndOfStream`]. The core handles
+    /// zero-length receives without invoking the platform.
     fn receive(
         &self,
-        data: &mut [u8],
+        length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-    ) -> Result<SocketOutcome<ReceiveSocketResponse>>;
+    ) -> Result<SocketOutcome<PlatformStreamReceive>>;
 
     /// Receives one datagram without waiting for platform readiness.
     ///
@@ -150,9 +159,9 @@ pub trait PlatformSocket: Send + Sync {
     /// is smaller, and zero-length datagrams are successful receives.
     fn receive_from(
         &self,
-        data: &mut [u8],
+        length: usize,
         flags: ReceiveFromFlags,
-    ) -> Result<SocketOutcome<ReceivedPlatformDatagram>>;
+    ) -> Result<SocketOutcome<PlatformDatagramReceive>>;
 
     /// Shuts down one or both socket directions.
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>>;
@@ -500,19 +509,20 @@ pub fn accept(
 pub fn send(
     session: &BrokerSession,
     handle: ObjectHandle,
-    data: &[u8],
+    data: Vec<u8>,
     flags: SendFlags,
 ) -> Result<SocketOutcome<usize>> {
     if flags.has_unsupported_bits() {
         return Err(BrokerError::UnsupportedOperation);
     }
+    let length = data.len();
     let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
     let outcome = resource.send(data, flags)?;
     if let SocketOutcome::Completed(sent) = outcome
-        && sent > data.len()
+        && sent > length
     {
         return Err(BrokerError::Internal);
     }
@@ -523,13 +533,14 @@ pub fn send(
 pub fn send_to(
     session: &BrokerSession,
     handle: ObjectHandle,
-    data: &[u8],
+    data: Vec<u8>,
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> Result<SocketOutcome<usize>> {
     if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
+    let length = data.len();
     let (resource, create_request, connection_status) =
         socket_state(session, handle, ObjectRights::WRITE)?;
     if !is_udp(create_request) {
@@ -552,28 +563,28 @@ pub fn send_to(
     }
     let outcome = resource.send_to(data, flags, destination)?;
     if let SocketOutcome::Completed(sent) = outcome
-        && sent != data.len()
+        && sent != length
     {
         return Err(BrokerError::Internal);
     }
     Ok(outcome)
 }
 
-/// Receives bytes without waiting for readiness.
+/// Receives stream bytes without waiting for readiness.
 pub fn receive(
     session: &BrokerSession,
     handle: ObjectHandle,
-    data: &mut [u8],
+    length: usize,
     flags: ReceiveFlags,
     peek_offset: u32,
     peek_length: u32,
-) -> Result<SocketOutcome<ReceiveSocketResponse>> {
-    if flags.has_unsupported_bits() {
+) -> Result<SocketOutcome<PlatformStreamReceive>> {
+    if flags.has_unsupported_bits() || length > MAX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let peek = flags.contains(ReceiveFlags::PEEK);
     let end = peek_offset
-        .checked_add(data.len().try_into().map_err(|_| BrokerError::Internal)?)
+        .checked_add(length.try_into().map_err(|_| BrokerError::Internal)?)
         .ok_or(BrokerError::UnsupportedOperation)?;
     let canonical_peek_length = peek_length
         .checked_sub(peek_offset)
@@ -581,7 +592,7 @@ pub fn receive(
     if (!peek && (peek_offset != 0 || peek_length != 0))
         || (peek
             && (!peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE)
-                || canonical_peek_length != data.len().try_into().ok()
+                || canonical_peek_length != length.try_into().ok()
                 || peek_length < end
                 || peek_length > litebox_broker_protocol::socket::MAX_SOCKET_PEEK_SIZE))
     {
@@ -591,12 +602,14 @@ pub fn receive(
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    if data.is_empty() {
-        return Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(0)));
+    if length == 0 {
+        return Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+            Vec::new(),
+        )));
     }
-    let outcome = resource.receive(data, flags, peek_offset, peek_length)?;
-    if let SocketOutcome::Completed(ReceiveSocketResponse::Received(received)) = outcome
-        && (received as usize > data.len() || received == 0)
+    let outcome = resource.receive(length, flags, peek_offset, peek_length)?;
+    if let SocketOutcome::Completed(PlatformStreamReceive::Received(received)) = &outcome
+        && (received.len() > length || received.is_empty())
     {
         return Err(BrokerError::Internal);
     }
@@ -607,20 +620,20 @@ pub fn receive(
 pub fn receive_from(
     session: &BrokerSession,
     handle: ObjectHandle,
-    data: &mut [u8],
+    length: usize,
     flags: ReceiveFromFlags,
-) -> Result<SocketOutcome<ReceivedPlatformDatagram>> {
-    if flags.has_unsupported_bits() || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+    if flags.has_unsupported_bits() || length > MAX_UDP_DATAGRAM_SIZE as usize {
         return Err(BrokerError::UnsupportedOperation);
     }
     let (resource, create_request, _) = socket_state(session, handle, ObjectRights::WAIT)?;
     if !is_udp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let outcome = resource.receive_from(data, flags)?;
-    if let SocketOutcome::Completed(received) = outcome
-        && (received.received > data.len()
-            || received.datagram_length < received.received
+    let outcome = resource.receive_from(length, flags)?;
+    if let SocketOutcome::Completed(received) = &outcome
+        && (received.data.len() > length
+            || received.datagram_length < received.data.len()
             || received.datagram_length > MAX_UDP_DATAGRAM_SIZE as usize)
     {
         return Err(BrokerError::Internal);
@@ -1023,13 +1036,13 @@ impl SocketResource {
         self.platform_socket().accept(readiness)
     }
 
-    fn send(&self, data: &[u8], flags: SendFlags) -> Result<SocketOutcome<usize>> {
+    fn send(&self, data: Vec<u8>, flags: SendFlags) -> Result<SocketOutcome<usize>> {
         self.platform_socket().send(data, flags)
     }
 
     fn send_to(
         &self,
-        data: &[u8],
+        data: Vec<u8>,
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> Result<SocketOutcome<usize>> {
@@ -1038,21 +1051,21 @@ impl SocketResource {
 
     fn receive(
         &self,
-        data: &mut [u8],
+        length: usize,
         flags: ReceiveFlags,
         peek_offset: u32,
         peek_length: u32,
-    ) -> Result<SocketOutcome<ReceiveSocketResponse>> {
+    ) -> Result<SocketOutcome<PlatformStreamReceive>> {
         self.platform_socket()
-            .receive(data, flags, peek_offset, peek_length)
+            .receive(length, flags, peek_offset, peek_length)
     }
 
     fn receive_from(
         &self,
-        data: &mut [u8],
+        length: usize,
         flags: ReceiveFromFlags,
-    ) -> Result<SocketOutcome<ReceivedPlatformDatagram>> {
-        self.platform_socket().receive_from(data, flags)
+    ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+        self.platform_socket().receive_from(length, flags)
     }
 
     fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>> {
@@ -1150,6 +1163,7 @@ pub(crate) mod tests {
     use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
     use std::sync::{Mutex as StdMutex, mpsc};
     use std::time::Duration;
+    use std::vec;
 
     #[derive(Clone, Default)]
     pub(crate) struct TestSocketProvider {
@@ -1300,44 +1314,42 @@ pub(crate) mod tests {
             }
         }
 
-        fn send(&self, data: &[u8], _flags: SendFlags) -> Result<SocketOutcome<usize>> {
-            self.state.sent.lock().unwrap().extend_from_slice(data);
+        fn send(&self, data: Vec<u8>, _flags: SendFlags) -> Result<SocketOutcome<usize>> {
+            self.state.sent.lock().unwrap().extend_from_slice(&data);
             Ok(SocketOutcome::Completed(data.len()))
         }
 
         fn send_to(
             &self,
-            data: &[u8],
+            data: Vec<u8>,
             _flags: SendFlags,
             _destination: Option<SocketAddrV4>,
         ) -> Result<SocketOutcome<usize>> {
-            self.state.sent.lock().unwrap().extend_from_slice(data);
+            self.state.sent.lock().unwrap().extend_from_slice(&data);
             Ok(SocketOutcome::Completed(data.len()))
         }
 
         fn receive(
             &self,
-            data: &mut [u8],
+            length: usize,
             _flags: ReceiveFlags,
             _peek_offset: u32,
             _peek_length: u32,
-        ) -> Result<SocketOutcome<ReceiveSocketResponse>> {
-            let received = data.len().min(2);
-            data[..received].copy_from_slice(&[7, 9][..received]);
-            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
-                u32::try_from(received).unwrap(),
+        ) -> Result<SocketOutcome<PlatformStreamReceive>> {
+            let received = length.min(2);
+            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                [7, 9][..received].to_vec(),
             )))
         }
 
         fn receive_from(
             &self,
-            data: &mut [u8],
+            length: usize,
             _flags: ReceiveFromFlags,
-        ) -> Result<SocketOutcome<ReceivedPlatformDatagram>> {
-            let received = data.len().min(2);
-            data[..received].copy_from_slice(&[7, 9][..received]);
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                received,
+        ) -> Result<SocketOutcome<PlatformDatagramReceive>> {
+            let received = length.min(2);
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                data: [7, 9][..received].to_vec(),
                 datagram_length: 4,
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             }))
@@ -1498,17 +1510,28 @@ pub(crate) mod tests {
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
         assert_eq!(
-            send(&session, handle, &[1, 2, 3], SendFlags::NONE),
+            send(&session, handle, vec![1, 2, 3], SendFlags::NONE),
             Ok(SocketOutcome::Completed(3))
         );
-        let mut data = [0; 4];
         assert_eq!(
-            receive(&session, handle, &mut data, ReceiveFlags::PEEK, 0, 4),
-            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(2)))
+            receive(&session, handle, 4, ReceiveFlags::PEEK, 0, 4),
+            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                vec![7, 9],
+            )))
         );
-        assert_eq!(data, [7, 9, 0, 0]);
         assert_eq!(
-            receive(&session, handle, &mut data[..1], ReceiveFlags::PEEK, 1, 2),
+            receive(&session, handle, 1, ReceiveFlags::PEEK, 1, 2),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(
+            receive(
+                &session,
+                handle,
+                MAX_SOCKET_TRANSFER_SIZE as usize + 1,
+                ReceiveFlags::NONE,
+                0,
+                0,
+            ),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(
@@ -1532,7 +1555,7 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         assert_eq!(
-            send(&session, handle, &[], SendFlags(1)),
+            send(&session, handle, Vec::new(), SendFlags(1)),
             Err(BrokerError::UnsupportedOperation)
         );
         let in_flight = socket_resource(&session, handle, ObjectRights::WAIT).unwrap();
@@ -1629,14 +1652,14 @@ pub(crate) mod tests {
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(
-            send_to(&session, handle, b"x", SendFlags::NONE, None),
+            send_to(&session, handle, b"x".to_vec(), SendFlags::NONE, None),
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
         assert_eq!(
             send_to(
                 &session,
                 handle,
-                b"x",
+                b"x".to_vec(),
                 SendFlags::NONE,
                 Some(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 53)),
             ),
@@ -1646,22 +1669,20 @@ pub(crate) mod tests {
             send_to(
                 &session,
                 handle,
-                b"udp",
+                b"udp".to_vec(),
                 SendFlags::NONE,
                 Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
             ),
             Ok(SocketOutcome::Completed(3))
         );
-        let mut data = [0; 2];
         assert_eq!(
-            receive_from(&session, handle, &mut data, ReceiveFromFlags::PEEK),
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                received: 2,
+            receive_from(&session, handle, 2, ReceiveFromFlags::PEEK),
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                data: vec![7, 9],
                 datagram_length: 4,
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             }))
         );
-        assert_eq!(data, [7, 9]);
         assert_eq!(
             connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53),),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
@@ -1676,7 +1697,7 @@ pub(crate) mod tests {
             SocketConnectionStatus::Connected
         );
         assert_eq!(
-            send_to(&session, handle, b"peer", SendFlags::NONE, None),
+            send_to(&session, handle, b"peer".to_vec(), SendFlags::NONE, None),
             Ok(SocketOutcome::Completed(4))
         );
         provider.fail_next_connect_indeterminate();
@@ -1703,7 +1724,7 @@ pub(crate) mod tests {
             })
         );
         assert_eq!(
-            send_to(&session, handle, b"peer", SendFlags::NONE, None),
+            send_to(&session, handle, b"peer".to_vec(), SendFlags::NONE, None),
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
         assert_eq!(
@@ -1711,11 +1732,11 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
         );
         assert_eq!(
-            send_to(&session, handle, b"peer", SendFlags::NONE, None),
+            send_to(&session, handle, b"peer".to_vec(), SendFlags::NONE, None),
             Ok(SocketOutcome::Completed(4))
         );
         assert_eq!(
-            send(&session, handle, b"x", SendFlags::NONE),
+            send(&session, handle, b"x".to_vec(), SendFlags::NONE),
             Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
         );
         assert_eq!(
