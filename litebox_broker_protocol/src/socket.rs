@@ -305,7 +305,7 @@ impl SocketError {
 pub enum SocketOutcome<T> {
     /// The operation completed successfully.
     Completed(T),
-    /// The host network stack reported an ordinary socket failure.
+    /// The broker socket backend reported an ordinary socket failure.
     Failed(SocketError),
 }
 
@@ -355,7 +355,7 @@ pub struct BindSocketRequest {
 /// Response to a socket bind request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BindSocketResponse {
-    /// Local address assigned by the host network stack.
+    /// Local address reserved in the guest's broker-managed namespace.
     pub local_address: SocketAddrV4,
 }
 
@@ -371,7 +371,7 @@ pub struct ListenSocketRequest {
 /// Response to a socket listen request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenSocketResponse {
-    /// Local address assigned by the host network stack.
+    /// Local address reserved in the guest's broker-managed namespace.
     pub local_address: SocketAddrV4,
 }
 
@@ -553,7 +553,7 @@ pub struct SocketStatusRequest {
 pub struct SocketStatusResponse {
     /// Current connection state.
     pub status: SocketConnectionStatus,
-    /// Local endpoint assigned by the host network stack, if any.
+    /// Local endpoint reserved in the guest's broker-managed namespace, if any.
     pub local_address: Option<SocketAddrV4>,
     /// Pending asynchronous socket error, consumed by this status query.
     pub pending_error: Option<SocketError>,

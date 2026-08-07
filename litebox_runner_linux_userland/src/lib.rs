@@ -60,13 +60,6 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub rewrite_syscalls: bool,
-    /// Connect to a TUN device with this name
-    #[arg(
-        long = "tun-device-name",
-        requires = "unstable",
-        help_heading = "Unstable Options"
-    )]
-    pub tun_device_name: Option<String>,
     /// Load the program binary from the tar file instead of from the host filesystem.
     ///
     /// When set, the program path refers to a path inside the tar filesystem.
@@ -211,7 +204,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
-    let platform = Platform::new(cli_args.tun_device_name.as_deref());
+    let platform = Platform::new();
 
     for file in cow_eligible_regions {
         platform.register_cow_region(file.data, file.abs_path);
@@ -356,38 +349,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let shim = shim_builder.build();
 
-    let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let net_worker = if cli_args.tun_device_name.is_some() {
-        let shim = shim.clone();
-        let shutdown_clone = shutdown.clone();
-        let child = litebox_platform_linux_userland::spawn_host_thread(move || {
-            const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
-            const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
-            pin_thread_to_cpu(0);
-
-            while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
-                let timeout = loop {
-                    match shim.perform_network_interaction() {
-                        litebox::net::PlatformInteractionReinvocationAdvice::CallAgainImmediately => {}
-                        litebox::net::PlatformInteractionReinvocationAdvice::WaitOnDeviceOrSocketInteraction{ timeout } => {
-                            break timeout;
-                        }
-                    }
-                };
-                // TODO: We only wait for ingress packets on the TUN device and thus may block processing egress packets for up to `timeout`.
-                // Set a maximum timeout to ensure we don't wait too long. Alternatively, shim could notify us when there are egress packets to process,
-                // but that would require more invasive changes.
-                platform.wait_on_tun(Some(timeout.unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT)));
-            }
-            // Final flush
-            // TODO: keep running until all sockets are closed?
-            while shim.perform_network_interaction().call_again_immediately() {}
-        });
-        Some(child)
-    } else {
-        None
-    };
-
     let argv = cli_args
         .program_and_arguments
         .iter()
@@ -441,22 +402,5 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
-    if let Some(net_worker) = net_worker {
-        shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
-        net_worker.join().unwrap();
-    }
     std::process::exit(program.process.wait())
-}
-
-/// Pin the current thread to a specific CPU core
-fn pin_thread_to_cpu(cpu: usize) {
-    unsafe {
-        let mut set = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) != 0 {
-            eprintln!("Warning: Failed to pin thread to CPU core {cpu}");
-        }
-    }
 }

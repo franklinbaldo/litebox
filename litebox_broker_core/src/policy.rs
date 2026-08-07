@@ -3,6 +3,7 @@
 
 use core::net::SocketAddrV4;
 
+use crate::socket::PlatformSocketScope;
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
@@ -324,6 +325,36 @@ impl SocketPolicy {
                 .any(|rule| rule.permits(caller_credential, address)),
         }
     }
+
+    /// Derives the host-network binding scope required by this socket's authorized destinations.
+    fn socket_scope(
+        self,
+        caller_credential: CallerCredential,
+        request: CreateSocketRequest,
+    ) -> PlatformSocketScope {
+        let ((
+            SocketType::Stream,
+            IpProtocol::Tcp,
+            Self::TcpDestinationRules(policy) | Self::TcpUdpDestinationRules { tcp: policy, .. },
+        )
+        | (
+            SocketType::Datagram,
+            IpProtocol::Udp,
+            Self::UdpDestinationRules(policy) | Self::TcpUdpDestinationRules { udp: policy, .. },
+        )) = (request.socket_type, request.protocol, self)
+        else {
+            return PlatformSocketScope::LoopbackOnly;
+        };
+        if policy.rules().iter().any(|rule| {
+            rule.caller_credential == caller_credential
+                && !(rule.destination.prefix_length() >= 8
+                    && rule.destination.network().0[0] == 127)
+        }) {
+            PlatformSocketScope::GeneralIpv4
+        } else {
+            PlatformSocketScope::LoopbackOnly
+        }
+    }
 }
 
 fn copy_destination_rules(
@@ -480,6 +511,14 @@ impl PolicyEngine {
         } else {
             Err(BrokerError::PolicyDenied)
         }
+    }
+
+    pub(crate) fn socket_scope(
+        &self,
+        caller_credential: CallerCredential,
+        request: CreateSocketRequest,
+    ) -> PlatformSocketScope {
+        self.socket_policy.socket_scope(caller_credential, request)
     }
 }
 

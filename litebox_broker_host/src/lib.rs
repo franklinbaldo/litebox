@@ -438,8 +438,13 @@ fn handle_socket_request<Memory: SharedMemory>(
             shared_buffers
                 .read(request.buffer.slot_index, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-            match litebox_broker_core::socket::send(session, request.handle, &data, request.flags)
-                .map_err(RequestFailure::from)?
+            match litebox_broker_core::socket::send_owned(
+                session,
+                request.handle,
+                data,
+                request.flags,
+            )
+            .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(sent) => {
                     let sent = sent
@@ -464,10 +469,10 @@ fn handle_socket_request<Memory: SharedMemory>(
             shared_buffers
                 .read(request.buffer.slot_index, &mut data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-            match litebox_broker_core::socket::send_to(
+            match litebox_broker_core::socket::send_to_owned(
                 session,
                 request.handle,
-                &data,
+                data,
                 request.flags,
                 request.destination,
             )
@@ -502,27 +507,33 @@ fn handle_socket_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            match litebox_broker_core::socket::receive(
+            match litebox_broker_core::socket::receive_owned(
                 session,
                 request.handle,
-                &mut data,
+                length,
                 request.flags,
                 request.peek_offset,
                 request.peek_length,
             )
             .map_err(RequestFailure::from)?
             {
-                SocketOutcome::Completed(response) => {
-                    if let ReceiveSocketResponse::Received(received) = response {
-                        shared_buffers
-                            .write(request.buffer.slot_index, &data[..received as usize])
-                            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-                    }
+                SocketOutcome::Completed(received) => {
+                    let response = match received {
+                        litebox_broker_core::socket::PlatformStreamReceive::Received(data) => {
+                            let received = data.len();
+                            shared_buffers
+                                .write(request.buffer.slot_index, &data)
+                                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                            ReceiveSocketResponse::Received(
+                                received
+                                    .try_into()
+                                    .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?,
+                            )
+                        }
+                        litebox_broker_core::socket::PlatformStreamReceive::EndOfStream => {
+                            ReceiveSocketResponse::EndOfStream
+                        }
+                    };
                     Ok(SocketResponse::Receive(response))
                 }
                 SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
@@ -534,26 +545,22 @@ fn handle_socket_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            match litebox_broker_core::socket::receive_from(
+            match litebox_broker_core::socket::receive_from_owned(
                 session,
                 request.handle,
-                &mut data,
+                length,
                 request.flags,
             )
             .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(received) => {
                     shared_buffers
-                        .write(request.buffer.slot_index, &data[..received.received])
+                        .write(request.buffer.slot_index, &received.data)
                         .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
                     Ok(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
                         received: received
-                            .received
+                            .data
+                            .len()
                             .try_into()
                             .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?,
                         datagram_length: received
@@ -695,8 +702,8 @@ mod tests {
     use core::net::{Ipv4Addr, SocketAddrV4};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
-        AcceptedPlatformSocket, PlatformConnectError, PlatformSocket, ReceivedPlatformDatagram,
-        SocketProvider,
+        AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
+        PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -759,6 +766,7 @@ mod tests {
             &self,
             _session_id: SessionId,
             request: CreateSocketRequest,
+            _scope: litebox_broker_core::socket::PlatformSocketScope,
             readiness: ReadinessRegistration,
         ) -> litebox_broker_core::Result<Arc<dyn PlatformSocket>> {
             Ok(Arc::new(TestPlatformSocket {
@@ -778,24 +786,14 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
-            address: SocketAddrV4,
-        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
-            let address = if address.port() == 0 {
-                SocketAddrV4::new(*address.ip(), 49152)
-            } else {
-                address
-            };
-            Ok(SocketOutcome::Completed(address))
+            _address: SocketAddrV4,
+            _kind: litebox_broker_core::socket::PlatformBindKind,
+        ) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Completed(()))
         }
 
-        fn listen(
-            &self,
-            _backlog: u32,
-        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
-            Ok(SocketOutcome::Completed(SocketAddrV4::new(
-                Ipv4Addr::LOCALHOST,
-                49152,
-            )))
+        fn listen(&self, _backlog: u32) -> litebox_broker_core::Result<SocketOutcome<()>> {
+            Ok(SocketOutcome::Completed(()))
         }
 
         fn accept(
@@ -821,7 +819,7 @@ mod tests {
 
         fn send(
             &self,
-            data: &[u8],
+            data: Vec<u8>,
             _flags: SendFlags,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
             Ok(SocketOutcome::Completed(data.len()))
@@ -829,7 +827,7 @@ mod tests {
 
         fn send_to(
             &self,
-            data: &[u8],
+            data: Vec<u8>,
             _flags: SendFlags,
             _destination: Option<SocketAddrV4>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
@@ -838,27 +836,25 @@ mod tests {
 
         fn receive(
             &self,
-            data: &mut [u8],
+            length: usize,
             _flags: ReceiveFlags,
             _peek_offset: u32,
             _peek_length: u32,
-        ) -> litebox_broker_core::Result<SocketOutcome<ReceiveSocketResponse>> {
-            let received = data.len().min(3);
-            data[..received].copy_from_slice(&[4, 5, 6][..received]);
-            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
-                u32::try_from(received).unwrap(),
+        ) -> litebox_broker_core::Result<SocketOutcome<PlatformStreamReceive>> {
+            let received = length.min(3);
+            Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+                [4, 5, 6][..received].to_vec(),
             )))
         }
 
         fn receive_from(
             &self,
-            data: &mut [u8],
+            length: usize,
             _flags: ReceiveFromFlags,
-        ) -> litebox_broker_core::Result<SocketOutcome<ReceivedPlatformDatagram>> {
-            let received = data.len().min(3);
-            data[..received].copy_from_slice(&[4, 5, 6][..received]);
-            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
-                received,
+        ) -> litebox_broker_core::Result<SocketOutcome<PlatformDatagramReceive>> {
+            let received = length.min(3);
+            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                data: [4, 5, 6][..received].to_vec(),
                 datagram_length: 4,
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             }))
@@ -1363,7 +1359,7 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: None,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
                 pending_error: None,
             }))
         );
