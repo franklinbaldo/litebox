@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -58,8 +59,13 @@ static void *blocking_accept_thread(void *argument) {
     return NULL;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    assert(argc == 2);
+    char *end = NULL;
+    unsigned long guest_port = strtoul(argv[1], &end, 10);
+    assert(end != argv[1] && *end == '\0' && guest_port > 0 &&
+           guest_port <= UINT16_MAX);
 
     int listener =
         socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -67,7 +73,7 @@ int main(void) {
     struct sockaddr_in local = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-        .sin_port = 0,
+        .sin_port = htons((uint16_t)guest_port),
     };
     assert(bind(listener, (const struct sockaddr *)&local, sizeof(local)) == 0);
     assert(listen(listener, 8) == 0);

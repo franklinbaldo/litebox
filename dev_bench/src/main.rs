@@ -712,15 +712,18 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
         let client_sh = xshell::Shell::new()?;
         let max_server_attempts = 5;
         let max_client_attempts = 50;
+        let guest_port = "5201";
         let mut last_failure = "sandboxed server did not become ready".to_owned();
 
         for server_attempt in 1..=max_server_attempts {
-            let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
+            let host_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
                 .local_addr()?
                 .port()
                 .to_string();
             let mut server_command = std::process::Command::new(&broker);
             server_command
+                .arg("--publish-tcp")
+                .arg(format!("127.0.0.1:{host_port}:{guest_port}"))
                 .arg("--runner")
                 .arg(&runner)
                 .arg("--")
@@ -733,7 +736,7 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
                 ])
                 .arg(&tar_file)
                 .arg(&iperf3_rewritten)
-                .args(["-s", "-1", "-B", "127.0.0.1", "-p", &port]);
+                .args(["-s", "-1", "-B", "127.0.0.1", "-p", guest_port]);
             if COMMAND_EXECUTION_IS_QUIET.load(Relaxed) {
                 server_command
                     .stdout(std::process::Stdio::null())
@@ -749,7 +752,7 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
             for client_attempt in 1..=max_client_attempts {
                 let result = cmd!(
                     client_sh,
-                    "{iperf3_host} -c 127.0.0.1 -p {port} --bytes 1G --connect-timeout 50"
+                    "{iperf3_host} -c 127.0.0.1 -p {host_port} --bytes 1G --connect-timeout 50"
                 )
                 .quiet()
                 .ignore_stdout()

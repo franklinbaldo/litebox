@@ -4,7 +4,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -22,7 +22,7 @@ use litebox_broker_core::{
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
-use litebox_broker_platform_linux_userland::LinuxSocketProvider;
+use litebox_broker_platform_linux_userland::{LinuxSocketProvider, SocketPortMapping};
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
@@ -85,6 +85,36 @@ impl FromStr for AllowedTcpDestination {
     }
 }
 
+/// Command-line description of one host-to-guest TCP port mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PortMappingArgument {
+    host_address: SocketAddrV4,
+    guest_port: u16,
+}
+
+impl FromStr for PortMappingArgument {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (host_address, guest_port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| "expected HOST_IP:HOST_PORT:GUEST_PORT".to_owned())?;
+        let host_address = host_address
+            .parse::<SocketAddrV4>()
+            .map_err(|error| format!("invalid host IPv4 endpoint: {error}"))?;
+        let guest_port = guest_port
+            .parse::<u16>()
+            .map_err(|error| format!("invalid guest port: {error}"))?;
+        if host_address.port() == 0 || guest_port == 0 {
+            return Err("mapped host and guest ports must be nonzero".to_owned());
+        }
+        Ok(Self {
+            host_address,
+            guest_port,
+        })
+    }
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     /// Permit outbound TCP connections to a destination CIDR and port range.
@@ -93,6 +123,9 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_tcp_destination: Vec<AllowedTcpDestination>,
+    /// Publish a host IPv4 TCP endpoint to a guest-local TCP port.
+    #[arg(long, value_name = "HOST_IP:HOST_PORT:GUEST_PORT")]
+    publish_tcp: Vec<PortMappingArgument>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -110,11 +143,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
+    let port_mappings = configured_port_mappings(&args.publish_tcp);
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
             .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         limits,
-        Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
+        Arc::new(LinuxSocketProvider::new_with_port_mappings(
+            limits.max_sockets,
+            &port_mappings,
+        )?),
     )?;
 
     let mut runner_command = Command::new(&args.runner);
@@ -137,6 +174,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
     Ok(())
+}
+
+fn configured_port_mappings(tcp: &[PortMappingArgument]) -> Vec<SocketPortMapping> {
+    tcp.iter()
+        .map(|mapping| SocketPortMapping {
+            guest_port: mapping.guest_port,
+            host_address: mapping.host_address,
+        })
+        .collect()
 }
 
 fn configured_socket_policy(
@@ -561,6 +607,29 @@ mod tests {
                 .is_err()
         );
         assert!("203.0.113.0/24:0".parse::<AllowedTcpDestination>().is_err());
+    }
+
+    #[test]
+    fn socket_port_mapping_arguments_name_distinct_host_and_guest_ports() {
+        let mapping = "127.0.0.1:8080:80".parse::<PortMappingArgument>().unwrap();
+
+        assert_eq!(
+            mapping,
+            PortMappingArgument {
+                host_address: "127.0.0.1:8080".parse().unwrap(),
+                guest_port: 80,
+            }
+        );
+        assert!("127.0.0.1:0:80".parse::<PortMappingArgument>().is_err());
+        assert!("127.0.0.1:8080:0".parse::<PortMappingArgument>().is_err());
+        assert!("8080:80".parse::<PortMappingArgument>().is_err());
+        assert_eq!(
+            configured_port_mappings(&[mapping]),
+            vec![SocketPortMapping {
+                guest_port: 80,
+                host_address: "127.0.0.1:8080".parse().unwrap(),
+            }]
+        );
     }
 
     #[test]

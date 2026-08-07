@@ -342,6 +342,16 @@ fn spawn_test_broker(
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
+    spawn_test_broker_with_port_mappings(control_socket_path, policy, connection_count, Vec::new())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn spawn_test_broker_with_port_mappings(
+    control_socket_path: &Path,
+    policy: litebox_broker_core::PolicyEngine,
+    connection_count: usize,
+    port_mappings: Vec<litebox_broker_platform_linux_userland::SocketPortMapping>,
+) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -359,8 +369,9 @@ fn spawn_test_broker(
                 policy,
                 limits,
                 std::sync::Arc::new(
-                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
+                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new_with_port_mappings(
                         limits.max_sockets,
+                        &port_mappings,
                     )
                     .expect("failed to create broker test socket provider"),
                 ),
@@ -739,23 +750,36 @@ fn test_runner_broker_tcp_server_with_rewriter() {
     use std::net::{Ipv4Addr, TcpStream};
     use std::process::Stdio;
 
+    const GUEST_PORT: u16 = 18_080;
+
     let target = common::compile(
         "./tests/tcp_broker_server.c",
         "broker_tcp_server_rewriter",
         false,
         false,
     );
+    let host_listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let host_address = match host_listener.local_addr().unwrap() {
+        std::net::SocketAddr::V4(address) => address,
+        std::net::SocketAddr::V6(_) => unreachable!("IPv4 bind returned an IPv6 address"),
+    };
+    drop(host_listener);
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-server-control");
-    let broker = spawn_test_broker(
+    let broker = spawn_test_broker_with_port_mappings(
         &control_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
         .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
         1,
+        vec![litebox_broker_platform_linux_userland::SocketPortMapping {
+            guest_port: GUEST_PORT,
+            host_address,
+        }],
     );
     let mut child = Runner::new(&target, "broker_tcp_server_rewriter")
         .broker_socket(&control_socket_path)
+        .arg(GUEST_PORT.to_string())
         .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
     let stdout = child.stdout.take().unwrap();
     let (line_sender, line_receiver) = std::sync::mpsc::channel();
@@ -786,8 +810,9 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         };
 
     let listen = next_marker("LISTEN ");
-    let port = listen.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let mut first = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let port: u16 = listen.split_whitespace().nth(1).unwrap().parse().unwrap();
+    assert_eq!(port, GUEST_PORT);
+    let mut first = TcpStream::connect(host_address).unwrap();
     first.set_read_timeout(Some(BROKER_HELPER_TIMEOUT)).unwrap();
     first
         .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
@@ -813,7 +838,7 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         child.try_wait().unwrap().is_none(),
         "blocking accept returned before a client connected"
     );
-    let mut second = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let mut second = TcpStream::connect(host_address).unwrap();
     second
         .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
         .unwrap();
