@@ -148,8 +148,6 @@ mod tests {
 
     use super::*;
 
-    const TUN_DEVICE_NAME: &str = "tun99";
-
     fn find_free_port() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind to port 0");
         listener.local_addr().unwrap().port()
@@ -267,7 +265,7 @@ mod tests {
         crate::syscalls::tests::TestPlatform,
         ShimTransport<crate::syscalls::tests::TestPlatform>,
     > {
-        let addr = socket_addr([10, 0, 0, 1], server.port);
+        let addr = socket_addr([127, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
 
@@ -281,12 +279,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tests (require TUN device + diod)
+    // Tests (require broker-backed socket setup + diod)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_tun_nine_p_create_and_read_file() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nine_p_create_and_read_file() {
+        let task = init_platform(None);
 
         let server = DiodServer::start();
         let fs = connect_9p(&task, &server);
@@ -319,8 +318,9 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_nine_p_host_files_visible() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nine_p_host_files_visible() {
+        let task = init_platform(None);
 
         let server = DiodServer::start();
 

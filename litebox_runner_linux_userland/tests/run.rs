@@ -113,11 +113,6 @@ impl Runner {
         self
     }
 
-    fn tun_device_name(&mut self, tun_name: &str) -> &mut Self {
-        self.command.arg("--tun-device-name").arg(tun_name);
-        self
-    }
-
     #[cfg(target_arch = "x86_64")]
     fn guest_program_path(&mut self, guest_path: &str) -> &mut Self {
         self.cmd_path = PathBuf::from(guest_path);
@@ -396,16 +391,11 @@ fn spawn_test_broker(
                 let control_ring =
                     litebox_broker_transport::control_ring::ControlRing::new(control_memory)
                         .expect("failed to attach broker test control ring");
-                control_stream
-                    .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
-                    .expect("failed to configure broker test read timeout");
-                control_stream
-                    .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
-                    .expect("failed to configure broker test write timeout");
+                let setup_deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
                 let mut channel =
                     litebox_broker_transport_linux_userland::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
                         control_stream,
-                        std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
+                        setup_deadline,
                     );
                 let readiness = std::sync::Arc::new(
                     litebox_broker_userland::readiness::ReadinessPublisherRuntime::new(),
@@ -416,8 +406,8 @@ fn spawn_test_broker(
                     &shared_buffers,
                     readiness.clone(),
                     |channel| {
-                        channel.send_memfd(shared_buffers.memory(), None)?;
-                        channel.send_memfd(control_ring.memory(), None)
+                        channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
+                        channel.send_memfd(control_ring.memory(), Some(setup_deadline))
                     },
                 )
                 .expect("broker host setup failed")
@@ -1068,107 +1058,15 @@ fn test_runner_with_python_repl_pty() {
     );
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn test_tun_with_tcp_socket() {
-    let tcp_server_path = PathBuf::from("./tests/net/tcp_server.c");
-    let tcp_client_path = PathBuf::from("./tests/net/tcp_client.c");
-    let unique_name = "tcp_server_exec_rewriter";
-    let server_target =
-        common::compile(tcp_server_path.to_str().unwrap(), unique_name, true, false);
-    let client_target = common::compile(
-        tcp_client_path.to_str().unwrap(),
-        "tcp_client",
-        false,
-        false,
-    );
-
-    let child = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(2)); // wait for server to start
-        std::process::Command::new(client_target.to_str().unwrap())
-            .arg("10.0.0.2")
-            .arg("12345")
-            .status()
-            .expect("failed to execute client");
-    });
-    Runner::new(&server_target, unique_name)
-        .arg("10.0.0.2")
-        .arg("12345")
-        .tun_device_name("tun99")
-        .run();
-    child.join().unwrap();
-}
-
-/// Test network performance with iperf3
-///
-/// To run it with release build and see output, use:
-/// ```
-/// cargo test --package litebox_runner_linux_userland --test run --release -- test_tun_and_runner_with_iperf3 --exact --nocapture
-/// ```
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_tun_and_runner_with_iperf3() {
-    const NUM_CLIENTS: usize = 1;
-    let iperf3_path = run_which("iperf3");
-    let cloned_path = iperf3_path.clone();
-    let has_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let has_started_clone = has_started.clone();
-    std::thread::spawn(move || {
-        // Rewrite iperf3 and its dependencies may take some time, wait until it's done.
-        while !has_started_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        std::println!("Connecting iperf3 client...");
-        // Retry with a short connect-timeout instead of a fixed sleep, so we
-        // start the transfer as soon as the server is actually listening.
-        let mut connected = false;
-        for attempt in 1..=50 {
-            let status = std::process::Command::new(&cloned_path)
-                .args([
-                    "-c",
-                    "10.0.0.2",
-                    "-P",
-                    NUM_CLIENTS.to_string().leak(),
-                    "--connect-timeout",
-                    "50",
-                    "--time",
-                    "1",
-                ])
-                .status()
-                .expect("Failed to start iperf3 client");
-            if status.success() {
-                connected = true;
-                break;
-            }
-            std::eprintln!("iperf3 client attempt {attempt} failed, retrying");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            connected,
-            "iperf3 client failed to connect after 50 attempts"
-        );
-    });
-    let mut runner = Runner::new(&iperf3_path, "iperf3_server_rewriter");
-    runner
-        .args([
-            "-s", // run in server mode
-            "-1", // handle one client then exit
-            "-B", "10.0.0.2", // bind to this address
-        ])
-        .tun_device_name("tun99");
-    has_started.store(true, std::sync::atomic::Ordering::Relaxed);
-    runner.run();
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn test_tun_with_curl() {
+fn test_broker_with_curl() {
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{Ipv4Addr, TcpListener};
 
     const RESPONSE_BODY: &str = "#!/bin/bash\necho 'Hello from litebox!'\n";
 
-    // Bind to an OS-assigned port on all interfaces.
-    let listener = TcpListener::bind("0.0.0.0:0").expect("Failed to bind HTTP server");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("Failed to bind HTTP server");
     let port = listener.local_addr().unwrap().port();
 
     let server_thread = std::thread::spawn(move || {
@@ -1189,16 +1087,166 @@ fn test_tun_with_curl() {
     });
 
     let curl_path = run_which("curl");
-    let url = format!("http://10.0.0.1:{port}/something");
+    let control_socket_path = unique_test_socket_path("runner-broker-curl-control");
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        1,
+    );
+    let url = format!("http://127.0.0.1:{port}/something");
     let output = Runner::new(&curl_path, "curl_rewriter")
         .args(["-sS", &url])
-        .tun_device_name("tun99")
+        .broker_socket(&control_socket_path)
         .output();
 
     server_thread.join().expect("Server thread panicked");
+    assert!(broker.next_close_object_count() > 0);
+    broker.join();
 
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
+
+/// Exercises sustained brokered TCP traffic and backpressure with iperf3.
+///
+/// To run it with a release build and see output:
+/// ```
+/// cargo test --package litebox_runner_linux_userland --test run --release -- test_broker_with_iperf3 --exact --nocapture
+/// ```
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_broker_with_iperf3() {
+    use std::io::{BufRead, BufReader};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::process::Stdio;
+
+    const IPERF_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let iperf3_path = run_which("iperf3");
+    let control_socket_path = unique_test_socket_path("runner-broker-iperf3-control");
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        1,
+    );
+
+    let mut last_server_output = String::new();
+    let mut started_server = None;
+    for _ in 0..5 {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve iperf3 port")
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut server = std::process::Command::new(&iperf3_path)
+            .args([
+                "-s",
+                "-1",
+                "--forceflush",
+                "-B",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to start iperf3 server");
+        let server_stdout = server.stdout.take().unwrap();
+        let (listening_tx, listening_rx) = std::sync::mpsc::channel();
+        let server_output = std::thread::spawn(move || {
+            let mut stdout = BufReader::new(server_stdout);
+            let mut output = String::new();
+            let mut listening_reported = false;
+            loop {
+                let mut line = String::new();
+                if stdout
+                    .read_line(&mut line)
+                    .expect("failed to read iperf3 server output")
+                    == 0
+                {
+                    break;
+                }
+                output.push_str(&line);
+                if !listening_reported && line.contains("Server listening") {
+                    listening_reported = true;
+                    let _ = listening_tx.send(());
+                }
+            }
+            output
+        });
+        if listening_rx.recv_timeout(BROKER_HELPER_TIMEOUT).is_ok() {
+            started_server = Some((port, server, server_output));
+            break;
+        }
+        let _ = server.kill();
+        let _ = server.wait();
+        last_server_output = server_output.join().unwrap();
+    }
+    let (port, mut server, server_output) = started_server
+        .unwrap_or_else(|| panic!("iperf3 server did not start; output:\n{last_server_output}"));
+
+    let mut runner = Runner::new(&iperf3_path, "broker_iperf3_client_rewriter");
+    runner
+        .args([
+            "-c",
+            "127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "--connect-timeout",
+            "1000",
+            "--bytes",
+            "1M",
+        ])
+        .broker_socket(&control_socket_path);
+
+    let mut guest = runner.spawn_with_stdio(Stdio::null(), Stdio::inherit(), Stdio::inherit());
+    let deadline = std::time::Instant::now() + IPERF_TEST_TIMEOUT;
+    let mut guest_status = None;
+    let mut server_status = None;
+    while guest_status.is_none() || server_status.is_none() {
+        if guest_status.is_none() {
+            guest_status = guest.try_wait().expect("failed to wait for iperf3 guest");
+        }
+        if server_status.is_none() {
+            server_status = server.try_wait().expect("failed to wait for iperf3 server");
+        }
+        if guest_status.is_some() && server_status.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            if guest_status.is_none() {
+                guest.kill().expect("failed to stop iperf3 guest");
+                let _ = guest.wait();
+            }
+            if server_status.is_none() {
+                server.kill().expect("failed to stop iperf3 server");
+                let _ = server.wait();
+            }
+            let output = server_output.join().unwrap();
+            panic!("iperf3 test did not finish; server output:\n{output}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let guest_status = guest.wait().expect("failed to reap iperf3 guest");
+    let server_status = server.wait().expect("failed to reap iperf3 server");
+    let server_output = server_output.join().unwrap();
+    assert!(
+        guest_status.success(),
+        "iperf3 guest failed; server output:\n{server_output}"
+    );
+    assert!(
+        server_status.success(),
+        "iperf3 server failed; output:\n{server_output}"
+    );
+    assert!(broker.next_close_object_count() > 0);
+    broker.join();
 }
 
 #[cfg(target_arch = "x86_64")]

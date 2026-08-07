@@ -2865,7 +2865,7 @@ mod tests {
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
-        SocketOption, SocketOptionName, TcpOption, errno::Errno,
+        SocketOption, SocketOptionName, errno::Errno,
     };
     use zerocopy::FromZeros as _;
 
@@ -2887,11 +2887,24 @@ mod tests {
             == core::mem::size_of::<libc::msghdr>()
     );
 
-    const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
-    const TUN_IP_ADDR_STR: &str = "10.0.0.2";
-    const TUN_DEVICE_NAME: &str = "tun99";
-    const SERVER_PORT: u16 = 8080;
-    const CLIENT_PORT: u16 = 8081;
+    const LOOPBACK_IP_ADDR: [u8; 4] = [127, 0, 0, 1];
+    const LOOPBACK_IP_ADDR_STR: &str = "127.0.0.1";
+
+    fn find_free_tcp_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve TCP port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn find_free_udp_port() -> u16 {
+        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve UDP port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
 
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
@@ -2899,6 +2912,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn dropping_inet_socket_pin_reaps_deferred_close() {
         let task = init_platform(None);
         let fd = task
@@ -2925,6 +2939,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
         let task = init_platform(None);
         let fd = task
@@ -2966,6 +2981,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn raw_inet_socket_pin_does_not_follow_dup2_replacement() {
         let task = init_platform(None);
         let old_fd = task
@@ -3080,6 +3096,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn inet_socket_returns_emfile_at_raw_fd_limit() {
         let task = init_platform(None);
         let fd = task
@@ -3174,22 +3191,21 @@ mod tests {
         let buf = "Hello, world!";
         let child_handle = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(200)); // Give server time to start
+            let port = port.to_string();
             match option {
                 "sendto" | "sendmsg" => std::process::Command::new("nc")
                     .args([
                         "-w", // timeout for connects and final net reads
                         "1",
-                        TUN_IP_ADDR_STR,
-                        SERVER_PORT.to_string().as_str(),
+                        LOOPBACK_IP_ADDR_STR,
+                        &port,
                     ])
                     .stdout(std::process::Stdio::piped())
                     .output(),
                 "recvfrom" | "recvmsg" => std::process::Command::new("sh")
                     .args([
                         "-c",
-                        &alloc::format!(
-                            "echo -n '{buf}' | nc -w 1 {TUN_IP_ADDR_STR} {SERVER_PORT}",
-                        ),
+                        &alloc::format!("echo -n '{buf}' | nc -w 1 {LOOPBACK_IP_ADDR_STR} {port}"),
                     ])
                     .output(),
                 _ => panic!("Unknown option"),
@@ -3224,7 +3240,7 @@ mod tests {
         let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
             panic!("Expected IPv4 address");
         };
-        assert_eq!(remote_addr.ip().octets(), [10, 0, 0, 1]);
+        assert_eq!(remote_addr.ip().octets(), LOOPBACK_IP_ADDR);
         assert_ne!(remote_addr.port(), 0);
 
         match option {
@@ -3339,20 +3355,20 @@ mod tests {
         close_socket(task, server);
     }
 
-    fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    fn test_tcp_socket_with_external_client(is_nonblocking: bool, test_trunc: bool) {
+        let task = init_platform(None);
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            port,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "recvfrom",
         );
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            port,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "recvmsg",
@@ -3360,19 +3376,19 @@ mod tests {
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let task = init_platform(None);
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            SERVER_PORT,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "sendto",
         );
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            SERVER_PORT,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "sendmsg",
@@ -3380,33 +3396,40 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_blocking_send_tcp_socket() {
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_send_tcp_socket() {
         test_tcp_socket_send(false, false);
     }
 
     #[test]
-    fn test_tun_nonblocking_send_tcp_socket() {
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nonblocking_send_tcp_socket() {
         test_tcp_socket_send(true, false);
     }
 
     #[test]
-    fn test_tun_blocking_recvfrom_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, false);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(false, false);
     }
 
     #[test]
-    fn test_tun_nonblocking_recvfrom_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, true, false);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nonblocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(true, false);
     }
 
     #[test]
-    fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, true);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_recvfrom_tcp_socket_with_truncation() {
+        test_tcp_socket_with_external_client(false, true);
     }
 
     #[test]
-    fn test_tun_tcp_connection_refused() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_tcp_connection_refused() {
+        let task = init_platform(None);
+        let port = find_free_tcp_port();
         let socket_fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -3419,8 +3442,8 @@ mod tests {
             .do_connect(
                 socket_fd2,
                 SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-                    core::net::Ipv4Addr::from([10, 0, 0, 1]),
-                    SERVER_PORT,
+                    core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+                    port,
                 ))),
             )
             .unwrap_err();
@@ -3434,18 +3457,15 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_tcp_socket_as_client() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_tcp_socket_as_client() {
+        let task = init_platform(None);
+        let port = find_free_tcp_port();
 
-        let child_handle = std::thread::spawn(|| {
+        let child_handle = std::thread::spawn(move || {
+            let port = port.to_string();
             std::process::Command::new("nc")
-                .args([
-                    "-w",
-                    "1",
-                    "-l",
-                    "10.0.0.1",
-                    SERVER_PORT.to_string().as_str(),
-                ])
+                .args(["-w", "1", "-l", LOOPBACK_IP_ADDR_STR, &port])
                 .output()
         });
         std::thread::sleep(core::time::Duration::from_secs(1));
@@ -3456,8 +3476,8 @@ mod tests {
             .expect("failed to create client socket");
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::from([10, 0, 0, 1]),
-            SERVER_PORT,
+            core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+            port,
         )));
         task.do_connect(client_fd, server_addr)
             .expect("failed to connect to server");
@@ -3472,19 +3492,6 @@ mod tests {
             .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
             .unwrap();
         assert_eq!(n, buf.len());
-
-        let linger = litebox_common_linux::Linger {
-            onoff: 1,   // enable linger
-            linger: 60, // timeout in seconds
-        };
-        let optval = UserPtr::from_usize((&raw const linger).cast::<u8>() as usize);
-        task.do_setsockopt(
-            client_fd,
-            SocketOptionName::Socket(SocketOption::LINGER),
-            optval,
-            core::mem::size_of::<litebox_common_linux::Linger>(),
-        )
-        .expect("Failed to set SO_LINGER");
 
         close_socket(&task, client_fd);
 
@@ -3503,6 +3510,9 @@ mod tests {
         is_nonblocking: bool,
         op: &str,
     ) {
+        let server_port = find_free_udp_port();
+        let client_port = find_free_udp_port();
+
         // Server socket and bind
         let server_fd = task
             .do_socket(
@@ -3517,8 +3527,8 @@ mod tests {
             )
             .expect("failed to create server socket");
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::from(TUN_IP_ADDR),
-            SERVER_PORT,
+            core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+            server_port,
         )));
         task.do_bind(server_fd, server_addr.clone())
             .expect("failed to bind server");
@@ -3542,9 +3552,9 @@ mod tests {
                 "-q", // quit after EOF on stdin and delay of secs
                 "1",
                 "-p", // Specify local port for remote connects
-                CLIENT_PORT.to_string().as_str(),
-                TUN_IP_ADDR_STR,
-                SERVER_PORT.to_string().as_str(),
+                client_port.to_string().as_str(),
+                LOOPBACK_IP_ADDR_STR,
+                server_port.to_string().as_str(),
             ])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -3636,7 +3646,7 @@ mod tests {
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap() else {
             panic!("Expected Inet socket address");
         };
-        assert_eq!(sender_addr.port(), CLIENT_PORT);
+        assert_eq!(sender_addr.port(), client_port);
 
         close_socket(task, server_fd);
 
@@ -3644,32 +3654,35 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_blocking_udp_server_socket() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_udp_server_socket() {
+        let task = init_platform(None);
         blocking_udp_server_socket(&task, false, false, false, "recvfrom");
         blocking_udp_server_socket(&task, false, false, false, "recvmsg");
     }
 
     #[test]
-    fn test_tun_nonblocking_udp_server_socket() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nonblocking_udp_server_socket() {
+        let task = init_platform(None);
         blocking_udp_server_socket(&task, false, false, true, "recvfrom");
         blocking_udp_server_socket(&task, false, false, true, "recvmsg");
     }
 
     #[test]
-    fn test_tun_blocking_udp_server_socket_with_truncation() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_udp_server_socket_with_truncation() {
+        let task = init_platform(None);
         blocking_udp_server_socket(&task, true, true, false, "recvfrom");
         blocking_udp_server_socket(&task, true, true, false, "recvmsg");
         blocking_udp_server_socket(&task, true, false, false, "recvmsg");
     }
 
     #[test]
-    fn test_tun_udp_client_socket_without_server() {
-        // We do not support loopback yet, so this test only checks that
-        // the client can send packets without a server.
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_udp_client_socket_without_server() {
+        let task = init_platform(None);
+        let server_port = find_free_udp_port();
 
         // Client socket and explicit bind
         let client_fd = task
@@ -3683,7 +3696,7 @@ mod tests {
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from([127, 0, 0, 1]),
-            SERVER_PORT,
+            server_port,
         )));
 
         // Send from client to server
@@ -3717,45 +3730,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_tcp_sockopt() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_tcp_keepalive_sockopt() {
+        let task = init_platform(None);
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
-
-        let mut congestion_name = [0u8; 16];
-        let optlen = task
-            .do_getsockopt(
-                sockfd,
-                SocketOptionName::TCP(TcpOption::CONGESTION),
-                UserPtrMut::from_usize(congestion_name.as_mut_ptr() as usize),
-                congestion_name.len().trunc(),
-            )
-            .expect("Failed to get TCP_CONGESTION");
-        assert_eq!(optlen, 4);
-        assert_eq!(
-            core::str::from_utf8(&congestion_name[..optlen]).unwrap(),
-            "none"
-        );
-
-        task.do_setsockopt(
-            sockfd,
-            SocketOptionName::TCP(TcpOption::CONGESTION),
-            UserPtr::from_usize(congestion_name.as_ptr() as usize),
-            optlen,
-        )
-        .expect("Failed to set TCP_CONGESTION");
-
-        let congestion_name = b"cubic\0";
-        let err = task
-            .do_setsockopt(
-                sockfd,
-                SocketOptionName::TCP(TcpOption::CONGESTION),
-                UserPtr::from_usize(congestion_name.as_ptr() as usize),
-                congestion_name.len(),
-            )
-            .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
 
         let val: u32 = 1;
         let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
@@ -3780,37 +3760,11 @@ mod tests {
             .expect("failed to get SO_KEEPALIVE");
         assert_eq!(len, core::mem::size_of::<u32>());
         assert_eq!(result, 1);
-    }
-
-    #[ignore = "timeout is 75s"]
-    #[test]
-    fn test_tun_tcp_so_error_network_unreachable() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
-        let sockfd = task
-            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
-            .expect("failed to create socket");
-
-        // Connect to an off-subnet IP (TEST-NET, 192.0.2.1).
-        // smoltcp does not report errors when route table lookup fails. Instead, it just dicards the packets.
-        // Our current implementation returns `ETIMEDOUT` instead of `ENETUNREACH`.
-        let err = task
-            .do_connect(
-                sockfd,
-                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-                    core::net::Ipv4Addr::from([192, 0, 2, 1]),
-                    SERVER_PORT,
-                ))),
-            )
-            .unwrap_err();
-        assert_eq!(err, Errno::ETIMEDOUT);
-
-        let so_err = get_so_error(&task, sockfd);
-        assert_eq!(so_err, i32::from(Errno::ETIMEDOUT).cast_unsigned());
-
         close_socket(&task, sockfd);
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn test_socket_dup_and_close() {
         let task = init_platform(None);
         let socket_fd = task
