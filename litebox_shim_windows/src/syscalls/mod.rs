@@ -374,6 +374,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         byte_offset: Option<Platform::RawConstPointer<i64>>,
         key: Option<Platform::RawConstPointer<u32>>,
     },
+    NtQueryDebugFilterState {
+        component_id: u32,
+        level: u32,
+    },
     NtQueryVolumeInformationFile {
         file_handle: Handle,
         io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
@@ -688,6 +692,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         flags: u32,
         field_size: u32,
         fields: Platform::RawConstPointer<trace::EventHeader>,
+    },
+    NtTraceControl {
+        function_code: u32,
+        input_buffer: Platform::RawConstPointer<u32>,
+        input_buffer_length: u32,
+        output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_length: u32,
+        return_length: Platform::RawMutPointer<u32>,
     },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
@@ -1047,6 +1059,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 byte_offset:*,
                 key:*,
             })),
+            NtSysno::NtQueryDebugFilterState => Some(sys_req!(NtQueryDebugFilterState {
+                component_id,
+                level,
+            })),
             NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(NtQueryVolumeInformationFile {
                 file_handle:{Handle::from_raw},
                 io_status_block:*,
@@ -1371,6 +1387,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 flags,
                 field_size,
                 fields:*,
+            })),
+            NtSysno::NtTraceControl => Some(sys_req!(NtTraceControl {
+                function_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
+                return_length:*,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },
