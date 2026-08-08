@@ -451,9 +451,9 @@ fn service(
                 Err(message) => Response::error(message),
             }
         }
-        // `serve` handles Shutdown before it gets here, and `Request::decode`
-        // refuses to produce a Response opcode at all.
-        Opcode::Shutdown | Opcode::Response => {
+        // `serve` handles Shutdown and LoadBinary before they get here, and
+        // `Request::decode` refuses to produce a Response opcode at all.
+        Opcode::Shutdown | Opcode::LoadBinary | Opcode::Response => {
             Response::error(format!("opcode {:?} is not a request", request.opcode))
         }
     }

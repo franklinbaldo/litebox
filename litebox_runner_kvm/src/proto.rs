@@ -64,7 +64,26 @@ pub const VERSION: u16 = 1;
 /// whole, so an unbounded length would be a trivial remote exhaustion; a TA
 /// parameter set that does not fit in a megabyte is not something this cut
 /// supports anyway.
+///
+/// Binaries do **not** raise this. `kmpp-ta.elf` is 2.5 MB, which would have
+/// forced this constant to at least 4 MiB had a binary been sent in one
+/// frame -- and this constant does not only bound binaries. It also bounds
+/// every memref parameter, the accumulated receive buffer in
+/// [`crate::ta::Channel`], and the clamp `crate::ta::read_user_bytes` applies
+/// to a length a *TA* left in its `UteeParams`. Raising it to accommodate one
+/// message type would silently loosen the bound on all of those. So binaries
+/// are chunked instead ([`Opcode::LoadBinary`]) and get their own, separately
+/// justified bound, [`MAX_BINARY_LEN`].
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
+
+/// Largest binary the guest will accept over [`Opcode::LoadBinary`].
+///
+/// 8 MiB. The largest artifact in the tree today is `kmpp-ta.elf` at 2.5 MB,
+/// so this is roughly a 3x headroom; it is also under 2% of the guest's ~495
+/// MB heap, and two of them (ldelf and the TA) are held at once. The declared
+/// total is checked against this **before** the receiving buffer is reserved,
+/// so a peer that announces a 4 GiB binary costs nothing.
+pub const MAX_BINARY_LEN: usize = 8 * 1024 * 1024;
 
 /// Maximum number of parameters in a request or response.
 ///
@@ -106,6 +125,21 @@ pub enum Error {
     TrailingBytes { remaining: usize },
     /// A string field was not valid UTF-8.
     NotUtf8,
+    /// A [`Opcode::LoadBinary`] frame named no known [`BinaryTarget`].
+    UnknownBinaryTarget { target: u8 },
+    /// A [`Opcode::LoadBinary`] frame declared a total size over
+    /// [`MAX_BINARY_LEN`].
+    BinaryTooLong { total_len: usize },
+    /// A [`Opcode::LoadBinary`] chunk does not fit inside the total it
+    /// declares. Caught in the decoder rather than in the guest, because
+    /// `offset + len > total_len` is a statement about the *frame*, and
+    /// letting it through would leave every consumer to re-derive the same
+    /// check.
+    BinaryChunkOutOfRange {
+        offset: usize,
+        chunk_len: usize,
+        total_len: usize,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -139,6 +173,21 @@ impl core::fmt::Display for Error {
                 write!(f, "{remaining} bytes left over after the frame")
             }
             Self::NotUtf8 => f.write_str("a string field is not valid UTF-8"),
+            Self::UnknownBinaryTarget { target } => {
+                write!(f, "unknown binary target {target}")
+            }
+            Self::BinaryTooLong { total_len } => write!(
+                f,
+                "binary declares {total_len} bytes, over the {MAX_BINARY_LEN}-byte limit"
+            ),
+            Self::BinaryChunkOutOfRange {
+                offset,
+                chunk_len,
+                total_len,
+            } => write!(
+                f,
+                "chunk of {chunk_len} bytes at offset {offset} does not fit in {total_len} bytes"
+            ),
         }
     }
 }
@@ -170,6 +219,8 @@ pub enum Opcode {
     Shutdown = 4,
     /// A reply. Only ever sent guest to host.
     Response = 5,
+    /// Deliver one chunk of `ldelf` or of the TA. See [`LoadChunk`].
+    LoadBinary = 6,
 }
 
 impl Opcode {
@@ -180,8 +231,67 @@ impl Opcode {
             3 => Ok(Self::CloseSession),
             4 => Ok(Self::Shutdown),
             5 => Ok(Self::Response),
+            6 => Ok(Self::LoadBinary),
             opcode => Err(Error::UnknownOpcode { opcode }),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary loading.
+// ---------------------------------------------------------------------------
+
+/// Which of the two binaries a [`LoadChunk`] belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum BinaryTarget {
+    /// OP-TEE's user-mode loader.
+    Ldelf = 1,
+    /// The trusted application ldelf will map.
+    Ta = 2,
+}
+
+impl BinaryTarget {
+    fn from_raw(raw: u8) -> Result<Self, Error> {
+        match raw {
+            1 => Ok(Self::Ldelf),
+            2 => Ok(Self::Ta),
+            target => Err(Error::UnknownBinaryTarget { target }),
+        }
+    }
+
+    /// The name used in log lines and error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ldelf => "ldelf",
+            Self::Ta => "the TA",
+        }
+    }
+}
+
+/// One slice of a binary being shipped into the guest.
+///
+/// Binaries are *chunked* rather than sent whole; see [`MAX_FRAME_LEN`] for
+/// why. Every chunk restates `total_len` so that the receiver can size its
+/// buffer from the first frame it sees and can reject a peer that changes its
+/// mind mid-transfer, and carries an explicit `offset` so that a lost or
+/// reordered chunk is a detected error rather than a silently corrupt ELF.
+/// The transfer is append-only: the guest requires `offset` to equal exactly
+/// what it already holds.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LoadChunk {
+    pub target: BinaryTarget,
+    /// The size of the whole binary, repeated in every chunk.
+    pub total_len: usize,
+    /// Where `data` belongs within it.
+    pub offset: usize,
+    pub data: Box<[u8]>,
+}
+
+impl LoadChunk {
+    /// True when this chunk ends the binary.
+    pub fn is_last(&self) -> bool {
+        self.offset + self.data.len() == self.total_len
     }
 }
 
@@ -316,6 +426,15 @@ impl Param {
 // ---------------------------------------------------------------------------
 
 /// A request, host to guest.
+///
+/// # Invariant
+///
+/// `load.is_some()` exactly when `opcode == Opcode::LoadBinary`. [`decode`]
+/// establishes it and [`encode`] asserts it, so no consumer has to check
+/// both.
+///
+/// [`decode`]: Request::decode
+/// [`encode`]: Request::encode
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Request {
     pub opcode: Opcode,
@@ -323,6 +442,31 @@ pub struct Request {
     /// carried unconditionally so every request has one shape.
     pub cmd_id: u32,
     pub params: Vec<Param>,
+    /// The binary chunk, for [`Opcode::LoadBinary`] and nothing else.
+    pub load: Option<LoadChunk>,
+}
+
+impl Request {
+    /// A request that carries no binary: everything except
+    /// [`Opcode::LoadBinary`].
+    pub fn simple(opcode: Opcode, cmd_id: u32, params: Vec<Param>) -> Self {
+        Self {
+            opcode,
+            cmd_id,
+            params,
+            load: None,
+        }
+    }
+
+    /// A [`Opcode::LoadBinary`] request.
+    pub fn load(chunk: LoadChunk) -> Self {
+        Self {
+            opcode: Opcode::LoadBinary,
+            cmd_id: 0,
+            params: Vec::new(),
+            load: Some(chunk),
+        }
+    }
 }
 
 /// A reply, guest to host.
@@ -358,6 +502,39 @@ impl Request {
     /// local programming error -- the guest never encodes a request -- and the
     /// only requests this crate builds are in its own tests.
     pub fn encode(&self) -> Vec<u8> {
+        assert_eq!(
+            self.load.is_some(),
+            self.opcode == Opcode::LoadBinary,
+            "a request carries a binary chunk exactly when its opcode is LoadBinary"
+        );
+        if let Some(chunk) = self.load.as_ref() {
+            assert!(
+                chunk.total_len <= MAX_BINARY_LEN,
+                "binary of {} bytes is over the {MAX_BINARY_LEN}-byte limit",
+                chunk.total_len
+            );
+            assert!(
+                chunk.offset + chunk.data.len() <= chunk.total_len,
+                "chunk of {} bytes at offset {} does not fit in {} bytes",
+                chunk.data.len(),
+                chunk.offset,
+                chunk.total_len
+            );
+            let mut payload = Vec::with_capacity(chunk.data.len() + 16);
+            payload.push(chunk.target as u8);
+            payload.extend_from_slice(
+                &u32::try_from(chunk.total_len)
+                    .expect("bounded above")
+                    .to_le_bytes(),
+            );
+            payload.extend_from_slice(
+                &u32::try_from(chunk.offset)
+                    .expect("bounded above")
+                    .to_le_bytes(),
+            );
+            put_bytes(&mut payload, &chunk.data);
+            return frame(self.opcode, &payload);
+        }
         // `Shutdown` carries nothing, so it is encoded as nothing. The
         // alternative -- emit the cmd_id and an empty parameter list anyway --
         // would make the encoder and the decoder disagree about what a
@@ -379,25 +556,42 @@ impl Request {
                 opcode: Opcode::Response as u16,
             });
         }
+        if opcode == Opcode::LoadBinary {
+            let target = BinaryTarget::from_raw(r.u8()?)?;
+            let total_len = r.u32()? as usize;
+            // Bounded before `bytes()` below is allowed to allocate anything,
+            // and before the guest sizes a buffer from it.
+            if total_len > MAX_BINARY_LEN {
+                return Err(Error::BinaryTooLong { total_len });
+            }
+            let offset = r.u32()? as usize;
+            let data = r.bytes()?;
+            if offset.saturating_add(data.len()) > total_len {
+                return Err(Error::BinaryChunkOutOfRange {
+                    offset,
+                    chunk_len: data.len(),
+                    total_len,
+                });
+            }
+            r.finish()?;
+            return Ok(Self::load(LoadChunk {
+                target,
+                total_len,
+                offset,
+                data,
+            }));
+        }
         // `Shutdown` carries nothing at all. Requiring an empty payload rather
         // than skipping whatever is there keeps the "no trailing bytes" rule
         // uniform.
         if opcode == Opcode::Shutdown {
             r.finish()?;
-            return Ok(Self {
-                opcode,
-                cmd_id: 0,
-                params: Vec::new(),
-            });
+            return Ok(Self::simple(opcode, 0, Vec::new()));
         }
         let cmd_id = r.u32()?;
         let params = get_params(&mut r)?;
         r.finish()?;
-        Ok(Self {
-            opcode,
-            cmd_id,
-            params,
-        })
+        Ok(Self::simple(opcode, cmd_id, params))
     }
 }
 
@@ -715,11 +909,7 @@ mod tests {
             Opcode::InvokeCommand,
             Opcode::CloseSession,
         ] {
-            let request = Request {
-                opcode,
-                cmd_id: 7,
-                params: all_params(),
-            };
+            let request = Request::simple(opcode, 7, all_params());
             let encoded = request.encode();
             assert_eq!(Request::decode(&encoded), Ok(request), "opcode {opcode:?}");
         }
@@ -727,11 +917,7 @@ mod tests {
 
     #[test]
     fn shutdown_round_trips_and_carries_nothing() {
-        let request = Request {
-            opcode: Opcode::Shutdown,
-            cmd_id: 0,
-            params: Vec::new(),
-        };
+        let request = Request::simple(Opcode::Shutdown, 0, Vec::new());
         let encoded = request.encode();
         // The header alone: no cmd_id, no parameter count.
         assert_eq!(encoded.len(), HEADER_LEN);
@@ -779,11 +965,7 @@ mod tests {
                 data: Box::from(&b"in and out"[..]),
             },
         ] {
-            let request = Request {
-                opcode: Opcode::InvokeCommand,
-                cmd_id: 0,
-                params: vec![param.clone()],
-            };
+            let request = Request::simple(Opcode::InvokeCommand, 0, vec![param.clone()]);
             let encoded = request.encode();
             assert_eq!(
                 Request::decode(&encoded).map(|r| r.params),
@@ -815,11 +997,7 @@ mod tests {
             Request::decode(&response.encode()),
             Err(Error::UnknownOpcode { opcode: 5 })
         ));
-        let request = Request {
-            opcode: Opcode::CloseSession,
-            cmd_id: 0,
-            params: Vec::new(),
-        };
+        let request = Request::simple(Opcode::CloseSession, 0, Vec::new());
         assert!(matches!(
             Response::decode(&request.encode()),
             Err(Error::UnknownOpcode { opcode: 3 })
@@ -828,12 +1006,7 @@ mod tests {
 
     #[test]
     fn truncation_at_every_length_is_an_error_not_a_panic() {
-        let encoded = Request {
-            opcode: Opcode::InvokeCommand,
-            cmd_id: 9,
-            params: all_params(),
-        }
-        .encode();
+        let encoded = Request::simple(Opcode::InvokeCommand, 9, all_params()).encode();
         for cut in 0..encoded.len() {
             assert!(
                 Request::decode(&encoded[..cut]).is_err(),
@@ -845,12 +1018,7 @@ mod tests {
 
     #[test]
     fn a_length_larger_than_the_buffer_is_truncated() {
-        let mut encoded = Request {
-            opcode: Opcode::CloseSession,
-            cmd_id: 0,
-            params: Vec::new(),
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::CloseSession, 0, Vec::new()).encode();
         encoded[..4].copy_from_slice(&1000_u32.to_le_bytes());
         assert_eq!(
             Request::decode(&encoded),
@@ -864,12 +1032,7 @@ mod tests {
 
     #[test]
     fn a_length_over_the_maximum_is_rejected_without_allocating() {
-        let mut encoded = Request {
-            opcode: Opcode::CloseSession,
-            cmd_id: 0,
-            params: Vec::new(),
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::CloseSession, 0, Vec::new()).encode();
         encoded[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
             Request::decode(&encoded),
@@ -898,12 +1061,7 @@ mod tests {
 
     #[test]
     fn an_unknown_version_is_rejected() {
-        let mut encoded = Request {
-            opcode: Opcode::OpenSession,
-            cmd_id: 0,
-            params: Vec::new(),
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::OpenSession, 0, Vec::new()).encode();
         encoded[4..6].copy_from_slice(&99_u16.to_le_bytes());
         assert_eq!(
             Request::decode(&encoded),
@@ -913,12 +1071,7 @@ mod tests {
 
     #[test]
     fn an_unknown_opcode_is_rejected() {
-        let mut encoded = Request {
-            opcode: Opcode::OpenSession,
-            cmd_id: 0,
-            params: Vec::new(),
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::OpenSession, 0, Vec::new()).encode();
         encoded[6..8].copy_from_slice(&4242_u16.to_le_bytes());
         assert_eq!(
             Request::decode(&encoded),
@@ -928,12 +1081,7 @@ mod tests {
 
     #[test]
     fn an_unknown_param_tag_is_rejected() {
-        let mut encoded = Request {
-            opcode: Opcode::InvokeCommand,
-            cmd_id: 0,
-            params: vec![Param::None],
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::InvokeCommand, 0, vec![Param::None]).encode();
         // ... len, version, opcode, cmd_id, count, tag.
         let tag_index = encoded.len() - 1;
         encoded[tag_index] = 200;
@@ -945,12 +1093,7 @@ mod tests {
 
     #[test]
     fn too_many_params_is_rejected_before_allocating() {
-        let mut encoded = Request {
-            opcode: Opcode::InvokeCommand,
-            cmd_id: 0,
-            params: Vec::new(),
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::InvokeCommand, 0, Vec::new()).encode();
         // The count byte is the last one, and claiming 255 parameters must not
         // reserve room for them.
         let count_index = encoded.len() - 1;
@@ -963,13 +1106,13 @@ mod tests {
 
     #[test]
     fn a_memref_length_larger_than_the_frame_is_truncated() {
-        let mut encoded = Request {
-            opcode: Opcode::InvokeCommand,
-            cmd_id: 0,
-            params: vec![Param::MemrefInput {
+        let mut encoded = Request::simple(
+            Opcode::InvokeCommand,
+            0,
+            vec![Param::MemrefInput {
                 data: Box::from(&b"abcd"[..]),
             }],
-        }
+        )
         .encode();
         // Overwrite the memref's own length prefix -- the last four bytes
         // before the data -- with something enormous. The frame's `len` is
@@ -987,12 +1130,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_are_rejected() {
-        let mut encoded = Request {
-            opcode: Opcode::CloseSession,
-            cmd_id: 0,
-            params: Vec::new(),
-        }
-        .encode();
+        let mut encoded = Request::simple(Opcode::CloseSession, 0, Vec::new()).encode();
         encoded.push(0);
         assert_eq!(
             Request::decode(&encoded),
@@ -1002,18 +1140,191 @@ mod tests {
 
     #[test]
     fn bytes_needed_walks_a_stream() {
-        let encoded = Request {
-            opcode: Opcode::InvokeCommand,
-            cmd_id: 1,
-            params: all_params(),
-        }
-        .encode();
+        let encoded = Request::simple(Opcode::InvokeCommand, 1, all_params()).encode();
         assert_eq!(bytes_needed(&[]), Ok(Some(4)));
         assert_eq!(bytes_needed(&encoded[..2]), Ok(Some(2)));
         for cut in 4..encoded.len() {
             assert_eq!(bytes_needed(&encoded[..cut]), Ok(Some(encoded.len() - cut)));
         }
         assert_eq!(bytes_needed(&encoded), Ok(None));
+    }
+
+    // -----------------------------------------------------------------
+    // Binary loading.
+    // -----------------------------------------------------------------
+
+    /// Builds a `LoadBinary` frame from raw field values, bypassing the
+    /// encoder's own assertions. Several of the tests below need to produce
+    /// frames the encoder would refuse to build.
+    fn load_frame(target: u8, total_len: u32, offset: u32, data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(target);
+        payload.extend_from_slice(&total_len.to_le_bytes());
+        payload.extend_from_slice(&offset.to_le_bytes());
+        put_bytes(&mut payload, data);
+        frame(Opcode::LoadBinary, &payload)
+    }
+
+    #[test]
+    fn a_load_chunk_round_trips_for_every_target() {
+        for target in [BinaryTarget::Ldelf, BinaryTarget::Ta] {
+            let request = Request::load(LoadChunk {
+                target,
+                total_len: 10,
+                offset: 4,
+                data: Box::from(&b"abcdef"[..]),
+            });
+            let encoded = request.encode();
+            assert_eq!(Request::decode(&encoded), Ok(request), "target {target:?}");
+        }
+    }
+
+    #[test]
+    fn a_load_request_carries_no_params_and_others_carry_no_chunk() {
+        let load = Request::decode(
+            &Request::load(LoadChunk {
+                target: BinaryTarget::Ta,
+                total_len: 1,
+                offset: 0,
+                data: Box::from(&b"x"[..]),
+            })
+            .encode(),
+        )
+        .expect("a well-formed load frame");
+        assert!(load.params.is_empty());
+        assert_eq!(load.cmd_id, 0);
+        assert!(load.load.is_some());
+        assert!(load.load.expect("just checked").is_last());
+
+        let other = Request::decode(&Request::simple(Opcode::CloseSession, 0, Vec::new()).encode())
+            .expect("a well-formed close frame");
+        assert_eq!(other.load, None);
+    }
+
+    #[test]
+    fn a_chunk_that_does_not_end_the_binary_is_not_the_last() {
+        let chunk = LoadChunk {
+            target: BinaryTarget::Ldelf,
+            total_len: 100,
+            offset: 0,
+            data: Box::from(&b"abcd"[..]),
+        };
+        assert!(!chunk.is_last());
+    }
+
+    #[test]
+    fn an_unknown_binary_target_is_rejected() {
+        assert_eq!(
+            Request::decode(&load_frame(9, 4, 0, b"abcd")),
+            Err(Error::UnknownBinaryTarget { target: 9 })
+        );
+    }
+
+    /// The oversized case: a declared total over [`MAX_BINARY_LEN`] is
+    /// refused on the strength of the four bytes that declare it, before the
+    /// receiver reserves anything.
+    #[test]
+    fn an_oversized_binary_is_rejected_before_allocating() {
+        let over = u32::try_from(MAX_BINARY_LEN).expect("MAX_BINARY_LEN fits in a u32") + 1;
+        assert_eq!(
+            Request::decode(&load_frame(1, over, 0, b"abcd")),
+            Err(Error::BinaryTooLong {
+                total_len: over as usize
+            })
+        );
+        // And the largest permitted total is still accepted, so the bound is
+        // exactly where it claims to be rather than one out.
+        let at_limit = u32::try_from(MAX_BINARY_LEN).expect("fits");
+        assert!(Request::decode(&load_frame(1, at_limit, 0, b"abcd")).is_ok());
+    }
+
+    /// A chunk that claims to sit past the end of the binary it belongs to.
+    #[test]
+    fn a_chunk_outside_the_declared_total_is_rejected() {
+        assert_eq!(
+            Request::decode(&load_frame(2, 10, 8, b"abcd")),
+            Err(Error::BinaryChunkOutOfRange {
+                offset: 8,
+                chunk_len: 4,
+                total_len: 10,
+            })
+        );
+        // An offset near u32::MAX must not wrap into the valid range.
+        assert_eq!(
+            Request::decode(&load_frame(2, 10, u32::MAX, b"")),
+            Err(Error::BinaryChunkOutOfRange {
+                offset: u32::MAX as usize,
+                chunk_len: 0,
+                total_len: 10,
+            })
+        );
+    }
+
+    /// The truncated case: every prefix of a load frame is an error, never a
+    /// panic and never a partial accept.
+    #[test]
+    fn a_truncated_load_frame_is_an_error_not_a_panic() {
+        let encoded = Request::load(LoadChunk {
+            target: BinaryTarget::Ta,
+            total_len: 2048,
+            offset: 1024,
+            data: Box::from(&[0x5A_u8; 1024][..]),
+        })
+        .encode();
+        for cut in 0..encoded.len() {
+            assert!(
+                Request::decode(&encoded[..cut]).is_err(),
+                "a {cut}-byte prefix of a load frame decoded as a whole frame"
+            );
+        }
+        assert!(Request::decode(&encoded).is_ok());
+    }
+
+    /// The chunk's own length prefix is checked against the bytes actually
+    /// present, not against what it claims.
+    #[test]
+    fn a_chunk_length_larger_than_the_frame_is_truncated() {
+        let mut encoded = load_frame(1, 4096, 0, b"abcd");
+        let data_len_index = encoded.len() - 8;
+        encoded[data_len_index..data_len_index + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            Request::decode(&encoded),
+            Err(Error::Truncated {
+                needed: u32::MAX as usize,
+                remaining: 4
+            })
+        );
+    }
+
+    /// A whole binary can be reassembled from chunks that each fit a frame,
+    /// which is the point of chunking at all: 2.5 MB of `kmpp-ta.elf` crosses
+    /// the wire without [`MAX_FRAME_LEN`] moving.
+    #[test]
+    fn chunks_reassemble_a_binary_larger_than_a_frame() {
+        const TOTAL: usize = 2_500_000;
+        const CHUNK: usize = 256 * 1024;
+        assert!(TOTAL > MAX_FRAME_LEN, "the point of the test");
+
+        let source: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let mut received = Vec::new();
+        for (index, piece) in source.chunks(CHUNK).enumerate() {
+            let encoded = Request::load(LoadChunk {
+                target: BinaryTarget::Ta,
+                total_len: TOTAL,
+                offset: index * CHUNK,
+                data: Box::from(piece),
+            })
+            .encode();
+            assert!(encoded.len() <= MAX_FRAME_LEN);
+            let chunk = Request::decode(&encoded)
+                .expect("a chunk this end built")
+                .load
+                .expect("a load frame carries a chunk");
+            assert_eq!(chunk.offset, received.len());
+            received.extend_from_slice(&chunk.data);
+            assert_eq!(chunk.is_last(), received.len() == TOTAL);
+        }
+        assert_eq!(received, source);
     }
 
     #[test]
