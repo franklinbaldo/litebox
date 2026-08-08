@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! LiteBox runner for a KVM/QEMU guest.
 //!
 //! Booted via the PVH boot protocol: QEMU's `-kernel` finds an

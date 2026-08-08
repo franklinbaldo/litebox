@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! The PVH memory map, and the decision about which of it becomes the heap.
 //!
 //! QEMU enters [`crate::_start`] with `%ebx` pointing at an `hvm_start_info`
