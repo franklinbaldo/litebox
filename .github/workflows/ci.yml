@@ -58,10 +58,14 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           # We exclude `litebox_runner_lvbs` because it requires a custom target and nightly
           # features. `build_and_test_lvbs` covers it.
+          # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
+          # `host_lvbs` and `host_kvm` are mutually exclusive; check each host separately.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |
@@ -76,7 +80,12 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+        run: |
+          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm
+          # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
+          # `host_lvbs` and `host_kvm` are mutually exclusive; document each host separately.
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
@@ -144,7 +153,13 @@ jobs:
             target/*/build/litebox_runner_linux_userland-*/out
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
+          # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
+          # `host_lvbs` and `host_kvm` are mutually exclusive; check each host separately.
+          # The remaining exclusions restore the default member selection, which
+          # `--workspace` (required by `--exclude`) would otherwise widen.
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm
           # Run clippy for lvbs with custom target (requires build-std)
           ./.github/tools/github_actions_run_cargo clippy -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
       - run: |
@@ -157,7 +172,12 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+        run: |
+          # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
+          # `host_lvbs` and `host_kvm` are mutually exclusive; document each host separately.
+          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm
 
   build_and_test_windows:
     name: Build and Test Windows
@@ -209,7 +229,11 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+        run: |
+          # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
+          # `host_lvbs` and `host_kvm` are mutually exclusive. The `build_and_test_lvbs`
+          # job documents each host separately.
+          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
 
   confirm_no_std:
     name: Confirm no_std
