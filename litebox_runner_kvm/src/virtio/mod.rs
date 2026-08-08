@@ -1012,9 +1012,6 @@ pub fn bring_up(transport: Transport) -> Result<Console, Error> {
 /// never end.
 const USED_POLL_LIMIT: u32 = 100_000_000;
 
-/// Size of the loopback proof's buffer.
-const PROOF_BUF_SIZE: usize = 256;
-
 impl Console {
     /// Submits `bytes` on the transmit queue and waits for the device to hand
     /// the descriptor back.
@@ -1052,57 +1049,94 @@ impl Console {
         false
     }
 
-    /// Posts a receive buffer and polls briefly for the device to fill it.
+    /// Posts a receive buffer and waits up to `timeout_nanos` for the device
+    /// to fill it.
     ///
-    /// Returns the number of bytes received, or `None` if nothing arrived
-    /// within the poll bound. Nothing arriving is the expected result when no
-    /// host client is sending, so this reports rather than fails.
+    /// Returns the number of bytes received, or `None` if the deadline passed
+    /// with nothing arriving.
+    ///
+    /// Exactly one descriptor is posted per call and waited on. The obvious
+    /// alternative -- post a buffer, poll for a while, return, and let the
+    /// caller try again -- loses bytes: the abandoned descriptors stay in the
+    /// available ring, the device fills the *oldest* of them, and the
+    /// completion is then discarded by a caller watching for a newer head.
+    /// That was observed, not reasoned about; see [`init`].
+    ///
+    /// The bound is a deadline rather than a spin count because a spin count
+    /// is not a duration: it means whatever the surrounding loop happens to
+    /// cost, which changes with every edit and differs by orders of magnitude
+    /// between TCG and KVM. A wall-clock deadline is checkable against the
+    /// client's own patience.
     ///
     /// # Panics
     ///
     /// Panics if the receive queue has no free descriptor.
-    pub fn receive_polling(
+    pub fn receive_deadline(
         &mut self,
         buffer: &mut queue::Dma,
         capacity: u32,
-        spins: u32,
+        timeout_nanos: u64,
     ) -> Option<u32> {
-        // SAFETY: the buffer is borrowed mutably for the whole call, so
-        // nothing else touches it while the device may be writing. It is
-        // submitted device-writable and is not read until the completion says
-        // the device has finished with it.
+        use litebox::platform::Instant as _;
+        use litebox_platform_lvbs::Instant;
+
+        // SAFETY: as `receive_polling` -- the buffer is borrowed mutably for
+        // the whole call, submitted device-writable, and not read until the
+        // completion says the device has finished with it.
         let head = unsafe { self.receive.submit(buffer.pa(), capacity, true) }
             .expect("receive queue has no free descriptor");
         self.transport.notify(&self.receive);
 
-        for _ in 0..spins {
+        let start = Instant::now();
+        loop {
             if let Some((completed, written)) = self.receive.take_used()
                 && completed == head
             {
                 return Some(written);
             }
+            let elapsed = Instant::now()
+                .checked_duration_since(&start)
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+            if elapsed >= timeout_nanos {
+                return None;
+            }
             core::hint::spin_loop();
         }
-        None
     }
 }
 
-/// Brings the console up and proves the transmit path end to end.
+/// Brings the console up, ready to carry framed messages.
 ///
-/// Returns the live console so later work can use it, or `None` if there is no
-/// virtio device -- which is the normal case for `scripts/run.sh`.
+/// Returns the live console, or `None` if there is no virtio device -- which
+/// is the normal case for `scripts/run.sh`.
+///
+/// # No loopback proof any more
+///
+/// This function used to transmit a `hello from the guest` banner and then
+/// post a receive buffer and poll it briefly, as Task 4's evidence that both
+/// directions worked. Both had to go once the channel became real, and for
+/// the same reason: the console is now a framed byte stream with an owner.
+///
+/// - The banner is not a frame. A client reading the socket takes its first
+///   four bytes as a length prefix and gets `1702127980`, which is `"litd"`.
+/// - The receive probe posts a descriptor and abandons it when nothing
+///   arrives within its spin bound. The device fills the *oldest* posted
+///   descriptor, so the abandoned one swallows the client's first request and
+///   the completion is then discarded by a caller watching for a newer head.
+///
+/// Both were observed, in that order, on the first end-to-end attempt. The
+/// channel working at all is strictly better evidence than either was.
 ///
 /// # Panics
 ///
-/// Panics if a device is present but cannot be brought up, or if a transmitted
-/// buffer is never returned by the used ring. A half-working device is worth
-/// failing on: it means the driver's model of it is wrong, and every later
-/// step would be built on that.
+/// Panics if a device is present but cannot be brought up. A half-working
+/// device is worth failing on: it means the driver's model of it is wrong,
+/// and every later step would be built on that.
 pub fn init() -> Option<Console> {
     let transport = probe()?;
     let address = transport.header.address;
 
-    let mut console = match bring_up(transport) {
+    let console = match bring_up(transport) {
         Ok(console) => console,
         Err(error) => panic!("virtio {address}: bring-up failed: {error}"),
     };
@@ -1111,50 +1145,5 @@ pub fn init() -> Option<Console> {
         console.features
     );
 
-    // The transmit proof. The bytes are recognisable on sight in a hex dump
-    // and include a newline, so a host reading the socket line-wise sees them
-    // immediately rather than sitting on a buffer.
-    let message = b"litebox virtio console: hello from the guest\n";
-    let mut buffer = queue::Dma::alloc(PROOF_BUF_SIZE as u64);
-    buffer.fill(message, PROOF_BUF_SIZE);
-    log::info!(
-        "virtio     {address}   transmitting {} bytes on queue {}",
-        message.len(),
-        console.transmit.index(),
-    );
-    assert!(
-        console.send_blocking(
-            &buffer,
-            u32::try_from(message.len()).expect("small message")
-        ),
-        "virtio {address}: the used ring never returned the transmitted descriptor"
-    );
-
-    // The receive direction, attempted cheaply. A buffer is posted and polled
-    // for a short while; nothing arriving is not a failure, because with no
-    // host client sending there is nothing to arrive. Whatever does arrive is
-    // reported, since it is free evidence that the receive queue is live.
-    let mut rx = queue::Dma::alloc(PROOF_BUF_SIZE as u64);
-    let rx_capacity = u32::try_from(PROOF_BUF_SIZE).expect("small buffer");
-    match console.receive_polling(&mut rx, rx_capacity, RX_POLL_SPINS) {
-        Some(len) => {
-            let len = (len as usize).min(PROOF_BUF_SIZE);
-            let mut bytes = [0_u8; PROOF_BUF_SIZE];
-            rx.read_into(&mut bytes, len);
-            log::info!(
-                "virtio     {address}   rx completed with {len} bytes: {:?}",
-                core::str::from_utf8(&bytes[..len]).unwrap_or("<not utf-8>")
-            );
-        }
-        None => log::info!(
-            "virtio     {address}   rx buffer posted; nothing arrived within {RX_POLL_SPINS} polls \
-             (expected with no host client sending)"
-        ),
-    }
-
     Some(console)
 }
-
-/// How long the receive probe waits. Short: it is an opportunistic check, and
-/// the boot path should not stall on it.
-const RX_POLL_SPINS: u32 = 10_000_000;

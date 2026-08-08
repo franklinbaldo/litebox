@@ -23,9 +23,14 @@ extern crate alloc;
 mod boot;
 mod memmap;
 mod pci;
-// Nothing calls the codec until the request loop does, one commit from now.
-// Compiled from here regardless, so the target build and clippy cover it.
-#[allow(dead_code, reason = "wired up by the request loop in the next commit")]
+// The codec has two halves and the guest is only one end of the channel: it
+// decodes requests and encodes responses, never the reverse. The other
+// direction is not dead -- `dev_tests/tests/kvm_proto.rs` and the host client
+// are its users -- but from inside this binary it looks it.
+#[allow(
+    dead_code,
+    reason = "the guest uses one direction of the codec; the tests exercise both"
+)]
 mod proto;
 mod ta;
 mod virtio;
@@ -309,11 +314,21 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     // virtio device on its QEMU line, and the runner must boot and run the TA
     // regardless.
     virtio::log_virtio_devices();
-    let _console = virtio::init();
 
     // The point of the whole phase: load and execute an OP-TEE TA in ring 3.
     // Everything above is the platform this needs.
-    ta::run();
+    //
+    // Which of the two ways that happens is decided here and nowhere else. A
+    // client on the other end of a virtio console gets to say what the TA
+    // does; with no device there is nobody to ask, so the embedded sequence
+    // runs exactly as it did before the channel existed. Both paths must keep
+    // working -- `scripts/run.sh` and the CI boot test use the second one.
+    if let Some(console) = virtio::init() {
+        ta::serve(console);
+    } else {
+        log::warn!("channel    no virtio device; running the embedded TA sequence");
+        ta::run();
+    }
 
     // Last, because it is not recoverable: an instruction-fetch fault leaves
     // RIP on the data page, which no exception-table entry can name. See
