@@ -74,7 +74,7 @@ directly on `LvbsLinuxKernel`:
 | `litebox::mm::allocator::MemoryProvider` | forwards to `HostLvbsInterface::alloc` → `panic!` | must actually work — back the allocator with usable RAM |
 | `ThreadLocalStorageProvider` | per-CPU variables | reusable verbatim |
 | `CrngProvider` | PRK + RDRAND | RDRAND-only seed, no PRK |
-| `DerivedKeyProvider` | PRK | `UnsupportedRebootPersistentKey` |
+| `DerivedKeyProvider` | PRK | TPM-backed key (not yet implemented; returns `UnsupportedRebootPersistentKey`) |
 | `HostInterface::log` | `serial_print_string` (COM1) | works verbatim under QEMU |
 
 `HostKvmInterface` is therefore a near-copy of the existing placeholder. We keep the
@@ -256,10 +256,13 @@ aggregate. Nothing here is a request to fix them now.
   single-CPU, which it is. `flush_tlb_range` under `host_kvm` flushes locally
   and the `TODO(SMP)` at `paging.rs:110` is unowned — the moment a second CPU
   is started, that TODO becomes a correctness bug rather than a note.
-- **No reboot-persistent key.** `DerivedKeyProvider` returns
-  `UnsupportedRebootPersistentKey`; a plain KVM guest has no platform root key.
-  This is the honest answer rather than a gap to plug, but it does mean sealed
-  storage is simply unavailable, and anything depending on it cannot run here.
+- **No reboot-persistent key yet.** `DerivedKeyProvider` returns
+  `UnsupportedRebootPersistentKey`. The intended source is a **TPM-backed key** —
+  QEMU can attach a TPM 2.0 device via `-tpmdev` (swtpm, or a passed-through host
+  TPM), and a key sealed to it provides the same reboot-persistence property LVBS
+  gets from its VBS-provisioned PRK. This is a gap to plug, not a permanent
+  limitation. Until it is plugged, sealed storage is unavailable and anything
+  depending on it cannot run here.
 - **The memory map exclusion set is validated against one QEMU layout.** After
   the I3 fix the runner withholds the first megabyte, everything below
   `_heap_start`, the `hvm_start_info` struct, the memmap table, the command

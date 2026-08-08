@@ -44,6 +44,13 @@
 //! * [`HostInterface::send_ip_packet`] and
 //!   [`HostInterface::receive_ip_packet`] — virtio-net. There is no network
 //!   device on the QEMU command line to drive.
+//! * `litebox::platform::DerivedKeyProvider` returns
+//!   `DerivedKeyError::UnsupportedRebootPersistentKey`. The intended source is
+//!   a **TPM-backed key** (QEMU can attach a TPM 2.0 device via `-tpmdev`);
+//!   until that is wired up there is nothing to root a persistent key in, and
+//!   refusing is better than manufacturing one. Note this returns an error
+//!   rather than `unimplemented!()` on purpose: callers can handle `Unsupported`,
+//!   and a panic would take down a guest that merely asked.
 //!
 //! ## Cannot exist here
 //!
@@ -53,12 +60,6 @@
 //! * [`HostInterface::switch`] is `unreachable!()`. It transfers control to
 //!   VTL0, and a plain KVM guest has no VTL0 peer to transfer to. There is no
 //!   future in which this gains a body.
-//! * `litebox::platform::DerivedKeyProvider` returns
-//!   `DerivedKeyError::UnsupportedRebootPersistentKey` rather than panicking.
-//!   A plain KVM guest has no platform root key to derive from; returning a
-//!   manufactured key would satisfy the signature while silently breaking the
-//!   reboot-persistence guarantee callers depend on. `Unsupported` is the
-//!   truthful answer, and callers can handle it.
 //!
 //! ## Compiled out silently — no panic to read
 //!
@@ -349,11 +350,13 @@ impl HostInterface for HostKvmInterface {
 // current state, with a backoff when RDRAND is temporarily dry.
 //
 // The one deliberate difference is the seed input. LVBS folds in the platform
-// root key, which a VBS platform provisions and which survives reboot. A plain
-// KVM guest has no such key and nothing to derive one from, so the seed here is
-// RDRAND alone. That weakens reboot-persistent key derivation -- see
-// `DerivedKeyProvider` below, which reports that honestly -- but not the CRNG
-// itself, whose security rests on RDRAND either way.
+// root key, which a VBS platform provisions and which survives reboot. Nothing
+// provisions such a key here *yet* -- the intended source is a TPM-backed key,
+// see `DerivedKeyProvider` below -- so the seed is RDRAND alone. That leaves
+// reboot-persistent key derivation unavailable for now, but does not weaken the
+// CRNG itself, whose security rests on RDRAND either way. When the TPM path
+// lands, folding its key in here would make the stream reproducible across a
+// reboot only if that is ever wanted; it is not required for the CRNG.
 //
 // The two implementations are duplicated rather than shared because their
 // modules are `cfg`-exclusive, and hoisting the common part into a shared
@@ -445,16 +448,21 @@ impl litebox::platform::CrngProvider for KvmGuest {
     }
 }
 
-/// A KVM guest has no reboot-persistent platform key.
+/// Reboot-persistent key derivation is not wired up yet.
 ///
-/// This is `Unsupported`, not `unimplemented!()`, and the distinction is the
-/// point: an unimplemented provider says "this is missing and someone should
-/// write it", whereas there is genuinely nothing on a plain KVM guest to root
-/// such a key in. LVBS derives its PRK from VBS-provisioned state; the closest
-/// equivalents here (vTPM, SEV-SNP key derivation) are not part of this
-/// platform. Manufacturing a key from, say, a boot nonce would satisfy the
-/// signature while quietly failing the "persistent across reboot" guarantee
-/// that callers rely on, so the honest answer is to refuse.
+/// The intended source is a **TPM-backed key**: QEMU can attach a TPM 2.0 device
+/// (`-tpmdev`, backed by swtpm or a passed-through host TPM), and a key sealed to
+/// it gives the same reboot-persistence property that LVBS gets from its
+/// VBS-provisioned PRK. That is the design; it is simply not implemented.
+///
+/// Until it is, this returns an error rather than `unimplemented!()`. The
+/// distinction is deliberate in the other direction from usual: a panic would
+/// take down a guest that merely *asked* for a derived key, whereas
+/// `Unsupported` is something callers already handle — `litebox_shim_optee`
+/// maps it to `TeeResult::NotSupported`. Manufacturing a key from, say, a boot
+/// nonce would satisfy the signature while quietly failing the "persistent
+/// across reboot" guarantee callers rely on, so refusing is the honest answer
+/// in the meantime.
 impl litebox::platform::DerivedKeyProvider for KvmGuest {
     fn derive_key<E>(
         &self,
