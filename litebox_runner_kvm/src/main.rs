@@ -1906,27 +1906,68 @@ fn check_heap(usable_bytes: u64) {
         "buddy allocation did not survive being written"
     );
 
-    // 3. Reuse. Free the 3 MiB block and ask for another the same size. If
-    //    the buddy allocator is merely bumping a pointer and leaking, the
-    //    second address differs -- and 512 MiB of RAM would let that go
-    //    unnoticed for a long time. Getting the same address back is direct
-    //    evidence the free path works.
+    // 3. Reuse. Free the 3 MiB block and allocate the same size again, over
+    //    and over, enough times that the total *exceeds the whole heap*. If
+    //    freed memory does not come back -- if the allocator is merely
+    //    bumping a pointer and leaking -- the loop cannot complete: it runs
+    //    out and the allocation error handler ends the guest. Completing it
+    //    is direct evidence the free path works.
+    //
+    //    This is deliberately phrased as "the memory came back" rather than
+    //    "the same address came back". Asserting address equality would test
+    //    `SafeZoneAllocator`'s current placement strategy, not the property
+    //    that matters, and would turn any future change of strategy into a
+    //    boot panic misreported as a leak. The address is still logged, and
+    //    is still the fastest hint when this does go wrong -- but only as an
+    //    observation.
     drop(big);
-    let again: Vec<u8> = Vec::with_capacity(HEAP_BIG_BYTES);
-    let again_ptr = again.as_ptr() as u64;
+    let rounds = (usable_bytes / HEAP_BIG_BYTES as u64).saturating_add(2);
+    // Guards the check against passing vacuously: if `usable_bytes` were ever
+    // reported as (near) zero, a handful of rounds would prove nothing.
+    assert!(
+        rounds.saturating_mul(HEAP_BIG_BYTES as u64) > usable_bytes,
+        "the churn total does not exceed the heap; this would prove nothing"
+    );
+    assert!(
+        rounds >= 16,
+        "only {rounds} rounds: heap reported too small"
+    );
+    let mut first_reuse_ptr = 0_u64;
+    for i in 0..rounds {
+        let mut again: Vec<u8> = Vec::with_capacity(HEAP_BIG_BYTES);
+        // Touch both ends -- but only the ends. Filling all 3 MiB every round
+        // would mean memset-ing more than the whole heap in a debug build,
+        // which costs minutes under QEMU and proves nothing the ends do not:
+        // step 2 above already wrote and verified a whole block.
+        let p = again.as_mut_ptr();
+        // SAFETY: `p` owns `HEAP_BIG_BYTES` bytes of freshly allocated,
+        // uninitialised capacity; writing byte 0 and byte `len - 1` is in
+        // bounds. The length is left at 0, so nothing reads them as
+        // initialised and the `Vec` still drops correctly.
+        unsafe {
+            p.write(0x77);
+            p.add(HEAP_BIG_BYTES - 1).write(0x88);
+            assert_eq!(p.read(), 0x77, "the reused block did not hold a write");
+            assert_eq!(
+                p.add(HEAP_BIG_BYTES - 1).read(),
+                0x88,
+                "the reused block did not hold a write"
+            );
+        }
+        if i == 0 {
+            first_reuse_ptr = p as u64;
+        }
+    }
     log::info!(
-        "heap reuse freed {big_ptr:#018X}, reallocated {again_ptr:#018X} -- {}",
-        if again_ptr == big_ptr {
-            "same block, memory is reused"
+        "heap reuse {rounds} x {HEAP_BIG_BYTES} B churned ({} B total) against a {usable_bytes} B heap; \
+         freed {big_ptr:#018X}, first reallocation {first_reuse_ptr:#018X} -- {}",
+        rounds.saturating_mul(HEAP_BIG_BYTES as u64),
+        if first_reuse_ptr == big_ptr {
+            "same block"
         } else {
-            "DIFFERENT block, memory was leaked"
+            "different block (fine: placement is the allocator's business)"
         }
     );
-    assert_eq!(
-        again_ptr, big_ptr,
-        "freed memory was not reused; the buddy allocator is leaking"
-    );
-    drop(again);
 
     // 4. Provenance. A `Box` is the smallest allocation there is, so it comes
     //    from the slab -- a different path from everything above. Its address
