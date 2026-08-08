@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
-litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false, features = ["host_kvm"] }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false }
 # The host is selected through the multiplexer's own `platform_kvm` feature, not
 # by pinning `host_kvm` on the `litebox_platform_lvbs` dependency here: doing the
 # latter unifies both host features across the graph and trips the crate's
