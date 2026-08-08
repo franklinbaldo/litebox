@@ -118,7 +118,7 @@ PDE/PTE at fixed frames (`mshv/vtl1_mem_layout.rs`). Under KVM none of that exis
 5. `src/mm/mod.rs:64` hardcodes `PageTable<ALIGN> = X64PageTable<LvbsLinuxKernel,
    ALIGN>` and needs a cfg arm for `KvmGuest`.
 
-## 3. The nine mshv seams
+## 3. The mshv seams
 
 Feature `host_kvm` compiles out `mod mshv`. Each seam gets the minimum treatment that
 leaves LVBS behaviour unchanged and its `.text` identical apart from 11 additional
@@ -137,7 +137,34 @@ in the Phase 1 plan for how this is measured.
 | 6 | `arch/x86/ioport.rs:6,161` — ringbuffer in `print()` | Route `print()` to `serial_print_string` so `serial_println!` works under QEMU. |
 | 7 | `arch/x86/timer.rs:30` — Hyper-V STIMER | cfg-out the module; milestone 1 has no preemption. The x2APIC half is architectural and salvageable later. |
 | 8 | `arch/x86/mm/paging.rs:64` — `flush_tlb_range` via hypercall | Unconditionally take the existing `!is_hvcall_ready()` fallback: local `invlpg` / `flush_all`. Correct for single CPU; needs IPI shootdown when SMP lands. |
-| 9 | `mm/mod.rs:64` — `PageTable<ALIGN>` bound to `LvbsLinuxKernel` | Add a cfg arm for `KvmGuest`. |
+| 9 | `mm/mod.rs:64` — `PageTable<ALIGN>` bound to `LvbsLinuxKernel` | Point it at `crate::Platform`, which is now host-selected. |
+| 10 | `host/per_cpu_variables.rs:8` — `PerCpuVariables` structurally embeds Hyper-V state | Discovered during execution; see below. |
+
+### Correction: seam 10 was missed by the static analysis
+
+The original count of nine came from grepping `mshv::` references. That undercounted,
+because `host/per_cpu_variables.rs` does not merely *call* into `mshv` — it **embeds
+Hyper-V types in a struct that generic kernel code depends on**:
+
+- four page-aligned hypervisor communication pages (`hv_vp_assist_page`, `hv_simp_page`,
+  `hvcall_input`, `hvcall_output`)
+- `vtl0_state: Cell<VtlState>` and `vtl0_locked_regs: Cell<ControlRegMap>`
+- `vp_index`, cached from `rdmsr(HV_REGISTER_VP_INDEX)`
+- `PerCpuVariablesAsm::vtl_return_addr`, consumed by the VTL-switch assembly
+
+This is a fatter seam than the other nine. Two facts keep it tractable rather than
+fatal:
+
+1. **Every external consumer of those fields lives inside `src/mshv/`**, which is
+   already gated. The blast radius is one file.
+2. **All assembly offsets are computed with `offset_of!`**, so removing fields under
+   `host_kvm` adjusts them automatically — no hand-maintained offset constants to
+   resynchronise.
+
+So the treatment is to `cfg` out the Hyper-V fields and their accessors within
+`per_cpu_variables.rs`. It does not change the extend-vs-fork conclusion; if anything
+it strengthens it, since a fork would have had to carry this same split anyway,
+permanently and by hand.
 
 ### Security note on seam 4
 
