@@ -502,12 +502,18 @@ fn check_interrupts() {
     // SAFETY: vector 3 is present in the IDT loaded above, and under
     // `host_kvm` its handler logs and returns rather than panicking. `int3`
     // itself has no effect beyond the trap.
+    //
+    // Deliberately *not* `options(nostack)`. Vector 3 is a same-privilege trap
+    // gate, so the CPU pushes five words (SS, RSP, RFLAGS, CS, RIP) onto the
+    // current `%rsp` rather than switching stacks, and the handler runs on top
+    // of them. `nostack` promises the asm neither writes below `%rsp` nor
+    // pushes, and this does both, so the annotation was simply untrue. Nothing
+    // is corrupted today only because the KVM target spec sets
+    // `"disable-redzone": true` and so leaves nothing below `%rsp` to clobber
+    // -- a property no comment here referenced and which the annotation should
+    // not be silently relying on. Dropping it costs nothing.
     unsafe {
-        core::arch::asm!(
-            "int3",
-            inlateout("r12") BP_WITNESS => witness,
-            options(nostack),
-        );
+        core::arch::asm!("int3", inlateout("r12") BP_WITNESS => witness);
     }
     log::info!("int3       returned, witness {witness:#018X}");
     assert_eq!(
