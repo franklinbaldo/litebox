@@ -38,7 +38,12 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 libc = "0.2.177"
 
 [features]
-default = []
+default = ["host_lvbs"]
+# Hyper-V VTL1 host. Enables the `mshv` module and VSM-based page protection.
+host_lvbs = []
+# Plain KVM/QEMU guest. LiteBox is the whole kernel; there is no hypervisor
+# to call and no VTL0 peer to protect against.
+host_kvm = []
 linux_syscall = []
 devbox = []
 # Tighten the preemption timer quantum so runaway-TA preemption can be tested

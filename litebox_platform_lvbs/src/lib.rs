@@ -46,6 +46,15 @@ pub mod mshv;
 
 pub mod syscall_entry;
 
+#[cfg(all(feature = "host_lvbs", feature = "host_kvm"))]
+compile_error!("features `host_lvbs` and `host_kvm` are mutually exclusive");
+
+#[cfg(not(any(feature = "host_lvbs", feature = "host_kvm")))]
+compile_error!(
+    "exactly one host must be selected: enable `host_lvbs` or `host_kvm`. \
+     Hint: you may have set `default-features = false` without picking a host."
+);
+
 /// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
 /// the mapping's lifetime.
 pub struct LvbsPhysPageMapInfo {
