@@ -510,8 +510,20 @@ fn discover() -> TscScale {
         ("i8254 PIT calibration", pit_calibrated_hz),
     ];
 
-    for (source, probe) in candidates {
-        if let Some(hz) = probe()
+    // What each probe actually returned, recorded as the loop runs.
+    //
+    // Recorded rather than re-derived on the panic path. Re-calling the probes
+    // would report *fresh* answers, not the ones that were rejected: a PIT
+    // calibration is a new 55 ms measurement each time, and `pvclock_hz` would
+    // enable and disable the pvclock MSR a second time. When the complaint is
+    // "these values were implausible", the message has to name the values that
+    // were actually judged, or it is evidence about a different run.
+    let mut results: [Option<u64>; 5] = [None; 5];
+
+    for (i, (source, probe)) in candidates.into_iter().enumerate() {
+        let hz = probe();
+        results[i] = hz;
+        if let Some(hz) = hz
             && plausible(hz)
         {
             // `hz` passed the plausibility range, so it is non-zero and this
@@ -544,6 +556,7 @@ fn discover() -> TscScale {
          CPUID: max standard leaf {max_standard_leaf:#x}, \
          hypervisor present {hypervisor_present}, \
          max hypervisor leaf {max_hypervisor_leaf:#x}, \
+         KVM signature {is_kvm}, \
          leaf 0x15 eax={:#x} ebx={:#x} ecx={:#x}, leaf 0x16 eax={:#x}. \
          Candidates: 0x40000010 {:?}, 0x15 {:?}, 0x16 {:?}, pvclock {:?}, PIT {:?}. \
          Refusing to guess a frequency",
@@ -551,11 +564,12 @@ fn discover() -> TscScale {
         leaf_15.ebx,
         leaf_15.ecx,
         leaf_16.eax,
-        candidates[0].1,
-        candidates[1].1,
-        candidates[2].1,
-        candidates[3].1,
-        candidates[4].1,
+        results[0],
+        results[1],
+        results[2],
+        results[3],
+        results[4],
+        is_kvm = kvm_max_leaf().is_some(),
     );
 }
 
