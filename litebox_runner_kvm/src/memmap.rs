@@ -332,6 +332,8 @@ fn reserved_ranges(
 
 /// Accumulates accepted ranges and reports what it did with each one.
 struct Regions {
+    /// Ranges withheld from the heap, **sorted by `start`**. [`Regions::add`]
+    /// depends on that order; it is established once at construction.
     reserved: arrayvec::ArrayVec<Range, MAX_RESERVED>,
     accepted_bytes: u64,
     accepted_count: u32,
@@ -350,8 +352,9 @@ impl Regions {
     /// Offers `[start, end)` to the heap, minus every reserved range that
     /// overlaps it.
     ///
-    /// The subtraction is a linear sweep over the reserved list sorted by
-    /// start: carry a cursor through the candidate range and emit the gaps.
+    /// The subtraction is a linear sweep over the reserved list, which is
+    /// sorted by start at construction: carry a cursor through the candidate
+    /// range and emit the gaps.
     /// The reserved ranges may overlap each other, which the `max` on the
     /// cursor handles.
     fn add(&mut self, start: u64, end: u64) {
@@ -368,11 +371,11 @@ impl Regions {
         }
         self.ram_end = self.ram_end.max(end);
 
-        let mut reserved = self.reserved.clone();
-        reserved.sort_unstable_by_key(|r| r.start);
-
+        // Indexed rather than iterated: `emit` takes `&mut self`, so a
+        // borrow of `self.reserved` cannot be held across the loop body.
         let mut cursor = start;
-        for r in &reserved {
+        for i in 0..self.reserved.len() {
+            let r = self.reserved[i];
             if r.start >= end {
                 break;
             }
@@ -479,6 +482,13 @@ pub fn init_heap_from_pvh(start_info_pa: u64) -> RamInfo {
     for r in &reserved {
         log::info!("  reserve pa {:#014X}..{:#014X}", r.start, r.end);
     }
+
+    // `Regions::add` sweeps this list in address order, once per memory map
+    // entry. The set is fixed from here on, so sort it once rather than on
+    // every call. Logged above in declaration order first, because the reason
+    // each range is withheld is what makes that log readable.
+    let mut reserved = reserved;
+    reserved.sort_unstable_by_key(|r| r.start);
 
     let mut regions = Regions {
         reserved,
