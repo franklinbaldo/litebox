@@ -191,10 +191,13 @@ QEMU_ARGS=(
 # modern interface; saying so on the command line makes that a contract
 # instead of an accident.
 #
-# QEMU is the socket *server* (`server=on`) and does not wait for a peer
-# (`wait=off`), so the guest boots whether or not a client ever connects.
-# That leaves the client racing QEMU's socket creation, which is why
-# client.py retries the connection rather than sleeping.
+# The *client* serves the socket and QEMU connects to it, which is the reverse
+# of the obvious arrangement and is deliberate. With `-k` the user may not be
+# in the `kvm` group, so QEMU runs under `sudo`; were QEMU the server it would
+# create the socket owned by root and client.py, running as the ordinary user,
+# would get EACCES. Root can connect to a socket owned by anyone, so serving
+# from the client works under either privilege arrangement. It also removes
+# the startup race: we wait for the socket to exist before starting QEMU.
 if [ -n "$COMMANDS" ]; then
     [ -f "$COMMANDS" ] || fatal "command sequence not found: $COMMANDS"
     command -v python3 >/dev/null || fatal "python3 not found, but -c needs it"
@@ -207,7 +210,7 @@ if [ -n "$COMMANDS" ]; then
     fi
     rm -f "$SOCKET"
     QEMU_ARGS+=(
-        -chardev "socket,id=optee,path=$SOCKET,server=on,wait=off"
+        -chardev "socket,id=optee,path=$SOCKET"
         -device virtio-serial-pci,id=vs0,disable-legacy=on
         -device virtconsole,chardev=optee,bus=vs0.0
     )
@@ -256,17 +259,33 @@ echo 1>&2
 # output, and the serial console stays interactive.
 set +e
 if [ -n "$COMMANDS" ]; then
-    # QEMU in the background, the client in the foreground. The client owns
-    # the conversation and ends it with a Shutdown, so the guest exits on its
-    # own; the `wait` below collects its status rather than killing it.
+    # The client starts first because it serves the socket (see above). Both
+    # run in the background so this script can wait on the client's verdict
+    # first: it is the side that finishes deterministically, and it is the one
+    # that can say what went wrong with the exchange.
     #
-    # QEMU keeps stdout and stderr, so the guest's serial log still
-    # interleaves with the client's output in the order things happened,
-    # which is the whole value of having both.
+    # Both keep stdout and stderr, so the guest's serial log interleaves with
+    # the client's output in the order things happened, which is the whole
+    # value of having both.
+    python3 "$CLIENT" "$SOCKET" "$LDELF" "$TA" "$COMMANDS" --timeout "$TIMEOUT" &
+    CLIENT_PID=$!
+
+    # Wait for the client to bind before QEMU tries to connect; QEMU exits
+    # immediately if the socket is not there yet. Bounded, because a client
+    # that died during startup must not hang the script.
+    SOCKET_WAIT=0
+    while [ ! -S "$SOCKET" ]; do
+        kill -0 "$CLIENT_PID" 2>/dev/null || fatal "client exited before binding $SOCKET"
+        SOCKET_WAIT=$((SOCKET_WAIT + 1))
+        [ "$SOCKET_WAIT" -gt 200 ] && fatal "client did not bind $SOCKET within 10s"
+        sleep 0.05
+    done
+
     $PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" \
         qemu-system-x86_64 "${QEMU_ARGS[@]}" </dev/null &
     QEMU_PID=$!
-    python3 "$CLIENT" "$SOCKET" "$LDELF" "$TA" "$COMMANDS" --timeout "$TIMEOUT"
+
+    wait "$CLIENT_PID"
     CLIENT_STATUS=$?
     # A client that gave up will never send the Shutdown the guest is waiting
     # for, so waiting for the guest would cost its whole request deadline and

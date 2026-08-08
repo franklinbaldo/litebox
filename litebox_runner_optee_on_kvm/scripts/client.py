@@ -37,12 +37,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import json
 import os
 import socket
 import struct
 import sys
-import time
 
 # --------------------------------------------------------------------------
 # The wire format. Must agree with litebox_runner_optee_on_kvm/src/proto.rs.
@@ -273,35 +273,38 @@ def decode_response(frame: bytes) -> dict:
 # --------------------------------------------------------------------------
 
 
-def connect(path: str, timeout: float) -> socket.socket:
-    """Connects to `path`, retrying until `timeout` seconds have passed.
+def listen(path: str, timeout: float) -> socket.socket:
+    """Binds `path`, then waits up to `timeout` seconds for QEMU to connect.
 
-    QEMU is the socket *server* here, so there is an unavoidable race: this
-    process may reach `connect` before QEMU has created the socket, or before
-    it has begun accepting. A fixed `sleep` would be a guess that is both too
-    long on a fast machine and too short on a loaded one; a bounded retry is
-    neither. Both `FileNotFoundError` (the path does not exist yet) and
-    `ConnectionRefusedError` (it exists but nothing is listening) are retried,
-    because which one occurs depends on how far QEMU has got.
+    This process is the socket *server*, not QEMU, and the reason is
+    privilege rather than taste. With `-k` the current user may not be in the
+    `kvm` group, so `run.sh` starts QEMU under `sudo`. Were QEMU the server it
+    would create the socket owned by root, and this process -- running as the
+    ordinary user -- would get `EACCES` connecting to it. Root, by contrast,
+    can connect to a socket owned by anyone, so serving from here works under
+    either privilege arrangement.
+
+    It also removes the startup race outright: `run.sh` waits for this socket
+    to exist before starting QEMU, so there is nothing to retry.
     """
-    deadline = time.monotonic() + timeout
-    attempts = 0
-    last: OSError | None = None
-    while time.monotonic() < deadline:
-        attempts += 1
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(path)
-            print(f"[client] connected to {path} after {attempts} attempt(s)")
-            return sock
-        except (FileNotFoundError, ConnectionRefusedError) as error:
-            last = error
-            sock.close()
-            time.sleep(0.05)
-    raise TaError(
-        f"could not connect to {path} within {timeout}s "
-        f"({attempts} attempts, last error: {last})"
-    )
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(path)
+        sock.listen(1)
+        sock.settimeout(timeout)
+        print(f"[client] listening on {path}", flush=True)
+        conn, _ = sock.accept()
+    except socket.timeout:
+        raise TaError(
+            f"QEMU did not connect to {path} within {timeout}s"
+        ) from None
+    finally:
+        sock.close()
+    print("[client] QEMU connected", flush=True)
+    conn.settimeout(timeout)
+    return conn
 
 
 def read_frame(sock: socket.socket) -> bytes:
@@ -420,7 +423,7 @@ def run(
     timeout: float,
     shutdown: bool,
 ) -> None:
-    sock = connect(path, timeout)
+    sock = listen(path, timeout)
     try:
         send_binary(sock, TARGET_LDELF, ldelf)
         send_binary(sock, TARGET_TA, ta)
