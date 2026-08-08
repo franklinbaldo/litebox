@@ -373,8 +373,8 @@ _start:
     jmp 3b
 
     /* `_start`'s physical address is fixed by the linker script, so a label's
-       physical address is {entry} plus its offset from `_start`. Folding each
-       Each address is folded into an absolute symbol by `.set`, whose
+       physical address is {entry} plus its offset from `_start`. Each such
+       address is folded into an absolute symbol by `.set`, whose
        expression parser handles symbol arithmetic that the Intel-syntax
        *operand* parser does not: written inline, `a - b + c` is rejected
        outright and `offset a + c` silently drops the addend. Uses then name a
