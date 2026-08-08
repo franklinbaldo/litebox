@@ -339,6 +339,14 @@ Follow `common_start` in `litebox_runner_lvbs/src/main.rs:396-430` — the order
 
 Phase 1 gated the Hyper-V fields out of `PerCpuVariables`, so this should work unmodified. If it does not, that is a Phase 1 gating error — report it rather than patching around it.
 
+**Step 1b (folded in from Task 6)** — **add a stack guard page.** Task 5 found the boot
+stack grows towards the early page tables in the same `NOLOAD` scratch region; an overflow
+destroys the mapping needed to report it. Task 6 deliberately deferred the guard page to
+here, and the reasoning is worth preserving: a guard page needs 4 KiB-granular tables, and
+armed *before* the IDT exists it converts silent corruption into a silent triple fault —
+no improvement. Once this task installs a `#PF` handler that can report `CR2`, the guard
+becomes genuinely diagnostic. Build it after the IDT is live, not before.
+
 **Step 2** — **`enable_smep_smap()`.** Phase 1's security argument for dropping VSM protection explicitly depends on this being called (see the debt list, MIN-5). It is not optional; it is the boundary.
 
 **Step 3** — `interrupts::init()` for the IDT, `gdt` setup with TSS, `syscall_entry::init()`.
