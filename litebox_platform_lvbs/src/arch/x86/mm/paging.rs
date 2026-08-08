@@ -240,6 +240,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     crate::debug_serial_println!("BUG: attempt to unmap a huge page");
                     None
                 }
+                // `debug_serial_println!` expands to nothing when
+                // `debug_assertions` is off, so `pa` is genuinely unused in
+                // release builds and used in debug ones. `allow` rather than
+                // `expect`: the latter warns when unfulfilled, which it would
+                // be in every debug build.
+                #[allow(unused_variables, reason = "used only by the debug-only print below")]
                 Err(X64UnmapError::InvalidFrameAddress(pa)) => {
                     crate::debug_serial_println!(
                         "BUG: attempt to unmap an invalid frame address: {:#x}",
