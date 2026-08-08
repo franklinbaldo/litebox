@@ -105,9 +105,16 @@ const OFF_HVM_START_INFO: u32 = 0x3030;
 ///
 /// Note what makes that failure mode nasty: the stack grows *towards* the page
 /// tables, so an overflow corrupts the mapping that would be needed to report
-/// it. A real guard page needs 4 KiB granularity, which the 2 MiB early tables
-/// cannot express; Task 6 owns proper memory setup and should add one. Until
-/// then this is headroom, not a fix.
+/// it. This headroom is not a fix.
+///
+/// TODO: give the boot stack a real guard page. Nothing on this path has one:
+/// neither this stack nor the per-CPU kernel stack switched to later, whose
+/// `_guard_page_0`/`_guard_page_1` fields in `PerCpuVariables` are padding
+/// that keeps neighbouring per-CPU data out of an overflow's way, not
+/// unmapped pages. A guard page needs 4 KiB-granular tables, which the 2 MiB
+/// early tables here cannot express, plus a way to punch a hole in the real
+/// tables built later -- `unmap_pages` and `mprotect_pages` in the platform
+/// crate's paging module are `pub(crate)` and would have to be exposed.
 const OFF_STACK_TOP: u32 = 0x80000;
 
 /// An ELF note with a 4-byte name and a 4-byte descriptor.
@@ -134,7 +141,7 @@ static PVH_NOTE: PvhNote = PvhNote {
 ///
 /// `%ebx` is the only pointer to that structure and is trivially clobbered, so
 /// the entry stub stores it in the scratch region before touching any other
-/// register. Task 6 consumes this to read the memory map.
+/// register. The memory map reader consumes this.
 ///
 /// Returns zero if the hypervisor passed a null `%ebx`.
 pub fn hvm_start_info_addr() -> u64 {
@@ -202,7 +209,8 @@ _start:
     mov dword ptr [{scratch} + {off_sinfo}], ebx
     mov dword ptr [{scratch} + {off_sinfo} + 4], 0
 
-    /* Liveness marker, matching the Task 1 behaviour. */
+    /* Liveness marker: proof the hypervisor reached this entry point at all,
+       emitted before anything that could plausibly fail. */
     mov dx, 0x3F8
     mov al, 'P'
     out dx, al
@@ -567,7 +575,8 @@ impl log::Log for HostLogger {
     }
 
     fn log(&self, record: &log::Record) {
-        // Stack-allocated: there is no allocator until Task 6. Records longer
+        // Stack-allocated: logging must work before the heap exists, and this
+        // logger is installed long before it does. Records longer
         // than the buffer are truncated rather than dropped.
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
@@ -660,11 +669,12 @@ extern "C" fn kvm_long_mode_entry() -> ! {
     //
     // `check_crng` has moved from before the heap to after the stack switch.
     // It was the single largest stack consumer on this path (a debug build of
-    // the ChaCha20 CRNG is what exhausted the boot stack in Task 5), and
+    // the ChaCha20 CRNG is what once exhausted the boot stack), and
     // there is no reason to spend it on the boot stack now that a 128 KiB
     // per-CPU kernel stack exists a few instructions later. This shrinks the
-    // window in which a boot-stack overflow is possible, which is most of the
-    // reason the guard page is deferred to Task 8.
+    // window in which a boot-stack overflow is possible, which is the best
+    // available mitigation while neither stack has a guard page (see
+    // `OFF_STACK_TOP`).
     // ---------------------------------------------------------------------
     litebox_platform_lvbs::arch::enable_fsgsbase();
     litebox_platform_lvbs::arch::enable_extended_states();
@@ -746,7 +756,8 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
     // a #DF before it executed a single instruction.
     //
     // Masking is the correct fix rather than remapping: nothing here services
-    // 8259 interrupts, there is no LAPIC bring-up, and Task 10 needs none.
+    // 8259 interrupts, there is no LAPIC bring-up, and running a TA needs
+    // none.
     // Remapping would only move the collision somewhere quieter while leaving
     // unhandled interrupts arriving.
     //
@@ -791,7 +802,7 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
 // Bring-up verification.
 //
 // Each check below is written to fail loudly and visibly rather than to pass
-// quietly. An IDT that is silently wrong presents in Task 10 as an
+// quietly. An IDT that is silently wrong presents during TA execution as an
 // inexplicable triple fault during TA execution, with no indication of which
 // layer to suspect; the point of these is to remove that ambiguity now, while
 // exactly one thing has just changed.
@@ -956,11 +967,13 @@ fn check_cpu_state() {
     //    requires a page with the USER bit set, and there is none: the early
     //    2 MiB tables built by the boot stub use flags 0x83
     //    (PRESENT|WRITABLE|HUGE) throughout, with USER clear on every entry.
-    //    Task 10 creates the first user mapping and should confirm there that
-    //    a kernel read of it faults with CR4.SMAP set and succeeds between
-    //    `stac`/`clac`. Inventing a user mapping here to test against would
-    //    prove only that the test's own mapping works.
-    log::warn!("smap       enforcement untested: no USER-accessible page exists yet (Task 10)");
+    //    `ta::check_smap` confirms enforcement later, once ldelf has created
+    //    a real user mapping: a kernel read of it faults with CR4.SMAP set
+    //    and succeeds between `stac`/`clac`. Inventing a user mapping here to
+    //    test against would prove only that the test's own mapping works.
+    log::warn!(
+        "smap       enforcement untested here: no USER-accessible page exists yet (see ta::check_smap)"
+    );
 }
 
 /// A magic value carried across the `int3` to show the ISR stub's register
@@ -975,7 +988,7 @@ fn check_interrupts() {
     //    register is loaded with a witness value across the trap: if
     //    `pop_regs` restored the wrong slots, or the stub's `add rsp, 8`
     //    error-code fixup were wrong, this comes back corrupted (or we never
-    //    come back at all). That return path is exactly what Task 10's
+    //    come back at all). That return path is exactly what the TA's
     //    ring-3 exception handling depends on.
     log::info!("int3       triggering breakpoint...");
     let witness: u64;
@@ -1523,9 +1536,8 @@ fn check_address_space() {
     drop(heap_probe);
 
     // 3. VA 0. The early identity map is gone, so PML4[0] is empty and a null
-    //    dereference finally faults. This is item 1 of Task 8's deferred list,
-    //    and it needed no work of its own: it is a consequence of mapping
-    //    physical memory only at `PA + KERNEL_OFFSET`.
+    //    dereference finally faults. This needed no work of its own: it is a
+    //    consequence of mapping physical memory only at `PA + KERNEL_OFFSET`.
     assert!(walk(0).is_none(), "VA 0 is still mapped");
     log::info!("pt now     VA 0 is unmapped");
 
@@ -1642,7 +1654,8 @@ fn read_cr2() -> u64 {
 /// failure one. Any other panic, before or after, still fails.
 ///
 /// The alternative -- skipping the check so the boot could end with a plain
-/// `exit()` -- would leave the central claim of Task 8 untested, and the
+/// `exit()` -- would leave DEP, the central guarantee of the page-table
+/// rebuild, untested, and the
 /// alternative to *that* -- hand-rolling a `longjmp` out of the panic handler
 /// -- would add a page of register-restore assembly to save one log line.
 fn check_nx_is_enforced() -> ! {

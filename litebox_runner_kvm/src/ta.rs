@@ -131,9 +131,10 @@ pub fn run() {
     log::info!("ta         open/close session completed");
 }
 
-/// Confirms that SMAP is actually enforced, which Task 7 could not.
+/// Confirms that SMAP is actually enforced, which `check_cpu_state` could not.
 ///
-/// Task 7 set CR4.SMAP but had nothing to test it against: every page in
+/// `enable_smep_smap` sets CR4.SMAP during bring-up, but at that point there
+/// was nothing to test it against: every page in
 /// existence had the USER bit clear, and inventing a user mapping for the test
 /// would only have proved that the test's own mapping worked. ldelf has now
 /// created real ones, so this is the first honest opportunity.
