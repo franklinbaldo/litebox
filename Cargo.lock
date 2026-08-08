@@ -1673,6 +1673,12 @@ dependencies = [
 [[package]]
 name = "litebox_runner_kvm"
 version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox_platform_lvbs",
+ "litebox_util_log",
+ "log",
+]
 
 [[package]]
 name = "litebox_runner_linux_on_windows_userland"

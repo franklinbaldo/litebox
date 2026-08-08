@@ -7,13 +7,16 @@
 //!
 //! The entry stub saves `%ebx`, builds early 2 MiB page tables, enters long
 //! mode, relocates execution into the high-canonical alias of the image, and
-//! calls into 64-bit Rust.
+//! calls into 64-bit Rust, which applies `.rela.dyn` before touching any
+//! pointer-bearing static and then brings up serial logging.
 
 #![no_std]
 #![no_main]
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
+
+use litebox_platform_lvbs::serial_println;
 
 /// Physical address of [`_start`].
 ///
@@ -302,15 +305,246 @@ _start:
     rust_entry = sym kvm_long_mode_entry,
 );
 
+// ---------------------------------------------------------------------------
+// Global allocator placeholder.
+//
+// Depending on `litebox_platform_lvbs` pulls in `alloc`, and rustc then
+// demands a `#[global_allocator]` at link time. Under `host_lvbs` the platform
+// crate supplies one (`host/lvbs_impl.rs`); under `host_kvm` it deliberately
+// does not, because the KVM heap needs the PVH memory map, which Task 6 parses.
+//
+// So this is a placeholder that cannot silently paper over the gap: every
+// entry point panics. Nothing on the Task 3 path allocates, so it is never
+// reached. TASK 6 MUST REPLACE THIS with the real `SafeZoneAllocator` wired to
+// the PVH memory map.
+// ---------------------------------------------------------------------------
+
+/// Placeholder allocator: panics on any use. See the module comment above.
+struct NoAllocatorYet;
+
+// SAFETY: Every method diverges, so the trait's contract about returned
+// pointers is vacuously upheld -- nothing is ever returned.
+unsafe impl core::alloc::GlobalAlloc for NoAllocatorYet {
+    unsafe fn alloc(&self, _layout: core::alloc::Layout) -> *mut u8 {
+        panic!("heap allocation before the KVM allocator exists (Task 6)")
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+        panic!("heap deallocation before the KVM allocator exists (Task 6)")
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: NoAllocatorYet = NoAllocatorYet;
+
+// ---------------------------------------------------------------------------
+// Relocation.
+//
+// The target links `--pie` (`relocation-model: "pie"` in x86_64_kvm.json), so
+// every absolute address the compiler needed to store in memory -- vtables,
+// `&'static str` data pointers, `&OTHER_STATIC` -- was emitted as a link-time
+// value plus an `R_X86_64_RELATIVE` entry in `.rela.dyn`. Nothing applies
+// those entries for us: PVH drops us straight into the raw image. Until the
+// loop below runs, any pointer-bearing static is wrong, and anything that
+// appears to work does so by accident.
+// ---------------------------------------------------------------------------
+
+/// An ELF64 relocation entry with an explicit addend (`Elf64_Rela`).
+#[repr(C)]
+struct Elf64Rela {
+    /// Link-time address of the word to patch.
+    offset: u64,
+    /// Symbol index in the high 32 bits, relocation type in the low 32.
+    info: u64,
+    /// Link-time value to which the load bias is added.
+    addend: i64,
+}
+
+/// `R_X86_64_RELATIVE`: `*offset = load_bias + addend`. The only relocation
+/// type a `--static --pie` image with no dynamic symbols can contain, and the
+/// only one handled here; anything else means the link went wrong.
+const R_X86_64_RELATIVE: u64 = 8;
+
+/// Applies every `R_X86_64_RELATIVE` entry in `.rela.dyn`, returning the load
+/// bias used.
+///
+/// # Load bias
+///
+/// The linker script starts at `. = 0x0` and puts `_memory_base` there, so
+/// link-time addresses are image offsets and the link-time base is exactly
+/// zero. The bias is therefore just the runtime address of `_memory_base`.
+///
+/// We are already executing in the high-canonical alias installed by the boot
+/// stub, so the RIP-relative `lea` below yields `0 + KERNEL_OFFSET`, and every
+/// relocated pointer comes out high-canonical -- which is what the rest of the
+/// kernel, and `litebox_platform_lvbs`'s `pa_to_va`, expect. Doing this before
+/// the jump into the alias would instead produce low physical pointers that
+/// would all have to be fixed up a second time.
+///
+/// # Position independence
+///
+/// This function must not itself depend on an absolute address, so the three
+/// linker symbols it needs are taken via RIP-relative `lea` rather than by
+/// reading a static.
+///
+/// # Safety
+///
+/// - Must run before anything reads a pointer-bearing static.
+/// - Must run exactly once.
+/// - The `.rela.dyn` table and every address it names must be mapped writable
+///   at `link-time address + load_bias`.
+#[inline(never)]
+unsafe fn apply_relocations() -> u64 {
+    unsafe extern "C" {
+        static _memory_base: u8;
+        static _rela_start: u8;
+        static _rela_end: u8;
+    }
+
+    let load_bias: u64;
+    let rela_start: u64;
+    let rela_end: u64;
+    // SAFETY: `lea` with RIP-relative operands only computes addresses into
+    // registers; it reads no memory and touches no flags.
+    unsafe {
+        core::arch::asm!(
+            "lea {base}, [rip + _memory_base]",
+            "lea {start}, [rip + _rela_start]",
+            "lea {end}, [rip + _rela_end]",
+            base = out(reg) load_bias,
+            start = out(reg) rela_start,
+            end = out(reg) rela_end,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+
+    // Already at the link-time base: nothing to adjust. Cannot happen here
+    // (we run in the high alias), but applying a zero bias would be a no-op
+    // anyway, and skipping keeps the invariant explicit.
+    if load_bias == 0 {
+        return 0;
+    }
+
+    let mut rela = rela_start as *const Elf64Rela;
+    let rela_end_ptr = rela_end as *const Elf64Rela;
+
+    while rela < rela_end_ptr {
+        // SAFETY: `rela` is within `[_rela_start, _rela_end)`, a linker-
+        // emitted array of `Elf64_Rela` (checked by the loop condition), and
+        // the section is 8-byte aligned by construction.
+        let entry = unsafe { &*rela };
+
+        if entry.info & 0xFFFF_FFFF == R_X86_64_RELATIVE {
+            let target = load_bias.wrapping_add(entry.offset) as *mut u64;
+            // The ELF ABI defines the addend as signed and the result as an
+            // unsigned address; wrapping through both is the intended
+            // arithmetic, not an overflow bug.
+            #[expect(
+                clippy::cast_possible_wrap,
+                clippy::cast_sign_loss,
+                reason = "ELF relocation arithmetic is defined modulo 2^64"
+            )]
+            let value = entry.addend.wrapping_add(load_bias as i64) as u64;
+            // SAFETY: `target` is a link-time address from the linker's own
+            // relocation table, biased into the mapping we execute in, so it
+            // lies inside the image and is 8-byte aligned. `write_volatile`
+            // keeps the store from being reordered against the reads that the
+            // relocated statics will shortly perform.
+            unsafe { target.write_volatile(value) };
+        }
+
+        // SAFETY: Still inside the table; the loop condition rechecks before
+        // the next dereference.
+        rela = unsafe { rela.add(1) };
+    }
+
+    load_bias
+}
+
+// ---------------------------------------------------------------------------
+// Relocation probe.
+//
+// A `&'static str` inside a static array is the cheapest thing that forces the
+// linker to emit an `R_X86_64_RELATIVE` entry: the array slot holds the
+// absolute address of the string data. Reading the slot's raw bits before and
+// after `apply_relocations` shows the bias being applied, and successfully
+// dereferencing it afterwards shows the result is a real, mapped pointer.
+// ---------------------------------------------------------------------------
+
+/// Static whose stored data pointer is patched by `.rela.dyn`.
+static RELOC_PROBE: [&str; 1] = ["relocation probe string"];
+
+/// Reads the raw bits of [`RELOC_PROBE`]'s data pointer without dereferencing
+/// it, so it is safe to call before relocations have been applied.
+fn read_reloc_probe_slot() -> u64 {
+    // The first word of a `&str` is its data pointer, which is what the
+    // relocation patches.
+    let slot = (&raw const RELOC_PROBE).cast::<u64>();
+    // SAFETY: `slot` points at the first eight bytes of a live, naturally
+    // aligned static. `read_volatile` forces an actual load of the stored
+    // value rather than letting the compiler rematerialise the address
+    // RIP-relatively, which would hide the very thing being measured.
+    unsafe { slot.read_volatile() }
+}
+
+// ---------------------------------------------------------------------------
+// Logging.
+// ---------------------------------------------------------------------------
+
+/// `log` backend that forwards formatted records to COM1.
+///
+/// Mirrors `litebox_runner_lvbs`'s logger. Phase 1 routed the platform crate's
+/// `print()` to COM1 under `host_kvm`, so this needs no extra plumbing.
+struct HostLogger;
+
+impl log::Log for HostLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        // Stack-allocated: there is no allocator until Task 6. Records longer
+        // than the buffer are truncated rather than dropped.
+        let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
+        let _ = litebox_util_log::format_record(&mut buf, record);
+        litebox_platform_lvbs::arch::ioport::serial_print_string(&buf);
+    }
+
+    fn flush(&self) {}
+}
+
+static HOST_LOGGER: HostLogger = HostLogger;
+
 /// The first 64-bit Rust code to run.
 ///
 /// Entered from the boot stub through the high-canonical alias, so `%rip` and
 /// `%rsp` are both at `PA + KERNEL_OFFSET` on arrival.
 ///
-/// This writes to COM1 by hand rather than through the platform crate's serial
-/// helpers, which are not wired up until Task 3.
+/// Nothing here may touch a pointer-bearing static until [`apply_relocations`]
+/// has run: the image is linked `--pie`, so every such pointer still holds its
+/// link-time value until then.
 extern "C" fn kvm_long_mode_entry() -> ! {
-    serial_str("LONG MODE\n");
+    // Sample the relocation probe *before* relocating, while its stored
+    // pointer is still the link-time address. Only the raw bits are read, so
+    // this does not dereference anything.
+    let probe_before = read_reloc_probe_slot();
+
+    // SAFETY: This is the first thing 64-bit Rust does, so nothing has yet
+    // relied on an unrelocated absolute address, and it therefore runs exactly
+    // once. The `.rela.dyn` bounds come from the linker script, and both the
+    // table and every target it names lie in the low 1 GiB, which the early
+    // page tables map writably through the high-canonical alias we run in.
+    let load_bias = unsafe { apply_relocations() };
+
+    let probe_after = read_reloc_probe_slot();
+
+    // Statics are now trustworthy, so the logger -- itself reached through a
+    // `&'static` -- can be installed.
+    let _ = log::set_logger(&HOST_LOGGER);
+    log::set_max_level(log::LevelFilter::Trace);
+
+    log::info!("litebox_runner_kvm: long mode, relocations applied");
+    log::info!("load bias  {load_bias:#018X}");
 
     // Evidence of 64-bit execution: %rip is a high-canonical address with bits
     // set far above bit 31, which no 32-bit mode could produce or reach.
@@ -320,43 +554,30 @@ extern "C" fn kvm_long_mode_entry() -> ! {
     unsafe {
         core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nomem, nostack));
     }
-    serial_str("RIP   ");
-    serial_hex64(rip);
-    serial_str("\n");
+    log::info!("rip        {rip:#018X}");
+    log::info!("start_info {:#018X}", hvm_start_info_addr());
 
-    serial_str("SINFO ");
-    serial_hex64(hvm_start_info_addr());
-    serial_str("\n");
+    // Relocation proof. `probe_before` is the raw word as the linker left it
+    // in the image; `probe_after` is the same slot once `.rela.dyn` has been
+    // applied, and must be the high-canonical address of the string data.
+    //
+    // Note that `probe_before` is *zero*, not the link-time address: in RELA
+    // form the value lives entirely in the entry's addend and the in-place
+    // field is left empty. That makes the point more sharply than a low
+    // address would -- dereferencing this static before relocation would have
+    // been a null-pointer read.
+    //
+    // Dereferencing it afterwards and getting the expected text back is the
+    // real check: a wrong load bias would fault or print rubbish.
+    serial_println!("probe ptr  {probe_before:#018X} -> {probe_after:#018X}");
+    serial_println!("probe str  {}", RELOC_PROBE[0]);
+    assert_eq!(probe_before, 0, "RELA entries should leave the field empty");
+    assert!(
+        probe_after.wrapping_sub(load_bias) < u64::from(BOOT_SCRATCH_BASE),
+        "relocated probe pointer does not land inside the image"
+    );
 
     halt();
-}
-
-/// COM1's transmit-holding register.
-const COM1: u16 = 0x3F8;
-
-/// Writes one byte to COM1.
-fn serial_byte(byte: u8) {
-    // SAFETY: `out` to COM1's transmit-holding register. QEMU's emulated 16550
-    // accepts writes with no initialisation, and port I/O touches no memory.
-    unsafe {
-        core::arch::asm!("out dx, al", in("dx") COM1, in("al") byte, options(nomem, nostack));
-    }
-}
-
-/// Writes an ASCII string to COM1.
-fn serial_str(text: &str) {
-    for byte in text.as_bytes() {
-        serial_byte(*byte);
-    }
-}
-
-/// Writes a 64-bit value to COM1 as `0x`-prefixed, zero-padded hex.
-fn serial_hex64(value: u64) {
-    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-    serial_str("0x");
-    for shift in (0..64).step_by(4).rev() {
-        serial_byte(DIGITS[((value >> shift) & 0xF) as usize]);
-    }
 }
 
 /// Disables interrupts and halts this CPU forever.
@@ -370,6 +591,7 @@ fn halt() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    serial_println!("PANIC: {info}");
     halt()
 }

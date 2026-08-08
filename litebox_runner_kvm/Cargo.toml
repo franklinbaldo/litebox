@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false, features = ["host_kvm"] }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+log = { version = "0.4", default-features = false }
 
 [lints]
 workspace = true
