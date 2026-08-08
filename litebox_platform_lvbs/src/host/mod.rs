@@ -2,6 +2,13 @@
 // Licensed under the MIT license.
 
 //! Different host implementations of [`super::HostInterface`]
+/// VTL1 memory info recorded by the LVBS boot path.
+///
+/// LVBS-only: the only consumers are `mshv::vsm` and `litebox_runner_lvbs`. A
+/// KVM guest gets its memory layout from the PVH memory map instead, so this
+/// module has no reader there. Its items are `pub`, so `dead_code` never fired
+/// and `-Dwarnings` did not catch it compiling for nothing.
+#[cfg(feature = "host_lvbs")]
 pub mod bootparam;
 #[cfg(feature = "host_kvm")]
 pub mod kvm_impl;
