@@ -50,6 +50,55 @@ fn outb(port: u16, value: u8) {
     }
 }
 
+/// Reads a 32-bit datum from an I/O port.
+///
+/// The 8-bit forms above are private because they only ever address a known
+/// UART. The 32-bit forms are public because PCI type-1 configuration access
+/// -- the only current consumer -- needs `0xCF8`/`0xCFC`, which live outside
+/// this module. They are architectural rather than host-specific, so they are
+/// not feature-gated.
+///
+/// # Safety
+///
+/// Port I/O is a side-effecting transaction with an arbitrary device. The
+/// caller must know that reading `port` as a dword is meaningful and free of
+/// unwanted side effects on the platform in question.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+pub unsafe fn inl(port: u16) -> u32 {
+    let mut value: u32;
+
+    // SAFETY: the caller guarantees the port is safe to read.
+    unsafe {
+        asm!(
+            "in eax, dx",
+            in("dx") port, out("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    value
+}
+
+/// Writes a 32-bit datum to an I/O port.
+///
+/// # Safety
+///
+/// The caller must know that writing `value` to `port` is meaningful and does
+/// not put a device the rest of the system relies on into an unexpected state.
+#[expect(clippy::inline_always)]
+#[inline(always)]
+pub unsafe fn outl(port: u16, value: u32) {
+    // SAFETY: the caller guarantees the write is safe.
+    unsafe {
+        asm!(
+            "out dx, eax",
+            in("dx") port, in("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
 #[expect(clippy::inline_always)]
 #[inline(always)]
 fn interrupt_enable(port: u16, value: u8) {
