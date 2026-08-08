@@ -297,11 +297,15 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     check_data_access();
     check_text_is_read_only();
 
-    // Discovery only: enumerate the PCI bus and parse the virtio capability
-    // structures of anything found. Nothing is written to configuration
-    // space and no BAR is mapped, so this cannot change the behaviour of
-    // anything below it.
+    // Enumerate the PCI bus, parse the virtio capability structures of
+    // anything found, and -- if there is a modern virtio device -- map its
+    // configuration structures and read them back.
+    //
+    // All of this tolerates the device being absent: `scripts/run.sh` has no
+    // virtio device on its QEMU line, and the runner must boot and run the TA
+    // regardless.
     virtio::log_virtio_devices();
+    let _transport = virtio::probe();
 
     // The point of the whole phase: load and execute an OP-TEE TA in ring 3.
     // Everything above is the platform this needs.

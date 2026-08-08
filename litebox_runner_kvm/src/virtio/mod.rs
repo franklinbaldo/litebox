@@ -15,6 +15,8 @@
 
 use crate::pci::{self, Bar, DeviceHeader};
 
+pub mod mmio;
+
 /// The `cfg_type` byte of a virtio PCI capability.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CfgType {
@@ -395,6 +397,250 @@ impl core::fmt::Display for NotifyMultiplier {
         match self.0 {
             Some(m) => write!(f, " notify_off_multiplier {m:#X}"),
             None => Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The mapped transport.
+// ---------------------------------------------------------------------------
+
+/// Field offsets within `virtio_pci_common_cfg`.
+///
+/// Fixed by the specification, not discovered: the capability says where the
+/// structure is, and this says what is in it.
+pub mod common {
+    /// Selects which 32-bit word of the device's feature bits [`DEVICE_FEATURE`]
+    /// reads (u32).
+    ///
+    /// [`DEVICE_FEATURE`]: self::DEVICE_FEATURE
+    pub const DEVICE_FEATURE_SELECT: u64 = 0x00;
+    /// The selected word of the device's feature bits (u32, read-only).
+    pub const DEVICE_FEATURE: u64 = 0x04;
+    /// The number of virtqueues the device implements (u16, read-only).
+    pub const NUM_QUEUES: u64 = 0x12;
+    /// Device status (u8).
+    pub const DEVICE_STATUS: u64 = 0x14;
+}
+
+/// Feature bit 32: the device follows the virtio 1.0 specification rather than
+/// the legacy layout. A device that does not offer this is not one this driver
+/// can talk to at all.
+pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
+
+/// A virtio device whose configuration structures have been mapped.
+pub struct Transport {
+    pub header: DeviceHeader,
+    pub common: mmio::Region,
+    pub notify: mmio::Region,
+    pub isr: mmio::Region,
+    /// Device-specific configuration, if the device declared any.
+    pub device_cfg: Option<mmio::Region>,
+    /// The stride between consecutive queues' notification addresses.
+    pub notify_off_multiplier: u32,
+}
+
+impl Transport {
+    /// Reads the 64 bits of features the device offers.
+    ///
+    /// Two selected reads rather than one, because the register is 32 bits
+    /// wide and the low word must be selected explicitly -- the selector's
+    /// value after reset is not something the specification promises.
+    pub fn device_features(&self) -> u64 {
+        let mut features = 0_u64;
+        for word in 0..2_u32 {
+            // SAFETY: `device_feature_select` is a selector with no effect
+            // beyond choosing which word the next read returns.
+            unsafe {
+                self.common.write_u32(common::DEVICE_FEATURE_SELECT, word);
+            }
+            features |= u64::from(self.common.read_u32(common::DEVICE_FEATURE)) << (word * 32);
+        }
+        features
+    }
+
+    /// The number of virtqueues the device implements.
+    pub fn num_queues(&self) -> u16 {
+        self.common.read_u16(common::NUM_QUEUES)
+    }
+
+    /// The current device status byte.
+    pub fn device_status(&self) -> u8 {
+        self.common.read_u8(common::DEVICE_STATUS)
+    }
+}
+
+/// Finds the first virtio device on bus 0 that exposes a complete modern
+/// capability set, sizes its BARs, and maps its configuration structures.
+///
+/// Returns `None` if there is no such device -- which is the normal case for
+/// `scripts/run.sh`, whose QEMU line has no virtio device at all. Absence is
+/// logged and returned, never panicked on: nothing else in the runner depends
+/// on this, and a runner that refused to boot without a device would be a
+/// worse runner.
+pub fn map_transport() -> Option<Transport> {
+    let mut found: Option<VirtioDevice> = None;
+    pci::for_each_device_with_vendor(pci::VENDOR_VIRTIO, |header| {
+        if found.is_none() {
+            let device = VirtioDevice::discover(*header);
+            if device.is_modern() {
+                found = Some(device);
+            }
+        }
+    });
+    let device = found?;
+    let address = device.header.address;
+
+    // Every structure this driver needs lives in some BAR; each has to be
+    // sized and mapped before it can be read. QEMU puts all four in BAR4, but
+    // that is an observation about QEMU and not a rule, so the BAR is taken
+    // from each capability rather than assumed.
+    //
+    // Sizing is done once per distinct BAR. Doing it per capability would
+    // reprogram the same register four times, and each reprogramming is a
+    // window in which the BAR decodes somewhere else.
+    let mut mapped: [Option<mmio::Region>; pci::BAR_COUNT as usize] = [None; _];
+    let mut region_for = |bar: u8| -> Option<mmio::Region> {
+        let slot = mapped.get_mut(bar as usize)?;
+        if let Some(region) = *slot {
+            return Some(region);
+        }
+        // SAFETY: nothing has mapped or accessed this BAR yet -- this is the
+        // code that is about to do so -- and no other agent in this guest
+        // touches PCI.
+        let (base, size) = unsafe { device.header.size_memory_bar(bar) }?;
+        log::info!("virtio     {address}   bar{bar} pa {base:#014X} size {size:#X}");
+        let region = mmio::Region::map(base, size);
+        log::info!(
+            "virtio     {address}   bar{bar} mapped at va {:#018X} (uncacheable)",
+            region.va()
+        );
+        *slot = Some(region);
+        Some(region)
+    };
+
+    // Each structure is narrowed to the sub-range its capability describes,
+    // so an offset mistake is caught by the region's own bounds check rather
+    // than landing in a neighbouring structure in the same BAR.
+    let mut structure = |cfg_type: CfgType| -> Option<mmio::Region> {
+        let cap = device.cap(cfg_type)?;
+        let bar = region_for(cap.bar)?;
+        Some(mmio::Region::sub(
+            bar,
+            u64::from(cap.offset),
+            u64::from(cap.length),
+        ))
+    };
+
+    let common = structure(CfgType::Common)?;
+    let notify_cap = *device.cap(CfgType::Notify)?;
+    let notify = structure(CfgType::Notify)?;
+    let isr = structure(CfgType::Isr)?;
+    let device_cfg = structure(CfgType::Device);
+
+    // Without this the memory BARs decode nothing and every read below would
+    // return all-ones. QEMU boots this guest with `-kernel` and no firmware,
+    // so nothing has enabled the decoders on our behalf.
+    let command = pci::read_u16(address, pci::offset::COMMAND);
+    // SAFETY: enabling memory-space decoding on a device whose BARs QEMU has
+    // already assigned, and bus mastering so its virtqueue DMA works. Neither
+    // moves anything; the BARs were restored by `size_memory_bar`.
+    unsafe {
+        pci::write_u16(
+            address,
+            pci::offset::COMMAND,
+            command | pci::COMMAND_MEMORY_SPACE | pci::COMMAND_BUS_MASTER,
+        );
+    }
+    log::info!(
+        "virtio     {address}   command {command:#06X} -> {:#06X} (memory space, bus master)",
+        pci::read_u16(address, pci::offset::COMMAND),
+    );
+
+    let notify_off_multiplier = notify_cap.notify_off_multiplier.unwrap_or_else(|| {
+        // Reaching here means the notify capability declared itself too short
+        // to have the field, which `log_virtio_devices` already warned about.
+        // Queue notification addresses would be unknowable, so refuse rather
+        // than pick a number.
+        panic!("virtio {address}: notify capability has no notify_off_multiplier")
+    });
+
+    Some(Transport {
+        header: device.header,
+        common,
+        notify,
+        isr,
+        device_cfg,
+        notify_off_multiplier,
+    })
+}
+
+/// Maps the first modern virtio device and reads back enough of its common
+/// configuration to prove the mapping and the capability offsets are both
+/// right.
+///
+/// This is the evidence step, not a driver: all-ones would mean the BAR is not
+/// decoding, all-zeroes that the offsets are wrong, and either is far cheaper
+/// to diagnose here than three layers into queue setup.
+pub fn probe() -> Option<Transport> {
+    let transport = map_transport()?;
+    let address = transport.header.address;
+
+    let features = transport.device_features();
+    log::info!(
+        "virtio     {address}   device_feature[0] {:#010X} [1] {:#010X} (= {features:#018X})",
+        features & 0xFFFF_FFFF,
+        features >> 32,
+    );
+    log::info!(
+        "virtio     {address}   num_queues {} device_status {:#04X}",
+        transport.num_queues(),
+        transport.device_status(),
+    );
+
+    // The rest of the mapped structures, reported rather than used: their
+    // addresses are the other half of the evidence that the capability
+    // offsets were parsed correctly, and the notify multiplier is what makes
+    // a queue's notification address computable at all.
+    log::info!(
+        "virtio     {address}   notify va {:#018X} multiplier {} isr va {:#018X}{}",
+        transport.notify.va(),
+        transport.notify_off_multiplier,
+        transport.isr.va(),
+        DeviceCfgVa(transport.device_cfg),
+    );
+
+    assert_ne!(
+        features,
+        u64::MAX,
+        "virtio {address}: device_feature reads all-ones; the BAR is not decoding"
+    );
+    assert_ne!(
+        features, 0,
+        "virtio {address}: device_feature reads zero; the mapping or the capability offsets are wrong"
+    );
+    assert!(
+        features & VIRTIO_F_VERSION_1 != 0,
+        "virtio {address}: VIRTIO_F_VERSION_1 is not offered ({features:#018X}); \
+         this is not a modern device"
+    );
+    log::info!("virtio     {address}   VIRTIO_F_VERSION_1 offered; mapping confirmed");
+
+    Some(transport)
+}
+
+/// Renders the device-specific configuration structure's address, or says
+/// there is none.
+///
+/// A newtype for the same reason [`NotifyMultiplier`] is one: an optional
+/// trailing fragment cannot be built inline without an allocator.
+struct DeviceCfgVa(Option<mmio::Region>);
+
+impl core::fmt::Display for DeviceCfgVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(region) => write!(f, " device-cfg va {:#018X}", region.va()),
+            None => f.write_str(" (no device-specific configuration)"),
         }
     }
 }

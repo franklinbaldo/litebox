@@ -148,6 +148,38 @@ pub fn read_u32(address: Address, offset: u8) -> u32 {
     }
 }
 
+/// Writes the aligned dword containing `offset` to configuration space.
+///
+/// # Safety
+///
+/// A configuration write is not a pure operation: it can move a BAR, disable
+/// a device's decoders, or reset it. The caller must know what the register
+/// does and must restore anything it perturbs.
+pub unsafe fn write_u32(address: Address, offset: u8, value: u32) {
+    // SAFETY: as `read_u32` for the address cycle; the data write is the
+    // caller's responsibility, which the function's own contract passes on.
+    unsafe {
+        outl(CONFIG_ADDRESS, address.config_address(offset));
+        outl(CONFIG_DATA, value);
+    }
+}
+
+/// Writes a 16-bit register by read-modify-writing the dword containing it.
+///
+/// # Safety
+///
+/// As [`write_u32`]. The read-modify-write also rewrites the *other* half of
+/// the dword with the value just read, which is harmless for the command and
+/// status pair used here but would not be for a register with write-1-to-clear
+/// bits in the untouched half.
+pub unsafe fn write_u16(address: Address, offset: u8, value: u16) {
+    let shift = (u32::from(offset) & 2) * 8;
+    let dword = read_u32(address, offset);
+    let merged = (dword & !(0xFFFF << shift)) | (u32::from(value) << shift);
+    // SAFETY: the caller's contract.
+    unsafe { write_u32(address, offset, merged) }
+}
+
 /// Reads a 16-bit register.
 ///
 /// Configuration cycles move a whole dword, so this selects the half the
@@ -311,6 +343,84 @@ impl DeviceHeader {
         bars
     }
 
+    /// Determines the size of memory BAR `index` and returns
+    /// `(base, size_in_bytes)`.
+    ///
+    /// The only way to learn a BAR's size is to write all-ones into it and
+    /// read back: the device leaves the bits it does not decode clear, so the
+    /// lowest set address bit of the result is the region's size. That means
+    /// the BAR momentarily decodes at a completely different address, which is
+    /// why memory decoding is disabled around the probe and the original value
+    /// is written back before it is re-enabled.
+    ///
+    /// A 64-bit BAR is probed as a pair. Writing ones to only the low dword
+    /// and restoring only the low dword would leave the upper half holding
+    /// whatever the probe put there -- which is why this takes the whole BAR,
+    /// not one register, as its unit.
+    ///
+    /// Returns `None` if `index` is not an implemented memory BAR.
+    ///
+    /// # Safety
+    ///
+    /// Reprogramming a BAR, even transiently, is only safe while nothing is
+    /// accessing the region. The caller must not have mapped it yet, and no
+    /// other agent in this guest may be talking to the device.
+    pub unsafe fn size_memory_bar(self, index: u8) -> Option<(u64, u64)> {
+        let (base, is_64bit) = match self.bars().get(index as usize)? {
+            Bar::Memory { base, is_64bit, .. } => (*base, *is_64bit),
+            Bar::Unused | Bar::Io { .. } => return None,
+        };
+
+        let low_offset = offset::BAR0 + index * 4;
+        let high_offset = low_offset + 4;
+        let saved_low = read_u32(self.address, low_offset);
+        let saved_high = is_64bit.then(|| read_u32(self.address, high_offset));
+
+        let command = read_u16(self.address, offset::COMMAND);
+
+        // SAFETY: the caller has promised nothing is using the region. Memory
+        // decoding is switched off first so that the aliased address the probe
+        // creates is never live, and every register touched is written back
+        // below before decoding is restored.
+        let (probe_low, probe_high) = unsafe {
+            write_u16(
+                self.address,
+                offset::COMMAND,
+                command & !COMMAND_MEMORY_SPACE,
+            );
+
+            write_u32(self.address, low_offset, u32::MAX);
+            if is_64bit {
+                write_u32(self.address, high_offset, u32::MAX);
+            }
+            let probe_low = read_u32(self.address, low_offset);
+            let probe_high = if is_64bit {
+                read_u32(self.address, high_offset)
+            } else {
+                0
+            };
+
+            write_u32(self.address, low_offset, saved_low);
+            if let Some(high) = saved_high {
+                write_u32(self.address, high_offset, high);
+            }
+            write_u16(self.address, offset::COMMAND, command);
+
+            (probe_low, probe_high)
+        };
+
+        // Mask off the low bits, which are the type field rather than address
+        // bits and read back as they were written -- counting them would
+        // report a size 16 bytes too small on every BAR.
+        let mask = (u64::from(probe_high) << 32) | u64::from(probe_low & BAR_MEM_ADDR_MASK);
+        // A BAR that decodes nothing reads back as all-zero here; `!mask + 1`
+        // would be 1, which is not a plausible size. Report it as absent.
+        if mask == 0 {
+            return None;
+        }
+        Some((base, (!mask).wrapping_add(1)))
+    }
+
     /// Iterates the capability list, calling `visit` with the offset and ID of
     /// each entry.
     ///
@@ -365,6 +475,13 @@ pub const BAR_MEM_PREFETCHABLE: u32 = 1 << 3;
 pub const BAR_MEM_ADDR_MASK: u32 = 0xFFFF_FFF0;
 /// Address bits of an I/O BAR (31:2).
 pub const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC;
+
+/// `COMMAND` bit 1: respond to memory space cycles. A memory BAR decodes
+/// nothing at all with this clear, and reads of it return all-ones.
+pub const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
+/// `COMMAND` bit 2: the device may act as a bus master, i.e. may DMA. A
+/// virtqueue is DMA, so nothing works without it.
+pub const COMMAND_BUS_MASTER: u16 = 1 << 2;
 
 /// A decoded base address register.
 #[derive(Clone, Copy)]
