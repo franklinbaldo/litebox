@@ -265,6 +265,14 @@ Build early page tables in `.bss`, enter long mode, reach Rust.
 
 **Files:** Create `litebox_runner_kvm/src/memmap.rs`; modify `litebox_platform_lvbs/src/host/kvm_impl.rs`
 
+> **Mandatory first step: delete `NoAllocatorYet`.** Task 3 had to link
+> `litebox_platform_lvbs`, which fails to *compile* without a `#[global_allocator]`
+> (`host_kvm` deliberately provides none, since the heap needs the PVH memmap). Task 3
+> therefore added a placeholder in the runner whose every method `panic!`s. It is
+> scaffolding, not an implementation. This task must remove it entirely and replace it
+> with the real `SafeZoneAllocator` wiring. **If it survives this task, the phase has a
+> latent panic in it.**
+
 This is the piece LVBS never needed — VTL0 hands it fixed memory, so `HostLvbsInterface::alloc` is a `panic!`.
 
 **Step 1** — define `hvm_start_info` and `hvm_memmap_table_entry` per the PVH boot spec. Fields you need: `magic` (`0x336ec578`), `version`, `memmap_paddr`, `memmap_entries`. Each entry is `{ addr: u64, size: u64, type: u32, reserved: u32 }`; type 1 is usable RAM.
