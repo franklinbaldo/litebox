@@ -6,11 +6,67 @@
 //! Unlike LVBS, LiteBox here *is* the kernel: there is no VTL0 peer to delegate
 //! to. The security boundary is ring 0 vs ring 3, enforced by page tables,
 //! SMEP/SMAP and the syscall gate — a conventional OS threat model rather than
-//! a VBS one.
+//! a VBS one. `litebox_runner_kvm` establishes that boundary; see the
+//! `set_physical_memory_protections` comment in `crate::lib` for the argument
+//! and where each half of it is set up.
 //!
-//! The heap, the logger, the clock, the CRNG and the exit path are real. The
-//! remaining methods are still stubs; they land with the rest of the boot
-//! path.
+//! # Inventory
+//!
+//! This module is no longer a set of stubs. As of Phase 2 the guest boots via
+//! PVH, reaches long mode, and runs an OP-TEE TA in ring 3, so most of what is
+//! here is load-bearing. What is missing is missing for three distinct
+//! reasons, and the distinction matters when reading a panic.
+//!
+//! ## Implemented
+//!
+//! * **The heap.** A `SafeZoneAllocator` registered as the
+//!   `#[global_allocator]` and wired to `litebox::mm::allocator::MemoryProvider`
+//!   and [`crate::mm::MemoryProvider`]. The runner walks the PVH memory map and
+//!   hands every usable region to [`heap_add_region`] at boot.
+//! * **The logger.** [`HostInterface::log`] writes to the 16550 UART.
+//! * **The clock.** `Instant::now()` reads the TSC and rescales to nanoseconds
+//!   (in `crate::lib`, not here). LVBS's Hyper-V reference counter does not
+//!   exist on this platform.
+//! * **The CRNG.** A ChaCha20 DRBG seeded and periodically reseeded from
+//!   RDRAND, exposed through `litebox::platform::CrngProvider`. See `KvmCrng`.
+//! * **The exit paths.** [`HostInterface::exit`] and
+//!   [`HostInterface::terminate`] end the guest through QEMU's `isa-debug-exit`
+//!   device; [`debug_exit`] documents the exit-status transform.
+//!
+//! ## Not built yet — `unimplemented!()`
+//!
+//! These are genuinely absent and someone should write them. Each will be
+//! needed by a specific piece of post-milestone-1 work:
+//!
+//! * [`HostInterface::wake_many`] and [`HostInterface::block_or_maybe_timeout`]
+//!   — the futex backend. Nothing multi-threaded runs here yet: there is no AP
+//!   bring-up and no preemption timer, so no thread has ever needed to block.
+//! * [`HostInterface::send_ip_packet`] and
+//!   [`HostInterface::receive_ip_packet`] — virtio-net. There is no network
+//!   device on the QEMU command line to drive.
+//!
+//! ## Cannot exist here
+//!
+//! Not gaps. These would be wrong to implement, and are deliberately *not*
+//! `unimplemented!()` so that they do not read as a to-do list:
+//!
+//! * [`HostInterface::switch`] is `unreachable!()`. It transfers control to
+//!   VTL0, and a plain KVM guest has no VTL0 peer to transfer to. There is no
+//!   future in which this gains a body.
+//! * `litebox::platform::DerivedKeyProvider` returns
+//!   `DerivedKeyError::UnsupportedRebootPersistentKey` rather than panicking.
+//!   A plain KVM guest has no platform root key to derive from; returning a
+//!   manufactured key would satisfy the signature while silently breaking the
+//!   reboot-persistence guarantee callers depend on. `Unsupported` is the
+//!   truthful answer, and callers can handle it.
+//!
+//! ## Absent entirely
+//!
+//! `litebox::platform::ThreadLocalStorageProvider` and `init_task` are
+//! implemented for `LvbsLinuxKernel` but have no `KvmGuest` counterpart — not
+//! even a stub. Nothing in the crate demands those bounds on this path yet, so
+//! the omission compiles. Neither is LVBS-specific (TLS is just `pcv.tls`), so
+//! both are straightforward ports whenever a caller first needs them.
 //!
 use crate::{Errno, HostInterface, arch::ioport::serial_print_string};
 use digest::Digest;
