@@ -503,6 +503,18 @@ unsafe fn apply_relocations() -> u64 {
             // keeps the store from being reordered against the reads that the
             // relocated statics will shortly perform.
             unsafe { target.write_volatile(value) };
+        } else {
+            // Silently skipping would leave the target at zero -- the RELA
+            // convention noted above -- and turn the link error into a null
+            // dereference at an arbitrary later moment, with nothing left to
+            // connect it back to here.
+            panic!(
+                "unsupported relocation type {:#X} at offset {:#X}; this image \
+                 is linked -pie with only R_X86_64_RELATIVE, so anything else \
+                 means the link went wrong",
+                entry.info & 0xFFFF_FFFF,
+                entry.offset
+            );
         }
 
         // SAFETY: Still inside the table; the loop condition rechecks before
