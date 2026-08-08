@@ -98,9 +98,14 @@ Commit: `Parse virtio PCI capability structures`
 
 **Files:** `litebox_runner_kvm/src/virtio/mod.rs`, possibly `litebox_runner_kvm/src/boot/mod.rs`
 
-The BARs live in the PCI hole well above `MAPPED_LIMIT` (1 GiB) — our memmap shows the q35 ECAM window at `0xB000_0000` and device BARs sit above it. So this needs genuinely new mapping work.
+Measured facts from Task 2, which correct this plan as first written:
 
-**Step 1** — read the BAR, determine its size by the standard write-all-ones-and-read-back dance, and restore it.
+- The device QEMU gives us is **transitional**: device ID `0x1003`, with a legacy I/O interface at BAR0 (port `0xC000`) *and* the full modern capability set. Adding `disable-legacy=on` to the QEMU line makes it `0x1043` with byte-identical capability offsets; doing so is worthwhile to make the modern-only contract explicit rather than incidental.
+- **All four structures live in BAR4**, one 4 KiB page each, contiguous over `0x0000..0x4000`. So only **16 KiB** needs mapping, not "the BARs".
+- **BAR4 is 64-bit and prefetchable**, base `0xFE00_0000`. The earlier claim that BARs sit above the ECAM window at `0xB000_0000` was wrong about ordering; both are above `MAPPED_LIMIT` (1 GiB), so the conclusion stands but the address does not.
+- `notify_off_multiplier` is **4**, not 0, so each queue has its own notify dword at `bar4 + 0x3000 + queue_notify_off * 4`.
+
+**Step 1** — read the BAR, determine its size by the standard write-all-ones-and-read-back dance, and restore it. **BAR4 is 64-bit**: write ones to *both* halves and restore both, or you will corrupt the upper dword.
 
 **Step 2** — map those physical pages into the kernel window. **MMIO must be mapped uncacheable** (`PCD`/`PWT`, or a PAT entry) — mapping device registers write-back will produce baffling behaviour.
 
