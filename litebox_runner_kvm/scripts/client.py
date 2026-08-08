@@ -345,12 +345,14 @@ def describe_param(index: int, param: dict) -> str:
             f"    [{index}] {kind} value_a={param['value_a']:#x} "
             f"value_b={param['value_b']:#x}"
         )
+    # Hex, not repr(). A memref is bytes, and repr() renders most of them as
+    # escapes and a few as ASCII, which is neither readable nor something a
+    # test can match on. The whole value is printed: these are cryptographic
+    # outputs, and a truncated one cannot be compared against a reference.
     data = param.get("data", b"")
-    shown = data[:32]
-    tail = "..." if len(data) > len(shown) else ""
     return (
         f"    [{index}] {kind} buffer_size={param.get('buffer_size', 0)} "
-        f"len={len(data)} data={shown!r}{tail}"
+        f"len={len(data)} hex={data.hex()}"
     )
 
 
