@@ -41,18 +41,27 @@ use litebox_platform_lvbs::{LvbsValidateAccess, reenter_thread_ref, run_thread_r
 use litebox_shim_optee::session::session_manager;
 use litebox_shim_optee::{LoadedProgram, OpteeShim, OpteeShimBuilder, UserConstPtr};
 
-use crate::proto::{self, Opcode, Param, Request, Response};
+use crate::proto::{self, BinaryTarget, LoadChunk, Opcode, Param, Request, Response};
 use crate::virtio::{self, queue::Dma};
 
 /// OP-TEE's user-mode loader, which runs before the TA and maps it.
+///
+/// Embedded for the **no-device path only**. [`serve`] takes both binaries
+/// over the channel; see [`Binaries`].
 static LDELF: &[u8] =
     include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/ldelf.elf");
 
-/// The TA itself. `hello-ta` is the simplest one in the tree, which is what we
-/// want for the first ring-3 execution this platform has ever performed.
+/// The TA the no-device path runs. `hello-ta` is the simplest one in the tree.
 ///
-/// Still embedded rather than shipped over the wire. Moving binaries across
-/// the channel is a later cut; nothing about the framing forbids it.
+/// The other four TAs are deliberately *not* embedded. Together they are about
+/// 4.8 MB (`kmpp-ta.elf` alone is 2.5 MB), and the kernel image shares an
+/// address space with the boot scratch region, so embedding a TA per test
+/// would grow the image by more than the whole rest of the runner. They arrive
+/// over the channel instead.
+///
+/// These two stay because the no-device path has to run *something* without a
+/// host peer, and 728 KB is the price of a CI test that needs no python3, no
+/// unix socket and no second process. See [`run`].
 static TA: &[u8] =
     include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 
@@ -78,7 +87,7 @@ pub fn run() {
         .expect("open-session token carries no session id");
     log::info!("ta         session id {session_id}");
 
-    let ta_uuid = ta_uuid();
+    let ta_uuid = ta_uuid(TA).expect("the embedded hello-ta.elf has a .ta_head section");
     let loaded_program = shim
         .load_ldelf(LDELF, ta_uuid, Some(TA))
         .unwrap_or_else(|e| panic!("failed to load ldelf: {e:?}"));
@@ -144,19 +153,19 @@ fn build_shim() -> OpteeShim {
 /// The UUID in the TA's own `.ta_head` section.
 ///
 /// `load_ldelf` rejects the binary with `InvalidUuid` if the UUID it is given
-/// disagrees. Reading it out of the binary rather than hard-coding it means
-/// swapping `hello-ta` for another TA needs no edit here, and means the value
-/// cannot silently drift from the artifact. (The userland runner's default
+/// disagrees. Reading it out of the binary is what lets the channel run *any*
+/// TA the client cares to ship: nothing here knows which one it is. (The userland runner's default
 /// path passes `TeeUuid::default()`; that evidently only ever ran against a
 /// nil-UUID TA.)
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the embedded TA has no parseable `.ta_head`, which is a fact
-/// about the build, not about anything a client did.
-fn ta_uuid() -> TeeUuid {
-    let ta_uuid = litebox_common_optee::parse_ta_head(TA)
-        .expect("hello-ta.elf has no parseable .ta_head section")
+/// Fails if the TA has no parseable `.ta_head`. On the channel path that is a
+/// statement about the bytes a *client* sent, so it must be a reply rather
+/// than a panic.
+fn ta_uuid(ta: &[u8]) -> Result<TeeUuid, String> {
+    let ta_uuid = litebox_common_optee::parse_ta_head(ta)
+        .ok_or_else(|| String::from("the TA has no parseable .ta_head section"))?
         .uuid;
     let node = ta_uuid.clock_seq_and_node;
     log::info!(
@@ -173,7 +182,7 @@ fn ta_uuid() -> TeeUuid {
         node[6],
         node[7],
     );
-    ta_uuid
+    Ok(ta_uuid)
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +324,100 @@ impl Channel {
     }
 }
 
+/// The two binaries the client ships in, and the transfer in progress.
+///
+/// A binary is complete when the buffer has reached the total the chunks
+/// declared. Until then it is *not* usable, and [`Binaries::ready`] says so:
+/// handing a half-received ELF to `load_ldelf` would produce a parse error
+/// that says nothing about the real problem, which is that the client stopped
+/// sending.
+///
+/// The transfer is append-only and single-tracked per target. A chunk whose
+/// offset is not exactly what has already been received is refused rather than
+/// used to seek, because seeking would let a client assemble a binary the
+/// frames it sent do not uniquely determine.
+#[derive(Default)]
+struct Binaries {
+    ldelf: Vec<u8>,
+    ldelf_total: Option<usize>,
+    ta: Vec<u8>,
+    ta_total: Option<usize>,
+}
+
+impl Binaries {
+    /// The buffer and declared total for one target.
+    fn slot(&mut self, target: BinaryTarget) -> (&mut Vec<u8>, &mut Option<usize>) {
+        match target {
+            BinaryTarget::Ldelf => (&mut self.ldelf, &mut self.ldelf_total),
+            BinaryTarget::Ta => (&mut self.ta, &mut self.ta_total),
+        }
+    }
+
+    /// Appends one chunk.
+    ///
+    /// `proto` has already bounded `total_len` by `MAX_BINARY_LEN` and checked
+    /// that the chunk fits inside it, so what is left to check here is the
+    /// part `proto` cannot see: agreement with the chunks that came *before*.
+    fn accept(&mut self, chunk: &LoadChunk) -> Result<(), String> {
+        let name = chunk.target.name();
+        let (buffer, total) = self.slot(chunk.target);
+
+        if chunk.offset == 0 {
+            // A fresh transfer, which also lets a client replace a binary it
+            // already sent.
+            buffer.clear();
+            buffer.reserve_exact(chunk.total_len);
+            *total = Some(chunk.total_len);
+        }
+        match *total {
+            None => {
+                return Err(format!(
+                    "a chunk of {name} at offset {} arrived before the first chunk",
+                    chunk.offset
+                ));
+            }
+            Some(declared) if declared != chunk.total_len => {
+                return Err(format!(
+                    "a chunk of {name} declares a total of {} bytes, but the transfer \
+                     already in progress declared {declared}",
+                    chunk.total_len
+                ));
+            }
+            Some(_) => {}
+        }
+        if chunk.offset != buffer.len() {
+            return Err(format!(
+                "a chunk of {name} is at offset {} but {} bytes have been received; \
+                 the transfer is append-only",
+                chunk.offset,
+                buffer.len()
+            ));
+        }
+        buffer.extend_from_slice(&chunk.data);
+        Ok(())
+    }
+
+    /// The two binaries, if both have been received in full.
+    fn ready(&self) -> Result<(&[u8], &[u8]), String> {
+        for (name, buffer, total) in [
+            ("ldelf", &self.ldelf, self.ldelf_total),
+            ("the TA", &self.ta, self.ta_total),
+        ] {
+            match total {
+                None => return Err(format!("{name} has not been loaded")),
+                Some(declared) if declared != buffer.len() => {
+                    return Err(format!(
+                        "{name} is incomplete: {} of {declared} bytes received",
+                        buffer.len()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok((&self.ldelf, &self.ta))
+    }
+}
+
 /// The TA state a session owns between an `OpenSession` and its
 /// `CloseSession`.
 struct Session {
@@ -347,6 +450,7 @@ pub fn serve(console: virtio::Console) {
     let mut channel = Channel::new(console);
     let mut session: Option<Session> = None;
     let mut ldelf_has_run = false;
+    let mut binaries = Binaries::default();
 
     log::info!("channel    serving requests");
     loop {
@@ -385,7 +489,33 @@ pub fn serve(console: virtio::Console) {
             return;
         }
 
-        let response = service(&shim, &request, &mut session, &mut ldelf_has_run);
+        // Handled here rather than in `service` because it is the only
+        // request that mutates state `service` has no business holding: the
+        // binaries outlive every session.
+        if let Some(chunk) = request.load.as_ref() {
+            let response = match binaries.accept(chunk) {
+                Ok(()) => {
+                    if chunk.is_last() {
+                        log::info!(
+                            "channel    {} received, {} bytes",
+                            chunk.target.name(),
+                            chunk.total_len
+                        );
+                    }
+                    Response::ok(0, Vec::new())
+                }
+                Err(message) => Response::error(message),
+            };
+            if response.status != proto::STATUS_OK {
+                log::warn!("channel    response error: {}", response.message);
+            }
+            if let Err(fatal) = channel.send(&response) {
+                panic!("channel: {fatal}");
+            }
+            continue;
+        }
+
+        let response = service(&shim, &request, &mut session, &mut ldelf_has_run, &binaries);
         match response.status {
             proto::STATUS_OK => log::info!(
                 "channel    response ok, TA returned {:#010X}, {} parameter(s)",
@@ -404,13 +534,13 @@ pub fn serve(console: virtio::Console) {
 ///
 /// Every failure here is a [`Response`], never a panic: a client that asks for
 /// something impossible must get an answer saying so, not a dead guest. The
-/// panics that remain are about the build (`ta_uuid`) or about the channel,
-/// not about the request.
+/// panics that remain are about the channel, not about the request.
 fn service(
     shim: &OpteeShim,
     request: &Request,
     session: &mut Option<Session>,
     ldelf_has_run: &mut bool,
+    binaries: &Binaries,
 ) -> Response {
     let params = match to_utee_params(&request.params) {
         Ok(params) => params,
@@ -424,7 +554,7 @@ fn service(
                     "a session is already open; close it before opening another",
                 ));
             }
-            match open_session(shim, &params, ldelf_has_run) {
+            match open_session(shim, &params, ldelf_has_run, binaries) {
                 Ok((new_session, response)) => {
                     *session = Some(new_session);
                     response
@@ -465,7 +595,12 @@ fn open_session(
     shim: &OpteeShim,
     params: &[UteeParamOwned],
     ldelf_has_run: &mut bool,
+    binaries: &Binaries,
 ) -> Result<(Session, Response), String> {
+    // Before a session id is taken, so a client that forgot to load gets a
+    // diagnosis rather than a leaked id.
+    let (ldelf, ta) = binaries.ready()?;
+
     let mut token = session_manager()
         .try_acquire_open_session_token()
         .map_err(|e| format!("no open-session token available: {e:?}"))?;
@@ -473,9 +608,9 @@ fn open_session(
         .session_id()
         .ok_or_else(|| String::from("open-session token carries no session id"))?;
 
-    // The client identity a real REE client would present. `hello-ta` does not
-    // inspect it; a TA that did would see the same default the userland
-    // runner's JSON path uses when the file names none.
+    // The client identity a real REE client would present. `kmpp-ta` is the
+    // one TA here that inspects it; the others see the same default the
+    // userland runner's JSON path uses when the file names none.
     session_manager().set_session_client_identity(
         session_id,
         Some(TeeIdentity {
@@ -485,7 +620,7 @@ fn open_session(
     );
 
     let loaded = shim
-        .load_ldelf(LDELF, ta_uuid(), Some(TA))
+        .load_ldelf(ldelf, ta_uuid(ta)?, Some(ta))
         .map_err(|e| format!("failed to load ldelf: {e:?}"))?;
     let entrypoints = loaded
         .entrypoints
