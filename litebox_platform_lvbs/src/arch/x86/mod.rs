@@ -15,11 +15,18 @@ pub mod msr;
 #[cfg(feature = "host_lvbs")]
 pub mod timer;
 
-/// Partition reference counter granularity: 100 ns ticks, i.e., 10 per microsecond.
+/// Ticks per microsecond of the *Hyper-V partition reference counter*
+/// (`HV_X64_MSR_TIME_REF_COUNT`): 100 ns per tick, i.e. 10 per microsecond.
+///
+/// This is a property of a Hyper-V synthetic MSR, not of x86. It is gated on
+/// `host_lvbs` so that a host without that MSR cannot accidentally inherit its
+/// granularity; see `Instant::TICK_NANOS` in `lib.rs`.
+#[cfg(feature = "host_lvbs")]
 pub(crate) const REF_TICKS_PER_MICRO: u64 = 10;
 
-/// Nanoseconds per partition reference-counter tick: the counter runs at
-/// 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
+/// Nanoseconds per tick of the *Hyper-V partition reference counter*: the
+/// counter runs at 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
+#[cfg(feature = "host_lvbs")]
 pub(crate) const REF_COUNTER_TICK_NANOS: u64 = 1_000 / REF_TICKS_PER_MICRO;
 
 /// Vector the local APIC delivers for a *spurious* interrupt (programmed

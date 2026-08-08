@@ -867,8 +867,10 @@ impl<Host: HostInterface> RawMutex<Host> {
 
 /// An implementation of [`litebox::platform::Instant`].
 ///
-/// Backed by the Hyper-V partition reference counter, which is monotonic
-/// and normalized by the hypervisor across TSC scaling and live migration.
+/// Holds an opaque reading of the host's monotonic counter. One tick of that
+/// counter is [`Instant::TICK_NANOS`] nanoseconds; *which* counter, and hence
+/// what a tick is worth, is host-specific and is declared alongside
+/// [`Instant::now`] in the per-host `impl` blocks below.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
@@ -891,30 +893,54 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let ticks = self.0.checked_sub(earlier.0)?;
-        // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
-        let nanos = ticks.checked_mul(crate::arch::REF_COUNTER_TICK_NANOS)?;
+        let nanos = ticks.checked_mul(Self::TICK_NANOS)?;
         Some(core::time::Duration::from_nanos(nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
         let nanos: u64 = duration.as_nanos().try_into().ok()?;
-        let ticks = nanos / crate::arch::REF_COUNTER_TICK_NANOS;
+        let ticks = nanos / Self::TICK_NANOS;
         Some(Instant(self.0.checked_add(ticks)?))
     }
 }
 
+// ---------------------------------------------------------------------------
+// The counter behind `Instant`, and the unit it counts in.
+//
+// `TICK_NANOS` has NO default and is defined nowhere except inside the same
+// `#[cfg]`-gated `impl` block as the `now()` that produces the ticks. The
+// arithmetic above names `Self::TICK_NANOS`, so a host that supplies a counter
+// without declaring that counter's unit fails to compile. A new host therefore
+// cannot silently inherit another host's granularity -- which is exactly how
+// `host_kvm` came to be compiled against the Hyper-V reference counter's
+// 100 ns tick while its own `now()` was still a stub.
+// ---------------------------------------------------------------------------
+
+/// The Hyper-V partition reference counter: monotonic, and normalized by the
+/// hypervisor across TSC scaling and live migration.
+#[cfg(feature = "host_lvbs")]
 impl Instant {
-    #[cfg(feature = "host_lvbs")]
+    /// One partition-reference-counter tick is 100 ns.
+    const TICK_NANOS: u64 = crate::arch::REF_COUNTER_TICK_NANOS;
+
     fn now() -> Self {
         Instant(crate::arch::timer::reference_time_100ns())
     }
+}
 
-    /// KVM has no Hyper-V reference counter. A TSC-based clock lands in Phase 2 with
-    /// the boot path; until there is something to boot, a stub is more honest than a
-    /// fabricated calibration.
-    #[cfg(feature = "host_kvm")]
+/// A plain KVM guest has no Hyper-V reference counter; the clock is the TSC.
+///
+/// The TSC's own frequency is discovered at runtime and varies per machine, so
+/// it is not a usable tick unit. `now()` therefore rescales to nanoseconds up
+/// front and `TICK_NANOS` is 1, which makes the arithmetic above an identity.
+#[cfg(feature = "host_kvm")]
+impl Instant {
+    /// `now()` returns nanoseconds, so a tick *is* a nanosecond.
+    const TICK_NANOS: u64 = 1;
+
+    /// Nanoseconds since an arbitrary boot-time origin.
     fn now() -> Self {
-        unimplemented!("KVM time source lands in Phase 2")
+        unimplemented!("KVM time source lands in Phase 2 Task 5")
     }
 }
 
