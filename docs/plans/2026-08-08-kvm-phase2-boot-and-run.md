@@ -67,6 +67,40 @@ relocation against an ordinary symbol (`R_X86_64_32 cannot be used against symbo
 `NOLOAD` region at fixed PA `0x1000000`, referenced as plain immediates. `_heap_start`
 begins above that region.
 
+## QEMU CPU model matters (found in Task 5)
+
+**TCG runs must use `-cpu max`.** The default `qemu64` model lacks RDRAND, so
+`CrngProvider` panics the moment anything asks for randomness. Task 10's TA almost
+certainly will. `-cpu max` also exposes RDRAND under TCG, verified producing distinct
+values.
+
+**Do not trust CPUID frequency leaves.** The dev host is an AMD EPYC 7763; leaves
+`0x15`/`0x16` are Intel-only and QEMU here reports max hypervisor leaf `0x40000001`, so
+`0x40000010` is absent too. Worse, at the default `level=0xd`, `-cpu max` returns
+*leaf-0xd contents* for leaf `0x15` — `eax=0x21f ebx=0x240 ecx=0xa88`, which parses as a
+plausible crystal ratio. CPUID returns the highest supported leaf's data for out-of-range
+input. **The max-leaf guards in `arch/x86/clock.rs` are load-bearing; do not remove them.**
+
+Working frequency sources, in the order the clock tries them:
+| Source | Where it wins |
+|---|---|
+| CPUID `0x15`/`0x16`/`0x40000010` | Intel hardware; never on this dev host |
+| KVM pvclock, MSR `0x4b564d01` | `--kvm` (2445432000 Hz observed) |
+| i8254 PIT calibration | TCG, always (~2.4457 GHz observed, agrees with pvclock to 0.02%) |
+
+## Two boot hazards found in Task 5
+
+- **SSE must be enabled before any non-trivial Rust runs.** `CR0.EM` is set and
+  `CR4.OSFXSR` clear at reset. SSE2 is x86-64 ABI baseline, so *any* Rust function may
+  emit xmm instructions. The boot path survived early tasks only because it was all
+  integer code; `rand_chacha` `#UD`'d immediately. With no IDT that is a silent triple
+  fault — `qemu exit: 0` and no output. Fixed in `595451a4`.
+- **The boot stack grows towards the early page tables.** Both live in the `NOLOAD`
+  scratch region at PA `0x1000000`, with the tables at its base. A stack overflow
+  destroys the mapping needed to report it. Enlarged to 512 KiB in `595451a4`, but a
+  real guard page needs 4 KiB granularity the 2 MiB early tables cannot express.
+  **Task 6 should address this** when it builds proper page tables.
+
 ## Verification gates
 
 **Gate P1 — Phase 1 invariant.** Every task must leave the LVBS build untouched:
