@@ -204,7 +204,7 @@ struct PvclockTimeInfo {
 struct PvclockCell(core::cell::UnsafeCell<PvclockTimeInfo>);
 
 // SAFETY: The contents are only ever touched through volatile reads of a raw
-// pointer, and the hypervisor is disabled again before `read_pvclock_hz`
+// pointer, and the hypervisor is disabled again before `pvclock_hz`
 // returns, so no reference into the cell outlives the window in which the
 // hypervisor may write.
 unsafe impl Sync for PvclockCell {}
