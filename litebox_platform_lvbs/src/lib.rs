@@ -1211,9 +1211,18 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // nothing to acquire. The `Option` is retained so the mapping's writability is still
         // tracked, and this branch is infallible.
         let protected_frame_access = perms.contains(PhysPageMapPermissions::WRITE).then_some(());
-        // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
-        // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
-        // shared raw mapping implementation.
+        // SAFETY: under `host_lvbs`, ordinary writable mappings were just checked against the
+        // protected and in-flight frames above, and the resulting guard is retained through map,
+        // access, and unmap.
+        //
+        // Under `host_kvm` no such check is performed, and the obligation is discharged
+        // differently: it is vacuously satisfied because the protected-frame registry is provably
+        // empty. The registry lives in `mshv::vsm`, which is gated out entirely under `host_kvm`,
+        // and its only writers — `protect_physical_memory_range` and the reservation path — are
+        // therefore not compiled. With no entries, no mapping can ever conflict with one, so
+        // there is nothing to check and no guard to retain.
+        //
+        // `vmap_privileged` provides the shared raw mapping implementation.
         let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
         map_info.protected_frame_access = protected_frame_access;
         Ok(map_info)
