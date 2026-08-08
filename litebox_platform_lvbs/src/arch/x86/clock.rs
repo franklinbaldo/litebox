@@ -64,6 +64,15 @@ const CPUID_TSC_RATIO_LEAF: u32 = 0x15;
 const CPUID_PROC_FREQ_LEAF: u32 = 0x16;
 /// Base of the hypervisor CPUID range; `EAX` is the highest supported leaf in it.
 const CPUID_HYPERVISOR_BASE: u32 = 0x4000_0000;
+/// KVM's interface signature, returned in `EBX`/`ECX`/`EDX` of leaf
+/// `0x4000_0000`: the twelve bytes `"KVMKVMKVM\0\0\0"`.
+///
+/// The `0x4000_00xx` range is shared by every hypervisor, and the meaning of
+/// every leaf in it is vendor specific. Nothing below may be read as a KVM
+/// value until these three registers say KVM; see [`kvm_max_leaf`].
+const CPUID_KVM_SIGNATURE_EBX: u32 = 0x4b4d_564b;
+const CPUID_KVM_SIGNATURE_ECX: u32 = 0x564b_4d56;
+const CPUID_KVM_SIGNATURE_EDX: u32 = 0x0000_004d;
 /// Hypervisor feature leaf; `EAX` is a bitmap of `KVM_FEATURE_*`.
 const CPUID_HYPERVISOR_FEATURES: u32 = 0x4000_0001;
 /// KVM paravirt leaf reporting the TSC frequency in kHz.
@@ -118,15 +127,10 @@ static TSC_SCALE: spin::Once<TscScale> = spin::Once::new();
 
 /// Reads the TSC frequency in Hz from the KVM paravirt CPUID leaf.
 ///
-/// Returns `None` if not running under a hypervisor, if the hypervisor range
-/// does not extend to the frequency leaf, or if the leaf reports zero.
+/// Returns `None` if the hypervisor is absent or is not KVM, if the KVM leaf
+/// range does not extend to the frequency leaf, or if the leaf reports zero.
 fn kvm_paravirt_hz() -> Option<u64> {
-    if !hypervisor_present() {
-        return None;
-    }
-
-    let max_hypervisor_leaf = cpuid_count(CPUID_HYPERVISOR_BASE, 0).eax;
-    if max_hypervisor_leaf < CPUID_KVM_TSC_FREQ_LEAF {
+    if kvm_max_leaf()? < CPUID_KVM_TSC_FREQ_LEAF {
         return None;
     }
 
@@ -172,6 +176,39 @@ fn base_frequency_hz() -> Option<u64> {
 /// Returns whether `CPUID.1:ECX` reports the hypervisor-present bit.
 fn hypervisor_present() -> bool {
     cpuid_count(CPUID_FEATURE_INFO, 0).ecx & CPUID_ECX_HYPERVISOR != 0
+}
+
+/// Returns the highest `0x4000_00xx` leaf, but *only if the hypervisor is KVM*.
+///
+/// The hypervisor CPUID range is not architectural and is not owned by any one
+/// vendor: every hypervisor puts its own leaves there, and the same leaf number
+/// means different things to different ones. Leaf `0x4000_0000` exists to say
+/// whose interpretation applies, and it must be consulted before anything in
+/// the range is read as a KVM value.
+///
+/// Skipping that check is not a theoretical problem. Under Hyper-V, leaf
+/// `0x4000_0001` `EAX` is the interface signature `"Hv#1"` = `0x3123_7648`, and
+/// bit 3 of that is set -- which is exactly the bit we read as
+/// `KVM_FEATURE_CLOCKSOURCE2`. Believing it leads straight to
+/// `wrmsr(0x4b564d01)`, a KVM MSR Hyper-V does not implement, which `#GP`s;
+/// with no IDT this early that is a silent triple fault.
+///
+/// A non-KVM hypervisor therefore means "no KVM paravirt clock sources", and
+/// discovery falls through to PIT calibration, which works everywhere.
+fn kvm_max_leaf() -> Option<u32> {
+    // The `0x4000_00xx` range is architecturally reserved on bare metal, where
+    // CPUID would alias it to the highest standard leaf's contents rather than
+    // returning zero, so the hypervisor-present bit gates the query itself.
+    if !hypervisor_present() {
+        return None;
+    }
+
+    let leaf = cpuid_count(CPUID_HYPERVISOR_BASE, 0);
+    let is_kvm = leaf.ebx == CPUID_KVM_SIGNATURE_EBX
+        && leaf.ecx == CPUID_KVM_SIGNATURE_ECX
+        && leaf.edx == CPUID_KVM_SIGNATURE_EDX;
+
+    is_kvm.then_some(leaf.eax)
 }
 
 // ---------------------------------------------------------------------------
@@ -237,9 +274,10 @@ const PVCLOCK_READ_ATTEMPTS: u32 = 16;
 /// `tsc_to_system_mul * 2^tsc_shift / 2^32` nanoseconds and the frequency is
 /// `10^9 * 2^(32 - tsc_shift) / tsc_to_system_mul`.
 ///
-/// Returns `None` if `KVM_FEATURE_CLOCKSOURCE2` is absent (so the MSR must not
-/// be written -- there is no IDT this early, and a `#GP` would triple-fault)
-/// or if the hypervisor never publishes a stable version.
+/// Returns `None` if the hypervisor is not KVM, or is KVM but lacks
+/// `KVM_FEATURE_CLOCKSOURCE2` (either way the MSR must not be written -- there
+/// is no IDT this early, and a `#GP` would triple-fault), or if the hypervisor
+/// never publishes a stable version.
 fn pvclock_hz() -> Option<u64> {
     if !kvm_clocksource2_supported() {
         return None;
@@ -305,12 +343,15 @@ fn frequency_from_pvclock(mul: u32, shift: i8) -> Option<u64> {
     u64::try_from(numerator / u128::from(mul)).ok()
 }
 
-/// Returns whether the hypervisor advertises `KVM_FEATURE_CLOCKSOURCE2`.
+/// Returns whether the hypervisor is KVM *and* advertises
+/// `KVM_FEATURE_CLOCKSOURCE2`. The vendor half is load-bearing: see
+/// [`kvm_max_leaf`] for the Hyper-V aliasing that makes reading this bit
+/// without it a triple fault.
 fn kvm_clocksource2_supported() -> bool {
-    if !hypervisor_present() {
+    let Some(max_leaf) = kvm_max_leaf() else {
         return false;
-    }
-    if cpuid_count(CPUID_HYPERVISOR_BASE, 0).eax < CPUID_HYPERVISOR_FEATURES {
+    };
+    if max_leaf < CPUID_HYPERVISOR_FEATURES {
         return false;
     }
     cpuid_count(CPUID_HYPERVISOR_FEATURES, 0).eax & KVM_FEATURE_CLOCKSOURCE2 != 0
