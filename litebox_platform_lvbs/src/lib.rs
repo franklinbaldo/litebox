@@ -56,12 +56,25 @@ compile_error!(
      Hint: you may have set `default-features = false` without picking a host."
 );
 
+/// The protected-frame access guard retained by a writable mapping.
+///
+/// Under LVBS this is a real VSM guard: it serialises the mapping against VTL0, the hostile
+/// lower-privilege peer kernel that shares the physical address space with us.
+///
+/// Under KVM there is no VTL0 peer — LiteBox *is* the kernel, and the only security boundary is
+/// ring 0 vs ring 3. There are therefore no foreign writers to guard against, so the guard carries
+/// no state and is the unit type.
+#[cfg(feature = "host_lvbs")]
+type ProtectedFrameAccess = crate::mshv::vsm::ProtectedFrameAccessGuard<'static>;
+#[cfg(feature = "host_kvm")]
+type ProtectedFrameAccess = ();
+
 /// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
 /// the mapping's lifetime.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    protected_frame_access: Option<crate::mshv::vsm::ProtectedFrameAccessGuard<'static>>,
+    protected_frame_access: Option<ProtectedFrameAccess>,
 }
 
 impl LvbsPhysPageMapInfo {
@@ -1136,6 +1149,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
+        #[cfg(feature = "host_lvbs")]
         let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
             // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
             // but does not support re-entry into a VTL protection change.
@@ -1143,6 +1157,11 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         } else {
             None
         };
+        #[cfg(feature = "host_kvm")]
+        // No VTL0 peer exists on KVM, so there are no foreign writers to guard against and
+        // nothing to acquire. The `Option` is retained so the mapping's writability is still
+        // tracked, and this branch is infallible.
+        let protected_frame_access = perms.contains(PhysPageMapPermissions::WRITE).then_some(());
         // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
         // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
         // shared raw mapping implementation.
@@ -1292,36 +1311,53 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Build a RangeSet so that adjacent pages are coalesced into contiguous
-        // ranges, minimizing the number of hypercalls.
-        let mut range_set = rangemap::RangeSet::new();
-        for page in pages {
-            let start = page.as_usize() as u64;
-            let end = start
-                .checked_add(ALIGN as u64)
-                .ok_or(PhysPointerError::Overflow)?;
-            range_set.insert(start..end);
+        #[cfg(feature = "host_lvbs")]
+        {
+            // Build a RangeSet so that adjacent pages are coalesced into contiguous
+            // ranges, minimizing the number of hypercalls.
+            let mut range_set = rangemap::RangeSet::new();
+            for page in pages {
+                let start = page.as_usize() as u64;
+                let end = start
+                    .checked_add(ALIGN as u64)
+                    .ok_or(PhysPointerError::Overflow)?;
+                range_set.insert(start..end);
+            }
+
+            let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
+                // VTL1 needs writable access, so deny VTL0 all access.
+                crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
+            } else if perms.contains(PhysPageMapPermissions::READ) {
+                // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
+                crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
+                    | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
+            } else {
+                // VTL1 no longer protects the pages.
+                crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
+            };
+
+            for range in range_set.iter() {
+                let frame_range = PhysFrame::range(
+                    PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
+                    PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
+                );
+                crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
+                    .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+            }
         }
 
-        let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // VTL1 needs writable access, so deny VTL0 all access.
-            crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
-        } else if perms.contains(PhysPageMapPermissions::READ) {
-            // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
-                | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
-        } else {
-            // VTL1 no longer protects the pages.
-            crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
-        };
-
-        for range in range_set.iter() {
-            let frame_range = PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
-                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
-            );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
-                .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+        #[cfg(feature = "host_kvm")]
+        {
+            // Under LVBS this function adjusts VSM page protections so that VTL0 — a hostile
+            // peer kernel running at lower privilege in the same physical address space —
+            // cannot read or write pages that VTL1 relies on.
+            //
+            // Under KVM there is no VTL0 peer: LiteBox *is* the kernel. The security boundary
+            // is ring 0 vs ring 3, enforced by the page tables, SMEP/SMAP and the syscall gate,
+            // which is the conventional OS threat model. No lower-privilege peer kernel exists
+            // that could tamper with these pages, so there is nothing for a per-page protection
+            // change to defend against and this call is correctly a no-op.
+            let _ = (pages, perms);
         }
 
         Ok(())
