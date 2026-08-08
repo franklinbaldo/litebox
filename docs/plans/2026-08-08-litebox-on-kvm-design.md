@@ -198,3 +198,55 @@ Boot-to-TA sequence:
 
 Deferred beyond milestone 1: SMP / AP bring-up, APIC-timer preemption, virtio-net,
 and a Linux-shim runner on the same platform.
+
+## 7. Not a production posture yet
+
+The ring 0 / ring 3 boundary described above is real and enforced, and the
+"legitimate standalone-OS deployment model" framing is the right long-term
+target. It is not what is shipped today.
+
+Every gap below is documented at its site, and each is the right call for
+Milestone 1 — a test vehicle running TAs we build ourselves, under QEMU, in CI.
+The problem this section exists to fix is that they were only ever recorded
+individually, so no reader ever saw them together and no reader could judge the
+aggregate. Nothing here is a request to fix them now.
+
+- **No preemption timer.** `run_thread` arms it under `host_lvbs` only
+  (`lib.rs:1505`); the LVBS implementation is built on Hyper-V synthetic timers
+  and has no KVM equivalent. On `host_kvm` the call is not emitted at all, so
+  there is no panic and no log: a TA that loops in ring 3 is never interrupted
+  and wedges the machine permanently. Ring-3 code is therefore *trusted not to
+  loop*, which is a trust assumption a ring 0/3 boundary is normally there to
+  avoid. Needs an APIC-deadline source.
+- **No stack guard page**, boot or per-CPU. `_guard_page_0` and `_guard_page_1`
+  in `PerCpuVariables` (`per_cpu_variables.rs:40,43`) are plain
+  `[u8; PAGE_SIZE]` padding — never unmapped, so they absorb an overflow
+  silently instead of trapping it. The failure mode has already occurred once
+  during bring-up, and is unreportable by construction: overflowing the kernel
+  stack corrupts whatever is adjacent rather than faulting. **This is an LVBS
+  bug too**, not only a KVM gap; the padding is in shared code.
+- **No TLB shootdown and no AP bring-up.** Correct as long as the system is
+  single-CPU, which it is. `flush_tlb_range` under `host_kvm` flushes locally
+  and the `TODO(SMP)` at `paging.rs:110` is unowned — the moment a second CPU
+  is started, that TODO becomes a correctness bug rather than a note.
+- **No reboot-persistent key.** `DerivedKeyProvider` returns
+  `UnsupportedRebootPersistentKey`; a plain KVM guest has no platform root key.
+  This is the honest answer rather than a gap to plug, but it does mean sealed
+  storage is simply unavailable, and anything depending on it cannot run here.
+- **The memory map exclusion set is validated against one QEMU layout.** After
+  the I3 fix the runner withholds the first megabyte, everything below
+  `_heap_start`, the `hvm_start_info` struct, the memmap table, the command
+  line (measured to its NUL) and every module image in the module list — and
+  it now *asserts* rather than assumes: `nr_modules` above `MAX_MODULES`, a
+  null `modlist_paddr` with a non-zero module count, and a command line with no
+  terminator within 4096 bytes are all loud failures. That converts "a layout
+  nobody has reasoned about" from silent heap corruption into a panic, which is
+  the goal; it is not the same as having reasoned about other layouts.
+- **The binary as shipped is not a production build.** Its final act is a
+  deliberate NX fault — the last self-check announces "the fault ends the run"
+  and the guest exits through a `#PF` panic by design, so the normal exit path
+  is a panic. Boot is also dominated by self-checks: a full run under TCG takes
+  around 9.5 s wall-clock, of which a fixed 1 s is a deliberate sleep in the
+  clock check, the rest being page-table, heap, SMAP/SMEP, W^X, `#PF` and NX
+  probes. All of it is bring-up instrumentation and would need to come out, or
+  go behind a feature, before anything ships.
