@@ -452,16 +452,21 @@ pub fn pit_reference_interval_nanos() -> Option<u64> {
 /// returned. Guessing instead would yield a clock that never fails loudly and
 /// is wrong by an unknown factor.
 fn discover() -> TscScale {
-    let candidates: [(&'static str, Option<u64>); 5] = [
-        ("CPUID 0x40000010 (KVM paravirt)", kvm_paravirt_hz()),
-        ("CPUID 0x15 (core crystal ratio)", crystal_ratio_hz()),
-        ("CPUID 0x16 (processor base frequency)", base_frequency_hz()),
-        ("KVM pvclock (MSR 0x4b564d01)", pvclock_hz()),
-        ("i8254 PIT calibration", pit_calibrated_hz()),
+    // Function pointers, not an array of already-computed `Option<u64>`: an
+    // array literal evaluates every element before the loop runs, so the
+    // ~55 ms PIT calibration and the pvclock MSR enable/disable pair would be
+    // paid on every boot even when CPUID answered first. Only the *selection*
+    // would be ordered, not the work.
+    let candidates: [(&'static str, fn() -> Option<u64>); 5] = [
+        ("CPUID 0x40000010 (KVM paravirt)", kvm_paravirt_hz),
+        ("CPUID 0x15 (core crystal ratio)", crystal_ratio_hz),
+        ("CPUID 0x16 (processor base frequency)", base_frequency_hz),
+        ("KVM pvclock (MSR 0x4b564d01)", pvclock_hz),
+        ("i8254 PIT calibration", pit_calibrated_hz),
     ];
 
-    for (source, candidate) in candidates {
-        if let Some(hz) = candidate
+    for (source, probe) in candidates {
+        if let Some(hz) = probe()
             && plausible(hz)
         {
             // `hz` passed the plausibility range, so it is non-zero and this
