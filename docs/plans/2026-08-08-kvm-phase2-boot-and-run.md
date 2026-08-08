@@ -101,6 +101,35 @@ Working frequency sources, in the order the clock tries them:
   real guard page needs 4 KiB granularity the 2 MiB early tables cannot express.
   **Task 6 should address this** when it builds proper page tables.
 
+## Phase 1 gating errors surface only when code is actually called
+
+Two `host_kvm` breakages were invisible throughout Phase 1 and only appeared in Task 7,
+when `init_idt()` was first called. **`--gc-sections` hides link errors until something
+references the object.** Expect more of these as Tasks 8 and 10 light up `mm` and the shim.
+
+- **`interrupts.S` undefined symbol.** Phase 1 gated the STIMER *IDT entry* and the
+  `stimer_handler_impl` *Rust function*, but `interrupts.S` is pulled in by `global_asm!`
+  unconditionally and its `isr_stimer` stub still contains `call stimer_handler_impl`.
+  Result under `host_kvm`: `rust-lld: error: undefined symbol: stimer_handler_impl`.
+  Fixed with a `host_kvm`-only panicking definition — chosen over splitting the `.S`,
+  which would have reordered LVBS's emitted assembly.
+- **`enable_extended_states()` asserted a VTL0 premise.** It ends with
+  `assert!(xcr0.contains(SSE), "XCR0 must have SSE enabled by VTL0")`. Under PVH we boot
+  from reset, where XCR0 is architecturally `0x1` (x87 only) — there is no VTL0 to have
+  set it. `host_kvm` now sets `XCR0.X87|SSE` itself, which it is entitled to do as sole
+  owner of the register. Needed by `allocate_xsave_area` (`VTL1_XSAVE_MASK = 0b11`).
+
+## Deferred to Task 8 (real page tables)
+
+- **`_guard_page_0` / `_guard_page_1` in `PerCpuVariables` are padding, not guard pages.**
+  They are plain `[u8; PAGE_SIZE]` fields and nothing anywhere marks them non-present.
+  A kernel stack overflow runs straight into `exception_stack` with no fault. **This is an
+  LVBS bug too**, not just a KVM gap — worth reporting to that crate's owners.
+- **VA 0 is mapped.** The early identity map covers the low 1 GiB, so a null dereference
+  does not fault. Real page tables should unmap page zero.
+- **SMAP enforcement is unverified.** No USER-accessible page exists yet. Task 10 should
+  confirm a kernel read of a user page faults, and succeeds between `stac`/`clac`.
+
 ## Verification gates
 
 **Gate P1 — Phase 1 invariant.** Every task must leave the LVBS build untouched:

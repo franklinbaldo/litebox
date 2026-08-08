@@ -75,6 +75,16 @@ d8a2ddb8e971d09794bf0397c64f0b2ed95036d26e0deb4b4254c8a719e2c91a
 Use Gate A' for Tasks 2-9. It stays stable across feature flips but still catches
 any real change to LiteBox code.
 
+**Gate at the item level, not inside a function body.** A `#[cfg]` block *inside* a
+function can perturb codegen for the other configuration. Found in Phase 2 Task 7: wrapping
+a `host_kvm` block inside `kernel_exception_handler_no_ctx` required restructuring
+`search(...).unwrap_or_else(...)` into a `let` binding plus the call. Semantically identical
+with the block compiled out — but in a debug build LLVM allocated an extra stack slot and
+emitted **10 more bytes in the LVBS binary** (`0x57` -> `0x61`). Two whole `cfg`-gated
+function definitions, with the `host_lvbs` body textually unchanged, moved nothing.
+
+Treat "an inner `cfg` block cannot affect the other config" as **false**.
+
 **Rebaselining.** A task that deliberately restructures code (rather than only adding
 `cfg`s) will legitimately move this hash. When that happens, diff the symbol tables and
 confirm the delta is exactly what the task mandated, then rebaseline. Task 7's helper
