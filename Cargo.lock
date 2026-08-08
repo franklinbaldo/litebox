@@ -1671,6 +1671,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_kvm"
+version = "0.1.0"
+
+[[package]]
 name = "litebox_runner_linux_on_windows_userland"
 version = "0.1.0"
 dependencies = [
