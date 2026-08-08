@@ -328,4 +328,7 @@ read_accessor!(u8, read_u8);
 read_accessor!(u16, read_u16);
 read_accessor!(u32, read_u32);
 
+write_accessor!(u8, write_u8);
+write_accessor!(u16, write_u16);
 write_accessor!(u32, write_u32);
+write_accessor!(u64, write_u64);

@@ -16,6 +16,7 @@
 use crate::pci::{self, Bar, DeviceHeader};
 
 pub mod mmio;
+pub mod queue;
 
 /// The `cfg_type` byte of a virtio PCI capability.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -417,10 +418,50 @@ pub mod common {
     pub const DEVICE_FEATURE_SELECT: u64 = 0x00;
     /// The selected word of the device's feature bits (u32, read-only).
     pub const DEVICE_FEATURE: u64 = 0x04;
+    /// Selects which word [`DRIVER_FEATURE`] writes (u32).
+    ///
+    /// [`DRIVER_FEATURE`]: self::DRIVER_FEATURE
+    pub const DRIVER_FEATURE_SELECT: u64 = 0x08;
+    /// The selected word of the features the driver accepts (u32).
+    pub const DRIVER_FEATURE: u64 = 0x0C;
     /// The number of virtqueues the device implements (u16, read-only).
     pub const NUM_QUEUES: u64 = 0x12;
     /// Device status (u8).
     pub const DEVICE_STATUS: u64 = 0x14;
+    /// Selects the queue the registers below refer to (u16).
+    pub const QUEUE_SELECT: u64 = 0x16;
+    /// The selected queue's size in descriptors (u16). Writable, to request a
+    /// smaller queue than the device's maximum.
+    pub const QUEUE_SIZE: u64 = 0x18;
+    /// Whether the selected queue is live (u16).
+    pub const QUEUE_ENABLE: u64 = 0x1C;
+    /// The selected queue's index into the notification region (u16,
+    /// read-only).
+    pub const QUEUE_NOTIFY_OFF: u64 = 0x1E;
+    /// Physical address of the selected queue's descriptor table (u64).
+    pub const QUEUE_DESC: u64 = 0x20;
+    /// Physical address of the selected queue's available ring (u64).
+    pub const QUEUE_DRIVER: u64 = 0x28;
+    /// Physical address of the selected queue's used ring (u64).
+    pub const QUEUE_DEVICE: u64 = 0x30;
+}
+
+/// `device_status` bits.
+pub mod status {
+    /// The driver has noticed the device.
+    pub const ACKNOWLEDGE: u8 = 1;
+    /// The driver knows how to drive it.
+    pub const DRIVER: u8 = 2;
+    /// The driver is ready; the device may start using the queues.
+    pub const DRIVER_OK: u8 = 4;
+    /// Feature negotiation is complete. The device clears this bit if it
+    /// cannot live with what the driver chose, which is the only way it has to
+    /// say so.
+    pub const FEATURES_OK: u8 = 8;
+    /// The driver has given up. Set on every bring-up failure path so the
+    /// device is left knowing it is not being driven, rather than half
+    /// initialised.
+    pub const FAILED: u8 = 128;
 }
 
 /// Feature bit 32: the device follows the virtio 1.0 specification rather than
@@ -644,3 +685,476 @@ impl core::fmt::Display for DeviceCfgVa {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Device initialisation.
+// ---------------------------------------------------------------------------
+
+/// `VIRTIO_CONSOLE_F_MULTIPORT` (feature bit 1): the device is a multiport
+/// console controller, with a control queue pair and two queues per port.
+///
+/// Deliberately *not* negotiated. See [`bring_up`] for what was measured.
+pub const VIRTIO_CONSOLE_F_MULTIPORT: u64 = 1 << 1;
+
+/// The queue carrying bytes from the device to the driver, with
+/// `F_MULTIPORT` declined.
+pub const QUEUE_RECEIVE: u16 = 0;
+/// The queue carrying bytes from the driver to the device.
+pub const QUEUE_TRANSMIT: u16 = 1;
+
+/// Why a bring-up attempt stopped.
+///
+/// Every variant carries the values that produced it. A bring-up failure with
+/// no numbers in it is nearly impossible to act on: the difference between "the
+/// device rejected the features" and "the mapping is wrong" is entirely in what
+/// the registers read back as.
+#[derive(Clone, Copy)]
+pub enum Error {
+    /// `device_status` did not return to zero after a reset was requested.
+    ResetTimedOut { status: u8 },
+    /// The device does not offer `VIRTIO_F_VERSION_1`.
+    NotModern { device_features: u64 },
+    /// The device cleared `FEATURES_OK`, rejecting what the driver accepted.
+    FeaturesRejected { accepted: u64, status: u8 },
+    /// The device implements fewer queues than the driver needs.
+    TooFewQueues { num_queues: u16, needed: u16 },
+    /// A queue reported a size of zero, i.e. it does not exist.
+    QueueUnavailable { queue: u16 },
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::ResetTimedOut { status } => {
+                write!(f, "reset timed out, device_status is still {status:#04X}")
+            }
+            Self::NotModern { device_features } => write!(
+                f,
+                "VIRTIO_F_VERSION_1 is not offered (features {device_features:#018X})"
+            ),
+            Self::FeaturesRejected { accepted, status } => write!(
+                f,
+                "device rejected features {accepted:#018X}; device_status read back {status:#04X} \
+                 with FEATURES_OK clear"
+            ),
+            Self::TooFewQueues { num_queues, needed } => write!(
+                f,
+                "device implements {num_queues} queues, {needed} are needed"
+            ),
+            Self::QueueUnavailable { queue } => {
+                write!(f, "queue {queue} reports size zero")
+            }
+        }
+    }
+}
+
+impl Transport {
+    /// Sets `device_status` to `value`.
+    fn set_status(&self, value: u8) {
+        // SAFETY: `device_status` is the register the driver drives the
+        // initialisation handshake with; writing it is the entire mechanism.
+        unsafe { self.common.write_u8(common::DEVICE_STATUS, value) }
+    }
+
+    /// Adds `bits` to `device_status`.
+    ///
+    /// Read-modify-write rather than a bare store because the specification
+    /// requires the bits to accumulate: the device sees the whole progression,
+    /// and clearing an earlier bit would tell it the driver had gone backwards.
+    fn add_status(&self, bits: u8) {
+        let status = self.device_status();
+        self.set_status(status | bits);
+    }
+
+    /// Writes the 64 bits of features the driver accepts.
+    fn set_driver_features(&self, features: u64) {
+        for word in 0..2_u32 {
+            // SAFETY: a selector followed by the word it selects. Neither has
+            // an effect until `FEATURES_OK` is set.
+            unsafe {
+                self.common.write_u32(common::DRIVER_FEATURE_SELECT, word);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "the shift-and-truncate is the register's 32-bit window on a 64-bit value"
+                )]
+                self.common
+                    .write_u32(common::DRIVER_FEATURE, (features >> (word * 32)) as u32);
+            }
+        }
+    }
+
+    /// Resets the device and waits for it to say so.
+    ///
+    /// The specification is explicit that writing zero is a *request*, and
+    /// that the driver must read the register back until it returns zero. The
+    /// wait is bounded so that a device that never resets is a reported error
+    /// rather than a hang with no output -- which, with no interrupts and no
+    /// watchdog, is indistinguishable from any other hang.
+    fn reset(&self) -> Result<(), Error> {
+        self.set_status(0);
+        for _ in 0..RESET_POLL_LIMIT {
+            let status = self.device_status();
+            if status == 0 {
+                return Ok(());
+            }
+        }
+        Err(Error::ResetTimedOut {
+            status: self.device_status(),
+        })
+    }
+
+    /// Selects `queue` and returns its maximum size, or `None` if the device
+    /// does not implement it.
+    fn queue_size(&self, queue: u16) -> Option<u16> {
+        // SAFETY: `queue_select` only chooses which queue the neighbouring
+        // registers refer to.
+        unsafe { self.common.write_u16(common::QUEUE_SELECT, queue) };
+        match self.common.read_u16(common::QUEUE_SIZE) {
+            0 => None,
+            size => Some(size),
+        }
+    }
+
+    /// Registers `queue` with the device and enables it.
+    ///
+    /// The queue must already be selected -- which [`Self::queue_size`] does,
+    /// and which is why the two are always called in that order.
+    fn configure_queue(&self, queue: &mut queue::Queue) {
+        // SAFETY: these registers take the physical addresses of the three
+        // rings, which is what `Queue` allocated and recorded. The queue is
+        // fully initialised -- descriptors threaded, rings zeroed -- before
+        // `queue_enable` makes the device look at any of it, which is the
+        // ordering that matters.
+        unsafe {
+            self.common.write_u16(common::QUEUE_SELECT, queue.index());
+            self.common.write_u16(common::QUEUE_SIZE, queue.size());
+            self.common.write_u64(common::QUEUE_DESC, queue.desc_pa());
+            self.common
+                .write_u64(common::QUEUE_DRIVER, queue.driver_pa());
+            self.common
+                .write_u64(common::QUEUE_DEVICE, queue.device_pa());
+        }
+        queue.set_notify_off(self.common.read_u16(common::QUEUE_NOTIFY_OFF));
+        // SAFETY: everything the device will read is now in place.
+        unsafe { self.common.write_u16(common::QUEUE_ENABLE, 1) };
+    }
+
+    /// Tells the device to look at `queue`'s available ring.
+    ///
+    /// The address is `notify_off * notify_off_multiplier` into the
+    /// notification structure, and the value written is the queue's index.
+    /// With `notify_off_multiplier` zero every queue would share one address
+    /// and the value would be the only thing distinguishing them; QEMU reports
+    /// 4, so each queue has its own dword and the write is really a doorbell
+    /// per queue.
+    pub fn notify(&self, queue: &queue::Queue) {
+        let offset = u64::from(queue.notify_off()) * u64::from(self.notify_off_multiplier);
+        // SAFETY: `Region` bounds-checks the offset against the notification
+        // structure's declared length. The write is a doorbell: its only
+        // effect is to make the device scan the queue named by the value.
+        unsafe { self.notify.write_u16(offset, queue.index()) };
+    }
+}
+
+/// How many times [`Transport::reset`] reads `device_status` before giving up.
+///
+/// QEMU resets synchronously, so the first read is expected to return zero.
+/// The bound exists for the case where it does not.
+const RESET_POLL_LIMIT: u32 = 1_000_000;
+
+/// A device that has completed the initialisation handshake, with its receive
+/// and transmit queues live.
+pub struct Console {
+    pub transport: Transport,
+    pub receive: queue::Queue,
+    pub transmit: queue::Queue,
+    /// The features actually negotiated.
+    pub features: u64,
+}
+
+/// Runs the virtio 1.0 initialisation handshake and sets up the console's two
+/// queues.
+///
+/// # Which queues, and why `F_MULTIPORT` is declined
+///
+/// `virtio-serial-pci` is the multiport console controller, and QEMU offers it
+/// with 31 ports, hence the 64 queues `num_queues` reports. With
+/// `VIRTIO_CONSOLE_F_MULTIPORT` negotiated the driver would owe the device a
+/// control-queue conversation -- `DEVICE_READY`, then a `PORT_OPEN` for each
+/// port the device announces -- before the device will move a byte, and the
+/// port a `virtconsole` lands on is not fixed.
+///
+/// Declining the feature avoids all of it. The device then presents as a plain
+/// single-port console: queue 0 is receive, queue 1 is transmit, and QEMU's
+/// `virtio-serial` treats port 0 -- which is reserved for `virtconsole` and is
+/// where a lone one lands -- as that single port. It is opened implicitly,
+/// with no control traffic at all. This was checked rather than assumed; see
+/// the commit message for the measured result.
+///
+/// The queues past 1 still exist and are simply left disabled.
+///
+/// # Errors
+///
+/// Returns [`Error`] with the register values that produced it, and leaves
+/// `FAILED` set in `device_status` so the device knows the driver gave up.
+pub fn bring_up(transport: Transport) -> Result<Console, Error> {
+    let address = transport.header.address;
+
+    // 1. Reset, and wait for it.
+    transport.reset()?;
+    log::info!(
+        "virtio     {address}   reset; device_status {:#04X}",
+        transport.device_status()
+    );
+
+    // 2 and 3. Acknowledge the device, then claim to know how to drive it.
+    transport.add_status(status::ACKNOWLEDGE);
+    transport.add_status(status::DRIVER);
+
+    // 4. Negotiate. As little as possible: VIRTIO_F_VERSION_1 is the only
+    //    feature this driver needs and the only one it understands. Every
+    //    other bit QEMU offers -- MULTIPORT, EMERG_WRITE, INDIRECT_DESC,
+    //    EVENT_IDX, RING_RESET -- is declined, because accepting a feature
+    //    means implementing it, and each of those changes either the ring
+    //    layout or the protocol.
+    let device_features = transport.device_features();
+    if device_features & VIRTIO_F_VERSION_1 == 0 {
+        transport.set_status(status::FAILED);
+        return Err(Error::NotModern { device_features });
+    }
+    let accepted = device_features & VIRTIO_F_VERSION_1;
+    transport.set_driver_features(accepted);
+    log::info!(
+        "virtio     {address}   features offered {device_features:#018X}, accepted {accepted:#018X} \
+         (VIRTIO_F_VERSION_1 only; MULTIPORT {})",
+        if device_features & VIRTIO_CONSOLE_F_MULTIPORT == 0 {
+            "not offered"
+        } else {
+            "offered and declined"
+        }
+    );
+
+    // 5. FEATURES_OK, then read it back. This is the device's one chance to
+    //    veto, and skipping the read-back turns a rejected feature set into a
+    //    device that silently never does anything.
+    transport.add_status(status::FEATURES_OK);
+    let status = transport.device_status();
+    if status & status::FEATURES_OK == 0 {
+        transport.set_status(status::FAILED);
+        return Err(Error::FeaturesRejected { accepted, status });
+    }
+    log::info!("virtio     {address}   FEATURES_OK stuck; device_status {status:#04X}");
+
+    // 6. The queues.
+    let num_queues = transport.num_queues();
+    if num_queues <= QUEUE_TRANSMIT {
+        transport.set_status(status::FAILED);
+        return Err(Error::TooFewQueues {
+            num_queues,
+            needed: QUEUE_TRANSMIT + 1,
+        });
+    }
+
+    let mut queues = [QUEUE_RECEIVE, QUEUE_TRANSMIT].map(|index| {
+        transport.queue_size(index).map(|max_size| {
+            // The device's maximum is used as-is. It is a power of two by
+            // specification, and there is no reason to want a smaller ring:
+            // the rings cost three pages between them at QEMU's size.
+            let mut q = queue::Queue::new(index, max_size);
+            transport.configure_queue(&mut q);
+            log::info!(
+                "virtio     {address}   queue {index} size {max_size} notify_off {} \
+                 desc {:#014X} driver {:#014X} device {:#014X}",
+                q.notify_off(),
+                q.desc_pa(),
+                q.driver_pa(),
+                q.device_pa(),
+            );
+            q
+        })
+    });
+    let transmit = queues[1].take().ok_or_else(|| {
+        transport.set_status(status::FAILED);
+        Error::QueueUnavailable {
+            queue: QUEUE_TRANSMIT,
+        }
+    })?;
+    let receive = queues[0].take().ok_or_else(|| {
+        transport.set_status(status::FAILED);
+        Error::QueueUnavailable {
+            queue: QUEUE_RECEIVE,
+        }
+    })?;
+
+    // 7. DRIVER_OK. Last, because it is the point at which the device may
+    //    start reading the rings, and everything they name must already be in
+    //    place.
+    transport.add_status(status::DRIVER_OK);
+    log::info!(
+        "virtio     {address}   DRIVER_OK; device_status {:#04X}, {num_queues} queues exposed, \
+         0 and 1 enabled",
+        transport.device_status()
+    );
+
+    Ok(Console {
+        transport,
+        receive,
+        transmit,
+        features: accepted,
+    })
+}
+
+/// How many times a completion poll reads the used ring before giving up.
+///
+/// The device is QEMU, which consumes a transmit buffer as soon as it is
+/// notified, so the first read is usually enough. A bound rather than an
+/// unbounded spin because there is no interrupt to break a wait that will
+/// never end.
+const USED_POLL_LIMIT: u32 = 100_000_000;
+
+/// Size of the loopback proof's buffer.
+const PROOF_BUF_SIZE: usize = 256;
+
+impl Console {
+    /// Submits `bytes` on the transmit queue and waits for the device to hand
+    /// the descriptor back.
+    ///
+    /// Returns `false` if the completion never arrived.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the transmit queue has no free descriptor, which with a
+    /// synchronous single-buffer caller cannot happen.
+    pub fn send_blocking(&mut self, buffer: &queue::Dma, len: u32) -> bool {
+        // SAFETY: the buffer outlives the call -- it is borrowed for the whole
+        // of it, and the call does not return until the device has handed the
+        // descriptor back -- and it is submitted device-readable, so the
+        // device only reads it while this function refrains from writing it.
+        let head = unsafe { self.transmit.submit(buffer.pa(), len, false) }
+            .expect("transmit queue has no free descriptor");
+        self.transport.notify(&self.transmit);
+
+        for _ in 0..USED_POLL_LIMIT {
+            if let Some((completed, written)) = self.transmit.take_used() {
+                if completed == head {
+                    log::info!(
+                        "virtio     tx completed: used ring returned descriptor {completed}, \
+                         len {written}"
+                    );
+                    return true;
+                }
+                log::warn!(
+                    "virtio     tx completion is for descriptor {completed}, expected {head}"
+                );
+            }
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// Posts a receive buffer and polls briefly for the device to fill it.
+    ///
+    /// Returns the number of bytes received, or `None` if nothing arrived
+    /// within the poll bound. Nothing arriving is the expected result when no
+    /// host client is sending, so this reports rather than fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the receive queue has no free descriptor.
+    pub fn receive_polling(
+        &mut self,
+        buffer: &mut queue::Dma,
+        capacity: u32,
+        spins: u32,
+    ) -> Option<u32> {
+        // SAFETY: the buffer is borrowed mutably for the whole call, so
+        // nothing else touches it while the device may be writing. It is
+        // submitted device-writable and is not read until the completion says
+        // the device has finished with it.
+        let head = unsafe { self.receive.submit(buffer.pa(), capacity, true) }
+            .expect("receive queue has no free descriptor");
+        self.transport.notify(&self.receive);
+
+        for _ in 0..spins {
+            if let Some((completed, written)) = self.receive.take_used()
+                && completed == head
+            {
+                return Some(written);
+            }
+            core::hint::spin_loop();
+        }
+        None
+    }
+}
+
+/// Brings the console up and proves the transmit path end to end.
+///
+/// Returns the live console so later work can use it, or `None` if there is no
+/// virtio device -- which is the normal case for `scripts/run.sh`.
+///
+/// # Panics
+///
+/// Panics if a device is present but cannot be brought up, or if a transmitted
+/// buffer is never returned by the used ring. A half-working device is worth
+/// failing on: it means the driver's model of it is wrong, and every later
+/// step would be built on that.
+pub fn init() -> Option<Console> {
+    let transport = probe()?;
+    let address = transport.header.address;
+
+    let mut console = match bring_up(transport) {
+        Ok(console) => console,
+        Err(error) => panic!("virtio {address}: bring-up failed: {error}"),
+    };
+    log::info!(
+        "virtio     {address}   negotiated features {:#018X}",
+        console.features
+    );
+
+    // The transmit proof. The bytes are recognisable on sight in a hex dump
+    // and include a newline, so a host reading the socket line-wise sees them
+    // immediately rather than sitting on a buffer.
+    let message = b"litebox virtio console: hello from the guest\n";
+    let mut buffer = queue::Dma::alloc(PROOF_BUF_SIZE as u64);
+    buffer.fill(message, PROOF_BUF_SIZE);
+    log::info!(
+        "virtio     {address}   transmitting {} bytes on queue {}",
+        message.len(),
+        console.transmit.index(),
+    );
+    assert!(
+        console.send_blocking(
+            &buffer,
+            u32::try_from(message.len()).expect("small message")
+        ),
+        "virtio {address}: the used ring never returned the transmitted descriptor"
+    );
+
+    // The receive direction, attempted cheaply. A buffer is posted and polled
+    // for a short while; nothing arriving is not a failure, because with no
+    // host client sending there is nothing to arrive. Whatever does arrive is
+    // reported, since it is free evidence that the receive queue is live.
+    let mut rx = queue::Dma::alloc(PROOF_BUF_SIZE as u64);
+    let rx_capacity = u32::try_from(PROOF_BUF_SIZE).expect("small buffer");
+    match console.receive_polling(&mut rx, rx_capacity, RX_POLL_SPINS) {
+        Some(len) => {
+            let len = (len as usize).min(PROOF_BUF_SIZE);
+            let mut bytes = [0_u8; PROOF_BUF_SIZE];
+            rx.read_into(&mut bytes, len);
+            log::info!(
+                "virtio     {address}   rx completed with {len} bytes: {:?}",
+                core::str::from_utf8(&bytes[..len]).unwrap_or("<not utf-8>")
+            );
+        }
+        None => log::info!(
+            "virtio     {address}   rx buffer posted; nothing arrived within {RX_POLL_SPINS} polls \
+             (expected with no host client sending)"
+        ),
+    }
+
+    Some(console)
+}
+
+/// How long the receive probe waits. Short: it is an opportunistic check, and
+/// the boot path should not stall on it.
+const RX_POLL_SPINS: u32 = 10_000_000;

@@ -305,7 +305,7 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     // virtio device on its QEMU line, and the runner must boot and run the TA
     // regardless.
     virtio::log_virtio_devices();
-    let _transport = virtio::probe();
+    let _console = virtio::init();
 
     // The point of the whole phase: load and execute an OP-TEE TA in ring 3.
     // Everything above is the platform this needs.
