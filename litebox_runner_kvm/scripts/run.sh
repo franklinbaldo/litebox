@@ -139,8 +139,7 @@ command -v qemu-system-x86_64 >/dev/null \
 # non-interactive run needs, and it swallows Ctrl-C. Without the mux the
 # serial console is plain stdout and Ctrl-C kills QEMU normally.
 #
-# Note the guest is never given stdin -- see the redirect at the call site,
-# which is load-bearing.
+# Ctrl-C reaches QEMU and kills it, which is what you want from a run script.
 QEMU_ARGS=(
     -machine q35
     -m "$MEMORY"
@@ -180,20 +179,25 @@ fi
 info "Booting ($([ "$ACCEL" -eq 1 ] && echo KVM || echo TCG), $MEMORY, ${TIMEOUT}s timeout)"
 echo 1>&2
 
-# Two details here are load-bearing, both learned the hard way:
+# Two details here are load-bearing:
 #
-# `< /dev/null`: QEMU's stdio chardev calls tcsetattr() to take the terminal
-# into raw mode when stdin is a tty. If the process is not in the foreground
-# process group -- which is easy to arrange with sudo, or inside tmux -- that
-# raises SIGTTOU and *stops* the process. The symptom is a run that prints
-# nothing at all and then hits the timeout, with no clue as to why. The guest
-# is entirely non-interactive, so giving it no stdin costs nothing.
+# `timeout --foreground`: without it, GNU timeout runs its child in a *new
+# process group* so it can signal the whole group on expiry. That leaves QEMU
+# in a background process group relative to the controlling terminal, so the
+# tcsetattr() its stdio chardev performs raises SIGTTOU and stops the process.
+# The symptom is a run that prints nothing at all and then hits the timeout,
+# with no indication why. QEMU is a single process here, so the process group
+# buys nothing and --foreground costs nothing. `dev_tests/tests/kvm_qemu_boot.rs`
+# uses the same form.
 #
-# No pipe: QEMU inherits stdout and stderr directly, so $? is QEMU's own
-# status rather than a filter's, and nothing sits between the guest and the
-# terminal reordering or buffering its output.
+# `--kill-after`: SIGTERM asks QEMU to exit; if it does not, follow up with
+# SIGKILL rather than leaving a VM running.
+#
+# No pipe: QEMU inherits stdin, stdout and stderr directly, so $? is QEMU's
+# own status rather than a filter's, nothing buffers or reorders the guest's
+# output, and the serial console stays interactive.
 set +e
-$PRIVILEGE timeout "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" < /dev/null
+$PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}"
 STATUS=$?
 set -e
 
