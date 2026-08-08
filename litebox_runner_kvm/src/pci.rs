@@ -56,6 +56,9 @@ pub mod offset {
     pub const CLASS_CODE: u8 = 0x09;
     /// Header type (u8); bit 7 marks a multi-function device.
     pub const HEADER_TYPE: u8 = 0x0E;
+    /// First base address register. Six follow, at 4-byte intervals, ending
+    /// one past `0x24`.
+    pub const BAR0: u8 = 0x10;
     /// Subsystem vendor ID (u16).
     pub const SUBSYSTEM_VENDOR_ID: u8 = 0x2C;
     /// Subsystem ID (u16).
@@ -69,6 +72,13 @@ pub const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
 
 /// `HEADER_TYPE` bit 7: the device is multi-function.
 pub const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
+
+/// The number of base address registers in a type-0 header.
+pub const BAR_COUNT: u8 = 6;
+
+/// Capability ID `0x09`: vendor-specific. Virtio puts all of its structure
+/// descriptors here.
+pub const CAP_ID_VENDOR_SPECIFIC: u8 = 0x09;
 
 /// A bus/device/function triple identifying one PCI function.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,6 +239,181 @@ impl DeviceHeader {
     pub fn layout(self) -> u8 {
         self.header_type & 0x7F
     }
+
+    /// Reads base address register `index` raw, exactly as the device
+    /// presents it.
+    ///
+    /// Deliberately *not* sized: sizing requires writing all-ones and reading
+    /// back, which momentarily decodes the BAR somewhere else entirely. That
+    /// belongs with the mapping work, not with discovery.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is not a type-0 BAR index.
+    pub fn raw_bar(self, index: u8) -> u32 {
+        assert!(index < BAR_COUNT, "BAR index {index} is out of range");
+        read_u32(self.address, offset::BAR0 + index * 4)
+    }
+
+    /// Decodes all six BARs, pairing the two halves of any 64-bit one.
+    pub fn bars(self) -> [Bar; BAR_COUNT as usize] {
+        let mut bars = [Bar::Unused; BAR_COUNT as usize];
+        let mut index = 0_u8;
+        while index < BAR_COUNT {
+            let raw = self.raw_bar(index);
+            let (bar, consumed) = if raw & BAR_SPACE_IO != 0 {
+                (
+                    Bar::Io {
+                        raw,
+                        port: raw & BAR_IO_ADDR_MASK,
+                    },
+                    1,
+                )
+            } else if raw & BAR_MEM_TYPE_MASK == BAR_MEM_TYPE_64 {
+                // The upper half lives in the next register, which is why
+                // this loop steps by a variable amount. A 64-bit BAR in slot
+                // 5 has nowhere to put its upper half and is malformed;
+                // treat the missing half as zero rather than reading past the
+                // end of the header.
+                let high = if index + 1 < BAR_COUNT {
+                    self.raw_bar(index + 1)
+                } else {
+                    0
+                };
+                (
+                    Bar::Memory {
+                        raw_low: raw,
+                        raw_high: Some(high),
+                        base: (u64::from(high) << 32) | u64::from(raw & BAR_MEM_ADDR_MASK),
+                        is_64bit: true,
+                        prefetchable: raw & BAR_MEM_PREFETCHABLE != 0,
+                    },
+                    2,
+                )
+            } else {
+                (
+                    Bar::Memory {
+                        raw_low: raw,
+                        raw_high: None,
+                        base: u64::from(raw & BAR_MEM_ADDR_MASK),
+                        is_64bit: false,
+                        prefetchable: raw & BAR_MEM_PREFETCHABLE != 0,
+                    },
+                    1,
+                )
+            };
+            // An all-zero BAR is one the device does not implement. Reported
+            // as unused rather than as a memory BAR at address zero, which is
+            // what the raw decode would otherwise claim.
+            bars[index as usize] = if raw == 0 { Bar::Unused } else { bar };
+            index += consumed;
+        }
+        bars
+    }
+
+    /// Iterates the capability list, calling `visit` with the offset and ID of
+    /// each entry.
+    ///
+    /// The walk is bounded. A capability list is a linked list living in
+    /// device-controlled memory, so a malformed or hostile one can contain a
+    /// cycle; without a bound this would hang the guest with no output. The
+    /// bound is the number of dword-aligned offsets that fit in the 192 bytes
+    /// of configuration space a capability may occupy, so no well-formed list
+    /// can reach it.
+    pub fn for_each_capability(self, mut visit: impl FnMut(u8, u8)) {
+        let Some(mut offset) = self.capabilities_ptr else {
+            return;
+        };
+        for _ in 0..(256 - 0x40) / 4 {
+            // Zero terminates the list. Offsets below 0x40 would alias the
+            // standard header, which no capability may do, so treat them as
+            // termination too rather than reading a header field as a
+            // capability.
+            if offset < 0x40 {
+                return;
+            }
+            let id = read_u8(self.address, offset);
+            let next = read_u8(self.address, offset + 1);
+            visit(offset, id);
+            // Capabilities must be dword aligned; a `next` that is not is
+            // malformed, and following it would misread the list.
+            if next & 0x3 != 0 {
+                log::warn!(
+                    "pci        {} capability at {offset:#04X} has misaligned next {next:#04X}",
+                    self.address
+                );
+                return;
+            }
+            offset = next;
+        }
+        log::warn!(
+            "pci        {} capability list did not terminate; walk abandoned",
+            self.address
+        );
+    }
+}
+
+/// BAR bit 0: the region lives in I/O space rather than memory space.
+pub const BAR_SPACE_IO: u32 = 1 << 0;
+/// Memory BAR bits 2:1, the type field.
+pub const BAR_MEM_TYPE_MASK: u32 = 0b110;
+/// Memory BAR type 2: the register is the low half of a 64-bit address.
+pub const BAR_MEM_TYPE_64: u32 = 0b100;
+/// Memory BAR bit 3: prefetchable.
+pub const BAR_MEM_PREFETCHABLE: u32 = 1 << 3;
+/// Address bits of a memory BAR (31:4).
+pub const BAR_MEM_ADDR_MASK: u32 = 0xFFFF_FFF0;
+/// Address bits of an I/O BAR (31:2).
+pub const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC;
+
+/// A decoded base address register.
+#[derive(Clone, Copy)]
+pub enum Bar {
+    /// The device does not implement this register, or it is the upper half
+    /// of the 64-bit BAR in the preceding slot.
+    Unused,
+    /// A memory-space region.
+    Memory {
+        raw_low: u32,
+        /// The upper dword, present only for a 64-bit BAR.
+        raw_high: Option<u32>,
+        base: u64,
+        is_64bit: bool,
+        prefetchable: bool,
+    },
+    /// An I/O-space region.
+    Io { raw: u32, port: u32 },
+}
+
+impl core::fmt::Display for Bar {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Unused => write!(f, "unused"),
+            Self::Memory {
+                raw_low,
+                raw_high,
+                base,
+                is_64bit,
+                prefetchable,
+            } => {
+                write!(
+                    f,
+                    "mem {}-bit{} base {base:#014X} raw {raw_low:#010X}",
+                    if is_64bit { 64 } else { 32 },
+                    if prefetchable {
+                        " prefetchable"
+                    } else {
+                        " non-prefetchable"
+                    },
+                )?;
+                if let Some(high) = raw_high {
+                    write!(f, ":{high:#010X}")?;
+                }
+                Ok(())
+            }
+            Self::Io { raw, port } => write!(f, "io  port {port:#06X} raw {raw:#010X}"),
+        }
+    }
 }
 
 /// Calls `visit` for every function on bus 0 whose vendor ID is `vendor`.
@@ -259,54 +444,4 @@ pub fn for_each_device_with_vendor(vendor: u16, mut visit: impl FnMut(&DeviceHea
             }
         }
     }
-}
-
-/// Logs every virtio device on bus 0.
-///
-/// Pure discovery: nothing is written to configuration space and no BAR is
-/// mapped. Returns the number of devices found so the caller can say something
-/// useful when there are none.
-pub fn log_virtio_devices() -> usize {
-    let mut found = 0;
-    for_each_device_with_vendor(VENDOR_VIRTIO, |header| {
-        found += 1;
-        let (base, sub, prog_if) = header.class;
-        log::info!(
-            "pci        {} vendor {:#06X} device {:#06X} subsys {:#06X}:{:#06X} rev {:#04X}",
-            header.address,
-            header.vendor_id,
-            header.device_id,
-            header.subsystem_vendor_id,
-            header.subsystem_id,
-            header.revision_id,
-        );
-        log::info!(
-            "pci        {}   class {base:#04X}/{sub:#04X}/{prog_if:#04X} header {:#04X} \
-             (layout {}, {}) command {:#06X} status {:#06X}",
-            header.address,
-            header.header_type,
-            header.layout(),
-            if header.is_multifunction() {
-                "multi-function"
-            } else {
-                "single-function"
-            },
-            header.command,
-            header.status,
-        );
-        match header.capabilities_ptr {
-            // A capability pointer of zero terminates the list before it
-            // starts, which for a virtio device means it is legacy-only.
-            Some(0) | None => log::info!("pci        {}   no capability list", header.address),
-            Some(ptr) => log::info!(
-                "pci        {}   capability list at {ptr:#04X}",
-                header.address
-            ),
-        }
-    });
-
-    if found == 0 {
-        log::warn!("pci        no virtio devices found on bus 0");
-    }
-    found
 }

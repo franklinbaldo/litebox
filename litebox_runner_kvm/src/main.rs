@@ -24,6 +24,7 @@ mod boot;
 mod memmap;
 mod pci;
 mod ta;
+mod virtio;
 
 use core::panic::PanicInfo;
 
@@ -296,10 +297,11 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     check_data_access();
     check_text_is_read_only();
 
-    // Discovery only: enumerate the PCI bus and report any virtio devices.
-    // Nothing is written to configuration space and no BAR is mapped, so this
-    // cannot change the behaviour of anything below it.
-    pci::log_virtio_devices();
+    // Discovery only: enumerate the PCI bus and parse the virtio capability
+    // structures of anything found. Nothing is written to configuration
+    // space and no BAR is mapped, so this cannot change the behaviour of
+    // anything below it.
+    virtio::log_virtio_devices();
 
     // The point of the whole phase: load and execute an OP-TEE TA in ring 3.
     // Everything above is the platform this needs.
