@@ -33,6 +33,40 @@ PVH entry is the phase's only real unknown — everything else is code we can re
 
 **What must NOT be reused:** anything under `litebox_platform_lvbs::mshv` — it does not compile under `host_kvm`.
 
+## Hazard discovered in Task 2: LLVM mis-assembles symbol arithmetic in immediates
+
+**Read this before writing any 32-bit or boot assembly.** LLVM's Intel-syntax operand
+parser silently mis-assembles address arithmetic. Task 2 triple-faulted on it:
+
+| Written | Result |
+|---|---|
+| `a - b + c` inline | hard error, "cannot use more than one symbol in memory operand" |
+| `(a + c)` | **silently** parsed as a memory dereference — `push (X)` became `push DWORD PTR [X]` |
+| `offset a + c` | **silently** drops the addend, and emitted a 16-bit `pushw` |
+
+The middle case is what bit: a far-return target assembled to a *load of the code bytes at
+that label*, which then served as its own bogus jump address.
+
+Only the `.set` directive's expression parser handles this arithmetic correctly. The
+working pattern:
+
+```asm
+.set SYM_ABS, (label - _start + 0x200000)
+mov eax, offset SYM_ABS      // stage through a register to avoid operand-size guessing
+push eax
+```
+
+**Disassembly review is mandatory, not optional, for boot asm on this toolchain.** Verify
+with `objdump -d` that what you wrote is what was emitted, before running it. A
+`-d int,cpu_reset` dump that shows the mode switch *succeeded* (correct `CS64`, `EFER.LMA`,
+`CR3`, `CR4.PAE`) but faults at an address outside the image is the signature of this bug.
+
+Related constraint: the target links `--pie`, and `rust-lld` rejects every 32-bit absolute
+relocation against an ordinary symbol (`R_X86_64_32 cannot be used against symbol ...`).
+32-bit mode has no RIP-relative fallback, so boot structures live in a linker-reserved
+`NOLOAD` region at fixed PA `0x1000000`, referenced as plain immediates. `_heap_start`
+begins above that region.
+
 ## Verification gates
 
 **Gate P1 — Phase 1 invariant.** Every task must leave the LVBS build untouched:
