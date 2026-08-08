@@ -23,7 +23,7 @@
 //! print everything, accepted and rejected alike, so the decision can be
 //! checked from outside rather than trusted.
 
-use crate::KERNEL_OFFSET;
+use crate::boot::KERNEL_OFFSET;
 
 /// `hvm_start_info.magic`: "xEn3" little-endian.
 const HVM_START_MAGIC_VALUE: u32 = 0x336e_c578;

@@ -18,6 +18,7 @@
 
 extern crate alloc;
 
+mod boot;
 mod memmap;
 mod ta;
 
@@ -31,6 +32,8 @@ use litebox_platform_lvbs::mm::MemoryProvider as _;
 use litebox_platform_lvbs::{Instant, serial_println};
 use litebox_platform_multiplex::Platform;
 
+use crate::boot::KERNEL_OFFSET;
+
 /// Physical address of [`_start`].
 ///
 /// The linker script places `.text` at `0x200000` and `KEEP`s `.text._start`
@@ -40,14 +43,6 @@ const PVH_ENTRY_ADDR: u32 = 0x0020_0000;
 
 /// `XEN_ELFNOTE_PHYS32_ENTRY`: the note type QEMU looks for to select PVH.
 const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18;
-
-/// Base of the high-canonical kernel window: `VA = PA + KERNEL_OFFSET`.
-///
-/// This must match `litebox_platform_lvbs::KERNEL_OFFSET` (lib.rs:160), which
-/// is what that crate's `MemoryProvider::pa_to_va` assumes. The early page
-/// tables built below install that window, so the platform crate's assumption
-/// already holds by the time Rust runs.
-const KERNEL_OFFSET: u64 = 0xFFFF_E200_0000_0000;
 
 /// PML4 index covering [`KERNEL_OFFSET`]: `(KERNEL_OFFSET >> 39) & 0x1FF`.
 ///
@@ -164,7 +159,7 @@ pub fn hvm_start_info_addr() -> u64 {
 /// script puts `_heap_start` above all of them.
 ///
 /// The symbol's address is taken with a RIP-relative `lea` rather than by
-/// reading a static, for the same reason [`apply_relocations`] does: it must
+/// reading a static, for the same reason [`boot::apply_relocations`] does: it must
 /// not depend on an absolute address. The result is the high-canonical VA, so
 /// subtracting [`KERNEL_OFFSET`] recovers the PA. That subtraction is exact
 /// because the image's load bias *is* `KERNEL_OFFSET` -- the linker script
@@ -398,148 +393,12 @@ _start:
 );
 
 // ---------------------------------------------------------------------------
-// Relocation.
-//
-// The target links `--pie` (`relocation-model: "pie"` in x86_64_kvm.json), so
-// every absolute address the compiler needed to store in memory -- vtables,
-// `&'static str` data pointers, `&OTHER_STATIC` -- was emitted as a link-time
-// value plus an `R_X86_64_RELATIVE` entry in `.rela.dyn`. Nothing applies
-// those entries for us: PVH drops us straight into the raw image. Until the
-// loop below runs, any pointer-bearing static is wrong, and anything that
-// appears to work does so by accident.
-// ---------------------------------------------------------------------------
-
-/// An ELF64 relocation entry with an explicit addend (`Elf64_Rela`).
-#[repr(C)]
-struct Elf64Rela {
-    /// Link-time address of the word to patch.
-    offset: u64,
-    /// Symbol index in the high 32 bits, relocation type in the low 32.
-    info: u64,
-    /// Link-time value to which the load bias is added.
-    addend: i64,
-}
-
-/// `R_X86_64_RELATIVE`: `*offset = load_bias + addend`. The only relocation
-/// type a `--static --pie` image with no dynamic symbols can contain, and the
-/// only one handled here; anything else means the link went wrong.
-const R_X86_64_RELATIVE: u64 = 8;
-
-/// Applies every `R_X86_64_RELATIVE` entry in `.rela.dyn`, returning the load
-/// bias used.
-///
-/// # Load bias
-///
-/// The linker script starts at `. = 0x0` and puts `_memory_base` there, so
-/// link-time addresses are image offsets and the link-time base is exactly
-/// zero. The bias is therefore just the runtime address of `_memory_base`.
-///
-/// We are already executing in the high-canonical alias installed by the boot
-/// stub, so the RIP-relative `lea` below yields `0 + KERNEL_OFFSET`, and every
-/// relocated pointer comes out high-canonical -- which is what the rest of the
-/// kernel, and `litebox_platform_lvbs`'s `pa_to_va`, expect. Doing this before
-/// the jump into the alias would instead produce low physical pointers that
-/// would all have to be fixed up a second time.
-///
-/// # Position independence
-///
-/// This function must not itself depend on an absolute address, so the three
-/// linker symbols it needs are taken via RIP-relative `lea` rather than by
-/// reading a static.
-///
-/// # Safety
-///
-/// - Must run before anything reads a pointer-bearing static.
-/// - Must run exactly once.
-/// - The `.rela.dyn` table and every address it names must be mapped writable
-///   at `link-time address + load_bias`.
-#[inline(never)]
-unsafe fn apply_relocations() -> u64 {
-    unsafe extern "C" {
-        static _memory_base: u8;
-        static _rela_start: u8;
-        static _rela_end: u8;
-    }
-
-    let load_bias: u64;
-    let rela_start: u64;
-    let rela_end: u64;
-    // SAFETY: `lea` with RIP-relative operands only computes addresses into
-    // registers; it reads no memory and touches no flags.
-    unsafe {
-        core::arch::asm!(
-            "lea {base}, [rip + _memory_base]",
-            "lea {start}, [rip + _rela_start]",
-            "lea {end}, [rip + _rela_end]",
-            base = out(reg) load_bias,
-            start = out(reg) rela_start,
-            end = out(reg) rela_end,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-
-    // Already at the link-time base: nothing to adjust. Cannot happen here
-    // (we run in the high alias), but applying a zero bias would be a no-op
-    // anyway, and skipping keeps the invariant explicit.
-    if load_bias == 0 {
-        return 0;
-    }
-
-    let mut rela = rela_start as *const Elf64Rela;
-    let rela_end_ptr = rela_end as *const Elf64Rela;
-
-    while rela < rela_end_ptr {
-        // SAFETY: `rela` is within `[_rela_start, _rela_end)`, a linker-
-        // emitted array of `Elf64_Rela` (checked by the loop condition), and
-        // the section is 8-byte aligned by construction.
-        let entry = unsafe { &*rela };
-
-        if entry.info & 0xFFFF_FFFF == R_X86_64_RELATIVE {
-            let target = load_bias.wrapping_add(entry.offset) as *mut u64;
-            // The ELF ABI defines the addend as signed and the result as an
-            // unsigned address; wrapping through both is the intended
-            // arithmetic, not an overflow bug.
-            #[expect(
-                clippy::cast_possible_wrap,
-                clippy::cast_sign_loss,
-                reason = "ELF relocation arithmetic is defined modulo 2^64"
-            )]
-            let value = entry.addend.wrapping_add(load_bias as i64) as u64;
-            // SAFETY: `target` is a link-time address from the linker's own
-            // relocation table, biased into the mapping we execute in, so it
-            // lies inside the image and is 8-byte aligned. `write_volatile`
-            // keeps the store from being reordered against the reads that the
-            // relocated statics will shortly perform.
-            unsafe { target.write_volatile(value) };
-        } else {
-            // Silently skipping would leave the target at zero -- the RELA
-            // convention noted above -- and turn the link error into a null
-            // dereference at an arbitrary later moment, with nothing left to
-            // connect it back to here.
-            panic!(
-                "unsupported relocation type {:#X} at offset {:#X}; this image \
-                 is linked -pie with only R_X86_64_RELATIVE, so anything else \
-                 means the link went wrong",
-                entry.info & 0xFFFF_FFFF,
-                entry.offset
-            );
-        }
-
-        // SAFETY: Still inside the table; the loop condition rechecks before
-        // the next dereference.
-        rela = unsafe { rela.add(1) };
-    }
-
-    load_bias
-}
-
-// ---------------------------------------------------------------------------
 // Relocation probe.
 //
 // A `&'static str` inside a static array is the cheapest thing that forces the
 // linker to emit an `R_X86_64_RELATIVE` entry: the array slot holds the
 // absolute address of the string data. Reading the slot's raw bits before and
-// after `apply_relocations` shows the bias being applied, and successfully
+// after `boot::apply_relocations` shows the bias being applied, and successfully
 // dereferencing it afterwards shows the result is a real, mapped pointer.
 // ---------------------------------------------------------------------------
 
@@ -593,7 +452,7 @@ static HOST_LOGGER: HostLogger = HostLogger;
 /// Entered from the boot stub through the high-canonical alias, so `%rip` and
 /// `%rsp` are both at `PA + KERNEL_OFFSET` on arrival.
 ///
-/// Nothing here may touch a pointer-bearing static until [`apply_relocations`]
+/// Nothing here may touch a pointer-bearing static until [`boot::apply_relocations`]
 /// has run: the image is linked `--pie`, so every such pointer still holds its
 /// link-time value until then.
 extern "C" fn kvm_long_mode_entry() -> ! {
@@ -607,7 +466,7 @@ extern "C" fn kvm_long_mode_entry() -> ! {
     // once. The `.rela.dyn` bounds come from the linker script, and both the
     // table and every target it names lie in the low 1 GiB, which the early
     // page tables map writably through the high-canonical alias we run in.
-    let load_bias = unsafe { apply_relocations() };
+    let load_bias = unsafe { boot::apply_relocations() };
 
     let probe_after = read_reloc_probe_slot();
 
@@ -1455,7 +1314,7 @@ fn init_platform(ram_end_pa: u64) -> &'static Platform {
     log::info!("pt         new tables live, cr3 {:#014X}", read_cr3());
 
     // Reclaim `.rela.dyn`. The relocations were applied by
-    // `apply_relocations` before any static was read, and nothing consults the
+    // `boot::apply_relocations` before any static was read, and nothing consults the
     // table afterwards. The bounds are rounded inwards to whole pages: the
     // section starts 2 MiB aligned but its end is not aligned to anything.
     let (rela_va_start, rela_va_end) = rela_va_range();
