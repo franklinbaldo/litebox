@@ -1220,6 +1220,25 @@ const SPIN_ITERS: u32 = 10_000_000;
 /// host-observed gap that is not one second.
 const CALIBRATED_WAIT_NANOS: u64 = 1_000_000_000;
 
+/// Largest TSC-versus-PIT disagreement `check_clock` tolerates, in permille.
+///
+/// 10%, which is deliberately loose. Two things set the floor and the ceiling:
+///
+/// - Observed error is 1-2 permille (measured over repeated TCG runs), all of
+///   it in one direction: `tsc_nanos` brackets the PIT interval and so also
+///   contains the port-I/O polling around it, while `pit_nanos` is the
+///   interval's exact *nominal* length and cannot move. So the check has
+///   roughly 50x headroom over the noise it actually sees.
+/// - The error is one-sided and, under TCG on a loaded machine, unbounded:
+///   nothing stops the host descheduling the QEMU thread mid-interval, which
+///   inflates `tsc_nanos` alone. A tight bound would turn that into a CI flake
+///   while proving nothing extra.
+///
+/// 10% is still far below anything the assertion is meant to catch. The
+/// smallest interesting failure is a frequency or conversion wrong by a factor
+/// of two, which is 1000 permille -- ten times the limit.
+const MAX_PIT_ERROR_PERMILLE: u64 = 100;
+
 /// Nanoseconds between two [`Instant`]s.
 fn elapsed_nanos(start: Instant, end: Instant) -> u64 {
     use litebox::platform::Instant as _;
@@ -1264,12 +1283,28 @@ fn check_clock() {
     }
     log::info!("wait 1s    done, measured {} ns", elapsed_nanos(start, end));
 
-    // Cross-check against the PIT. This is the part that actually proves the
-    // TSC scaling is right rather than merely self-consistent: the PIT is a
-    // separate counter with an independently fixed rate, so bracketing one of
-    // its gated intervals with two `Instant`s compares two clocks that share
-    // nothing. A TSC frequency wrong by a factor of N shows up here as an
-    // error of N, whereas the spin above would look perfectly healthy.
+    // Cross-check against the PIT: bracket one of its gated intervals with two
+    // `Instant`s and compare what each clock says the interval was.
+    //
+    // How much this proves depends on which source won discovery, and the
+    // honest answer is "less than it looks like under TCG":
+    //
+    // - If `tsc_source()` is *not* the PIT -- CPUID leaf 0x15/0x16, the KVM
+    //   paravirt leaf, or pvclock -- then this is genuine independent
+    //   evidence. The TSC scale came from one authority and the interval
+    //   length from a different counter whose rate is fixed by the i8254's
+    //   hardware definition, so a TSC frequency wrong by a factor of N shows
+    //   up here as an error of N.
+    // - If `tsc_source()` *is* "i8254 PIT calibration", which is the case
+    //   under TCG and therefore in CI, the check is circular: the TSC scale
+    //   was derived from this same PIT, so the comparison degenerates into an
+    //   arithmetic self-check. It cannot detect a wrong frequency, because
+    //   both sides move together.
+    //
+    // The bound below is asserted either way. Even in the degenerate case it
+    // is worth having: it still catches a broken fixed-point tick-to-nanosecond
+    // conversion (a wrong `SCALE_SHIFT`, a lost widening to u128, an overflow),
+    // which is arithmetic downstream of the frequency and so does *not* cancel.
     let start = Instant::now();
     let pit_nanos = litebox_platform_lvbs::arch::clock::pit_reference_interval_nanos();
     let end = Instant::now();
@@ -1281,6 +1316,14 @@ fn check_clock() {
                 (tsc_nanos.abs_diff(pit_nanos)).saturating_mul(1000) / pit_nanos.max(1);
             log::info!(
                 "pit check  pit {pit_nanos} ns vs tsc {tsc_nanos} ns, error {error_permille} permille"
+            );
+            assert!(
+                error_permille <= MAX_PIT_ERROR_PERMILLE,
+                "TSC and PIT disagree by {error_permille} permille (limit \
+                 {MAX_PIT_ERROR_PERMILLE}): pit {pit_nanos} ns vs tsc {tsc_nanos} ns. \
+                 The TSC scale (source: {}) is wrong, or the tick-to-nanosecond \
+                 conversion is",
+                litebox_platform_lvbs::arch::clock::tsc_source()
             );
         }
         None => log::warn!("pit check  PIT unavailable, cross-check skipped"),
