@@ -63,8 +63,46 @@ pub fn get_core_id() -> usize {
 }
 
 /// Enable FSGSBASE instructions
+///
+/// Under `host_lvbs` no CPUID check is made: VTL1 runs on a partition VTL0 has
+/// already brought up, which guarantees FSGSBASE. Adding a check here would be
+/// dead code on the only path that reaches it.
+#[cfg(feature = "host_lvbs")]
 #[inline]
 pub fn enable_fsgsbase() {
+    let mut flags = x86_64::registers::control::Cr4::read();
+    flags.insert(x86_64::registers::control::Cr4Flags::FSGSBASE);
+    unsafe {
+        x86_64::registers::control::Cr4::write(flags);
+    }
+}
+
+/// Enable FSGSBASE instructions.
+///
+/// Under `host_kvm` LiteBox is entered from reset and nothing has vetted the
+/// CPU model, so CPUID is checked first. Setting `CR4.FSGSBASE` on a CPU that
+/// does not implement it raises `#GP`, and this runs before the IDT exists, so
+/// the fault would be a triple fault with no output at all. QEMU's *default*
+/// CPU model (`qemu64`) is such a CPU, so this is the common case, not an
+/// exotic one.
+///
+/// Panicking instead is safe here and strictly better: the panic handler
+/// writes to COM1 and exits through `isa-debug-exit` without needing an IDT.
+///
+/// # Panics
+///
+/// Panics if CPUID does not advertise FSGSBASE.
+#[cfg(feature = "host_kvm")]
+#[inline]
+pub fn enable_fsgsbase() {
+    // CPUID.07h:EBX bit 0 = FSGSBASE
+    let structured_features = cpuid_count(0x07, 0);
+    assert!(
+        structured_features.ebx & (1 << 0) != 0,
+        "CPU does not support FSGSBASE (CPUID.07:EBX bit 0 clear); \
+         pass `-cpu max` to QEMU (or `-cpu host` under KVM)"
+    );
+
     let mut flags = x86_64::registers::control::Cr4::read();
     flags.insert(x86_64::registers::control::Cr4Flags::FSGSBASE);
     unsafe {
@@ -76,20 +114,19 @@ pub fn enable_fsgsbase() {
 /// such as SSE and XSAVE
 ///
 /// `CR0` and `CR4` are configured identically for both hosts. `XCR0` is where they
-/// differ, because ownership of that register differs:
+/// differ, because ownership of that register differs; see the `host_kvm` copy of
+/// this function below.
 ///
-/// - Under `host_lvbs`, VTL0 and VTL1 share `XCR0`, so this function *verifies* that
-///   VTL0 has already enabled x87 and SSE rather than modifying it, and panics if it
-///   has not.
-/// - Under `host_kvm`, LiteBox is the sole owner of `XCR0` and boots from reset, where
-///   it is architecturally `0x1` (x87 only). There is no VTL0 to have set it, so this
-///   function enables x87 and SSE itself and cannot panic.
+/// Under `host_lvbs`, VTL0 and VTL1 share `XCR0`, so this function *verifies* that
+/// VTL0 has already enabled x87 and SSE rather than modifying it, and panics if it
+/// has not. That VTL0 got as far as launching VTL1 is also what guarantees XSAVE
+/// is present, so no CPUID check is made before setting `CR4.OSXSAVE`.
 ///
 /// # Panics
 ///
-/// Under `host_lvbs` only: panics if `XCR0` (from the VTL0 kernel) does not have x87
-/// and SSE enabled.
+/// Panics if `XCR0` (from the VTL0 kernel) does not have x87 and SSE enabled.
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "host_lvbs")]
 pub fn enable_extended_states() {
     let mut flags = x86_64::registers::control::Cr0::read();
     flags.remove(x86_64::registers::control::Cr0Flags::EMULATE_COPROCESSOR);
@@ -107,7 +144,6 @@ pub fn enable_extended_states() {
     }
 
     // VTL1 should not modify XCR0 - verify that VTL0 has already enabled x87 and SSE
-    #[cfg(feature = "host_lvbs")]
     {
         let xcr0 = x86_64::registers::xcontrol::XCr0::read();
         assert!(
@@ -119,17 +155,59 @@ pub fn enable_extended_states() {
             "XCR0 must have SSE enabled by VTL0"
         );
     }
+}
 
-    // Under `host_kvm` there is no VTL0: LiteBox *is* the kernel, entered from
-    // reset via PVH, where XCR0 is architecturally 0x1 (x87 only). Nobody has
-    // enabled SSE state management, so the assertion above could never hold --
-    // and unlike VTL1, we are the owner of XCR0 and are entitled to set it.
-    //
+/// Enable CPU extended states such as XMM and instructions to use and manage them
+/// such as SSE and XSAVE
+///
+/// `CR0` and `CR4` are configured identically for both hosts. `XCR0` is where they
+/// differ: under `host_kvm` LiteBox is the sole owner of `XCR0` and boots from
+/// reset, where it is architecturally `0x1` (x87 only). There is no VTL0 to have
+/// set it, so this function enables x87 and SSE itself.
+///
+/// Unlike the `host_lvbs` copy, CPUID is checked before `CR4.OSXSAVE` is set:
+/// nothing has vetted the CPU model, and this runs before the IDT exists, so the
+/// `#GP` from setting `OSXSAVE` without XSAVE support would be a triple fault with
+/// no output at all. QEMU's *default* CPU model (`qemu64`) implements no XSAVE, so
+/// this is the common case, not an exotic one. The panic handler writes to COM1
+/// and exits through `isa-debug-exit` without needing an IDT, so failing loudly
+/// here is safe.
+///
+/// # Panics
+///
+/// Panics if CPUID does not advertise XSAVE.
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "host_kvm")]
+pub fn enable_extended_states() {
+    // CPUID.01h:ECX bit 26 = XSAVE. Checked before CR4.OSXSAVE, and before the
+    // XCR0 access below, which #UDs without OSXSAVE.
+    let features = cpuid_count(0x01, 0);
+    assert!(
+        features.ecx & (1 << 26) != 0,
+        "CPU does not support XSAVE (CPUID.01:ECX bit 26 clear); \
+         pass `-cpu max` to QEMU (or `-cpu host` under KVM)"
+    );
+
+    let mut flags = x86_64::registers::control::Cr0::read();
+    flags.remove(x86_64::registers::control::Cr0Flags::EMULATE_COPROCESSOR);
+    flags.insert(x86_64::registers::control::Cr0Flags::MONITOR_COPROCESSOR);
+    unsafe {
+        x86_64::registers::control::Cr0::write(flags);
+    }
+
+    let mut flags = x86_64::registers::control::Cr4::read();
+    flags.insert(x86_64::registers::control::Cr4Flags::OSFXSR);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSXMMEXCPT_ENABLE);
+    flags.insert(x86_64::registers::control::Cr4Flags::OSXSAVE);
+    unsafe {
+        x86_64::registers::control::Cr4::write(flags);
+    }
+
     // SSE (bit 1) is required because `allocate_xsave_area` sizes its buffer
     // from `VTL1_XSAVE_MASK` (0b11) and `xsave` faults if XCR0 lacks a
     // requested bit. AVX is deliberately not enabled: the KVM target sets
     // `-avx,-avx2,-avx512f`, so nothing generates state beyond x87 and SSE.
-    #[cfg(feature = "host_kvm")]
+    //
     // SAFETY: `XCr0::write` is unsafe because enabling a state component whose
     // XSAVE area the OS has not provisioned corrupts memory on the next
     // `xsave`. Only x87 and SSE are enabled here, and `allocate_xsave_area`
