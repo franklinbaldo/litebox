@@ -51,6 +51,30 @@ Baseline `.text` hash (recorded at `655833c8`):
 293dc2d00ea51d892d5e31d07fe22f5a2a101ef8aa2ec2ef1b191bae173b64ad
 ```
 
+**Gate A' — LiteBox symbol names and sizes (for feature-gating tasks).**
+Gate A is only valid for pure code moves within an *unchanged feature set*.
+Enabling a cargo feature changes `litebox_platform_lvbs`'s `-C metadata` hash,
+which changes every downstream mangled symbol, which changes which crate's copy
+of a shared generic `-Z share-generics` selects — linking extra upstream CGUs.
+(Measured on Task 2: 11 added `base16ct` copies of `core` generics, +1024 bytes
+of `.text`, with zero LiteBox code changed and no symbol removed or resized.)
+
+Gate A' sidesteps that by comparing only *our* symbols, by name and size:
+
+```bash
+nm -S --defined-only "$BIN" | awk 'NF>=4{print $2, $4}' \
+  | grep -E 'litebox|_start|syscall|isr_' \
+  | sed -E 's/(17h|C[sS])[0-9a-zA-Z]{10,}_?//g' | sort | sha256sum
+```
+
+Baseline (12599 symbols, recorded at `76b176f6`):
+```
+de61da6739bc88fe6239f820ac42f334f6e59056e06cf09c8be040bb484c61c2
+```
+
+Use Gate A' for Tasks 2-9. It stays stable across feature flips but still catches
+any real change to LiteBox code.
+
 **Gate B — builds and tests pass (for restructuring tasks).**
 The bare-metal build must succeed, plus:
 
@@ -62,8 +86,7 @@ Expected: `15 passed; 0 failed; 4 ignored`.
 Note the host test suite is a *weak* gate — much mshv-coupled code is `#[cfg(not(test))]`
 and never compiled during `cargo test`. The bare-metal build is the load-bearing check.
 
-Gate A does not apply from Task 4 onward: introducing `cfg` attributes legitimately
-perturbs codegen. Those tasks use Gate B.
+Gate A applies to Task 1 only. Tasks 2-9 use Gate A' plus Gate B.
 
 Save yourself typing:
 
@@ -226,10 +249,11 @@ compile_error!(
 );
 ```
 
-**Step 3: Verify with Gate A**
+**Step 3: Verify with Gate A'**
 
-Run `/tmp/lvbs-check.sh`. The default feature set is unchanged in effect, so the hash
-must still be `293dc2d00ea51d892d5e31d07fe22f5a2a101ef8aa2ec2ef1b191bae173b64ad`.
+Run `/tmp/lvbs-check.sh`. Use **Gate A'** here, not Gate A: enabling a feature
+perturbs upstream codegen. The symbol hash must still be
+`de61da6739bc88fe6239f820ac42f334f6e59056e06cf09c8be040bb484c61c2` (12599 symbols).
 
 **Step 4: Verify the guard rail actually fires**
 
@@ -356,7 +380,8 @@ impl HostInterface for HostKvmInterface {
 
 **Step 3: Verify with Gate A**
 
-Run `/tmp/lvbs-check.sh`. `host_kvm` is off by default, so the `.text` hash must be unchanged.
+Run `/tmp/lvbs-check.sh`. `host_kvm` is off by default, so the Gate A' symbol hash
+must be unchanged.
 
 **Step 4: Commit**
 
