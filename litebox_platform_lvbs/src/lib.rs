@@ -939,8 +939,13 @@ impl Instant {
     const TICK_NANOS: u64 = 1;
 
     /// Nanoseconds since an arbitrary boot-time origin.
-    fn now() -> Self {
-        unimplemented!("KVM time source lands in Phase 2 Task 5")
+    ///
+    /// # Panics
+    ///
+    /// Panics on first use if the TSC frequency cannot be determined from
+    /// CPUID; see [`crate::arch::clock::tsc_hz`].
+    pub fn now() -> Self {
+        Instant(crate::arch::clock::monotonic_nanos())
     }
 }
 

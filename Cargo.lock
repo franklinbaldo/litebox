@@ -1675,6 +1675,7 @@ name = "litebox_runner_kvm"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "litebox",
  "litebox_platform_lvbs",
  "litebox_util_log",
  "log",

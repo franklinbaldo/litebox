@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+/// TSC-based monotonic clock. KVM guests have no Hyper-V reference counter,
+/// so the TSC is the only cheap monotonic source available.
+#[cfg(feature = "host_kvm")]
+pub mod clock;
 pub mod gdt;
 pub mod instrs;
 pub mod interrupts;

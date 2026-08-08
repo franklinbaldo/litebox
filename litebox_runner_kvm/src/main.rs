@@ -16,7 +16,7 @@
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-use litebox_platform_lvbs::serial_println;
+use litebox_platform_lvbs::{Instant, serial_println};
 
 /// Physical address of [`_start`].
 ///
@@ -615,7 +615,137 @@ extern "C" fn kvm_long_mode_entry() -> ! {
         "relocated probe pointer does not land inside the image"
     );
 
+    check_clock();
+    check_crng();
+
     halt();
+}
+
+// ---------------------------------------------------------------------------
+// Clock and CRNG checks.
+//
+// These exist because "it did not panic" is not evidence that a clock works: a
+// wrong TSC frequency produces a clock that runs happily at the wrong rate.
+// ---------------------------------------------------------------------------
+
+/// Iterations of the short spin used to show the clock advancing over a small,
+/// bounded interval. Large enough to dwarf the two `rdtsc` reads, small enough
+/// to stay well under a second even under TCG.
+const SPIN_ITERS: u32 = 10_000_000;
+
+/// Busy-waits until this many nanoseconds have elapsed *by our own clock*.
+///
+/// One second is convenient because it is directly checkable from outside the
+/// guest: the two log lines bracketing the wait are timestamped by the host as
+/// they arrive on the serial port, so a wrong TSC frequency shows up as a
+/// host-observed gap that is not one second.
+const CALIBRATED_WAIT_NANOS: u64 = 1_000_000_000;
+
+/// Nanoseconds between two [`Instant`]s.
+fn elapsed_nanos(start: &Instant, end: &Instant) -> u64 {
+    use litebox::platform::Instant as _;
+    end.checked_duration_since(start)
+        .expect("clock went backwards")
+        .as_nanos()
+        .try_into()
+        .expect("interval does not fit in u64 nanoseconds")
+}
+
+/// Exercises the TSC clock and reports enough numbers to tell a working clock
+/// from a plausible-looking broken one.
+fn check_clock() {
+    log::info!(
+        "tsc freq   {} Hz via {}",
+        litebox_platform_lvbs::arch::clock::tsc_hz(),
+        litebox_platform_lvbs::arch::clock::tsc_source()
+    );
+
+    // A short spin. Checks the clock advances, and by an amount whose order of
+    // magnitude is credible for this many iterations.
+    let start = Instant::now();
+    for _ in 0..SPIN_ITERS {
+        core::hint::spin_loop();
+    }
+    let end = Instant::now();
+    let spin_nanos = elapsed_nanos(&start, &end);
+    log::info!("spin       {SPIN_ITERS} iters -> {spin_nanos} ns");
+    assert!(
+        spin_nanos > 0,
+        "clock did not advance across {SPIN_ITERS} iterations"
+    );
+
+    // A wait of one second by our own clock. The host timestamps the two lines
+    // below as they arrive, so this is checked against a clock we do not own.
+    log::info!("wait 1s    start");
+    let start = Instant::now();
+    let mut end = Instant::now();
+    while elapsed_nanos(&start, &end) < CALIBRATED_WAIT_NANOS {
+        core::hint::spin_loop();
+        end = Instant::now();
+    }
+    log::info!(
+        "wait 1s    done, measured {} ns",
+        elapsed_nanos(&start, &end)
+    );
+
+    // Cross-check against the PIT. This is the part that actually proves the
+    // TSC scaling is right rather than merely self-consistent: the PIT is a
+    // separate counter with an independently fixed rate, so bracketing one of
+    // its gated intervals with two `Instant`s compares two clocks that share
+    // nothing. A TSC frequency wrong by a factor of N shows up here as an
+    // error of N, whereas the spin above would look perfectly healthy.
+    let start = Instant::now();
+    let pit_nanos = litebox_platform_lvbs::arch::clock::pit_reference_interval_nanos();
+    let end = Instant::now();
+    match pit_nanos {
+        Some(pit_nanos) => {
+            let tsc_nanos = elapsed_nanos(&start, &end);
+            // Integer permille error, avoiding floating point.
+            let error_permille =
+                (tsc_nanos.abs_diff(pit_nanos)).saturating_mul(1000) / pit_nanos.max(1);
+            log::info!(
+                "pit check  pit {pit_nanos} ns vs tsc {tsc_nanos} ns, error {error_permille} permille"
+            );
+        }
+        None => log::warn!("pit check  PIT unavailable, cross-check skipped"),
+    }
+}
+
+/// Draws from the CRNG twice and shows that it produces bytes, and different
+/// ones each time.
+fn check_crng() {
+    // QEMU's default `qemu64` CPU model does not implement RDRAND, and the
+    // CRNG rightly refuses to run without it rather than substituting
+    // something weaker. Skip the self-check loudly in that case: provoking a
+    // deliberate panic would tell us nothing we did not already know from
+    // CPUID, and would stop the rest of boot.
+    if !litebox_platform_lvbs::host::kvm_impl::rdrand_supported() {
+        log::warn!("crng       RDRAND absent (CPUID.1:ECX bit 30 clear), check skipped");
+        return;
+    }
+
+    let mut first = [0u8; 32];
+    let mut second = [0u8; 32];
+    litebox_platform_lvbs::host::kvm_impl::fill_bytes_crng(&mut first);
+    litebox_platform_lvbs::host::kvm_impl::fill_bytes_crng(&mut second);
+
+    log::info!("crng #1    {}", HexBytes(&first));
+    log::info!("crng #2    {}", HexBytes(&second));
+
+    assert_ne!(first, second, "CRNG returned the same block twice");
+    assert!(first != [0u8; 32], "CRNG returned all zeroes");
+}
+
+/// Formats a byte slice as lower-case hex without allocating.
+struct HexBytes<'a>(&'a [u8]);
+
+impl core::fmt::Display for HexBytes<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Disables interrupts and halts this CPU forever.
