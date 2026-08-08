@@ -32,6 +32,18 @@
 //! * **The exit paths.** [`HostInterface::exit`] and
 //!   [`HostInterface::terminate`] end the guest through QEMU's `isa-debug-exit`
 //!   device; [`debug_exit`] documents the exit-status transform.
+//! * **Reboot-persistent key derivation, on an emulated root key.**
+//!   `litebox::platform::DerivedKeyProvider` derives from a PRK installed by
+//!   [`install_development_platform_root_key`], which the runner calls at boot.
+//!   Read that function before believing this line: the key is a **development
+//!   key with no security value** — SHA-256 of a fixed ASCII string, public,
+//!   and identical on every guest. It emulates what a vTPM would provide so
+//!   that TAs exercise the real derivation path instead of the refusal path,
+//!   and it warns loudly on every boot that it is doing so. Whether it is
+//!   "implemented" depends on what you were asking: the *mechanism* is real
+//!   and mirrors `lvbs_impl` (no raw PRK getter, shim-supplied KDF required);
+//!   the *root of trust* is absent, and a real deployment needs a TPM-sealed
+//!   key. See "Not built yet" below for what that would cost.
 //!
 //! ## Not built yet — `unimplemented!()`
 //!
@@ -44,13 +56,18 @@
 //! * [`HostInterface::send_ip_packet`] and
 //!   [`HostInterface::receive_ip_packet`] — virtio-net. There is no network
 //!   device on the QEMU command line to drive.
-//! * `litebox::platform::DerivedKeyProvider` returns
-//!   `DerivedKeyError::UnsupportedRebootPersistentKey`. The intended source is
-//!   a **TPM-backed key** (QEMU can attach a TPM 2.0 device via `-tpmdev`);
-//!   until that is wired up there is nothing to root a persistent key in, and
-//!   refusing is better than manufacturing one. Note this returns an error
-//!   rather than `unimplemented!()` on purpose: callers can handle `Unsupported`,
-//!   and a panic would take down a guest that merely asked.
+//! * **A real root of trust for the PRK.** QEMU supports `-tpmdev emulator`
+//!   backed by swtpm, which puts a TPM 2.0 device in front of the guest, and a
+//!   key sealed to it would give the reboot-persistence property LVBS gets from
+//!   its VBS-provisioned PRK. Nothing about that is free on the guest side: it
+//!   needs a TPM2 driver for whichever interface QEMU exposes (TIS or CRB, both
+//!   MMIO, plus the ACPI or device-tree plumbing to find it), command and
+//!   response marshalling for the TPM2 command set, and then the sealing policy
+//!   itself — `TPM2_CreatePrimary` under the storage hierarchy, `TPM2_Create`
+//!   and `TPM2_Load` for the sealed blob, `TPM2_Unseal` at boot, and somewhere
+//!   non-volatile to keep the blob between boots, which this guest also does
+//!   not have. That is a phase of work, not a patch, which is why the
+//!   development key above exists in the meantime.
 //!
 //! ## Cannot exist here
 //!
@@ -448,28 +465,142 @@ impl litebox::platform::CrngProvider for KvmGuest {
     }
 }
 
-/// Reboot-persistent key derivation is not wired up yet.
+/// Length of the platform root key, in bytes.
 ///
-/// The intended source is a **TPM-backed key**: QEMU can attach a TPM 2.0 device
-/// (`-tpmdev`, backed by swtpm or a passed-through host TPM), and a key sealed to
-/// it gives the same reboot-persistence property that LVBS gets from its
-/// VBS-provisioned PRK. That is the design; it is simply not implemented.
+/// Defined here rather than imported from `litebox_common_lvbs::PRK_LEN`, which
+/// is the same value (32): that crate is an optional dependency gated on
+/// `host_lvbs`, and pulling an LVBS-only crate into the KVM build to share a
+/// constant would couple two unrelated roots of trust for no benefit. It is
+/// also exactly SHA-256's output length, which is what actually fixes it.
+const PRK_LEN: usize = 32;
+
+/// The ASCII sentence the development platform root key is derived from.
 ///
-/// Until it is, this returns an error rather than `unimplemented!()`. The
-/// distinction is deliberate in the other direction from usual: a panic would
-/// take down a guest that merely *asked* for a derived key, whereas
-/// `Unsupported` is something callers already handle — `litebox_shim_optee`
-/// maps it to `TeeResult::NotSupported`. Manufacturing a key from, say, a boot
-/// nonce would satisfy the signature while quietly failing the "persistent
-/// across reboot" guarantee callers rely on, so refusing is the honest answer
-/// in the meantime.
+/// The key is `SHA-256` of exactly these bytes and nothing else. It is spelled
+/// out here so that the value is reproducible by anybody with a shell, and so
+/// that it cannot be mistaken for a secret: a secret that is printed in the
+/// source of a public repository is not one. Deriving it from a documented
+/// constant rather than from invented-looking entropy is the whole point --
+/// a plausible-looking 32-byte literal would read as though somebody had
+/// generated it, and somebody eventually would have trusted it.
+const DEV_PRK_DERIVATION_STRING: &[u8] =
+    b"litebox-kvm development platform root key v1 -- NOT A SECRET";
+
+/// The emulated platform root key, installed by
+/// [`install_development_platform_root_key`].
+///
+/// Deliberately mirrors `lvbs_impl`'s `PRK_ONCE`, including the absence of a
+/// raw getter: there is no `get_platform_root_key` here either, so the only
+/// way to reach the key material is through [`DerivedKeyProvider::derive_key`]
+/// with a shim-supplied KDF. That property is worth keeping even for a key
+/// with no security value, because the day it is replaced by a real one the
+/// call sites must already be correct.
+static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
+
+/// Installs a **fake** platform root key that emulates what a vTPM would give
+/// us, and says so on the console.
+///
+/// # What this stands in for
+///
+/// LVBS gets its PRK from VBS, which provisions it and re-provisions the same
+/// value after a reboot. The equivalent here would be a key sealed to a TPM 2.0
+/// device -- QEMU can attach one with `-tpmdev emulator` backed by swtpm. That
+/// path does not exist yet, so this manufactures the key instead.
+///
+/// # What it does and does not satisfy
+///
+/// It satisfies the *shape* of the contract and none of the security. The
+/// contract `DerivedKeyProvider` callers rely on is "the same key comes back
+/// after a reboot", and a constant compiled into the image satisfies that
+/// exactly: it is stable across reboots, across guests, and across machines.
+/// What it does not have is any of the reason that property is worth anything.
+/// The key is public, identical on every LiteBox-on-KVM guest ever built from
+/// this source, and rooted in nothing. Anything sealed with a key derived from
+/// it is sealed against nobody.
+///
+/// # Why manufacture it at all
+///
+/// The alternative -- returning `UnsupportedRebootPersistentKey`, which is what
+/// this used to do -- is more honest but tests less. `kmpp-ta` under refusal
+/// exercises its *error* path and never reaches the code that actually uses a
+/// derived key, so the derivation path in `litebox_shim_optee` was untested on
+/// this platform. Installing a key moves the TA onto the real path.
+///
+/// The earlier objection to manufacturing a key still stands: a fabricated key
+/// breaks the reboot-persistence guarantee's *meaning* while satisfying its
+/// letter, and does so silently. The answer to "silently" is the `WARN` this
+/// emits on every boot, not a decision to keep refusing.
+///
+/// # Why this is not behind a cargo feature
+///
+/// It would be reasonable to gate it, and it is not gated. The argument:
+///
+/// * Nothing about this configuration is production. `docs/plans/2026-08-08-litebox-on-kvm-design.md`
+///   §7 lists a missing preemption timer (ring-3 code is *trusted not to loop*),
+///   absent stack guard pages, and no TLB shootdown. Singling this one item out
+///   for a feature gate would imply the others are settled, which is the more
+///   dangerous message.
+/// * A feature that must be enabled to run the tests is a feature that gets
+///   copied into whatever build eventually ships. An off-by-default flag is
+///   exactly as easy to turn on as it is to leave on, and it is invisible in a
+///   console log afterwards.
+/// * The protection that actually works here is legibility at runtime. A `WARN`
+///   on every boot, a key derived from an ASCII string reading
+///   `NOT A SECRET`, and this doc comment cannot be missed by anybody reading a
+///   boot log or the source. A cfg flag can be.
+/// * When the TPM path lands, this is deleted outright. A feature gate would be
+///   a second thing to delete and a third state to reason about in the interim.
+///
+/// Calling this more than once is harmless and installs nothing the second
+/// time, matching `spin::Once`.
+pub fn install_development_platform_root_key() {
+    PRK_ONCE.call_once(|| {
+        // Loud on purpose, and unconditional: this is the only runtime signal
+        // that the guest's sealed storage is sealed against nobody.
+        litebox_util_log::warn!(
+            "prk        installing a DEVELOPMENT platform root key with NO SECURITY VALUE"
+        );
+        litebox_util_log::warn!(
+            "prk        it is SHA-256 of a fixed string in kvm_impl.rs, public and identical \
+             on every LiteBox-on-KVM guest; anything sealed with a key derived from it is \
+             sealed against nobody"
+        );
+        litebox_util_log::warn!(
+            "prk        a real deployment needs a TPM-sealed key (QEMU -tpmdev emulator + swtpm); \
+             until then this guest is a test vehicle, not a deployment"
+        );
+        let prk: [u8; PRK_LEN] = sha2::Sha256::new()
+            .chain_update(DEV_PRK_DERIVATION_STRING)
+            .finalize()
+            .into();
+        prk
+    });
+}
+
+/// Reboot-persistent key derivation, rooted in a development key with no
+/// security value.
+///
+/// Mirrors `lvbs_impl`'s implementation exactly, including the insistence that
+/// the shim supply the KDF: the raw PRK never leaves this module. The only
+/// difference is where the key came from, which is
+/// [`install_development_platform_root_key`] and its warning.
+///
+/// If that function has not been called -- an embedded or unit-test path that
+/// skips the runner's boot sequence -- this still returns
+/// `UnsupportedRebootPersistentKey` rather than deriving from nothing.
 impl litebox::platform::DerivedKeyProvider for KvmGuest {
     fn derive_key<E>(
         &self,
-        _kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
-        _params: litebox::platform::KDFParams,
+        kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
+        params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
-        Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey)
+        let Some(prk) = PRK_ONCE.get() else {
+            return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
+        };
+        match kdf {
+            None => Err(litebox::platform::DerivedKeyError::ShimKDFRequired),
+            Some(kdf) => Ok(kdf(prk, params)?),
+        }
     }
 }
 

@@ -294,6 +294,16 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     litebox_platform_lvbs::arch::enable_smep_smap();
 
     check_crng();
+
+    // The platform root key. Deliberately here rather than lazily on first use:
+    // the whole point of the key is that it announces itself, and an
+    // announcement that only happens if a TA asks for a derived key is one that
+    // most boots never make. This warns three lines about having no security
+    // value every single boot, which is the intended cost. See
+    // `install_development_platform_root_key` for why it is not behind a
+    // feature.
+    litebox_platform_lvbs::host::kvm_impl::install_development_platform_root_key();
+
     check_heap(usable, mapped_limit);
     check_cpu_state();
     check_interrupts();

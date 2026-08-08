@@ -631,33 +631,63 @@ fn runs_the_aes_ta() {
     assert_ta_succeeded("aes-ta", status, &console);
 }
 
-/// `kmpp-ta`. It passes, and it passes *while* the platform refuses it a
-/// derived key -- so this test pins both halves.
+/// `kmpp-ta`, and the test that changed meaning when the platform grew a root
+/// key.
 ///
-/// `DerivedKeyProvider` for `KvmGuest` returns `UnsupportedRebootPersistentKey`
-/// (there is no platform root key on a plain KVM guest) and
-/// `litebox_shim_optee/src/syscalls/pta.rs` maps that to
-/// `TeeResult::NotSupported`. The TA sees `0xffff000a` out of
-/// `derive_unique_key`, logs `Failed to get machine secret`, cannot encrypt
-/// the private key it was asked to import, and returns that failure to its
-/// caller *inside the output memref* -- while `TA_InvokeCommandEntryPoint`
-/// itself returns 0. Under `litebox_runner_optee_on_linux_userland` the
-/// derivation succeeds and none of those log lines appear.
+/// It used to assert the *opposite* of what it asserts now. `DerivedKeyProvider`
+/// for `KvmGuest` returned `UnsupportedRebootPersistentKey`,
+/// `litebox_shim_optee/src/syscalls/pta.rs` mapped that to
+/// `TeeResult::NotSupported`, and the TA saw `0xffff000a` out of
+/// `derive_unique_key`, logged `Failed to get machine secret`, could not
+/// encrypt the private key it was asked to import, and reported that failure
+/// inside the output memref while `TA_InvokeCommandEntryPoint` itself returned
+/// 0. The test pinned that refusal deliberately, so that whoever installed a
+/// key would be forced to come and read this comment. That has now happened.
 ///
-/// So the userland runner's standard -- `ctx.rax == 0` after every command --
-/// is met here for a materially different reason, and asserting only on it
-/// would let this test claim parity it does not have. The refusal is asserted
-/// on directly instead. If a platform root key ever arrives, this assertion
-/// fails and someone has to come and read this comment, which is the point.
+/// `litebox_platform_lvbs::host::kvm_impl::install_development_platform_root_key`
+/// installs an emulated PRK at boot, so derivation takes the real path and
+/// `KeyIso_SERVER_import_private_key` runs to completion. The assertions below
+/// are the inverses of the old ones: the two failure lines must be *absent*,
+/// and the TA's own completion line must be present and say `Success`.
+///
+/// The reason to assert on absence as well as presence is that
+/// `TA_InvokeCommandEntryPoint` returned 0 in the failing case too, so
+/// `assert_ta_succeeded` alone never distinguished the two. It still does not;
+/// these assertions are what make this test mean anything.
+///
+/// **The key has no security value.** It is SHA-256 of a fixed ASCII string
+/// compiled into the image, and the guest warns three lines about that on every
+/// boot. What this test now demonstrates is that the *derivation path* works,
+/// not that anything is sealed against anybody.
 #[test]
 fn runs_the_kmpp_ta() {
     let (status, console) = run_ta("kmpp-ta");
     // The TA really ran: it imports an EC private key twice, opening and
     // closing a session around each.
     assert_console_contains(&console, "KeyIso_SERVER_import_private_key");
-    // ... and the platform refused it a derived key, for the documented
-    // reason. `ffff000a` is TEE_ERROR_NOT_SUPPORTED.
-    assert_console_contains(&console, "derive_unique_key failed: returned ffff000a");
-    assert_console_contains(&console, "Failed to get machine secret");
+    // ... and this time it got all the way through, which it cannot do without
+    // a derived key.
+    assert_console_contains(&console, "_cleanup_import_private_key");
+    assert_console_contains(&console, "Complete- Success");
+    // The two lines the refusal used to produce. `ffff000a` is
+    // TEE_ERROR_NOT_SUPPORTED. If either comes back, derivation has regressed
+    // to the refusal path and the assertions above are not enough to catch it
+    // on their own.
+    assert!(
+        !console.contains("derive_unique_key failed"),
+        "the platform refused a derived key; it is supposed to install one at boot.\n\
+         --- output ---\n{console}",
+    );
+    assert!(
+        !console.contains("Failed to get machine secret"),
+        "the TA could not get a machine secret, so derivation did not reach it.\n\
+         --- output ---\n{console}",
+    );
+    // And the boot-time warning is part of the contract: a fake root key that
+    // installs quietly is the failure mode the warning exists to prevent.
+    assert_console_contains(
+        &console,
+        "DEVELOPMENT platform root key with NO SECURITY VALUE",
+    );
     assert_ta_succeeded("kmpp-ta", status, &console);
 }

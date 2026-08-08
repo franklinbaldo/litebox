@@ -256,13 +256,32 @@ aggregate. Nothing here is a request to fix them now.
   single-CPU, which it is. `flush_tlb_range` under `host_kvm` flushes locally
   and the `TODO(SMP)` at `paging.rs:110` is unowned — the moment a second CPU
   is started, that TODO becomes a correctness bug rather than a note.
-- **No reboot-persistent key yet.** `DerivedKeyProvider` returns
-  `UnsupportedRebootPersistentKey`. The intended source is a **TPM-backed key** —
-  QEMU can attach a TPM 2.0 device via `-tpmdev` (swtpm, or a passed-through host
-  TPM), and a key sealed to it provides the same reboot-persistence property LVBS
-  gets from its VBS-provisioned PRK. This is a gap to plug, not a permanent
-  limitation. Until it is plugged, sealed storage is unavailable and anything
-  depending on it cannot run here.
+- **The reboot-persistent key is fake.** `DerivedKeyProvider` no longer refuses;
+  `install_development_platform_root_key` (`kvm_impl.rs`) installs a PRK at boot
+  and derivation takes the real path. The key is **SHA-256 of a fixed ASCII
+  string compiled into the image** — public, identical on every LiteBox-on-KVM
+  guest ever built from this source, and rooted in nothing. It satisfies the
+  *shape* of the contract callers rely on (the same key comes back after a
+  reboot) and none of the reason that property is worth anything. Anything
+  sealed with a key derived from it is sealed against nobody. This reverses an
+  earlier decision to refuse rather than manufacture a key; the reasoning behind
+  that decision was not wrong, so the mitigation is that the guest emits three
+  `WARN` lines saying exactly the above on **every boot**, and the constant is
+  spelled `NOT A SECRET` in source. The reason to manufacture it at all is that
+  refusal left the derivation path in `litebox_shim_optee` untested on this
+  platform: `kmpp-ta` exercised its error path and stopped. It is deliberately
+  *not* behind a cargo feature — see the function's doc comment for that
+  argument, the short form being that nothing else in this section is gated
+  either, and a runtime warning is harder to miss than a cfg flag.
+
+  The real fix is a **TPM-sealed key**. QEMU can attach a TPM 2.0 device with
+  `-tpmdev emulator` backed by swtpm, and that is the intended source. It is a
+  phase of work rather than a patch: the guest needs a TPM2 driver for whichever
+  interface QEMU exposes (TIS or CRB, both MMIO, plus the ACPI plumbing to find
+  it), TPM2 command and response marshalling, and the sealing policy itself
+  (`TPM2_CreatePrimary`, `TPM2_Create`/`TPM2_Load`, `TPM2_Unseal`) — plus
+  somewhere non-volatile to keep the sealed blob between boots, which this guest
+  also does not have. Not implemented, not estimated beyond "not small".
 - **The memory map exclusion set is validated against one QEMU layout.** After
   the I3 fix the runner withholds the first megabyte, everything below
   `_heap_start`, the `hvm_start_info` struct, the memmap table, the command
