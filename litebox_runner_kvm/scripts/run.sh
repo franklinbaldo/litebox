@@ -43,6 +43,12 @@ TIMEOUT=120
 INITRD=""
 COMMANDS=""
 SOCKET=""
+# Defaults for -c: the same artifacts litebox_runner_optee_on_linux_userland's
+# tests use, taken *unrewritten*. See client.py's module docstring for why the
+# KVM runner must not use the rewriter's output.
+TA_DIR="$REPO_ROOT/litebox_runner_optee_on_linux_userland/tests"
+LDELF="$TA_DIR/ldelf.elf"
+TA="$TA_DIR/hello-ta.elf"
 
 usage() {
     cat 1>&2 <<EOF
@@ -63,6 +69,13 @@ Usage: $0 [options]
             TA sequence. Adds a virtio-serial-pci device and a unix-socket
             chardev to the QEMU line and runs scripts/client.py against it.
             Try litebox_runner_optee_on_linux_userland/tests/hello-ta-cmds.json.
+  -l FILE   ldelf.elf to ship to the guest with -c
+            (default: $LDELF).
+  -a FILE   TA .elf to ship to the guest with -c
+            (default: $TA). Both are the raw,
+            *unrewritten* binaries: under KVM LiteBox is the kernel, so the
+            TA's own syscall instructions trap to syscall_entry and
+            litebox_syscall_rewriter's output would be wrong.
   -S PATH   Socket path for -c (default: a fresh one under \$TMPDIR).
   -t SECS   Timeout in seconds (default: $TIMEOUT)
   -d        Add QEMU interrupt/reset tracing (-d int,cpu_reset). Useful when
@@ -79,7 +92,7 @@ because it is the one that says what went wrong with the exchange.
 EOF
 }
 
-while getopts ":hkrbsm:i:t:dc:S:" opt; do
+while getopts ":hkrbsm:i:t:dc:S:l:a:" opt; do
     case $opt in
         h) usage; exit 0 ;;
         k) ACCEL=1 ;;
@@ -89,6 +102,8 @@ while getopts ":hkrbsm:i:t:dc:S:" opt; do
         m) MEMORY="$OPTARG" ;;
         i) INITRD="$OPTARG" ;;
         c) COMMANDS="$OPTARG" ;;
+        l) LDELF="$OPTARG" ;;
+        a) TA="$OPTARG" ;;
         S) SOCKET="$OPTARG" ;;
         t) TIMEOUT="$OPTARG" ;;
         d) DEBUG_QEMU=1 ;;
@@ -183,6 +198,8 @@ QEMU_ARGS=(
 if [ -n "$COMMANDS" ]; then
     [ -f "$COMMANDS" ] || fatal "command sequence not found: $COMMANDS"
     command -v python3 >/dev/null || fatal "python3 not found, but -c needs it"
+    [ -f "$LDELF" ] || fatal "ldelf not found: $LDELF"
+    [ -f "$TA" ] || fatal "TA not found: $TA"
     CLIENT="$SCRIPT_DIR/client.py"
     [ -f "$CLIENT" ] || fatal "client not found at $CLIENT"
     if [ -z "$SOCKET" ]; then
@@ -249,7 +266,7 @@ if [ -n "$COMMANDS" ]; then
     $PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" \
         qemu-system-x86_64 "${QEMU_ARGS[@]}" </dev/null &
     QEMU_PID=$!
-    python3 "$CLIENT" "$SOCKET" "$COMMANDS" --timeout "$TIMEOUT"
+    python3 "$CLIENT" "$SOCKET" "$LDELF" "$TA" "$COMMANDS" --timeout "$TIMEOUT"
     CLIENT_STATUS=$?
     # A client that gave up will never send the Shutdown the guest is waiting
     # for, so waiting for the guest would cost its whole request deadline and

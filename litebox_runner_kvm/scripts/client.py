@@ -6,9 +6,15 @@
 """Host-side client for the KVM runner's virtio message channel.
 
 Connects to the unix socket QEMU's `-chardev socket,server=on` listens on,
-replays a JSON command sequence at the guest, prints what the TA returned, and
-exits non-zero if anything -- the protocol, the runner, or the TA -- reports a
-failure.
+ships `ldelf` and a TA into the guest, replays a JSON command sequence at it,
+prints what the TA returned, and exits non-zero if anything -- the protocol,
+the runner, or the TA -- reports a failure.
+
+The two binaries are the *raw* `.elf` files. The userland runner rewrites both
+with `litebox_syscall_rewriter` first; that would be wrong here. Rewriting is
+how syscalls are hooked when LiteBox is a userland library; under KVM LiteBox
+is the kernel and the TA's real `syscall` instructions trap to
+`syscall_entry`.
 
 The JSON is *the same shape* `litebox_runner_optee_on_linux_userland` already
 consumes, so `tests/hello-ta-cmds.json` and its siblings work unchanged. The
@@ -44,6 +50,7 @@ import time
 
 VERSION = 1
 MAX_FRAME_LEN = 1024 * 1024
+MAX_BINARY_LEN = 8 * 1024 * 1024
 MAX_PARAMS = 4
 
 OP_OPEN_SESSION = 1
@@ -51,6 +58,7 @@ OP_INVOKE_COMMAND = 2
 OP_CLOSE_SESSION = 3
 OP_SHUTDOWN = 4
 OP_RESPONSE = 5
+OP_LOAD_BINARY = 6
 
 OPCODE_NAMES = {
     OP_OPEN_SESSION: "OpenSession",
@@ -58,7 +66,22 @@ OPCODE_NAMES = {
     OP_CLOSE_SESSION: "CloseSession",
     OP_SHUTDOWN: "Shutdown",
     OP_RESPONSE: "Response",
+    OP_LOAD_BINARY: "LoadBinary",
 }
+
+TARGET_LDELF = 1
+TARGET_TA = 2
+
+TARGET_NAMES = {TARGET_LDELF: "ldelf", TARGET_TA: "the TA"}
+
+# Payload bytes per LoadBinary frame.
+#
+# 256 KiB, comfortably inside MAX_FRAME_LEN with the ~17 bytes of framing and
+# chunk header to spare. Larger would mean fewer round trips; it would also
+# mean a guest-side buffer four times the size for no measurable gain, since
+# under TCG the cost of a transfer is dominated by the guest copying bytes out
+# of the virtqueue rather than by the number of frames.
+CHUNK_SIZE = 256 * 1024
 
 TAG_NONE = 0
 TAG_VALUE_INPUT = 1
@@ -131,6 +154,15 @@ def encode_param(param: dict) -> bytes:
             )
         return struct.pack("<BQ", TAG_MEMREF_INOUT, size) + _put_bytes(data)
     raise ValueError(f"unknown param_type {kind!r}")
+
+
+def encode_load(target: int, total_len: int, offset: int, data: bytes) -> bytes:
+    """Builds one LoadBinary frame."""
+    payload = struct.pack("<BII", target, total_len, offset) + _put_bytes(data)
+    body = struct.pack("<HH", VERSION, OP_LOAD_BINARY) + payload
+    if len(body) + 4 > MAX_FRAME_LEN:
+        raise ValueError(f"load frame of {len(body) + 4} bytes exceeds the maximum")
+    return struct.pack("<I", len(body)) + body
 
 
 def encode_request(opcode: int, cmd_id: int, params: list[dict]) -> bytes:
@@ -347,9 +379,49 @@ def exchange(sock: socket.socket, opcode: int, cmd_id: int, params: list[dict]) 
     return response
 
 
-def run(path: str, commands: list[dict], timeout: float, shutdown: bool) -> None:
+def send_binary(sock: socket.socket, target: int, path: str) -> None:
+    """Ships one ELF into the guest, in CHUNK_SIZE pieces.
+
+    Every chunk is acknowledged before the next is sent. That costs a round
+    trip per chunk and buys the thing that matters when this goes wrong: the
+    failure is reported at the chunk that caused it, rather than as a
+    mysterious parse error at OpenSession several megabytes later.
+    """
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if not data:
+        raise TaError(f"{path} is empty")
+    if len(data) > MAX_BINARY_LEN:
+        raise TaError(
+            f"{path} is {len(data)} bytes, over the {MAX_BINARY_LEN}-byte limit"
+        )
+    name = TARGET_NAMES[target]
+    chunks = (len(data) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    print(f"[client] -> LoadBinary {name}: {path} ({len(data)} bytes, {chunks} chunk(s))")
+    for offset in range(0, len(data), CHUNK_SIZE):
+        sock.sendall(
+            encode_load(target, len(data), offset, data[offset : offset + CHUNK_SIZE])
+        )
+        response = decode_response(read_frame(sock))
+        if response["status"] != STATUS_OK:
+            raise TaError(
+                f"LoadBinary {name} at offset {offset} failed: {response['message']}"
+            )
+    print(f"[client] <- {name} loaded")
+
+
+def run(
+    path: str,
+    ldelf: str,
+    ta: str,
+    commands: list[dict],
+    timeout: float,
+    shutdown: bool,
+) -> None:
     sock = connect(path, timeout)
     try:
+        send_binary(sock, TARGET_LDELF, ldelf)
+        send_binary(sock, TARGET_TA, ta)
         for command in commands:
             raw = command.get("func_id")
             if raw not in FUNC_IDS:
@@ -365,6 +437,15 @@ def run(path: str, commands: list[dict], timeout: float, shutdown: bool) -> None
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("socket", help="path of the unix socket QEMU is listening on")
+    # `ldelf ta commands`, in that order, is the argument shape
+    # litebox_runner_optee_on_linux_userland's own CLI takes -- with the socket
+    # prepended, because this side has to be told where the guest is. The
+    # binaries are the *raw* .elf files: unlike the userland runner, nothing
+    # here rewrites them. On Linux userland syscalls are hooked by rewriting;
+    # under KVM LiteBox is the kernel, so a TA's real `syscall` instructions
+    # trap to `syscall_entry` and a rewritten binary would be wrong.
+    parser.add_argument("ldelf", help="path of ldelf.elf (not rewritten)")
+    parser.add_argument("ta", help="path of the TA's .elf (not rewritten)")
     parser.add_argument(
         "commands",
         help="JSON command sequence, in the shape "
@@ -391,7 +472,14 @@ def main() -> int:
         return 2
 
     try:
-        run(args.socket, commands, args.timeout, not args.no_shutdown)
+        run(
+            args.socket,
+            args.ldelf,
+            args.ta,
+            commands,
+            args.timeout,
+            not args.no_shutdown,
+        )
     except (ProtocolError, TaError, ValueError, OSError) as error:
         # Non-zero, and specific. A client that always exited 0 would make the
         # integration test that runs it worthless.
