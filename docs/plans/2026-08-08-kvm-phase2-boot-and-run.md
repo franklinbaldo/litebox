@@ -130,6 +130,31 @@ references the object.** Expect more of these as Tasks 8 and 10 light up `mm` an
 - **SMAP enforcement is unverified.** No USER-accessible page exists yet. Task 10 should
   confirm a kernel read of a user page faults, and succeeds between `stac`/`clac`.
 
+## CR0.WP was clear — found in Task 8, and it mattered
+
+**PVH leaves `CR0.WP` clear** (`CR0 = 0x8000_0013` at entry). With WP clear, a *supervisor*
+write to a read-only page **succeeds silently**. The read-only `.text` mapping would have
+been decorative: the W^X test would have passed by not faulting, and we would have reported
+a guarantee that did not exist.
+
+LVBS never sets WP because Hyper-V hands VTL1 a CR0 that already has it. Nothing in the
+shared code sets it. The runner now sets WP **before** the CR3 switch, so there is no
+interval where `.text` is nominally read-only and actually writable.
+
+This is exactly the class of bug that only testing a claim can find — the code looked
+correct, the mapping was correct, and the guarantee was absent.
+
+Verified DEP state after the switch (4 KiB granularity, no USER bit anywhere):
+
+| Region | Flags | Probe | CR2 | Error code |
+|---|---|---|---|---|
+| `.text` | `[rXs]` read-only, executable | write to `.text+0x40` | `0xffffe20000200040` | `0x3` present+write |
+| heap / `.data` / stack | `[WNs]` writable, NX | call into a heap page | `0xffffe20000608000` | `0x11` present+**instruction fetch** |
+| VA 0 | unmapped | null read | `0x0` | `0x0` not-present |
+
+The NX probe's faulting RIP *equals* the data page address, which is what makes it a real
+instruction-fetch fault rather than a data fault that happened to be nearby.
+
 ## Verification gates
 
 **Gate P1 — Phase 1 invariant.** Every task must leave the LVBS build untouched:
