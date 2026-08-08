@@ -150,6 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         limits,
         Arc::new(LinuxSocketProvider::new_with_port_mappings(
             limits.max_sockets,
+            limits.max_sockets_per_session,
             &port_mappings,
         )?),
     )?;

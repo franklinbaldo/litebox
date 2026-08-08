@@ -371,6 +371,7 @@ fn spawn_test_broker_with_port_mappings(
                 std::sync::Arc::new(
                     litebox_broker_platform_linux_userland::LinuxSocketProvider::new_with_port_mappings(
                         limits.max_sockets,
+                        limits.max_sockets_per_session,
                         &port_mappings,
                     )
                     .expect("failed to create broker test socket provider"),
