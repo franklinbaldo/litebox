@@ -16,7 +16,9 @@
 //! - **MCE (Vector 18)**: Machine Check Exceptions are delivered to VTL0 and handled
 //!   by the VTL0 kernel. VTL1 does not receive MCEs.
 
-use super::timer::{SPURIOUS_VECTOR, STIMER_VECTOR};
+use super::SPURIOUS_VECTOR;
+#[cfg(feature = "host_lvbs")]
+use super::timer::STIMER_VECTOR;
 #[cfg(feature = "host_lvbs")]
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
@@ -44,6 +46,7 @@ unsafe extern "C" {
     fn isr_alignment_check();
     fn isr_simd_floating_point();
     fn isr_hyperv_sint();
+    #[cfg(feature = "host_lvbs")]
     fn isr_stimer();
     fn isr_spurious();
 }
@@ -92,6 +95,7 @@ fn idt() -> &'static InterruptDescriptorTable {
             #[cfg(feature = "host_lvbs")]
             idt.index_mut(HYPERVISOR_CALLBACK_VECTOR)
                 .set_handler_addr(VirtAddr::from_ptr(isr_hyperv_sint as *const ()));
+            #[cfg(feature = "host_lvbs")]
             idt.index_mut(STIMER_VECTOR)
                 .set_handler_addr(VirtAddr::from_ptr(isr_stimer as *const ()));
             idt.index_mut(SPURIOUS_VECTOR)
@@ -212,6 +216,7 @@ extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
 /// handlers run with IF clear, so an in-scope kernel-mode fire only lands
 /// in the bounded init/reenter prologue, where the re-arm just refreshes
 /// that prologue's quantum.
+#[cfg(feature = "host_lvbs")]
 #[unsafe(no_mangle)]
 extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
     use crate::host::per_cpu_variables::with_per_cpu_variables;

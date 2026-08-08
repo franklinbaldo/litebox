@@ -33,16 +33,12 @@ use crate::mshv::{
     HV_X64_MSR_STIMER0_CONFIG, HV_X64_MSR_STIMER0_COUNT, HV_X64_MSR_TIME_REF_COUNT,
     HYPERV_CPUID_FEATURES, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
 };
+use super::SPURIOUS_VECTOR;
 use core::arch::x86_64::__cpuid_count as cpuid_count;
 
 /// Vector the preemption timer fires on. Above the 0..31 exception range and
 /// clear of the Hyper-V SINT vector (0xf3).
 pub(crate) const STIMER_VECTOR: u8 = 0x40;
-
-/// Vector the local APIC delivers for a *spurious* interrupt (programmed
-/// into the SVR). `0xff` is conventional (top of range). Requires no EOI;
-/// handled by the bare `iretq` stub `isr_spurious`.
-pub(crate) const SPURIOUS_VECTOR: u8 = 0xff;
 
 // Architectural x86 local-APIC (x2APIC) MSRs and the bit fields we use.
 const IA32_APIC_BASE: u32 = 0x1b;

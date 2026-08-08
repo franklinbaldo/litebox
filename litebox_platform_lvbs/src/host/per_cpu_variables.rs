@@ -70,11 +70,14 @@ pub struct PerCpuVariables {
     vp_index: Cell<u32>,
     /// Set once this CPU's preemption timer is configured (see `arch::timer`).
     /// Zero-initialized to `false`.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_timer_enabled: Cell<bool>,
     /// True while the preemption timer is armed (see `arch::timer`).
     /// Zero-initialized to `false`.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_armed: Cell<bool>,
     /// Set when a preemption timer killed user-mode code.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_timeout_killed_user: Cell<bool>,
 }
 

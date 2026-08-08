@@ -7,7 +7,18 @@ pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
+/// Hyper-V synthetic-timer (STIMER) preemption timer.
+///
+/// Note: roughly half of this module is architectural x2APIC bring-up code
+/// (`IA32_APIC_BASE`, `X2APIC_SVR`, `X2APIC_EOI`) that is not Hyper-V specific
+/// and is worth lifting out when an APIC-timer preemption source lands.
+#[cfg(feature = "host_lvbs")]
 pub mod timer;
+
+/// Vector the local APIC delivers for a *spurious* interrupt (programmed
+/// into the SVR). `0xff` is conventional (top of range). Requires no EOI;
+/// handled by the bare `iretq` stub `isr_spurious`.
+pub(crate) const SPURIOUS_VECTOR: u8 = 0xff;
 
 pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},

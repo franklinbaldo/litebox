@@ -67,13 +67,20 @@ nm -S --defined-only "$BIN" | awk 'NF>=4{print $2, $4}' \
   | sed -E 's/(17h|C[sS])[0-9a-zA-Z]{10,}_?//g' | sort | sha256sum
 ```
 
-Baseline (12599 symbols, recorded at `76b176f6`):
+Baseline (12600 symbols, rebaselined at `c5911fac`):
 ```
-de61da6739bc88fe6239f820ac42f334f6e59056e06cf09c8be040bb484c61c2
+d8a2ddb8e971d09794bf0397c64f0b2ed95036d26e0deb4b4254c8a719e2c91a
 ```
 
 Use Gate A' for Tasks 2-9. It stays stable across feature flips but still catches
 any real change to LiteBox code.
+
+**Rebaselining.** A task that deliberately restructures code (rather than only adding
+`cfg`s) will legitimately move this hash. When that happens, diff the symbol tables and
+confirm the delta is exactly what the task mandated, then rebaseline. Task 7's helper
+extraction did this: `flush_tlb_range` went `0x206` -> `0x11a` plus a new `0xfa`
+`flush_tlb_range_local`, with no other symbol touched. Baseline moved
+`de61da67...`/12599 -> `d8a2ddb8...`/12600.
 
 **Gate B — builds and tests pass (for restructuring tasks).**
 The bare-metal build must succeed, plus:
@@ -253,7 +260,7 @@ compile_error!(
 
 Run `/tmp/lvbs-check.sh`. Use **Gate A'** here, not Gate A: enabling a feature
 perturbs upstream codegen. The symbol hash must still be
-`de61da6739bc88fe6239f820ac42f334f6e59056e06cf09c8be040bb484c61c2` (12599 symbols).
+`d8a2ddb8e971d09794bf0397c64f0b2ed95036d26e0deb4b4254c8a719e2c91a` (12600 symbols).
 
 **Step 4: Verify the guard rail actually fires**
 
