@@ -249,7 +249,7 @@ fn reserved_ranges(
     //    possible.
     out.push(Range {
         start: start_info_pa,
-        end: start_info_pa + size_of::<HvmStartInfo>() as u64,
+        end: start_info_pa.saturating_add(size_of::<HvmStartInfo>() as u64),
     });
 
     // 4. The memory map table. Same reasoning; also, we are iterating over it
