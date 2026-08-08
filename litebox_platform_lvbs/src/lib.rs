@@ -42,6 +42,7 @@ extern crate alloc;
 pub mod arch;
 pub mod host;
 pub mod mm;
+#[cfg(feature = "host_lvbs")]
 pub mod mshv;
 
 pub mod syscall_entry;
@@ -464,7 +465,7 @@ type UserMutPtr<T> =
 pub enum Vmap {}
 
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
-    type Manager = crate::host::LvbsLinuxKernel;
+    type Manager = crate::Platform;
     fn manager() -> &'static Self::Manager {
         crate::platform_low()
     }
@@ -590,7 +591,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         //      the hypervisor writes executable code into it at runtime)
         #[allow(unused_mut)]
         let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
-        #[cfg(not(test))]
+        #[cfg(all(not(test), feature = "host_lvbs"))]
         {
             use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
             // get_hvcall_page_start_address() now returns a virtual address (two-phase relocation).
@@ -2010,7 +2011,10 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.
 // Rather than doing this, we should implement LVBS interface/provider for the platform.
 
+#[cfg(feature = "host_lvbs")]
 pub type Platform = crate::host::LvbsLinuxKernel;
+#[cfg(feature = "host_kvm")]
+pub type Platform = crate::host::KvmGuest;
 
 static PLATFORM_LOW: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
 

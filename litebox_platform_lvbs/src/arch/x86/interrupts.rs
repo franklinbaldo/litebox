@@ -17,6 +17,7 @@
 //!   by the VTL0 kernel. VTL1 does not receive MCEs.
 
 use super::timer::{SPURIOUS_VECTOR, STIMER_VECTOR};
+#[cfg(feature = "host_lvbs")]
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
 use litebox_common_linux::PtRegs;
@@ -88,6 +89,7 @@ fn idt() -> &'static InterruptDescriptorTable {
                 .set_handler_addr(VirtAddr::from_ptr(isr_alignment_check as *const ()));
             idt.simd_floating_point
                 .set_handler_addr(VirtAddr::from_ptr(isr_simd_floating_point as *const ()));
+            #[cfg(feature = "host_lvbs")]
             idt.index_mut(HYPERVISOR_CALLBACK_VECTOR)
                 .set_handler_addr(VirtAddr::from_ptr(isr_hyperv_sint as *const ()));
             idt.index_mut(STIMER_VECTOR)

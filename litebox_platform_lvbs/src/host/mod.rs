@@ -21,6 +21,7 @@ pub(crate) use lvbs_impl::set_platform_root_key;
 pub mod mock;
 
 /// Anchor byte that ensures the `.hvcall_page` linker section is emitted.
+#[cfg(feature = "host_lvbs")]
 #[used]
 #[unsafe(link_section = ".hvcall_page")]
 static HVCALL_PAGE_ANCHOR: u8 = 0;
@@ -34,6 +35,7 @@ static HVCALL_PAGE_ANCHOR: u8 = 0;
 ///
 /// Different Virtual Processors (VPs) can share the same address because
 /// Hyper-V identifies the calling VP internally.
+#[cfg(feature = "host_lvbs")]
 #[inline]
 pub fn hv_hypercall_page_address() -> u64 {
     crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address()
