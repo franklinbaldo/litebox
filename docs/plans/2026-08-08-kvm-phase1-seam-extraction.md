@@ -778,3 +778,77 @@ git commit -am "Verify host_kvm compiles; check both hosts in CI"
 PVH boot, the page allocator over the firmware memmap, `litebox_runner_kvm`, the
 OP-TEE TA, and the QEMU integration test. Those are Phase 2 onward — see
 `docs/plans/2026-08-08-litebox-on-kvm-design.md` section 6.
+
+---
+
+## Phase 2 debt (from the final review)
+
+Findings that are not Phase 1 blockers but must not be rediscovered later.
+
+### Traps
+
+- **`Instant`'s tick unit is a Hyper-V constant now shared with KVM.**
+  `arch/x86/mod.rs` holds `REF_TICKS_PER_MICRO` / `REF_COUNTER_TICK_NANOS`, whose doc
+  comments still say "partition reference counter" — a Hyper-V synthetic MSR, not an
+  architectural x86 fact. Under `host_kvm`, `Instant::checked_duration_since` and
+  `checked_add` compile and hardcode "1 tick = 100 ns". This is unreachable today
+  because `Instant::now()` panics, but whoever implements a TSC-based `now()` will get
+  a type that compiles, never warns, and silently returns durations off by the
+  TSC-to-100ns ratio. Make the tick unit per-host *before* implementing the clock.
+  `Instant`'s own doc still reads "Backed by the Hyper-V partition reference counter".
+
+- **`SAFETY:` comment at `lib.rs:1179-1181` asserts a check that does not happen under
+  `host_kvm`.** The conclusion still holds — the protected-frame registry is provably
+  empty when `mshv` is compiled out, since its only writers are mshv-only — but the
+  justification needs a per-host split rather than stating a check that was elided.
+
+- **The `host_kvm` security argument depends on an unrecorded Phase 2 obligation.**
+  `lib.rs` argues the boundary is ring 0/3 "enforced by page tables, SMEP/SMAP and the
+  syscall gate". `enable_smep_smap()` is called only from `litebox_runner_lvbs`. The
+  KVM runner **must** call `enable_smep_smap()` and the DEP setup, or the argument is
+  false.
+
+### Incompleteness
+
+- **`KvmGuest` is missing whole trait impls**, not merely method bodies: the
+  `#[global_allocator]` / `litebox::mm::allocator::MemoryProvider`, `CrngProvider`,
+  `DerivedKeyProvider`, `ThreadLocalStorageProvider` (this one is not even LVBS-specific
+  — it just reads `pcv.tls`), and `init_task`. It compiles only because nothing in-crate
+  demands those bounds yet. `kvm_impl.rs`'s module doc should carry the inventory.
+
+- **Two LVBS-only modules still compile under `host_kvm`**, escaping `-Dwarnings` only
+  because their items are `pub` (so `dead_code` does not fire — `-Dwarnings` is not a
+  safety net for this class): `host/bootparam.rs` in its entirety (VTL1 memory info,
+  consumed only by `mshv/vsm.rs` and the LVBS runner) and `host/linux.rs::CpuMask`.
+
+- **LVBS-only dependencies are unconditional** in `litebox_platform_lvbs/Cargo.toml`:
+  `litebox_common_lvbs`, `rand_chacha`, `rand_core`, `sha2`, `digest`, `zeroize`,
+  `modular-bitfield`. All are used only by `mshv/` and `lvbs_impl.rs`, so a `host_kvm`
+  build compiles the entire LVBS crypto stack for nothing.
+
+- **Docs are not bi-modal.** `SPURIOUS_VECTOR` still says "programmed into the SVR",
+  but under `host_kvm` the `timer` module that programs it is gated out, so
+  `isr_spurious` is installed with no APIC configured. `interrupts.rs`'s module doc,
+  `LvbsPhysPageMapInfo`, `vtl1_phys_frame_range` and `LinuxKernel::new` all retain VTL
+  language in the KVM build.
+
+### Test and CI gaps
+
+- Nothing runs the test suite under `host_kvm`. Adding
+  `nextest -p litebox_platform_lvbs --no-default-features --features host_kvm` costs
+  seconds (6 pass / 4 ignored, vs 15 / 4 under `host_lvbs`; the other 9 live in `mshv`).
+- `devbox` and `preemption_test_quantum` are no longer exercised by any `--all-features`
+  sweep with `--all-targets`, so their test targets are unchecked.
+- The `compile_error!` guards fire but are drowned out — a hostless build emits 21
+  errors, of which the friendly message is one. Consider `cfg(not(any(...)))` fallback
+  arms so a misconfigured build produces only the guard.
+
+### Cosmetic
+
+- `Option<ProtectedFrameAccess>` where `ProtectedFrameAccess = ()`: the comment claims
+  it "tracks writability", but the field is never read anywhere in the workspace — it
+  exists only to hold the LVBS guard alive until `Drop`.
+- The `host_kvm` `flush_tlb_range` has a redundant `count == 0` early return that
+  `flush_tlb_range_local` already handles.
+- `print()`'s two bodies are near-duplicates; one body with a gated ringbuffer tee
+  would be smaller.
