@@ -3,9 +3,9 @@
 
 //! Different host implementations of [`super::HostInterface`]
 pub mod bootparam;
-pub mod linux;
 #[cfg(feature = "host_kvm")]
 pub mod kvm_impl;
+pub mod linux;
 #[cfg(feature = "host_lvbs")]
 pub mod lvbs_impl;
 pub mod per_cpu_variables;

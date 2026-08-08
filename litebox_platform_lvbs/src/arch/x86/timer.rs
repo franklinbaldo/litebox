@@ -25,6 +25,7 @@
 //! -> kill) with a rare in-kernel safety net (`interrupts::stimer_handler_impl`,
 //! which re-arms via `rearm_preemption`).
 
+use super::SPURIOUS_VECTOR;
 use super::instrs::{rdmsr, wrmsr};
 use crate::host::per_cpu_variables::with_per_cpu_variables;
 use crate::mshv::{
@@ -33,7 +34,6 @@ use crate::mshv::{
     HV_X64_MSR_STIMER0_CONFIG, HV_X64_MSR_STIMER0_COUNT, HV_X64_MSR_TIME_REF_COUNT,
     HYPERV_CPUID_FEATURES, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
 };
-use super::SPURIOUS_VECTOR;
 use core::arch::x86_64::__cpuid_count as cpuid_count;
 
 /// Vector the preemption timer fires on. Above the 0..31 exception range and
