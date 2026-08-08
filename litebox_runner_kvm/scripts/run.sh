@@ -132,11 +132,21 @@ command -v qemu-system-x86_64 >/dev/null \
     || fatal "qemu-system-x86_64 not found. On Debian/Ubuntu:
     sudo apt-get install -y qemu-system-x86"
 
+# `-display none -serial stdio` rather than `-nographic`.
+#
+# `-nographic` expands to `-display none -serial mon:stdio`. The `mon:` mux
+# adds the QEMU monitor and the Ctrl-A escape, neither of which a
+# non-interactive run needs, and it swallows Ctrl-C. Without the mux the
+# serial console is plain stdout and Ctrl-C kills QEMU normally.
+#
+# Note the guest is never given stdin -- see the redirect at the call site,
+# which is load-bearing.
 QEMU_ARGS=(
     -machine q35
     -m "$MEMORY"
     -kernel "$BIN"
-    -nographic
+    -display none
+    -serial stdio
     -no-reboot
     -device isa-debug-exit,iobase=0xf4,iosize=0x04
 )
@@ -170,9 +180,21 @@ fi
 info "Booting ($([ "$ACCEL" -eq 1 ] && echo KVM || echo TCG), $MEMORY, ${TIMEOUT}s timeout)"
 echo 1>&2
 
+# Two details here are load-bearing, both learned the hard way:
+#
+# `< /dev/null`: QEMU's stdio chardev calls tcsetattr() to take the terminal
+# into raw mode when stdin is a tty. If the process is not in the foreground
+# process group -- which is easy to arrange with sudo, or inside tmux -- that
+# raises SIGTTOU and *stops* the process. The symptom is a run that prints
+# nothing at all and then hits the timeout, with no clue as to why. The guest
+# is entirely non-interactive, so giving it no stdin costs nothing.
+#
+# No pipe: QEMU inherits stdout and stderr directly, so $? is QEMU's own
+# status rather than a filter's, and nothing sits between the guest and the
+# terminal reordering or buffering its output.
 set +e
-$PRIVILEGE timeout "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" 2>&1 | tr -d '\r'
-STATUS=${PIPESTATUS[0]}
+$PRIVILEGE timeout "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}" < /dev/null
+STATUS=$?
 set -e
 
 echo 1>&2
