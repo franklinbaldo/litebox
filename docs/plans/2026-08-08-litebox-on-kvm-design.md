@@ -121,7 +121,11 @@ PDE/PTE at fixed frames (`mshv/vtl1_mem_layout.rs`). Under KVM none of that exis
 ## 3. The nine mshv seams
 
 Feature `host_kvm` compiles out `mod mshv`. Each seam gets the minimum treatment that
-leaves LVBS behaviour byte-identical.
+leaves LVBS behaviour unchanged and its `.text` identical apart from 11 additional
+upstream generic instantiations (`base16ct` copies of `core` generics, +1024 bytes)
+that `-Z share-generics` selects differently once a cargo feature is added to the
+crate. No LiteBox symbol is added, removed, or resized. See the Gate A/A' discussion
+in the Phase 1 plan for how this is measured.
 
 | # | Seam | Treatment |
 |---|---|---|

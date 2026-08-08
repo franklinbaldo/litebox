@@ -161,7 +161,7 @@ instruction-fetch fault rather than a data fault that happened to be nearby.
 ```bash
 /tmp/lvbs-check.sh
 ```
-Expected: `Gate A' symbols d8a2ddb8e971d09794bf0397c64f0b2ed95036d26e0deb4b4254c8a719e2c91a`, `12600`, `fmt CLEAN`, `15 passed; 0 failed`.
+Expected: `Gate A' symbols de61da6739bc88fe6239f820ac42f334f6e59056e06cf09c8be040bb484c61c2`, `12599`, `fmt CLEAN`, `15 passed; 0 failed`.
 
 If you change shared code in `litebox_platform_lvbs`, this hash WILL move. That is allowed in Phase 2 — but only deliberately. Diff the symbol tables, confirm the delta is what you intended, and rebaseline in your commit message. Never rebaseline silently.
 

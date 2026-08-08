@@ -55,19 +55,6 @@ const PML4_INDEX_MASK: u64 = 0x1FF;
 pub(crate) const KERNEL_PML4_START: usize =
     ((crate::KERNEL_OFFSET >> PML4_SHIFT) & PML4_INDEX_MASK) as usize;
 
-/// Flush TLB entries for a contiguous page range on the *current* core only.
-#[cfg(not(test))]
-fn flush_tlb_range_local(start: Page<Size4KiB>, count: usize) {
-    if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
-        let base = start.start_address().as_u64();
-        for i in 0..count {
-            x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
-        }
-    } else {
-        x86_64::instructions::tlb::flush_all();
-    }
-}
-
 /// Flush TLB entries for a contiguous page range across all cores.
 ///
 /// Uses Hyper-V hypercalls so that remote cores sharing the same page table
@@ -83,7 +70,14 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     // If the current VP is the BSP, it might use MM operations **before** the hypercall page is set up.
     // In that case, we fall back to local TLB flushes. This is safe because no AP enters VTL1 yet.
     if !is_hvcall_ready() {
-        flush_tlb_range_local(start, count);
+        if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+            let base = start.start_address().as_u64();
+            for i in 0..count {
+                x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
+            }
+        } else {
+            x86_64::instructions::tlb::flush_all();
+        }
         return;
     }
 
@@ -100,8 +94,19 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     }
 }
 
-/// KVM has no hypervisor to broadcast invalidations through. Milestone 1 is single-CPU,
-/// so a local flush is complete.
+/// Flush TLB entries for a contiguous page range on the *current* core only.
+///
+/// KVM has no hypervisor to broadcast invalidations through. Milestone 1 is
+/// single-CPU, so a local flush is complete.
+///
+/// This is a separate whole-function definition rather than a shared helper
+/// called from both hosts, because factoring the local-flush loop out of the
+/// `host_lvbs` function above changed that function's emitted code in the
+/// debug build (0x206 -> 0x11a bytes plus a 0xfa-byte out-of-line helper,
+/// caught by Gate A'). Behaviour was identical, but the LVBS build is meant to
+/// be provably unchanged, so the body above is kept textually as it is on
+/// `main` and this one carries its own copy. Same reasoning as the two
+/// `kernel_exception_handler_no_ctx` definitions in `lib.rs`.
 // TODO(SMP): needs IPI-based shootdown once AP bring-up lands.
 #[cfg(all(not(test), feature = "host_kvm"))]
 fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
@@ -109,7 +114,14 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
         return;
     }
 
-    flush_tlb_range_local(start, count);
+    if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+        let base = start.start_address().as_u64();
+        for i in 0..count {
+            x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
+        }
+    } else {
+        x86_64::instructions::tlb::flush_all();
+    }
 }
 
 #[cfg(test)]

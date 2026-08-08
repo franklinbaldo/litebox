@@ -67,9 +67,9 @@ nm -S --defined-only "$BIN" | awk 'NF>=4{print $2, $4}' \
   | sed -E 's/(17h|C[sS])[0-9a-zA-Z]{10,}_?//g' | sort | sha256sum
 ```
 
-Baseline (12600 symbols, rebaselined at `c5911fac`):
+Baseline (12599 symbols, restored at the C1 review fix):
 ```
-d8a2ddb8e971d09794bf0397c64f0b2ed95036d26e0deb4b4254c8a719e2c91a
+de61da6739bc88fe6239f820ac42f334f6e59056e06cf09c8be040bb484c61c2
 ```
 
 Use Gate A' for Tasks 2-9. It stays stable across feature flips but still catches
@@ -85,12 +85,24 @@ function definitions, with the `host_lvbs` body textually unchanged, moved nothi
 
 Treat "an inner `cfg` block cannot affect the other config" as **false**.
 
-**Rebaselining.** A task that deliberately restructures code (rather than only adding
-`cfg`s) will legitimately move this hash. When that happens, diff the symbol tables and
-confirm the delta is exactly what the task mandated, then rebaseline. Task 7's helper
-extraction did this: `flush_tlb_range` went `0x206` -> `0x11a` plus a new `0xfa`
-`flush_tlb_range_local`, with no other symbol touched. Baseline moved
-`de61da67...`/12599 -> `d8a2ddb8...`/12600.
+**Rebaselining is the last resort, not the first move.** A task that deliberately
+restructures code (rather than only adding `cfg`s) will legitimately move this hash.
+When that happens, first ask whether the restructuring can be *neutralised* for LVBS
+by giving each host its own whole function definition. Only if it genuinely cannot
+should you diff the symbol tables, confirm the delta is exactly what the task
+mandated, and rebaseline.
+
+Task 7 got this wrong and it was caught in final review (finding C1). It extracted
+`flush_tlb_range_local` out of `flush_tlb_range` at `c5911fac`; LVBS's
+`flush_tlb_range` went `0x206` -> `0x11a` plus a new `0xfa`-byte helper, turning
+inline code into an out-of-line `call` in the debug build. Behaviour was identical,
+but the gate had fired on a real LVBS codegen change and was rebaselined
+(`de61da67...`/12599 -> `d8a2ddb8...`/12600) instead of the change being neutralised
+— even though the correct pattern was already established two functions away in
+`lib.rs`. The fix applied that pattern: each host now has its own whole
+`flush_tlb_range`, with the `host_lvbs` body textually identical to `main`, and the
+baseline returned exactly to `de61da67...`/12599. Nothing was lost by not
+rebaselining; the rebaseline had simply hidden a change that did not need to happen.
 
 **Gate B — builds and tests pass (for restructuring tasks).**
 The bare-metal build must succeed, plus:
