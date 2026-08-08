@@ -887,20 +887,29 @@ impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let ticks = self.0.checked_sub(earlier.0)?;
         // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
-        let nanos = ticks.checked_mul(crate::arch::timer::REF_COUNTER_TICK_NANOS)?;
+        let nanos = ticks.checked_mul(crate::arch::REF_COUNTER_TICK_NANOS)?;
         Some(core::time::Duration::from_nanos(nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
         let nanos: u64 = duration.as_nanos().try_into().ok()?;
-        let ticks = nanos / crate::arch::timer::REF_COUNTER_TICK_NANOS;
+        let ticks = nanos / crate::arch::REF_COUNTER_TICK_NANOS;
         Some(Instant(self.0.checked_add(ticks)?))
     }
 }
 
 impl Instant {
+    #[cfg(feature = "host_lvbs")]
     fn now() -> Self {
         Instant(crate::arch::timer::reference_time_100ns())
+    }
+
+    /// KVM has no Hyper-V reference counter. A TSC-based clock lands in Phase 2 with
+    /// the boot path; until there is something to boot, a stub is more honest than a
+    /// fabricated calibration.
+    #[cfg(feature = "host_kvm")]
+    fn now() -> Self {
+        unimplemented!("KVM time source lands in Phase 2")
     }
 }
 
@@ -1430,6 +1439,7 @@ fn run_thread_inner(
     //
     // Arm the preemption timer for this user-thread execution. This function is
     // idempotent, so `reenter` does not change the timeout.
+    #[cfg(feature = "host_lvbs")]
     crate::arch::timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
@@ -1955,6 +1965,7 @@ unsafe extern "C" fn exception_handler(
     };
     // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
     // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
+    #[cfg(feature = "host_lvbs")]
     if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
         crate::arch::timer::eoi();
         crate::arch::timer::mark_user_timeout_kill();

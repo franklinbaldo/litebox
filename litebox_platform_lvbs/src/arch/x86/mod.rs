@@ -15,6 +15,13 @@ pub mod msr;
 #[cfg(feature = "host_lvbs")]
 pub mod timer;
 
+/// Partition reference counter granularity: 100 ns ticks, i.e., 10 per microsecond.
+pub(crate) const REF_TICKS_PER_MICRO: u64 = 10;
+
+/// Nanoseconds per partition reference-counter tick: the counter runs at
+/// 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
+pub(crate) const REF_COUNTER_TICK_NANOS: u64 = 1_000 / REF_TICKS_PER_MICRO;
+
 /// Vector the local APIC delivers for a *spurious* interrupt (programmed
 /// into the SVR). `0xff` is conventional (top of range). Requires no EOI;
 /// handled by the bare `iretq` stub `isr_spurious`.
