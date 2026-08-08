@@ -23,7 +23,9 @@ use core::panic::PanicInfo;
 use litebox_platform_lvbs::host::per_cpu_variables::{
     KERNEL_STACK_SIZE, PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
 };
+use litebox_platform_lvbs::mm::MemoryProvider as _;
 use litebox_platform_lvbs::{Instant, serial_println};
+use litebox_platform_multiplex::Platform;
 
 /// Physical address of [`_start`].
 ///
@@ -653,7 +655,7 @@ extern "C" fn kvm_long_mode_entry() -> ! {
 
     // The heap. Everything after this point may allocate; nothing before it
     // may.
-    let usable = memmap::init_heap_from_pvh(hvm_start_info_addr());
+    let ram = memmap::init_heap_from_pvh(hvm_start_info_addr());
 
     allocate_per_cpu_variables();
     init_per_cpu_variables();
@@ -686,7 +688,8 @@ extern "C" fn kvm_long_mode_entry() -> ! {
             "call {kernel_main}",
             kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
             kernel_main = sym kernel_main,
-            in("rdi") usable,
+            in("rdi") ram.usable_bytes,
+            in("rsi") ram.ram_end_pa,
             options(noreturn),
         );
     }
@@ -696,7 +699,7 @@ extern "C" fn kvm_long_mode_entry() -> ! {
 ///
 /// Reached only via the stack switch at the end of [`kvm_long_mode_entry`],
 /// with `%rsp` inside this core's `PerCpuVariables::kernel_stack`.
-extern "C" fn kernel_main(usable: u64) -> ! {
+extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
     // The XSAVE areas are allocated here rather than beside
     // `allocate_per_cpu_variables` for the reason the platform's own doc
     // comment gives: the CPUID queries and `avec!` allocations use more stack
@@ -730,7 +733,18 @@ extern "C" fn kernel_main(usable: u64) -> ! {
     check_cpu_state();
     check_interrupts();
 
-    halt();
+    // The real page tables. Everything above ran on the early 2 MiB boot
+    // mapping; everything below runs on 4 KiB tables with DEP.
+    init_platform(ram_end_pa);
+
+    check_address_space();
+    check_data_access();
+    check_text_is_read_only();
+
+    // Last, because it is not recoverable: an instruction-fetch fault leaves
+    // RIP on the data page, which no exception-table entry can name. See
+    // `check_nx_is_enforced`.
+    check_nx_is_enforced();
 }
 
 // ---------------------------------------------------------------------------
@@ -941,18 +955,582 @@ fn check_interrupts() {
         Err(_) => log::info!("pf         faulted and recovered as expected"),
     }
 
-    // 3. A null read, for the record. PA 0 *is* mapped (PML4[0] identity-maps
-    //    the low 1 GiB, and the boot stub needs that to survive enabling
-    //    paging), so this does not fault today. Noted rather than asserted:
-    //    Task 8 builds real page tables and should unmap page zero.
-    log::warn!(
-        "pf         VA 0 is still mapped by the early identity map (Task 8 should unmap it)"
+    // 3. A null read is deliberately *not* attempted here. PA 0 is still
+    //    mapped at this point (PML4[0] identity-maps the low 1 GiB, and the
+    //    boot stub needs that to survive enabling paging), so it would not
+    //    fault and would prove nothing. `check_address_space` retries it
+    //    after the real page tables are loaded, where PML4[0] is empty.
+    log::info!(
+        "pf         VA 0 still mapped by the early identity map; retried after the CR3 switch"
     );
 }
 
 /// A physical address beyond the 1 GiB the early PD covers, used to provoke a
 /// page fault at an address that cannot be mapped by accident.
 const UNMAPPED_PROBE_PA: u64 = 0x8000_0000;
+
+// ---------------------------------------------------------------------------
+// The real page tables.
+//
+// Everything above this point ran on the early 2 MiB tables the boot stub
+// built: an identity map of the low 1 GiB plus the same 1 GiB again at
+// `KERNEL_OFFSET`, every leaf `PRESENT | WRITABLE | HUGE`. That mapping has no
+// DEP, no read-only text, and maps VA 0.
+//
+// `Platform::new` replaces it with 4 KiB tables covering the guest's physical
+// memory once, at `PA + KERNEL_OFFSET` only, with `.text` mapped
+// read-only-executable and every other page `NO_EXECUTE`. The identity map
+// disappears with it, which is what finally unmaps VA 0.
+// ---------------------------------------------------------------------------
+
+/// Page-table entry bits, named so the walk below reads as prose.
+const PTE_PRESENT: u64 = 1 << 0;
+const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_USER: u64 = 1 << 2;
+const PTE_HUGE: u64 = 1 << 7;
+const PTE_NO_EXECUTE: u64 = 1 << 63;
+/// The physical-address field of a page-table entry (bits 51:12).
+const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
+/// CR0.WP: honour the read-only bit for supervisor writes.
+const CR0_WP: u64 = 1 << 16;
+
+/// The result of a software page-table walk.
+#[derive(Clone, Copy)]
+struct Translation {
+    /// Physical address the virtual address maps to.
+    pa: u64,
+    /// The leaf entry, for its flag bits.
+    pte: u64,
+    /// Level the walk terminated at: 1 for a 4 KiB page, 2 for 2 MiB, 3 for
+    /// 1 GiB.
+    level: u32,
+}
+
+impl core::fmt::Display for Translation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "pa {:#014X} {} [{}{}{}]",
+            self.pa,
+            match self.level {
+                1 => "4K",
+                2 => "2M",
+                _ => "1G",
+            },
+            if self.pte & PTE_WRITABLE != 0 {
+                "W"
+            } else {
+                "r"
+            },
+            if self.pte & PTE_NO_EXECUTE != 0 {
+                "N"
+            } else {
+                "X"
+            },
+            if self.pte & PTE_USER != 0 { "U" } else { "s" },
+        )
+    }
+}
+
+/// Reads CR3.
+fn read_cr3() -> u64 {
+    let cr3: u64;
+    // SAFETY: reading CR3 into a register has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
+    }
+    cr3
+}
+
+/// Reads CR0.
+fn read_cr0() -> u64 {
+    let cr0: u64;
+    // SAFETY: reading CR0 into a register has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+    }
+    cr0
+}
+
+/// Walks the page tables currently in CR3 in software and reports what `va`
+/// translates to, or `None` if it is unmapped at some level.
+///
+/// This exists because "we did not triple-fault" is the only other evidence
+/// available that a mapping is what it was meant to be, and it arrives too
+/// late to be useful. Reading the tables directly turns a claim about page
+/// permissions into a printed number.
+///
+/// Table frames are reached through the `KERNEL_OFFSET` alias, which both the
+/// early tables (for the low 1 GiB) and the new tables (for all of RAM) map.
+fn walk(va: u64) -> Option<Translation> {
+    let mut table = read_cr3() & PTE_ADDR_MASK;
+    let mut level = 4_u32;
+
+    loop {
+        let shift = 12 + 9 * (level - 1);
+        let index = (va >> shift) & 0x1FF;
+        let entry_va = table + KERNEL_OFFSET + index * 8;
+        // SAFETY: `table` is a page-table frame physical address, taken from
+        // CR3 or from a present entry of the level above, so it is a real
+        // 4 KiB-aligned frame inside guest RAM and is mapped read/write
+        // through `KERNEL_OFFSET`. `index` is masked to 0..512, so the read
+        // stays inside that frame. `read_volatile` keeps the compiler from
+        // caching entries across the CR3 switch.
+        let entry = unsafe { (entry_va as *const u64).read_volatile() };
+
+        if entry & PTE_PRESENT == 0 {
+            return None;
+        }
+
+        // Level 1 entries are always leaves; above that, PS/HUGE marks one.
+        if level == 1 || entry & PTE_HUGE != 0 {
+            let page_mask = (1_u64 << shift) - 1;
+            return Some(Translation {
+                pa: (entry & PTE_ADDR_MASK & !page_mask) | (va & page_mask),
+                pte: entry,
+                level,
+            });
+        }
+
+        table = entry & PTE_ADDR_MASK;
+        level -= 1;
+    }
+}
+
+/// The `.text` section's bounds, as virtual addresses.
+///
+/// Taken with RIP-relative `lea`s for the same reason [`heap_start_pa`] does:
+/// this must not depend on an absolute address. The platform's own
+/// `get_text_start_address` is unavailable here -- it lives in the `mshv`
+/// module, which Phase 1 gated out entirely under `host_kvm` -- but the linker
+/// symbols themselves are defined identically by `x86_64_kvm.ld`.
+fn text_va_range() -> (u64, u64) {
+    unsafe extern "C" {
+        static _text_start: u8;
+        static _text_end: u8;
+    }
+
+    let start: u64;
+    let end: u64;
+    // SAFETY: `lea` with RIP-relative operands only computes addresses into
+    // registers; it reads no memory and touches no flags.
+    unsafe {
+        core::arch::asm!(
+            "lea {s}, [rip + _text_start]",
+            "lea {e}, [rip + _text_end]",
+            s = out(reg) start,
+            e = out(reg) end,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    (start, end)
+}
+
+/// The `.rela.dyn` section's bounds, as virtual addresses.
+fn rela_va_range() -> (u64, u64) {
+    unsafe extern "C" {
+        static _rela_start: u8;
+        static _rela_end: u8;
+    }
+
+    let start: u64;
+    let end: u64;
+    // SAFETY: as `text_va_range`.
+    unsafe {
+        core::arch::asm!(
+            "lea {s}, [rip + _rela_start]",
+            "lea {e}, [rip + _rela_end]",
+            s = out(reg) start,
+            e = out(reg) end,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    (start, end)
+}
+
+/// Reads the GDTR with `sgdt`.
+fn read_gdtr_base() -> u64 {
+    /// The 10-byte pseudo-descriptor `sgdt`/`sidt` store.
+    #[repr(C, packed)]
+    struct Pseudo {
+        limit: u16,
+        base: u64,
+    }
+
+    let mut p = Pseudo { limit: 0, base: 0 };
+    // SAFETY: `sgdt` writes exactly ten bytes to the given address, which is a
+    // live, correctly sized local.
+    unsafe {
+        core::arch::asm!("sgdt [{}]", in(reg) &raw mut p, options(nostack, preserves_flags));
+    }
+    p.base
+}
+
+/// Reads the IDTR with `sidt`.
+fn read_idtr_base() -> u64 {
+    #[repr(C, packed)]
+    struct Pseudo {
+        limit: u16,
+        base: u64,
+    }
+
+    let mut p = Pseudo { limit: 0, base: 0 };
+    // SAFETY: as `read_gdtr_base`.
+    unsafe {
+        core::arch::asm!("sidt [{}]", in(reg) &raw mut p, options(nostack, preserves_flags));
+    }
+    p.base
+}
+
+/// A `.data` object written by [`check_data_access`], so that the data path is
+/// exercised on a page that is neither the heap nor the stack.
+static DATA_PROBE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Constructs the real platform and switches to its page tables.
+///
+/// # The ranges
+///
+/// `phys_start` is 0 and `phys_end` is one past the highest usable-RAM address
+/// the PVH memory map described (clamped to the 1 GiB the early tables reach,
+/// which with `-m 512M` loses nothing). The range therefore covers, in one
+/// span, every physical page anything currently in use lives on: the loaded
+/// image, the boot scratch region, and all of the heap. Starting at 0 rather
+/// than at the image costs 2 MiB of mappings and removes an entire class of
+/// "that PA was just outside the range" failure.
+///
+/// Nothing is mapped at VA 0 as a result: the new tables map physical memory
+/// exactly once, at `PA + KERNEL_OFFSET`, so PML4[0] is left empty and the
+/// early identity map ceases to exist the moment CR3 changes.
+///
+/// # The CR3 switch
+///
+/// `Platform::new` builds the tables *and* loads them; there is no window in
+/// which the caller can inspect the new PML4 before it becomes live. So the
+/// verification below is done the other way round: for each address that must
+/// survive the switch, walk the *current* tables, confirm they translate it to
+/// `VA - KERNEL_OFFSET`, and confirm that physical address lies inside
+/// `[phys_start, phys_end)`. Since the new tables map that whole range at
+/// exactly `PA + KERNEL_OFFSET`, coverage of the range is coverage of the
+/// address.
+///
+/// # Panics
+///
+/// Panics if any address that must survive the switch is not covered, rather
+/// than letting the switch triple-fault.
+fn init_platform(ram_end_pa: u64) -> &'static Platform {
+    let (text_va_start, text_va_end) = text_va_range();
+    let text_phys_start = Platform::va_to_pa(x86_64::VirtAddr::new(text_va_start));
+    let text_phys_end = Platform::va_to_pa(x86_64::VirtAddr::new(text_va_end));
+
+    let phys_start = x86_64::PhysAddr::new(0);
+    let phys_end = x86_64::PhysAddr::new(ram_end_pa);
+
+    log::info!(
+        "pt         phys {:#014X}..{:#014X} ({} MiB)",
+        phys_start.as_u64(),
+        phys_end.as_u64(),
+        (phys_end.as_u64() - phys_start.as_u64()) / (1024 * 1024)
+    );
+    log::info!(
+        "pt         text va {text_va_start:#018X}..{text_va_end:#018X} -> pa {:#014X}..{:#014X}",
+        text_phys_start.as_u64(),
+        text_phys_end.as_u64()
+    );
+
+    // Everything that must remain addressable across the CR3 switch. Named
+    // individually because a merged list cannot be reviewed, and because a
+    // missing entry here is a triple fault with no output.
+    let rsp: u64;
+    let rip: u64;
+    // SAFETY: both only copy a register (or a RIP-relative address) into
+    // another register.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nomem, nostack, preserves_flags));
+    }
+    let heap_probe = alloc::boxed::Box::new(0_u64);
+    let must_stay_mapped = [
+        ("rip (.text)", rip),
+        (".text start", text_va_start),
+        (".text end-1", text_va_end - 1),
+        (".data probe", (&raw const DATA_PROBE) as u64),
+        (".bss (per-cpu ptr)", read_gsbase()),
+        ("rsp (kernel stack)", rsp),
+        ("gdt", read_gdtr_base()),
+        ("idt", read_idtr_base()),
+        ("heap", (&raw const *heap_probe) as u64),
+        ("page tables (cr3)", read_cr3() & PTE_ADDR_MASK),
+    ];
+
+    for (name, va) in must_stay_mapped {
+        // CR3 is a physical address, not a virtual one; normalise it into the
+        // alias so one loop covers both kinds.
+        let va = if va < KERNEL_OFFSET {
+            va + KERNEL_OFFSET
+        } else {
+            va
+        };
+        let translation = walk(va).unwrap_or_else(|| {
+            panic!("{name} at {va:#018X} is not mapped even by the early tables")
+        });
+        log::info!("pt keep    {name:<20} va {va:#018X} -> {translation}");
+        assert_eq!(
+            translation.pa,
+            va - KERNEL_OFFSET,
+            "{name} at {va:#018X} is not in the KERNEL_OFFSET alias, so the new \
+             tables will not map it"
+        );
+        assert!(
+            translation.pa >= phys_start.as_u64() && translation.pa < phys_end.as_u64(),
+            "{name} at pa {:#014X} is outside the range the new tables will map",
+            translation.pa
+        );
+    }
+    drop(heap_probe);
+
+    // CR0.WP. Without it, the read-only `.text` mapping `Platform::new` is
+    // about to install is advisory: a supervisor write to a read-only page
+    // succeeds silently when WP is clear, which is how the CPU comes out of
+    // reset and how PVH leaves us. LVBS never sets this bit because the
+    // hypervisor hands VTL1 a CR0 that already has it; on KVM nobody does.
+    //
+    // Set before the switch, so there is no interval in which text is nominally
+    // read-only and actually writable.
+    let cr0 = read_cr0();
+    log::info!(
+        "cr0        {cr0:#018X} (WP {})",
+        if cr0 & CR0_WP != 0 { "set" } else { "CLEAR" }
+    );
+    if cr0 & CR0_WP == 0 {
+        // SAFETY: setting CR0.WP only makes supervisor writes honour the
+        // read-only bit. Nothing on this path writes to a read-only mapping;
+        // the early tables mark every page writable, so no existing access
+        // can start faulting.
+        unsafe {
+            core::arch::asm!(
+                "mov cr0, {}",
+                in(reg) cr0 | CR0_WP,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        log::info!("cr0        {:#018X} (WP set)", read_cr0());
+    }
+
+    // The switch. `Platform::new` maps the range with DEP, enables EFER.NXE
+    // and loads CR3 before returning.
+    let platform = Platform::new(phys_start, phys_end, text_phys_start, text_phys_end);
+    log::info!("pt         new tables live, cr3 {:#014X}", read_cr3());
+
+    // Reclaim `.rela.dyn`. The relocations were applied by
+    // `apply_relocations` before any static was read, and nothing consults the
+    // table afterwards. The bounds are rounded inwards to whole pages: the
+    // section starts 2 MiB aligned but its end is not aligned to anything.
+    let (rela_va_start, rela_va_end) = rela_va_range();
+    let rela_start = rela_va_start.next_multiple_of(4096);
+    let rela_end = rela_va_end - rela_va_end % 4096;
+    if rela_end > rela_start {
+        let size = rela_end - rela_start;
+        // SAFETY: `.rela.dyn` is dead once relocations are applied, so nothing
+        // references these pages. They lie inside the physical range just
+        // mapped read/write, and the memory map withheld them from the heap
+        // (they are below `_heap_start`), so this is the only claim on them.
+        unsafe {
+            Platform::mem_fill_pages(
+                usize::try_from(rela_start).expect("64-bit target"),
+                usize::try_from(size).expect("64-bit target"),
+            );
+        }
+        log::info!("heap       reclaim .rela.dyn va {rela_start:#018X}, size {size:#X}");
+    }
+
+    litebox_platform_multiplex::set_platform(platform);
+    litebox_platform_lvbs::set_platform_low(platform);
+    log::info!("platform   registered with the multiplexer");
+
+    platform
+}
+
+/// Walks the *new* tables for the same addresses [`init_platform`] checked,
+/// and confirms VA 0 has gone away.
+fn check_address_space() {
+    let (text_va_start, text_va_end) = text_va_range();
+    let rsp: u64;
+    // SAFETY: reading RSP into a register has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+
+    // 1. `.text` must be present, executable and *not* writable. The W^X rule
+    //    lives in `map_phys_frame_range`, which clears WRITABLE for any frame
+    //    inside an exec range; this is the check that it actually did.
+    for (name, va) in [
+        ("text start", text_va_start),
+        ("text end-1", text_va_end - 1),
+    ] {
+        let t = walk(va).unwrap_or_else(|| panic!("{name} {va:#018X} is unmapped"));
+        log::info!("pt now     {name:<16} va {va:#018X} -> {t}");
+        assert_eq!(t.level, 1, "{name} is not mapped with 4 KiB pages");
+        assert!(
+            t.pte & PTE_NO_EXECUTE == 0,
+            "{name} is NO_EXECUTE: the kernel cannot run"
+        );
+        assert!(
+            t.pte & PTE_WRITABLE == 0,
+            "{name} is writable: W^X is not being applied to .text"
+        );
+    }
+
+    // 2. Everything that is not `.text` must be NO_EXECUTE. This is the DEP
+    //    guarantee stated as a page-table fact rather than as an intention.
+    let heap_probe = alloc::boxed::Box::new(0_u64);
+    for (name, va) in [
+        (".data", (&raw const DATA_PROBE) as u64),
+        ("per-cpu / stack", rsp),
+        ("heap", (&raw const *heap_probe) as u64),
+    ] {
+        let t = walk(va).unwrap_or_else(|| panic!("{name} {va:#018X} is unmapped"));
+        log::info!("pt now     {name:<16} va {va:#018X} -> {t}");
+        assert!(
+            t.pte & PTE_NO_EXECUTE != 0,
+            "{name} is executable: DEP is not being applied"
+        );
+        assert!(t.pte & PTE_WRITABLE != 0, "{name} is not writable");
+        assert!(
+            t.pte & PTE_USER == 0,
+            "{name} is user-accessible: SMAP/SMEP would be bypassable"
+        );
+    }
+    drop(heap_probe);
+
+    // 3. VA 0. The early identity map is gone, so PML4[0] is empty and a null
+    //    dereference finally faults. This is item 1 of Task 8's deferred list,
+    //    and it needed no work of its own: it is a consequence of mapping
+    //    physical memory only at `PA + KERNEL_OFFSET`.
+    assert!(walk(0).is_none(), "VA 0 is still mapped");
+    log::info!("pt now     VA 0 is unmapped");
+
+    log::info!("null       reading VA 0...");
+    // SAFETY: this is exactly what `read_u64_fallible` exists for: the pointer
+    // is expected to fault and the fault is recovered through the exception
+    // table rather than propagating.
+    let result = unsafe { litebox::mm::exception_table::read_u64_fallible(core::ptr::null()) };
+    assert!(
+        result.is_err(),
+        "a read of VA 0 succeeded: page zero is still mapped"
+    );
+    log::info!("null       faulted and recovered as expected");
+}
+
+/// Confirms the new tables did not break ordinary data access.
+///
+/// A DEP change that also broke normal reads and writes would show up as
+/// something far more confusing later, so each of the three kinds of writable
+/// memory is written and read back here.
+fn check_data_access() {
+    use core::sync::atomic::Ordering;
+
+    // 1. `.data`.
+    DATA_PROBE.store(0x0123_4567_89AB_CDEF, Ordering::SeqCst);
+    let data = DATA_PROBE.load(Ordering::SeqCst);
+    assert_eq!(data, 0x0123_4567_89AB_CDEF, ".data write did not stick");
+
+    // 2. The stack. `black_box` keeps the round trip from being folded away.
+    let mut on_stack = [0_u64; 16];
+    for (i, slot) in on_stack.iter_mut().enumerate() {
+        *slot = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    let stack_sum = core::hint::black_box(&on_stack)
+        .iter()
+        .fold(0_u64, |a, x| a.wrapping_add(*x));
+
+    // 3. The heap, through a fresh allocation large enough to come from the
+    //    buddy allocator rather than a slab that was already warm.
+    let mut heap: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(256 * 1024);
+    heap.resize(256 * 1024, 0x5A);
+    heap[0] = 0x11;
+    heap[256 * 1024 - 1] = 0x22;
+    assert!(
+        heap[1..256 * 1024 - 1].iter().all(|&b| b == 0x5A),
+        "heap write did not survive the CR3 switch"
+    );
+
+    log::info!(
+        "data ok    .data {data:#018X}, stack sum {stack_sum:#018X}, heap {:#018X} ends {:#04X}/{:#04X}",
+        heap.as_ptr() as u64,
+        heap[0],
+        heap[256 * 1024 - 1]
+    );
+}
+
+/// Proves `.text` is read-only: a supervisor write to it faults.
+///
+/// Recovered through the exception table so boot continues. The handler under
+/// `host_kvm` prints CR2, the error code and the faulting RIP on the recovery
+/// path, which is the actual evidence.
+fn check_text_is_read_only() {
+    let (text_va_start, _) = text_va_range();
+    // Aim at the middle of the first text page rather than at byte zero, so a
+    // "wrote to the wrong thing entirely" bug cannot look like a pass.
+    let target = (text_va_start + 0x40) as *mut u8;
+
+    log::info!("wx         writing to .text at {:#018X}...", target as u64);
+    // SAFETY: the write is expected to fault, and `write_u8_fallible`
+    // registers it in `.ex_table` so the fault is recovered rather than
+    // propagating. If it does *not* fault the assertion below fires; the byte
+    // written is the one already there, so even that case leaves `.text`
+    // unchanged.
+    let existing = unsafe { core::ptr::read_volatile(target) };
+    let result = unsafe { litebox::mm::exception_table::write_u8_fallible(target, existing) };
+    assert!(
+        result.is_err(),
+        "a write to .text at {:#018X} succeeded: W^X is not enforced",
+        target as u64
+    );
+    log::info!("wx         .text write faulted and recovered as expected");
+}
+
+/// Proves NX is enforced: executing from a data page faults with the
+/// instruction-fetch bit set in the error code.
+///
+/// This is the more important half of the DEP guarantee and the one that
+/// cannot be recovered from. The exception table is keyed on the faulting RIP,
+/// and on an instruction-fetch fault the faulting RIP *is* the data page --
+/// an address no `.ex_table` entry can name, since entries store link-time
+/// relative offsets. So there is no fixup to find and the handler panics,
+/// after printing CR2, the error code and the RIP.
+///
+/// It is therefore the last thing the boot path does. The alternative --
+/// skipping it -- would leave the central claim of this task untested.
+fn check_nx_is_enforced() -> ! {
+    // 0xC3 is `ret`. If NX were not enforced this would execute and return
+    // cleanly, which is precisely the failure the assertion below reports.
+    let mut code: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(4096);
+    code.resize(4096, 0xC3);
+    let entry = code.as_ptr() as u64;
+
+    let t = walk(entry).expect("the code buffer is unmapped");
+    log::info!("nx         heap buffer va {entry:#018X} -> {t}");
+    assert!(
+        t.pte & PTE_NO_EXECUTE != 0,
+        "the heap page is not NO_EXECUTE; the probe would prove nothing"
+    );
+
+    log::info!("nx         calling into the heap buffer (expected: #PF, error code bit 4 set)");
+    log::info!("nx         this is the last check; the fault is not recoverable");
+
+    // SAFETY: nothing about this is sound, and that is the point -- the call
+    // is expected never to reach its target. The buffer is 4 KiB of `ret`, so
+    // in the failure case (NX not enforced) the callee is a valid, ABI-correct
+    // no-op function and control returns here to report it.
+    let f: extern "C" fn() = unsafe { core::mem::transmute::<u64, extern "C" fn()>(entry) };
+    f();
+
+    panic!(
+        "execution from the heap page at {entry:#018X} SUCCEEDED: NX is not enforced, \
+         DEP is a fiction"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Clock and CRNG checks.

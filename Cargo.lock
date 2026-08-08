@@ -1677,8 +1677,10 @@ dependencies = [
  "arrayvec",
  "litebox",
  "litebox_platform_lvbs",
+ "litebox_platform_multiplex",
  "litebox_util_log",
  "log",
+ "x86_64",
 ]
 
 [[package]]

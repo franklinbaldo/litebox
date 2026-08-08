@@ -219,6 +219,15 @@ struct Regions {
     reserved: arrayvec::ArrayVec<Range, MAX_RESERVED>,
     accepted_bytes: u64,
     accepted_count: u32,
+    /// Highest physical address one past the end of any *usable RAM* entry,
+    /// clamped to [`MAPPED_LIMIT`].
+    ///
+    /// Tracked from the raw type-1 entries rather than from the accepted
+    /// ranges because it describes how much physical memory the platform must
+    /// map, not how much of it the heap owns. The reserved ranges -- the
+    /// image, the boot scratch region, the boot structures -- sit *inside*
+    /// RAM and must stay mapped even though they are withheld from the heap.
+    ram_end: u64,
 }
 
 impl Regions {
@@ -241,6 +250,7 @@ impl Regions {
         if start >= end {
             return;
         }
+        self.ram_end = self.ram_end.max(end);
 
         let mut reserved = self.reserved.clone();
         reserved.sort_unstable_by_key(|r| r.start);
@@ -298,16 +308,27 @@ impl Regions {
     }
 }
 
+/// What [`init_heap_from_pvh`] learned about guest RAM.
+#[derive(Clone, Copy)]
+pub struct RamInfo {
+    /// Total bytes handed to the heap.
+    pub usable_bytes: u64,
+    /// One past the highest usable-RAM physical address, clamped to
+    /// [`MAPPED_LIMIT`].
+    ///
+    /// This is the upper bound of the physical range the platform owns, and
+    /// is what the runner passes to `Platform::new` as `phys_end`.
+    pub ram_end_pa: u64,
+}
+
 /// Parses the PVH memory map and gives every usable region to the heap.
-///
-/// Returns the total number of bytes accepted.
 ///
 /// # Panics
 ///
 /// Panics if the `hvm_start_info` magic is wrong, or if no usable memory is
 /// found at all -- the latter because continuing would only defer the failure
 /// to the first allocation, where the cause would be much less obvious.
-pub fn init_heap_from_pvh(start_info_pa: u64) -> u64 {
+pub fn init_heap_from_pvh(start_info_pa: u64) -> RamInfo {
     let info = read_start_info(start_info_pa);
 
     log::info!(
@@ -345,6 +366,7 @@ pub fn init_heap_from_pvh(start_info_pa: u64) -> u64 {
         reserved,
         accepted_bytes: 0,
         accepted_count: 0,
+        ram_end: 0,
     };
 
     for index in 0..info.memmap_entries {
@@ -369,9 +391,13 @@ pub fn init_heap_from_pvh(start_info_pa: u64) -> u64 {
         regions.accepted_bytes / 1024,
         regions.accepted_bytes / (1024 * 1024)
     );
+    log::info!("ram        pa {:#014X}..{:#014X}", 0, regions.ram_end);
     assert!(
         regions.accepted_bytes > 0,
         "PVH memory map yielded no usable memory"
     );
-    regions.accepted_bytes
+    RamInfo {
+        usable_bytes: regions.accepted_bytes,
+        ram_end_pa: regions.ram_end,
+    }
 }
