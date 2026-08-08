@@ -3,19 +3,24 @@
 
 //! Per-CPU VTL1 kernel variables
 
-use crate::{
-    arch::{gdt, instrs::rdmsr},
-    mshv::{
-        HV_REGISTER_VP_INDEX, HvMessage, HvMessagePage, HvVpAssistPage, vsm::ControlRegMap,
-        vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE,
-    },
+use crate::arch::gdt;
+#[cfg(feature = "host_lvbs")]
+use crate::arch::instrs::rdmsr;
+use crate::mm::layout::PAGE_SIZE;
+#[cfg(feature = "host_lvbs")]
+use crate::mshv::{
+    HV_REGISTER_VP_INDEX, HvMessage, HvMessagePage, HvVpAssistPage, vsm::ControlRegMap,
+    vtl_switch::VtlState,
 };
 use aligned_vec::avec;
 use alloc::boxed::Box;
-use core::cell::{Cell, UnsafeCell};
+use core::cell::Cell;
+#[cfg(feature = "host_lvbs")]
+use core::cell::UnsafeCell;
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::{rdgsbase, wrgsbase};
+#[cfg(feature = "host_lvbs")]
 use litebox_common_lvbs::MAX_CORES;
 use x86_64::VirtAddr;
 
@@ -39,38 +44,52 @@ pub struct PerCpuVariables {
     /// The below four pages are used for communication with the hypervisor and
     /// must be page-aligned. `UnsafeCell` is used for interior mutability since
     /// the hypervisor can write to or read from them with loose Rust guarantees.
+    #[cfg(feature = "host_lvbs")]
     hv_vp_assist_page: UnsafeCell<[u8; PAGE_SIZE]>,
+    #[cfg(feature = "host_lvbs")]
     hv_simp_page: UnsafeCell<[u8; PAGE_SIZE]>,
+    #[cfg(feature = "host_lvbs")]
     hvcall_input: UnsafeCell<[u8; PAGE_SIZE]>,
+    #[cfg(feature = "host_lvbs")]
     hvcall_output: UnsafeCell<[u8; PAGE_SIZE]>,
     /// VTL0 general-purpose register state, saved/restored by assembly
     /// (`SAVE_VTL_STATE_ASM`/`LOAD_VTL_STATE_ASM`) via raw pushes/pops to
     /// the address cached in `PerCpuVariablesAsm::vtl0_state_top_addr`.
     /// Rust code accesses it only between save and load (i.e., while VTL1
     /// is executing), so there is no data race with the assembly.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) vtl0_state: Cell<VtlState>,
+    #[cfg(feature = "host_lvbs")]
     pub(crate) vtl0_locked_regs: Cell<ControlRegMap>,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<VirtAddr>,
     /// Cached VP index from the hypervisor. Lazily initialized on first access
     /// via `rdmsr(HV_REGISTER_VP_INDEX)` and immutable thereafter.
     /// Uses `u32::MAX` as the "uninitialized" sentinel.
+    #[cfg(feature = "host_lvbs")]
     vp_index: Cell<u32>,
     /// Set once this CPU's preemption timer is configured (see `arch::timer`).
     /// Zero-initialized to `false`.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_timer_enabled: Cell<bool>,
     /// True while the preemption timer is armed (see `arch::timer`).
     /// Zero-initialized to `false`.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_armed: Cell<bool>,
     /// Set when a preemption timer killed user-mode code.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_timeout_killed_user: Cell<bool>,
 }
 
 // These Hyper-V pages must be page-aligned.
 // These compile-time assertions guard against layout regressions.
+#[cfg(feature = "host_lvbs")]
 const _: () = assert!(offset_of!(PerCpuVariables, hv_vp_assist_page) % PAGE_SIZE == 0);
+#[cfg(feature = "host_lvbs")]
 const _: () = assert!(offset_of!(PerCpuVariables, hv_simp_page) % PAGE_SIZE == 0);
+#[cfg(feature = "host_lvbs")]
 const _: () = assert!(offset_of!(PerCpuVariables, hvcall_input) % PAGE_SIZE == 0);
+#[cfg(feature = "host_lvbs")]
 const _: () = assert!(offset_of!(PerCpuVariables, hvcall_output) % PAGE_SIZE == 0);
 
 impl PerCpuVariables {
@@ -91,10 +110,12 @@ impl PerCpuVariables {
         &raw const self.exception_stack as u64 + (self.exception_stack.len() - 1) as u64
     }
 
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn hv_vp_assist_page_as_u64(&self) -> u64 {
         self.hv_vp_assist_page.get() as u64
     }
 
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn hv_simp_page_as_u64(&self) -> u64 {
         self.hv_simp_page.get() as u64
     }
@@ -108,6 +129,7 @@ impl PerCpuVariables {
     /// This is safe because the SynIC protocol guarantees the hypervisor
     /// will not overwrite a slot whose `message_type` is non-zero. By
     /// reading first and clearing last, no concurrent write is possible.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn take_sint_message(&self, sint_index: usize) -> HvMessage {
         // SAFETY: interior mutability via `UnsafeCell`. The SynIC protocol
         // ensures the hypervisor does not concurrently write to this slot
@@ -122,6 +144,7 @@ impl PerCpuVariables {
     ///
     /// The hypervisor writes to this page *before* entering VTL1 (e.g.,
     /// `vtl_entry_reason`). No concurrent modification.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn with_vp_assist_page<R>(&self, f: impl FnOnce(&HvVpAssistPage) -> R) -> R {
         // SAFETY: interior mutability via `UnsafeCell`. The hypervisor
         // finishes writing before VTL1 entry, so no concurrent write is
@@ -134,6 +157,7 @@ impl PerCpuVariables {
     ///
     /// **Not re-entrant**: the closure must not call back into this method,
     /// as that would create aliasing mutable references to the same page.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn with_hvcall_input<T, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         const { assert!(core::mem::size_of::<T>() <= PAGE_SIZE) };
         const { assert!(core::mem::align_of::<T>() <= PAGE_SIZE) };
@@ -148,6 +172,7 @@ impl PerCpuVariables {
     ///
     /// **Not re-entrant**: the closure must not call back into this method,
     /// as that would create aliasing mutable references to the same page.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn with_hvcall_output<T, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         const { assert!(core::mem::size_of::<T>() <= PAGE_SIZE) };
         const { assert!(core::mem::align_of::<T>() <= PAGE_SIZE) };
@@ -158,6 +183,7 @@ impl PerCpuVariables {
         f(unsafe { &mut *self.hvcall_output.get().cast::<T>() })
     }
 
+    #[cfg(feature = "host_lvbs")]
     pub fn set_vtl_return_value(&self, value: u64) {
         let mut state = self.vtl0_state.get();
         state.r8 = value; // LVBS uses R8 to return a value from VTL1 to VTL0
@@ -169,6 +195,7 @@ impl PerCpuVariables {
     ///
     /// # Panics
     /// Panics if the VP index returned by the hypervisor is ≥ `MAX_CORES`.
+    #[cfg(feature = "host_lvbs")]
     pub fn vp_index(&self) -> u32 {
         let idx = self.vp_index.get();
         if idx == u32::MAX {
@@ -267,12 +294,14 @@ pub struct PerCpuVariablesAsm {
     /// Exception stack pointer (TSS.RSP0)
     exception_stack_ptr: Cell<usize>,
     /// Return address for call-based VTL switching
+    #[cfg(feature = "host_lvbs")]
     vtl_return_addr: Cell<usize>,
     /// Scratch pad
     scratch: Cell<usize>,
     /// User-mode RFLAGS captured at `syscall` entry
     user_rflags: Cell<usize>,
     /// Top address of VTL0 VtlState
+    #[cfg(feature = "host_lvbs")]
     vtl0_state_top_addr: Cell<usize>,
     /// Current kernel stack pointer
     cur_kernel_stack_ptr: Cell<usize>,
@@ -326,12 +355,15 @@ impl PerCpuVariablesAsm {
     pub fn get_exception_stack_ptr(&self) -> usize {
         self.exception_stack_ptr.get()
     }
+    #[cfg(feature = "host_lvbs")]
     pub fn set_vtl_return_addr(&self, addr: usize) {
         self.vtl_return_addr.set(addr);
     }
+    #[cfg(feature = "host_lvbs")]
     pub fn get_vtl_return_addr(&self) -> usize {
         self.vtl_return_addr.get()
     }
+    #[cfg(feature = "host_lvbs")]
     pub fn set_vtl0_state_top_addr(&self, addr: usize) {
         self.vtl0_state_top_addr.set(addr);
     }
@@ -363,6 +395,7 @@ impl PerCpuVariablesAsm {
     pub const fn exception_stack_ptr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, exception_stack_ptr)
     }
+    #[cfg(feature = "host_lvbs")]
     pub const fn vtl_return_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl_return_addr)
     }
@@ -372,6 +405,7 @@ impl PerCpuVariablesAsm {
     pub const fn user_rflags_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_rflags)
     }
+    #[cfg(feature = "host_lvbs")]
     pub const fn vtl0_state_top_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl0_state_top_addr)
     }
@@ -494,6 +528,7 @@ pub fn allocate_per_cpu_variables() {
         let ptr = per_cpu_variables.as_mut_ptr();
         ptr.write_bytes(0, 1);
         // Set the "uninitialized" sentinel for vp_index (0 is a valid VP index).
+        #[cfg(feature = "host_lvbs")]
         core::ptr::addr_of_mut!((*ptr).vp_index).write(Cell::new(u32::MAX));
         per_cpu_variables.assume_init()
     };
@@ -541,6 +576,7 @@ pub fn init_per_cpu_variables() {
         // address. This is sound because the assembly executes outside any
         // Rust reference scope and the Cell is only accessed in Rust between
         // the save and load points (i.e., while VTL1 is executing).
+        #[cfg(feature = "host_lvbs")]
         let vtl0_state_top_addr =
             TruncateExt::<usize>::trunc(&raw const per_cpu_variables.vtl0_state as u64)
                 + core::mem::size_of::<VtlState>();
@@ -549,6 +585,7 @@ pub fn init_per_cpu_variables() {
             .asm
             .set_double_fault_stack_ptr(double_fault_sp);
         per_cpu_variables.asm.set_exception_stack_ptr(exception_sp);
+        #[cfg(feature = "host_lvbs")]
         per_cpu_variables
             .asm
             .set_vtl0_state_top_addr(vtl0_state_top_addr);

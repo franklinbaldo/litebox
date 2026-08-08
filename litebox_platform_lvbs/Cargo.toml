@@ -8,7 +8,7 @@ edition = "2024"
 bitflags = "2.9.0"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
-litebox_common_lvbs = { path = "../litebox_common_lvbs/", version = "0.1.0" }
+litebox_common_lvbs = { path = "../litebox_common_lvbs/", version = "0.1.0", optional = true }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 spin = { version = "0.10.0", default-features = false, features = [
   "spin_mutex",
@@ -20,7 +20,7 @@ rangemap = { version = "1.5.1", features = ["const_fn"] }
 thiserror = { version = "2.0.6", default-features = false }
 num_enum = { version = "0.7.3", default-features = false }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
-modular-bitfield = { version = "0.12.0", default-features = false }
+modular-bitfield = { version = "0.12.0", default-features = false, optional = true }
 hashbrown = "0.15.2"
 sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
 digest = { version = "0.10.7", default-features = false }
@@ -38,7 +38,20 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 libc = "0.2.177"
 
 [features]
-default = []
+default = ["host_lvbs"]
+# Hyper-V VTL1 host. Enables the `mshv` module and VSM-based page protection.
+#
+# `litebox_common_lvbs` (MAX_CORES, sizing the VP masks) and `modular-bitfield`
+# (the hypercall register layouts) have no reader outside `mshv`, so they are
+# optional and pulled in here rather than built for nothing by a KVM guest.
+#
+# The rest of what looks like an LVBS crypto stack -- `sha2`, `digest`,
+# `rand_chacha`, `rand_core`, `zeroize` -- is *not* optional: Task 5's ChaCha20
+# CRNG in `host/kvm_impl.rs` uses every one of them.
+host_lvbs = ["dep:litebox_common_lvbs", "dep:modular-bitfield"]
+# Plain KVM/QEMU guest. LiteBox is the whole kernel; there is no hypervisor
+# to call and no VTL0 peer to protect against.
+host_kvm = []
 linux_syscall = []
 devbox = []
 # Tighten the preemption timer quantum so runaway-TA preemption can be tested

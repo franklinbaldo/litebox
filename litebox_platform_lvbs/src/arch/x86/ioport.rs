@@ -3,6 +3,7 @@
 
 //! I/O Port-based serial communication
 
+#[cfg(feature = "host_lvbs")]
 use crate::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
@@ -155,12 +156,22 @@ impl fmt::Write for ComPort {
 }
 
 #[doc(hidden)]
+#[cfg(feature = "host_lvbs")]
 pub fn print(args: ::core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
     if let Some(rb) = ringbuffer() {
         let _ = rb.lock().write_fmt(args);
     }
+}
+
+/// On KVM the serial port *is* the console (QEMU `-nographic` maps COM1 to stdio),
+/// so writes go straight to the UART rather than through a hypervisor transport.
+#[doc(hidden)]
+#[cfg(feature = "host_kvm")]
+pub fn print(args: ::core::fmt::Arguments) {
+    use core::fmt::Write;
+    let _ = com().lock().write_fmt(args);
 }
 
 #[macro_export]

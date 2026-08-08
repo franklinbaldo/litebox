@@ -1,13 +1,42 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+/// TSC-based monotonic clock. KVM guests have no Hyper-V reference counter,
+/// so the TSC is the only cheap monotonic source available.
+#[cfg(feature = "host_kvm")]
+pub mod clock;
 pub mod gdt;
 pub mod instrs;
 pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
+/// Hyper-V synthetic-timer (STIMER) preemption timer.
+///
+/// Note: roughly half of this module is architectural x2APIC bring-up code
+/// (`IA32_APIC_BASE`, `X2APIC_SVR`, `X2APIC_EOI`) that is not Hyper-V specific
+/// and is worth lifting out when an APIC-timer preemption source lands.
+#[cfg(feature = "host_lvbs")]
 pub mod timer;
+
+/// Ticks per microsecond of the *Hyper-V partition reference counter*
+/// (`HV_X64_MSR_TIME_REF_COUNT`): 100 ns per tick, i.e. 10 per microsecond.
+///
+/// This is a property of a Hyper-V synthetic MSR, not of x86. It is gated on
+/// `host_lvbs` so that a host without that MSR cannot accidentally inherit its
+/// granularity; see `Instant::TICK_NANOS` in `lib.rs`.
+#[cfg(feature = "host_lvbs")]
+pub(crate) const REF_TICKS_PER_MICRO: u64 = 10;
+
+/// Nanoseconds per tick of the *Hyper-V partition reference counter*: the
+/// counter runs at 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
+#[cfg(feature = "host_lvbs")]
+pub(crate) const REF_COUNTER_TICK_NANOS: u64 = 1_000 / REF_TICKS_PER_MICRO;
+
+/// Vector the local APIC delivers for a *spurious* interrupt (programmed
+/// into the SVR). `0xff` is conventional (top of range). Requires no EOI;
+/// handled by the bare `iretq` stub `isr_spurious`.
+pub(crate) const SPURIOUS_VECTOR: u8 = 0xff;
 
 pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},
@@ -70,15 +99,35 @@ pub fn enable_extended_states() {
     }
 
     // VTL1 should not modify XCR0 - verify that VTL0 has already enabled x87 and SSE
-    let xcr0 = x86_64::registers::xcontrol::XCr0::read();
-    assert!(
-        xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::X87),
-        "XCR0 must have x87 enabled by VTL0"
-    );
-    assert!(
-        xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::SSE),
-        "XCR0 must have SSE enabled by VTL0"
-    );
+    #[cfg(feature = "host_lvbs")]
+    {
+        let xcr0 = x86_64::registers::xcontrol::XCr0::read();
+        assert!(
+            xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::X87),
+            "XCR0 must have x87 enabled by VTL0"
+        );
+        assert!(
+            xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::SSE),
+            "XCR0 must have SSE enabled by VTL0"
+        );
+    }
+
+    // Under `host_kvm` there is no VTL0: LiteBox *is* the kernel, entered from
+    // reset via PVH, where XCR0 is architecturally 0x1 (x87 only). Nobody has
+    // enabled SSE state management, so the assertion above could never hold --
+    // and unlike VTL1, we are the owner of XCR0 and are entitled to set it.
+    //
+    // SSE (bit 1) is required because `allocate_xsave_area` sizes its buffer
+    // from `VTL1_XSAVE_MASK` (0b11) and `xsave` faults if XCR0 lacks a
+    // requested bit. AVX is deliberately not enabled: the KVM target sets
+    // `-avx,-avx2,-avx512f`, so nothing generates state beyond x87 and SSE.
+    #[cfg(feature = "host_kvm")]
+    unsafe {
+        let mut xcr0 = x86_64::registers::xcontrol::XCr0::read();
+        xcr0.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
+        xcr0.insert(x86_64::registers::xcontrol::XCr0Flags::SSE);
+        x86_64::registers::xcontrol::XCr0::write(xcr0);
+    }
 }
 
 #[inline]

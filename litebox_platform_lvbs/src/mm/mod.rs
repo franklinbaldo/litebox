@@ -5,6 +5,7 @@
 
 use crate::arch::{PhysAddr, VirtAddr};
 
+pub mod layout;
 pub(crate) mod pgtable;
 pub(crate) mod vmap;
 
@@ -62,7 +63,7 @@ pub trait MemoryProvider {
 
 #[cfg(all(target_arch = "x86_64", not(test)))]
 pub type PageTable<const ALIGN: usize> =
-    crate::arch::mm::paging::X64PageTable<'static, crate::host::LvbsLinuxKernel, ALIGN>;
+    crate::arch::mm::paging::X64PageTable<'static, crate::Platform, ALIGN>;
 #[cfg(all(target_arch = "x86_64", test))]
 pub type PageTable<const ALIGN: usize> =
     crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel, ALIGN>;

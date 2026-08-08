@@ -59,7 +59,7 @@ pub(crate) const KERNEL_PML4_START: usize =
 ///
 /// Uses Hyper-V hypercalls so that remote cores sharing the same page table
 /// also see the invalidation.
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "host_lvbs"))]
 fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     use crate::mshv::{hvcall_mm, is_hvcall_ready};
 
@@ -90,6 +90,36 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     if let Err(e) = result {
         // Hypercall failed — fall back to local flush so this core is at least coherent.
         debug_assert!(false, "TLB flush hypercall failed: {e:?}");
+        x86_64::instructions::tlb::flush_all();
+    }
+}
+
+/// Flush TLB entries for a contiguous page range on the *current* core only.
+///
+/// KVM has no hypervisor to broadcast invalidations through. Milestone 1 is
+/// single-CPU, so a local flush is complete.
+///
+/// This is a separate whole-function definition rather than a shared helper
+/// called from both hosts, because factoring the local-flush loop out of the
+/// `host_lvbs` function above changed that function's emitted code in the
+/// debug build (0x206 -> 0x11a bytes plus a 0xfa-byte out-of-line helper,
+/// caught by Gate A'). Behaviour was identical, but the LVBS build is meant to
+/// be provably unchanged, so the body above is kept textually as it is on
+/// `main` and this one carries its own copy. Same reasoning as the two
+/// `kernel_exception_handler_no_ctx` definitions in `lib.rs`.
+// TODO(SMP): needs IPI-based shootdown once AP bring-up lands.
+#[cfg(all(not(test), feature = "host_kvm"))]
+fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
+    if count == 0 {
+        return;
+    }
+
+    if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+        let base = start.start_address().as_u64();
+        for i in 0..count {
+            x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
+        }
+    } else {
         x86_64::instructions::tlb::flush_all();
     }
 }

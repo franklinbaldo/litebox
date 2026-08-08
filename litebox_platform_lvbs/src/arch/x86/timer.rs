@@ -25,6 +25,7 @@
 //! -> kill) with a rare in-kernel safety net (`interrupts::stimer_handler_impl`,
 //! which re-arms via `rearm_preemption`).
 
+use super::SPURIOUS_VECTOR;
 use super::instrs::{rdmsr, wrmsr};
 use crate::host::per_cpu_variables::with_per_cpu_variables;
 use crate::mshv::{
@@ -38,11 +39,6 @@ use core::arch::x86_64::__cpuid_count as cpuid_count;
 /// Vector the preemption timer fires on. Above the 0..31 exception range and
 /// clear of the Hyper-V SINT vector (0xf3).
 pub(crate) const STIMER_VECTOR: u8 = 0x40;
-
-/// Vector the local APIC delivers for a *spurious* interrupt (programmed
-/// into the SVR). `0xff` is conventional (top of range). Requires no EOI;
-/// handled by the bare `iretq` stub `isr_spurious`.
-pub(crate) const SPURIOUS_VECTOR: u8 = 0xff;
 
 // Architectural x86 local-APIC (x2APIC) MSRs and the bit fields we use.
 const IA32_APIC_BASE: u32 = 0x1b;
@@ -72,15 +68,8 @@ const QUANTUM_MICROS: u64 = 50_000_000; // 50 s
 #[cfg(feature = "preemption_test_quantum")]
 const QUANTUM_MICROS: u64 = 10_000; // 10 ms
 
-/// Partition reference counter granularity: 100 ns ticks, i.e., 10 per microsecond.
-const REF_TICKS_PER_MICRO: u64 = 10;
-
 /// Quantum as a reference-counter tick count (STIMER deadlines are in ticks).
-const QUANTUM_100NS: u64 = QUANTUM_MICROS * REF_TICKS_PER_MICRO;
-
-/// Nanoseconds per partition reference-counter tick: the counter runs at
-/// 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
-pub(crate) const REF_COUNTER_TICK_NANOS: u64 = 1_000 / REF_TICKS_PER_MICRO;
+const QUANTUM_100NS: u64 = QUANTUM_MICROS * super::REF_TICKS_PER_MICRO;
 
 /// Read the Hyper-V partition reference counter (`HV_X64_MSR_TIME_REF_COUNT`).
 ///

@@ -42,16 +42,39 @@ extern crate alloc;
 pub mod arch;
 pub mod host;
 pub mod mm;
+#[cfg(feature = "host_lvbs")]
 pub mod mshv;
 
 pub mod syscall_entry;
+
+#[cfg(all(feature = "host_lvbs", feature = "host_kvm"))]
+compile_error!("features `host_lvbs` and `host_kvm` are mutually exclusive");
+
+#[cfg(not(any(feature = "host_lvbs", feature = "host_kvm")))]
+compile_error!(
+    "exactly one host must be selected: enable `host_lvbs` or `host_kvm`. \
+     Hint: you may have set `default-features = false` without picking a host."
+);
+
+/// The protected-frame access guard retained by a writable mapping.
+///
+/// Under LVBS this is a real VSM guard: it serialises the mapping against VTL0, the hostile
+/// lower-privilege peer kernel that shares the physical address space with us.
+///
+/// Under KVM there is no VTL0 peer — LiteBox *is* the kernel, and the only security boundary is
+/// ring 0 vs ring 3. There are therefore no foreign writers to guard against, so the guard carries
+/// no state and is the unit type.
+#[cfg(feature = "host_lvbs")]
+type ProtectedFrameAccess = crate::mshv::vsm::ProtectedFrameAccessGuard<'static>;
+#[cfg(feature = "host_kvm")]
+type ProtectedFrameAccess = ();
 
 /// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
 /// the mapping's lifetime.
 pub struct LvbsPhysPageMapInfo {
     base: *mut u8,
     size: usize,
-    protected_frame_access: Option<crate::mshv::vsm::ProtectedFrameAccessGuard<'static>>,
+    protected_frame_access: Option<ProtectedFrameAccess>,
 }
 
 impl LvbsPhysPageMapInfo {
@@ -389,6 +412,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
+    /// VTL1's window of trusting VTL0; meaningless without a VTL0 peer.
+    #[cfg(feature = "host_lvbs")]
     end_of_boot: core::sync::atomic::AtomicBool,
 }
 
@@ -455,7 +480,7 @@ type UserMutPtr<T> =
 pub enum Vmap {}
 
 impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
-    type Manager = crate::host::LvbsLinuxKernel;
+    type Manager = crate::Platform;
     fn manager() -> &'static Self::Manager {
         crate::platform_low()
     }
@@ -581,7 +606,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         //      the hypervisor writes executable code into it at runtime)
         #[allow(unused_mut)]
         let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
-        #[cfg(not(test))]
+        #[cfg(all(not(test), feature = "host_lvbs"))]
         {
             use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
             // get_hvcall_page_start_address() now returns a virtual address (two-phase relocation).
@@ -622,16 +647,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(base_pt),
             vtl1_phys_frame_range: vtl1_range,
+            #[cfg(feature = "host_lvbs")]
             end_of_boot: core::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     /// Whether VTL1's window of trusting VTL0 has closed.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn end_of_boot_reached(&self) -> bool {
         self.end_of_boot.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     /// Close VTL1's window of trusting VTL0. One-way.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn signal_end_of_boot(&self) {
         self.end_of_boot
             .store(true, core::sync::atomic::Ordering::SeqCst);
@@ -839,8 +867,14 @@ impl<Host: HostInterface> RawMutex<Host> {
 
 /// An implementation of [`litebox::platform::Instant`].
 ///
-/// Backed by the Hyper-V partition reference counter, which is monotonic
-/// and normalized by the hypervisor across TSC scaling and live migration.
+/// Holds an opaque reading of the host's monotonic counter. One tick of that
+/// counter is `Instant::TICK_NANOS` nanoseconds; *which* counter, and hence
+/// what a tick is worth, is host-specific and is declared alongside
+/// `Instant::now` in the per-host `impl` blocks below.
+///
+/// Both are deliberately spelled as code rather than as intra-doc links: they
+/// are private, so linking to them from this public item is a rustdoc error
+/// even under `--document-private-items`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
@@ -863,21 +897,59 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let ticks = self.0.checked_sub(earlier.0)?;
-        // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
-        let nanos = ticks.checked_mul(crate::arch::timer::REF_COUNTER_TICK_NANOS)?;
+        let nanos = ticks.checked_mul(Self::TICK_NANOS)?;
         Some(core::time::Duration::from_nanos(nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
         let nanos: u64 = duration.as_nanos().try_into().ok()?;
-        let ticks = nanos / crate::arch::timer::REF_COUNTER_TICK_NANOS;
+        let ticks = nanos / Self::TICK_NANOS;
         Some(Instant(self.0.checked_add(ticks)?))
     }
 }
 
+// ---------------------------------------------------------------------------
+// The counter behind `Instant`, and the unit it counts in.
+//
+// `TICK_NANOS` has NO default and is defined nowhere except inside the same
+// `#[cfg]`-gated `impl` block as the `now()` that produces the ticks. The
+// arithmetic above names `Self::TICK_NANOS`, so a host that supplies a counter
+// without declaring that counter's unit fails to compile. A new host therefore
+// cannot silently inherit another host's granularity -- which is exactly how
+// `host_kvm` came to be compiled against the Hyper-V reference counter's
+// 100 ns tick while its own `now()` was still a stub.
+// ---------------------------------------------------------------------------
+
+/// The Hyper-V partition reference counter: monotonic, and normalized by the
+/// hypervisor across TSC scaling and live migration.
+#[cfg(feature = "host_lvbs")]
 impl Instant {
+    /// One partition-reference-counter tick is 100 ns.
+    const TICK_NANOS: u64 = crate::arch::REF_COUNTER_TICK_NANOS;
+
     fn now() -> Self {
         Instant(crate::arch::timer::reference_time_100ns())
+    }
+}
+
+/// A plain KVM guest has no Hyper-V reference counter; the clock is the TSC.
+///
+/// The TSC's own frequency is discovered at runtime and varies per machine, so
+/// it is not a usable tick unit. `now()` therefore rescales to nanoseconds up
+/// front and `TICK_NANOS` is 1, which makes the arithmetic above an identity.
+#[cfg(feature = "host_kvm")]
+impl Instant {
+    /// `now()` returns nanoseconds, so a tick *is* a nanosecond.
+    const TICK_NANOS: u64 = 1;
+
+    /// Nanoseconds since an arbitrary boot-time origin.
+    ///
+    /// # Panics
+    ///
+    /// Panics on first use if the TSC frequency cannot be determined from
+    /// CPUID; see [`crate::arch::clock::tsc_hz`].
+    pub fn now() -> Self {
+        Instant(crate::arch::clock::monotonic_nanos())
     }
 }
 
@@ -1126,6 +1198,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         pages: &PhysPageAddrArray<ALIGN>,
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
+        #[cfg(feature = "host_lvbs")]
         let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
             // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
             // but does not support re-entry into a VTL protection change.
@@ -1133,9 +1206,23 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         } else {
             None
         };
-        // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
-        // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
-        // shared raw mapping implementation.
+        #[cfg(feature = "host_kvm")]
+        // No VTL0 peer exists on KVM, so there are no foreign writers to guard against and
+        // nothing to acquire. The `Option` is retained so the mapping's writability is still
+        // tracked, and this branch is infallible.
+        let protected_frame_access = perms.contains(PhysPageMapPermissions::WRITE).then_some(());
+        // SAFETY: under `host_lvbs`, ordinary writable mappings were just checked against the
+        // protected and in-flight frames above, and the resulting guard is retained through map,
+        // access, and unmap.
+        //
+        // Under `host_kvm` no such check is performed, and the obligation is discharged
+        // differently: it is vacuously satisfied because the protected-frame registry is provably
+        // empty. The registry lives in `mshv::vsm`, which is gated out entirely under `host_kvm`,
+        // and its only writers — `protect_physical_memory_range` and the reservation path — are
+        // therefore not compiled. With no entries, no mapping can ever conflict with one, so
+        // there is nothing to check and no guard to retain.
+        //
+        // `vmap_privileged` provides the shared raw mapping implementation.
         let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
         map_info.protected_frame_access = protected_frame_access;
         Ok(map_info)
@@ -1282,36 +1369,67 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             unimplemented!("ALIGN other than 4KiB is not supported yet");
         }
 
-        // Build a RangeSet so that adjacent pages are coalesced into contiguous
-        // ranges, minimizing the number of hypercalls.
-        let mut range_set = rangemap::RangeSet::new();
-        for page in pages {
-            let start = page.as_usize() as u64;
-            let end = start
-                .checked_add(ALIGN as u64)
-                .ok_or(PhysPointerError::Overflow)?;
-            range_set.insert(start..end);
+        #[cfg(feature = "host_lvbs")]
+        {
+            // Build a RangeSet so that adjacent pages are coalesced into contiguous
+            // ranges, minimizing the number of hypercalls.
+            let mut range_set = rangemap::RangeSet::new();
+            for page in pages {
+                let start = page.as_usize() as u64;
+                let end = start
+                    .checked_add(ALIGN as u64)
+                    .ok_or(PhysPointerError::Overflow)?;
+                range_set.insert(start..end);
+            }
+
+            let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
+                // VTL1 needs writable access, so deny VTL0 all access.
+                crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
+            } else if perms.contains(PhysPageMapPermissions::READ) {
+                // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
+                crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
+                    | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
+            } else {
+                // VTL1 no longer protects the pages.
+                crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
+            };
+
+            for range in range_set.iter() {
+                let frame_range = PhysFrame::range(
+                    PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
+                    PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
+                );
+                crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
+                    .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+            }
         }
 
-        let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // VTL1 needs writable access, so deny VTL0 all access.
-            crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
-        } else if perms.contains(PhysPageMapPermissions::READ) {
-            // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
-                | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
-        } else {
-            // VTL1 no longer protects the pages.
-            crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
-        };
-
-        for range in range_set.iter() {
-            let frame_range = PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
-                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
-            );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
-                .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
+        #[cfg(feature = "host_kvm")]
+        {
+            // Under LVBS this function adjusts VSM page protections so that VTL0 — a hostile
+            // peer kernel running at lower privilege in the same physical address space —
+            // cannot read or write pages that VTL1 relies on.
+            //
+            // Under KVM there is no VTL0 peer: LiteBox *is* the kernel. The security boundary
+            // is ring 0 vs ring 3, which is the conventional OS threat model. No lower-privilege
+            // peer kernel exists that could tamper with these pages, so there is nothing for a
+            // per-page protection change to defend against and this call is correctly a no-op.
+            //
+            // The boundary this defers to is established by `litebox_runner_kvm`, not assumed:
+            //
+            // * `enable_smep_smap()` (`litebox_runner_kvm::main`) sets CR4.SMEP and CR4.SMAP, so
+            //   the kernel can neither execute nor read ring-3 pages. It asserts CPUID support
+            //   first, and the runner re-reads CR4 afterwards and panics if either bit is clear.
+            // * CR0.WP is set by the runner before it switches CR3. PVH hands off with WP clear,
+            //   which would let supervisor writes silently bypass read-only page-table entries
+            //   and quietly defeat the DEP mapping below it.
+            // * The 4 KiB page tables the runner installs carry NX and the USER bit, and the
+            //   syscall gate (`Platform::enable_syscall_support`) is the only entry back.
+            //
+            // Enforcement is checked empirically, not merely configured: a supervisor read of a
+            // user page faults with error code 0x1 (present + protection violation), and the same
+            // read succeeds between `with_user_memory_access`'s `stac` and `clac`.
+            let _ = (pages, perms);
         }
 
         Ok(())
@@ -1384,6 +1502,12 @@ fn run_thread_inner(
     //
     // Arm the preemption timer for this user-thread execution. This function is
     // idempotent, so `reenter` does not change the timeout.
+    //
+    // TODO(Phase 2): `host_kvm` has no preemption timer, because the LVBS one is built
+    // on Hyper-V synthetic timers. Until an APIC-deadline source replaces it, a ring-3
+    // infinite loop on KVM is unkillable. This is a known Phase 1 gap, not a decision
+    // that preemption is unnecessary.
+    #[cfg(feature = "host_lvbs")]
     crate::arch::timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
@@ -1855,12 +1979,55 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
 ///
 /// Returns the fixup address on success (to be patched into the saved RIP)
 /// or panics if no fixup entry is found.
+#[cfg(not(feature = "host_kvm"))]
 unsafe extern "C" fn kernel_exception_handler_no_ctx(
     cr2: usize,
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
     litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(|| {
+        panic!(
+            "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
+             Accessed Address: {cr2:#x}\n\
+             Error Code: {error_code:#x}\n\
+             Faulting RIP: {faulting_rip:#x}",
+        )
+    })
+}
+
+/// As above, but additionally reports faults that were *recovered* through the
+/// exception table.
+///
+/// The panic path already prints everything, but the fixup path is silent,
+/// which makes a recovered `#PF` indistinguishable from one that never
+/// happened. The KVM bring-up (Task 7) needs to see CR2 to prove the `#PF`
+/// gate is wired correctly, and Task 10 will want the same visibility when
+/// ring-3 faults start arriving.
+///
+/// This is a separate definition rather than a `cfg` block inside the one
+/// above because even a `cfg`-disabled restructuring of that function's body
+/// changed its emitted size in the LVBS build (0x57 -> 0x61 bytes, caught by
+/// Gate A'). Duplicating the function keeps the `host_lvbs` codegen provably
+/// byte-identical.
+#[cfg(feature = "host_kvm")]
+unsafe extern "C" fn kernel_exception_handler_no_ctx(
+    cr2: usize,
+    error_code: usize,
+    faulting_rip: usize,
+) -> usize {
+    let fixup = litebox::mm::exception_table::search_exception_tables(faulting_rip);
+
+    if let Some(fixup) = fixup {
+        crate::serial_println!(
+            "EXCEPTION: PAGE FAULT recovered via exception table\n\
+             Accessed Address: {cr2:#x}\n\
+             Error Code: {error_code:#x}\n\
+             Faulting RIP: {faulting_rip:#x}\n\
+             Fixup RIP: {fixup:#x}"
+        );
+    }
+
+    fixup.unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
              Accessed Address: {cr2:#x}\n\
@@ -1909,6 +2076,10 @@ unsafe extern "C" fn exception_handler(
     };
     // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
     // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
+    //
+    // TODO(Phase 2): absent under `host_kvm` for the same reason as `arm_preemption`
+    // above — there is no synthetic timer to fire, so no timeout kill can occur.
+    #[cfg(feature = "host_lvbs")]
     if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
         crate::arch::timer::eoi();
         crate::arch::timer::mark_user_timeout_kill();
@@ -2001,7 +2172,10 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
 // NOTE: The below code is a naive workaround to let LVBS code to access the platform.
 // Rather than doing this, we should implement LVBS interface/provider for the platform.
 
+#[cfg(feature = "host_lvbs")]
 pub type Platform = crate::host::LvbsLinuxKernel;
+#[cfg(feature = "host_kvm")]
+pub type Platform = crate::host::KvmGuest;
 
 static PLATFORM_LOW: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
 
