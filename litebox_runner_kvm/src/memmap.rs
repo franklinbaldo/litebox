@@ -3,9 +3,9 @@
 
 //! The PVH memory map, and the decision about which of it becomes the heap.
 //!
-//! QEMU enters [`crate::_start`] with `%ebx` pointing at an `hvm_start_info`
+//! QEMU enters `boot::pvh::_start` with `%ebx` pointing at an `hvm_start_info`
 //! structure; the entry stub squirrels that pointer away (see
-//! [`crate::hvm_start_info_addr`]). From version 1 onwards that structure
+//! [`crate::boot::pvh::hvm_start_info_addr`]). From version 1 onwards that structure
 //! carries a table of `hvm_memmap_table_entry`, which is the only description
 //! of guest RAM we get.
 //!
