@@ -13,3 +13,16 @@ workspace = true
 
 [dependencies]
 ignore = "0.4.25"
+
+[features]
+# Opt in to the QEMU boot test. It needs `qemu-system-x86_64` and the nightly
+# toolchain pinned by `litebox_runner_kvm/rust-toolchain.toml` (with `rust-src`),
+# neither of which the default `Build and Test` CI job has, so the test target
+# below is not built unless this is enabled. `--all-features` sweeps still
+# compile and lint it.
+kvm_qemu = []
+
+[[test]]
+name = "kvm_qemu_boot"
+path = "tests/kvm_qemu_boot.rs"
+required-features = ["kvm_qemu"]
