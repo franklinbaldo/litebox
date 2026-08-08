@@ -12,6 +12,9 @@ litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", 
 # latter unifies both host features across the graph and trips the crate's
 # mutual-exclusion guard.
 litebox_platform_multiplex = { version = "0.1.0", path = "../litebox_platform_multiplex", default-features = false, features = ["platform_kvm"] }
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
+litebox_shim_optee = { version = "0.1.0", path = "../litebox_shim_optee", default-features = false, features = ["platform_kvm"] }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

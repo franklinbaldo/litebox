@@ -16,6 +16,7 @@
 extern crate alloc;
 
 mod memmap;
+mod ta;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -715,9 +716,29 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
     // silent triple fault.
     litebox_platform_lvbs::arch::interrupts::init_idt();
 
-    // Interrupts stay masked. Nothing on this path generates one, there is no
-    // LAPIC bring-up, and Task 10 does not need them; an unexpected interrupt
-    // through a half-configured controller would only add failure modes.
+    // Mask the legacy 8259 PICs. Ring 0 runs with interrupts off, but ring 3
+    // does not: `PtRegs::sanitize_for_user_return` forces EFLAGS.IF on before
+    // every user entry, and rightly so -- a user thread that could not be
+    // interrupted would be unkillable by design rather than by omission.
+    //
+    // The PICs come out of QEMU's firmware with IRQ0 (the PIT) unmasked and
+    // the master's vector base still at its power-on default of 0x08, which
+    // collides with the architectural exception vectors. So the first timer
+    // tick after entering ring 3 is delivered as vector 8 -- through the
+    // *double-fault* gate. That is exactly what happened on the first attempt
+    // to run ldelf: `-d int` showed `Servicing hardware INT=0x08 ... cpl=3` at
+    // ldelf's entry point, and the shim dutifully killed the thread for taking
+    // a #DF before it executed a single instruction.
+    //
+    // Masking is the correct fix rather than remapping: nothing here services
+    // 8259 interrupts, there is no LAPIC bring-up, and Task 10 needs none.
+    // Remapping would only move the collision somewhere quieter while leaving
+    // unhandled interrupts arriving.
+    //
+    // The PIT itself is left running -- it is not a source of IRQs once the
+    // PIC is masked, and `pit_reference_interval_nanos` uses channel 2, which
+    // is gated by port 0x61 and raises no IRQ at all.
+    mask_legacy_pics();
 
     // LSTAR / SFMASK / STAR. Requires the GDT, hence the ordering.
     litebox_platform_lvbs::Platform::enable_syscall_support();
@@ -741,9 +762,13 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
     check_data_access();
     check_text_is_read_only();
 
+    // The point of the whole phase: load and execute an OP-TEE TA in ring 3.
+    // Everything above is the platform this needs.
+    ta::run();
+
     // Last, because it is not recoverable: an instruction-fetch fault leaves
     // RIP on the data page, which no exception-table entry can name. See
-    // `check_nx_is_enforced`.
+    // `check_nx_is_enforced`, which ends the guest through the panic handler.
     check_nx_is_enforced();
 }
 
@@ -756,6 +781,36 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
 // layer to suspect; the point of these is to remove that ambiguity now, while
 // exactly one thing has just changed.
 // ---------------------------------------------------------------------------
+
+/// Data port of the master 8259 PIC; with ICW initialisation complete this is
+/// the interrupt mask register.
+const PIC1_DATA_PORT: u16 = 0x21;
+/// Data port of the slave 8259 PIC.
+const PIC2_DATA_PORT: u16 = 0xA1;
+
+/// Masks every IRQ line on both 8259 PICs.
+///
+/// See the call site in [`kernel_main`] for why this is necessary.
+fn mask_legacy_pics() {
+    // SAFETY: writes 0xFF to the two PIC interrupt-mask registers. Masking
+    // every line is always a legal state for the device and cannot fault; no
+    // memory is touched.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") PIC1_DATA_PORT,
+            in("al") 0xFF_u8,
+            options(nomem, nostack, preserves_flags),
+        );
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") PIC2_DATA_PORT,
+            in("al") 0xFF_u8,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    log::info!("pic        legacy 8259 IRQs masked");
+}
 
 /// CR4.SMEP.
 const CR4_SMEP: u64 = 1 << 20;
@@ -1096,6 +1151,56 @@ fn walk(va: u64) -> Option<Translation> {
         table = entry & PTE_ADDR_MASK;
         level -= 1;
     }
+}
+
+/// Scans the page tables for the first mapped page whose leaf entry has the
+/// USER bit set, and returns its virtual address.
+///
+/// The whole table is scanned, kernel entries included, and the result is
+/// asserted to be in the lower half. Restricting the scan instead would hide
+/// exactly the bug worth catching: a kernel page that had USER set would be
+/// skipped silently rather than tripping the assertion.
+///
+/// The USER bit must be set at *every* level for the hardware to grant user
+/// access, so the walk requires it all the way down rather than only at the
+/// leaf. Reporting a leaf whose parent withheld USER would be reporting a page
+/// the CPU does not in fact consider user-accessible.
+fn first_user_page() -> Option<u64> {
+    /// Recursive descent through one table. `base_va` is the virtual address
+    /// the first entry of this table covers, sign-extended by the caller at
+    /// the top level.
+    fn descend(table_pa: u64, level: u32, base_va: u64) -> Option<u64> {
+        let shift = 12 + 9 * (level - 1);
+        for index in 0..512_u64 {
+            let entry_va = table_pa + KERNEL_OFFSET + index * 8;
+            // SAFETY: `table_pa` is a page-table frame physical address taken
+            // from CR3 or from a present non-leaf entry, so it is a real 4 KiB
+            // frame inside guest RAM, mapped read/write through
+            // `KERNEL_OFFSET`. `index` stays inside the frame.
+            let entry = unsafe { (entry_va as *const u64).read_volatile() };
+            if entry & PTE_PRESENT == 0 || entry & PTE_USER == 0 {
+                continue;
+            }
+            let va = base_va + (index << shift);
+            if level == 1 || entry & PTE_HUGE != 0 {
+                return Some(va);
+            }
+            if let Some(found) = descend(entry & PTE_ADDR_MASK, level - 1, va) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    descend(read_cr3() & PTE_ADDR_MASK, 4, 0).map(|va| {
+        // Lower half only, so no sign extension is needed; assert that rather
+        // than assume it.
+        assert!(
+            va < (1 << 47),
+            "user page {va:#018X} is not in the lower half"
+        );
+        va
+    })
 }
 
 /// The `.text` section's bounds, as virtual addresses.
@@ -1490,6 +1595,22 @@ fn check_text_is_read_only() {
     log::info!("wx         .text write faulted and recovered as expected");
 }
 
+/// Address of the [`check_nx_is_enforced`] probe page, or 0 before it is
+/// armed.
+///
+/// Read by [`panic`] to tell the run's expected ending from a real failure.
+static NX_PROBE_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Reads CR2, the address of the most recent page fault.
+fn read_cr2() -> u64 {
+    let cr2: u64;
+    // SAFETY: reading CR2 into a register has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
+    }
+    cr2
+}
+
 /// Proves NX is enforced: executing from a data page faults with the
 /// instruction-fetch bit set in the error code.
 ///
@@ -1500,8 +1621,16 @@ fn check_text_is_read_only() {
 /// relative offsets. So there is no fixup to find and the handler panics,
 /// after printing CR2, the error code and the RIP.
 ///
-/// It is therefore the last thing the boot path does. The alternative --
-/// skipping it -- would leave the central claim of this task untested.
+/// It is therefore the last thing the boot path does, and it is how a
+/// successful run *ends*: [`panic`] recognises this specific fault -- by
+/// comparing CR2, which is still the faulting address at that point, against
+/// [`NX_PROBE_ADDR`] -- and exits with the success status rather than the
+/// failure one. Any other panic, before or after, still fails.
+///
+/// The alternative -- skipping the check so the boot could end with a plain
+/// `exit()` -- would leave the central claim of Task 8 untested, and the
+/// alternative to *that* -- hand-rolling a `longjmp` out of the panic handler
+/// -- would add a page of register-restore assembly to save one log line.
 fn check_nx_is_enforced() -> ! {
     // 0xC3 is `ret`. If NX were not enforced this would execute and return
     // cleanly, which is precisely the failure the assertion below reports.
@@ -1517,7 +1646,12 @@ fn check_nx_is_enforced() -> ! {
     );
 
     log::info!("nx         calling into the heap buffer (expected: #PF, error code bit 4 set)");
-    log::info!("nx         this is the last check; the fault is not recoverable");
+    log::info!("nx         this is the last check; the fault ends the run");
+
+    // Armed as late as possible: `panic` treats a fault at exactly this
+    // address as the successful end of the run, so the window in which an
+    // unrelated panic could be misreported is the two instructions below.
+    NX_PROBE_ADDR.store(entry, core::sync::atomic::Ordering::SeqCst);
 
     // SAFETY: nothing about this is sound, and that is the point -- the call
     // is expected never to reach its target. The buffer is 4 KiB of `ret`, so
@@ -1834,6 +1968,27 @@ impl core::fmt::Display for HexBytes<'_> {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("PANIC: {info}");
+
+    // The one expected panic: the unrecoverable instruction-fetch fault that
+    // `check_nx_is_enforced` provokes as the last act of a successful run.
+    //
+    // It is identified by CR2 rather than by a bare "expected panic" flag.
+    // CR2 still holds the faulting address here -- nothing has faulted since
+    // -- so this asserts that the panic we are handling is *that* fault at
+    // *that* address, not merely some panic that happened after the flag was
+    // set. Anything else, including a second fault at a different address, is
+    // reported as a failure.
+    let probe = NX_PROBE_ADDR.load(core::sync::atomic::Ordering::SeqCst);
+    if probe != 0 && read_cr2() == probe {
+        serial_println!(
+            "nx         instruction fetch from {probe:#018X} faulted as expected; \
+             DEP is enforced and the run is complete"
+        );
+        litebox_platform_lvbs::host::kvm_impl::debug_exit(
+            litebox_platform_lvbs::host::kvm_impl::DEBUG_EXIT_SUCCESS,
+        )
+    }
+
     litebox_platform_lvbs::host::kvm_impl::debug_exit(
         litebox_platform_lvbs::host::kvm_impl::DEBUG_EXIT_FAILURE,
     )
