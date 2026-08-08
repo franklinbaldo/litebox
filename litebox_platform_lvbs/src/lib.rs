@@ -1952,12 +1952,55 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
 ///
 /// Returns the fixup address on success (to be patched into the saved RIP)
 /// or panics if no fixup entry is found.
+#[cfg(not(feature = "host_kvm"))]
 unsafe extern "C" fn kernel_exception_handler_no_ctx(
     cr2: usize,
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
     litebox::mm::exception_table::search_exception_tables(faulting_rip).unwrap_or_else(|| {
+        panic!(
+            "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
+             Accessed Address: {cr2:#x}\n\
+             Error Code: {error_code:#x}\n\
+             Faulting RIP: {faulting_rip:#x}",
+        )
+    })
+}
+
+/// As above, but additionally reports faults that were *recovered* through the
+/// exception table.
+///
+/// The panic path already prints everything, but the fixup path is silent,
+/// which makes a recovered `#PF` indistinguishable from one that never
+/// happened. The KVM bring-up (Task 7) needs to see CR2 to prove the `#PF`
+/// gate is wired correctly, and Task 10 will want the same visibility when
+/// ring-3 faults start arriving.
+///
+/// This is a separate definition rather than a `cfg` block inside the one
+/// above because even a `cfg`-disabled restructuring of that function's body
+/// changed its emitted size in the LVBS build (0x57 -> 0x61 bytes, caught by
+/// Gate A'). Duplicating the function keeps the `host_lvbs` codegen provably
+/// byte-identical.
+#[cfg(feature = "host_kvm")]
+unsafe extern "C" fn kernel_exception_handler_no_ctx(
+    cr2: usize,
+    error_code: usize,
+    faulting_rip: usize,
+) -> usize {
+    let fixup = litebox::mm::exception_table::search_exception_tables(faulting_rip);
+
+    if let Some(fixup) = fixup {
+        crate::serial_println!(
+            "EXCEPTION: PAGE FAULT recovered via exception table\n\
+             Accessed Address: {cr2:#x}\n\
+             Error Code: {error_code:#x}\n\
+             Faulting RIP: {faulting_rip:#x}\n\
+             Fixup RIP: {fixup:#x}"
+        );
+    }
+
+    fixup.unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\
              Accessed Address: {cr2:#x}\n\

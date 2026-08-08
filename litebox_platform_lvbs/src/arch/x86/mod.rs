@@ -99,15 +99,35 @@ pub fn enable_extended_states() {
     }
 
     // VTL1 should not modify XCR0 - verify that VTL0 has already enabled x87 and SSE
-    let xcr0 = x86_64::registers::xcontrol::XCr0::read();
-    assert!(
-        xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::X87),
-        "XCR0 must have x87 enabled by VTL0"
-    );
-    assert!(
-        xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::SSE),
-        "XCR0 must have SSE enabled by VTL0"
-    );
+    #[cfg(feature = "host_lvbs")]
+    {
+        let xcr0 = x86_64::registers::xcontrol::XCr0::read();
+        assert!(
+            xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::X87),
+            "XCR0 must have x87 enabled by VTL0"
+        );
+        assert!(
+            xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::SSE),
+            "XCR0 must have SSE enabled by VTL0"
+        );
+    }
+
+    // Under `host_kvm` there is no VTL0: LiteBox *is* the kernel, entered from
+    // reset via PVH, where XCR0 is architecturally 0x1 (x87 only). Nobody has
+    // enabled SSE state management, so the assertion above could never hold --
+    // and unlike VTL1, we are the owner of XCR0 and are entitled to set it.
+    //
+    // SSE (bit 1) is required because `allocate_xsave_area` sizes its buffer
+    // from `VTL1_XSAVE_MASK` (0b11) and `xsave` faults if XCR0 lacks a
+    // requested bit. AVX is deliberately not enabled: the KVM target sets
+    // `-avx,-avx2,-avx512f`, so nothing generates state beyond x87 and SSE.
+    #[cfg(feature = "host_kvm")]
+    unsafe {
+        let mut xcr0 = x86_64::registers::xcontrol::XCr0::read();
+        xcr0.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
+        xcr0.insert(x86_64::registers::xcontrol::XCr0Flags::SSE);
+        x86_64::registers::xcontrol::XCr0::write(xcr0);
+    }
 }
 
 #[inline]

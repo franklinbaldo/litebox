@@ -20,6 +20,9 @@ mod memmap;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
+use litebox_platform_lvbs::host::per_cpu_variables::{
+    KERNEL_STACK_SIZE, PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
+};
 use litebox_platform_lvbs::{Instant, serial_println};
 
 /// Physical address of [`_start`].
@@ -624,15 +627,332 @@ extern "C" fn kvm_long_mode_entry() -> ! {
     );
 
     check_clock();
-    check_crng();
+
+    // ---------------------------------------------------------------------
+    // Per-CPU bring-up. The order below is the LVBS runner's `common_start`
+    // (litebox_runner_lvbs/src/main.rs), and it is load-bearing:
+    //
+    //   1. FSGSBASE, because `allocate_per_cpu_variables` sets GSBASE with
+    //      `wrgsbase`, which #UDs without CR4.FSGSBASE.
+    //   2. Extended states, because the XSAVE-area allocation below queries
+    //      CPUID and needs CR4.OSXSAVE set to read XCR0.
+    //   3. The heap, because per-CPU variables are heap-allocated.
+    //   4. `allocate_per_cpu_variables` / `init_per_cpu_variables`.
+    //   5. The stack switch.
+    //
+    // `check_crng` has moved from before the heap to after the stack switch.
+    // It was the single largest stack consumer on this path (a debug build of
+    // the ChaCha20 CRNG is what exhausted the boot stack in Task 5), and
+    // there is no reason to spend it on the boot stack now that a 128 KiB
+    // per-CPU kernel stack exists a few instructions later. This shrinks the
+    // window in which a boot-stack overflow is possible, which is most of the
+    // reason the guard page is deferred to Task 8.
+    // ---------------------------------------------------------------------
+    litebox_platform_lvbs::arch::enable_fsgsbase();
+    litebox_platform_lvbs::arch::enable_extended_states();
 
     // The heap. Everything after this point may allocate; nothing before it
     // may.
     let usable = memmap::init_heap_from_pvh(hvm_start_info_addr());
+
+    allocate_per_cpu_variables();
+    init_per_cpu_variables();
+
+    // Switch to this core's per-CPU kernel stack and tail-call `kernel_main`.
+    //
+    // `kernel_stack_ptr` is the first field of `PerCpuVariablesAsm`, which is
+    // the first field of `PerCpuVariables`, so GSBASE + this offset addresses
+    // it directly -- the layout the platform's own assembly assumes.
+    //
+    // `init_per_cpu_variables` already aligned the stored value to 16, so the
+    // `call` below leaves RSP ≡ 8 (mod 16) on entry to `kernel_main`, which is
+    // what the SysV ABI requires. RBP is zeroed to terminate the frame chain,
+    // since the new stack has no caller.
+    //
+    // The offset is a `const` operand, not symbol arithmetic, so the
+    // `.set`-only hazard from the boot stub does not apply here -- but the
+    // emitted code was disassembled and checked regardless.
+    //
+    // SAFETY: GSBASE points at this core's `PerCpuVariables` (just set by
+    // `allocate_per_cpu_variables`), and `kernel_stack_ptr` points one past
+    // the top of the 128 KiB `kernel_stack` field inside it (just set by
+    // `init_per_cpu_variables`). Nothing on the boot stack is live across
+    // this point: `kernel_main` diverges and never returns here.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, gs:[{kernel_sp_off}]",
+            "and rsp, -16",
+            "xor ebp, ebp",
+            "call {kernel_main}",
+            kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
+            kernel_main = sym kernel_main,
+            in("rdi") usable,
+            options(noreturn),
+        );
+    }
+}
+
+/// Everything that runs on the per-CPU kernel stack.
+///
+/// Reached only via the stack switch at the end of [`kvm_long_mode_entry`],
+/// with `%rsp` inside this core's `PerCpuVariables::kernel_stack`.
+extern "C" fn kernel_main(usable: u64) -> ! {
+    // The XSAVE areas are allocated here rather than beside
+    // `allocate_per_cpu_variables` for the reason the platform's own doc
+    // comment gives: the CPUID queries and `avec!` allocations use more stack
+    // than the boot stack has. LVBS likewise defers this into `init()`.
+    litebox_platform_lvbs::host::per_cpu_variables::allocate_xsave_area();
+
+    // GDT and TSS first: `syscall_entry::init` reads the segment selectors
+    // back out of per-CPU state to program STAR, and the IDT's double-fault
+    // gate refers to TSS.IST1.
+    litebox_platform_lvbs::arch::gdt::init();
+
+    // The IDT. From here on a fault is a reportable event rather than a
+    // silent triple fault.
+    litebox_platform_lvbs::arch::interrupts::init_idt();
+
+    // Interrupts stay masked. Nothing on this path generates one, there is no
+    // LAPIC bring-up, and Task 10 does not need them; an unexpected interrupt
+    // through a half-configured controller would only add failure modes.
+
+    // LSTAR / SFMASK / STAR. Requires the GDT, hence the ordering.
+    litebox_platform_lvbs::Platform::enable_syscall_support();
+
+    // SMEP and SMAP. Not a nicety: Phase 1 made VSM page protection a no-op
+    // under `host_kvm` on the grounds that the real boundary is ring 0 vs
+    // ring 3, "enforced by page tables, SMEP/SMAP and the syscall gate".
+    // Until this call existed that claim was false on this path.
+    litebox_platform_lvbs::arch::enable_smep_smap();
+
+    check_crng();
     check_heap(usable);
+    check_cpu_state();
+    check_interrupts();
 
     halt();
 }
+
+// ---------------------------------------------------------------------------
+// Bring-up verification.
+//
+// Each check below is written to fail loudly and visibly rather than to pass
+// quietly. An IDT that is silently wrong presents in Task 10 as an
+// inexplicable triple fault during TA execution, with no indication of which
+// layer to suspect; the point of these is to remove that ambiguity now, while
+// exactly one thing has just changed.
+// ---------------------------------------------------------------------------
+
+/// CR4.SMEP.
+const CR4_SMEP: u64 = 1 << 20;
+/// CR4.SMAP.
+const CR4_SMAP: u64 = 1 << 21;
+/// CR4.FSGSBASE.
+const CR4_FSGSBASE: u64 = 1 << 16;
+
+/// Reads CR4.
+fn read_cr4() -> u64 {
+    let cr4: u64;
+    // SAFETY: reading CR4 into a register has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+    cr4
+}
+
+/// Reads GSBASE with `rdgsbase`.
+fn read_gsbase() -> u64 {
+    let gsbase: u64;
+    // SAFETY: `rdgsbase` is enabled (CR4.FSGSBASE was set by
+    // `enable_fsgsbase` before any per-CPU state was allocated, and is
+    // asserted below); it only reads a register.
+    unsafe {
+        core::arch::asm!("rdgsbase {}", out(reg) gsbase, options(nomem, nostack, preserves_flags));
+    }
+    gsbase
+}
+
+/// Reads `kernel_stack_ptr` through `%gs`, exactly as the platform's own
+/// assembly does.
+///
+/// Read this way rather than through an accessor so that the check exercises
+/// the same addressing mode the syscall and exception entry paths use: a
+/// getter would prove the field's value, but not that `gs:[offset]` reaches
+/// it.
+fn read_gs_kernel_stack_ptr() -> u64 {
+    let sp: u64;
+    // SAFETY: GSBASE points at this core's `PerCpuVariables`, whose first
+    // field is `PerCpuVariablesAsm`, whose `kernel_stack_ptr` sits at this
+    // offset. The load is 8 bytes from a naturally aligned `Cell<usize>`.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[{off}]",
+            out(reg) sp,
+            off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    sp
+}
+
+/// Checks GSBASE, the kernel stack switch, and CR4's protection bits.
+fn check_cpu_state() {
+    use litebox_platform_lvbs::host::per_cpu_variables::with_per_cpu_variables;
+
+    // 1. GSBASE. `rdgsbase` must return this core's `PerCpuVariables`, which
+    //    is a `#[repr(C, align(4096))]` heap allocation in the high-canonical
+    //    kernel alias. A zero or low value means `wrgsbase` never took, and
+    //    every `gs:`-relative access the platform's assembly makes -- syscall
+    //    entry included -- would be reading whatever sits at that address.
+    let gsbase = read_gsbase();
+    let via_helper = with_per_cpu_variables(|pcv| (&raw const *pcv) as u64);
+    log::info!("gsbase     {gsbase:#018X} (per-CPU variables)");
+    assert_ne!(gsbase, 0, "GSBASE is zero: wrgsbase did not take");
+    assert_eq!(
+        gsbase, via_helper,
+        "GSBASE disagrees with with_per_cpu_variables"
+    );
+    assert!(
+        gsbase >= KERNEL_OFFSET,
+        "GSBASE {gsbase:#018X} is not in the high-canonical kernel alias"
+    );
+    assert_eq!(gsbase % 4096, 0, "PerCpuVariables is not page-aligned");
+
+    // 2. The stack switch. RSP must lie inside the per-CPU kernel stack, i.e.
+    //    below the stored `kernel_stack_ptr` and within one stack's length of
+    //    it -- and, critically, *nowhere near* the boot stack in the scratch
+    //    region, which is what we just stopped using.
+    let rsp: u64;
+    // SAFETY: reading RSP into a register has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    let stack_top = read_gs_kernel_stack_ptr();
+    log::info!(
+        "kstack     rsp {rsp:#018X}, top {stack_top:#018X}, used {} B",
+        stack_top.saturating_sub(rsp)
+    );
+    assert!(
+        rsp <= stack_top && stack_top - rsp < KERNEL_STACK_SIZE as u64,
+        "RSP {rsp:#018X} is not inside the per-CPU kernel stack (top {stack_top:#018X})"
+    );
+    let boot_stack_top = u64::from(BOOT_SCRATCH_BASE + OFF_STACK_TOP) + KERNEL_OFFSET;
+    assert!(
+        rsp > boot_stack_top || boot_stack_top - rsp > (1 << 20),
+        "RSP {rsp:#018X} is still on the boot stack"
+    );
+
+    // 3. CR4. SMEP and SMAP are the load-bearing bits: with them clear, the
+    //    ring-0/ring-3 boundary Phase 1 leans on is not actually enforced by
+    //    anything. `enable_smep_smap` asserts CPUID support before setting
+    //    them, so reaching here with them clear would mean the write itself
+    //    was dropped.
+    let cr4 = read_cr4();
+    log::info!(
+        "cr4        {cr4:#018X} (SMEP {}, SMAP {}, FSGSBASE {})",
+        if cr4 & CR4_SMEP != 0 { "set" } else { "CLEAR" },
+        if cr4 & CR4_SMAP != 0 { "set" } else { "CLEAR" },
+        if cr4 & CR4_FSGSBASE != 0 {
+            "set"
+        } else {
+            "CLEAR"
+        },
+    );
+    assert!(
+        cr4 & CR4_SMEP != 0,
+        "CR4.SMEP is clear: the kernel can execute ring-3 pages"
+    );
+    assert!(
+        cr4 & CR4_SMAP != 0,
+        "CR4.SMAP is clear: the kernel can read ring-3 pages"
+    );
+    assert!(cr4 & CR4_FSGSBASE != 0, "CR4.FSGSBASE is clear");
+
+    // 4. SMAP enforcement is *not* tested here, deliberately. Proving it
+    //    requires a page with the USER bit set, and there is none: the early
+    //    2 MiB tables built by the boot stub use flags 0x83
+    //    (PRESENT|WRITABLE|HUGE) throughout, with USER clear on every entry.
+    //    Task 10 creates the first user mapping and should confirm there that
+    //    a kernel read of it faults with CR4.SMAP set and succeeds between
+    //    `stac`/`clac`. Inventing a user mapping here to test against would
+    //    prove only that the test's own mapping works.
+    log::warn!("smap       enforcement untested: no USER-accessible page exists yet (Task 10)");
+}
+
+/// A magic value carried across the `int3` to show the ISR stub's register
+/// restore is correct, not merely that the handler ran.
+const BP_WITNESS: u64 = 0x5EED_1234_ABCD_F00D;
+
+/// Triggers a breakpoint and a page fault and confirms both are reported.
+fn check_interrupts() {
+    // 1. `int3`. The handler logs and returns, so this exercises the whole
+    //    round trip: IDT gate -> `isr_breakpoint` -> `push_regs` -> Rust
+    //    handler -> `pop_regs` -> `iretq` -> here. A callee-clobbered
+    //    register is loaded with a witness value across the trap: if
+    //    `pop_regs` restored the wrong slots, or the stub's `add rsp, 8`
+    //    error-code fixup were wrong, this comes back corrupted (or we never
+    //    come back at all). That return path is exactly what Task 10's
+    //    ring-3 exception handling depends on.
+    log::info!("int3       triggering breakpoint...");
+    let witness: u64;
+    // SAFETY: vector 3 is present in the IDT loaded above, and under
+    // `host_kvm` its handler logs and returns rather than panicking. `int3`
+    // itself has no effect beyond the trap.
+    unsafe {
+        core::arch::asm!(
+            "int3",
+            inlateout("r12") BP_WITNESS => witness,
+            options(nostack),
+        );
+    }
+    log::info!("int3       returned, witness {witness:#018X}");
+    assert_eq!(
+        witness, BP_WITNESS,
+        "register state was corrupted across the breakpoint"
+    );
+
+    // 2. A deliberate fault at an unmapped address.
+    //
+    //    Note this is *not* a null read, despite the task asking for one: a
+    //    null read does not fault here. PML4[0] identity-maps the low 1 GiB
+    //    (the boot stub cannot survive enabling paging without it), so VA 0 is
+    //    a perfectly good mapping and reading it would prove nothing. Reading
+    //    through the high-canonical alias of PA 0x8000_0000 -- beyond the 1
+    //    GiB the PD covers -- is genuinely unmapped, so the fault is
+    //    unambiguous and CR2 is checkable against a value we chose.
+    //
+    //    `read_u64_fallible` registers the load in `.ex_table`, so
+    //    `kernel_exception_handler_no_ctx` finds a fixup and, under
+    //    `host_kvm`, logs CR2, the error code and the faulting RIP before
+    //    patching the saved RIP and `iretq`-ing. That proves the #PF gate,
+    //    `kernel_exception_callback`, the exception table and the resume
+    //    path, and it leaves the kernel running so the boot log completes.
+    let unmapped = (KERNEL_OFFSET + UNMAPPED_PROBE_PA) as *const u64;
+    log::info!("pf         reading unmapped {:#018X}...", unmapped as u64);
+    // SAFETY: this is precisely what `read_u64_fallible` exists for -- the
+    // pointer is expected to fault, and the fault is recovered through the
+    // exception table rather than propagating.
+    let result = unsafe { litebox::mm::exception_table::read_u64_fallible(unmapped) };
+    match result {
+        Ok(v) => panic!(
+            "read of unmapped {:#018X} succeeded, returned {v:#X}",
+            unmapped as u64
+        ),
+        Err(_) => log::info!("pf         faulted and recovered as expected"),
+    }
+
+    // 3. A null read, for the record. PA 0 *is* mapped (PML4[0] identity-maps
+    //    the low 1 GiB, and the boot stub needs that to survive enabling
+    //    paging), so this does not fault today. Noted rather than asserted:
+    //    Task 8 builds real page tables and should unmap page zero.
+    log::warn!(
+        "pf         VA 0 is still mapped by the early identity map (Task 8 should unmap it)"
+    );
+}
+
+/// A physical address beyond the 1 GiB the early PD covers, used to provoke a
+/// page fault at an address that cannot be mapped by accident.
+const UNMAPPED_PROBE_PA: u64 = 0x8000_0000;
 
 // ---------------------------------------------------------------------------
 // Clock and CRNG checks.

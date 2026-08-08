@@ -126,9 +126,28 @@ extern "C" fn debug_handler_impl(regs: &PtRegs) {
 }
 
 /// Kernel-mode handler for breakpoint exception (vector 3).
+#[cfg(feature = "host_lvbs")]
 #[unsafe(no_mangle)]
 extern "C" fn breakpoint_handler_impl(regs: &PtRegs) {
     panic!("EXCEPTION: BREAKPOINT\n{regs:#x?}");
+}
+
+/// Kernel-mode handler for breakpoint exception (vector 3).
+///
+/// A kernel-mode `#BP` is a debugger trap deliberately planted by the code
+/// that executed `int3`, not a fault: `RIP` already points past the trapping
+/// byte, so returning resumes cleanly. Under `host_kvm` this is the only way
+/// to demonstrate that the IDT dispatches *and* that the ISR stub's
+/// `pop_regs; add rsp,8; iretq` epilogue restores state correctly -- a
+/// property Task 10's ring-3 exception return path depends on, and one that a
+/// panicking handler can never show.
+///
+/// This deliberately differs from the `host_lvbs` handler above, which
+/// panics. LVBS's behaviour is unchanged.
+#[cfg(feature = "host_kvm")]
+#[unsafe(no_mangle)]
+extern "C" fn breakpoint_handler_impl(regs: &PtRegs) {
+    crate::serial_println!("EXCEPTION: BREAKPOINT (resuming)\n{regs:#x?}");
 }
 
 /// Kernel-mode handler for overflow exception (vector 4).
@@ -225,6 +244,24 @@ extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
     if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
         super::timer::rearm_preemption();
     }
+}
+
+/// Placeholder for the `host_lvbs`-only STIMER handler.
+///
+/// Phase 1 gated the STIMER vector out of the IDT and gated
+/// `stimer_handler_impl` (below) behind `host_lvbs` -- but `interrupts.S` is
+/// included by `global_asm!` unconditionally, and its `isr_stimer` stub still
+/// contains a `call stimer_handler_impl`. Under `host_kvm` that is an
+/// undefined symbol, and the link fails the moment anything actually
+/// references this module (which nothing did until Task 7 called `init_idt`).
+///
+/// The stub is unreachable: `init_idt` never installs vector 0x40 under
+/// `host_kvm`, so nothing can dispatch to it. Defining the symbol here rather
+/// than splitting `interrupts.S` keeps the LVBS assembly byte-identical.
+#[cfg(feature = "host_kvm")]
+#[unsafe(no_mangle)]
+extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
+    panic!("STIMER interrupt on a KVM guest: vector 0x40 is never installed in the IDT");
 }
 
 // Note: isr_hyperv_sint is defined in interrupts.S as a minimal stub that only
