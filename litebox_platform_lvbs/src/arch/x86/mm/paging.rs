@@ -55,11 +55,24 @@ const PML4_INDEX_MASK: u64 = 0x1FF;
 pub(crate) const KERNEL_PML4_START: usize =
     ((crate::KERNEL_OFFSET >> PML4_SHIFT) & PML4_INDEX_MASK) as usize;
 
+/// Flush TLB entries for a contiguous page range on the *current* core only.
+#[cfg(not(test))]
+fn flush_tlb_range_local(start: Page<Size4KiB>, count: usize) {
+    if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
+        let base = start.start_address().as_u64();
+        for i in 0..count {
+            x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
+        }
+    } else {
+        x86_64::instructions::tlb::flush_all();
+    }
+}
+
 /// Flush TLB entries for a contiguous page range across all cores.
 ///
 /// Uses Hyper-V hypercalls so that remote cores sharing the same page table
 /// also see the invalidation.
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "host_lvbs"))]
 fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     use crate::mshv::{hvcall_mm, is_hvcall_ready};
 
@@ -70,14 +83,7 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
     // If the current VP is the BSP, it might use MM operations **before** the hypercall page is set up.
     // In that case, we fall back to local TLB flushes. This is safe because no AP enters VTL1 yet.
     if !is_hvcall_ready() {
-        if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
-            let base = start.start_address().as_u64();
-            for i in 0..count {
-                x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
-            }
-        } else {
-            x86_64::instructions::tlb::flush_all();
-        }
+        flush_tlb_range_local(start, count);
         return;
     }
 
@@ -92,6 +98,18 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
         debug_assert!(false, "TLB flush hypercall failed: {e:?}");
         x86_64::instructions::tlb::flush_all();
     }
+}
+
+/// KVM has no hypervisor to broadcast invalidations through. Milestone 1 is single-CPU,
+/// so a local flush is complete.
+// TODO(SMP): needs IPI-based shootdown once AP bring-up lands.
+#[cfg(all(not(test), feature = "host_kvm"))]
+fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
+    if count == 0 {
+        return;
+    }
+
+    flush_tlb_range_local(start, count);
 }
 
 #[cfg(test)]
