@@ -328,15 +328,44 @@ fn require_python3() {
 /// script's own bounding is broken, and 124 says so distinctly instead of
 /// hanging the job.
 fn run_channel_session(root: &Path, name: &str, commands: &str) -> (i32, String) {
+    let dir = scratch_dir(name);
+    let command_file = dir.join("commands.json");
+    std::fs::write(&command_file, commands)
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", command_file.display()));
+    let out = run_channel_session_with(root, &dir, &ta_artifact("hello-ta.elf"), &command_file);
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// The unrewritten OP-TEE artifact `name`, from the userland runner's tests.
+///
+/// Unrewritten is the whole point: `litebox_runner_optee_on_linux_userland`'s
+/// own `run.rs` puts both binaries through `litebox_syscall_rewriter` first,
+/// because on Linux userland LiteBox is a library and syscalls have to be
+/// hooked by rewriting them. Under KVM LiteBox is the kernel: a TA's real
+/// `syscall` instructions trap to `syscall_entry`, and the rewriter's output
+/// would be the wrong binary.
+fn ta_artifact(name: &str) -> PathBuf {
+    let path = repo_root()
+        .join("litebox_runner_optee_on_linux_userland/tests")
+        .join(name);
+    assert!(path.is_file(), "{} does not exist", path.display());
+    path
+}
+
+/// Drive one channel session against `ta` with the sequence in `command_file`.
+fn run_channel_session_with(
+    root: &Path,
+    dir: &Path,
+    ta: &Path,
+    command_file: &Path,
+) -> (i32, String) {
     require_python3();
     let binary = build_runner(root);
     assert!(binary.is_file(), "{} vanished", binary.display());
 
-    let dir = scratch_dir(name);
     let socket = dir.join("optee.sock");
-    let command_file = dir.join("commands.json");
-    std::fs::write(&command_file, commands)
-        .unwrap_or_else(|e| panic!("cannot write {}: {e}", command_file.display()));
+    let ldelf = ta_artifact("ldelf.elf");
 
     let script = root.join("litebox_runner_kvm/scripts/run.sh");
     assert!(script.is_file(), "{} does not exist", script.display());
@@ -353,6 +382,10 @@ fn run_channel_session(root: &Path, name: &str, commands: &str) -> (i32, String)
             CHANNEL_TIMEOUT_SECS,
             "-c",
             command_file.to_str().expect("command path must be UTF-8"),
+            "-l",
+            ldelf.to_str().expect("ldelf path must be UTF-8"),
+            "-a",
+            ta.to_str().expect("TA path must be UTF-8"),
             "-S",
             socket.to_str().expect("socket path must be UTF-8"),
         ])
@@ -374,7 +407,6 @@ fn run_channel_session(root: &Path, name: &str, commands: &str) -> (i32, String)
          run.sh's own -t {CHANNEL_TIMEOUT_SECS} bound did not hold.\n\
          --- output ---\n{console}",
     );
-    let _ = std::fs::remove_dir_all(&dir);
     (status, console)
 }
 
@@ -462,4 +494,170 @@ fn the_channel_rejects_a_command_without_a_session() {
         status, SCRIPT_CLIENT_FAILURE,
         "expected run.sh to report the client's failure.\n--- output ---\n{console}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// The five TAs, mirroring `litebox_runner_optee_on_linux_userland/tests/run.rs`.
+//
+// Same five binaries, same five command sequences, read from the same
+// directory -- but *unrewritten*, and driven over the channel rather than
+// in-process. The verification standard is the userland runner's: the client
+// raises, and `run.sh` exits non-zero, if any command comes back with a
+// non-zero `ta_return` or a non-zero runner status, so `status == 0` below is
+// exactly "every command's `ctx.rax` was 0". Each test then adds an assertion
+// on something only that TA could have produced, because an exit status alone
+// would be satisfied by a runner that acknowledged the requests and ran
+// nothing.
+// ---------------------------------------------------------------------------
+
+/// Run `{name}.elf` against `{name}-cmds.json`, the pair `run.rs` runs.
+fn run_ta(name: &str) -> (i32, String) {
+    let root = repo_root();
+    let dir = scratch_dir(name);
+    let ta = ta_artifact(&format!("{name}.elf"));
+    let commands = ta_artifact(&format!("{name}-cmds.json"));
+    let out = run_channel_session_with(&root, &dir, &ta, &commands);
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// Assert the session succeeded, i.e. every command returned `ta_return == 0`.
+fn assert_ta_succeeded(name: &str, status: i32, console: &str) {
+    assert_console_contains(console, "channel    serving requests");
+    assert_console_contains(console, "[client] sequence completed");
+    assert_console_contains(console, "Guest completed successfully");
+    assert_eq!(
+        status, 0,
+        "{name} did not complete cleanly.\n--- output ---\n{console}",
+    );
+}
+
+/// `hello-ta` over the channel, from the shipped binary rather than the
+/// embedded one.
+///
+/// `a_client_drives_the_ta_over_the_channel` already covers this arithmetic
+/// with an inline sequence; this covers the *file*, so a change to
+/// `hello-ta-cmds.json` that the other test's hard-coded 100 and 200 would
+/// hide shows up here.
+#[test]
+fn runs_the_hello_ta() {
+    let (status, console) = run_ta("hello-ta");
+    assert_console_contains(&console, "Hello World!");
+    assert_console_contains(&console, "Goodbye!");
+    // 100 -> 101 and 200 -> 199, the TA's own arithmetic read back out of
+    // ring 3.
+    assert_console_contains(&console, "value_inout value_a=0x65");
+    assert_console_contains(&console, "value_inout value_a=0xc7");
+    assert_ta_succeeded("hello-ta", status, &console);
+}
+
+/// `hello3seg-ta` does not load under KVM, for a reason that has nothing to do
+/// with the channel.
+///
+/// It is the same TA as `hello-ta` built with three `PT_LOAD` segments, so
+/// `ldelf` maps the third at a *fixed* address with a non-zero `pad_end`. That
+/// takes `sys_map_bin`'s `MAP_FIXED_NOREPLACE` branch, which calls
+/// `ensure_pads_are_unmapped` -- and on this platform the padding is not
+/// unmapped. `ldelf` exits `0xffff0003` (`TEE_ERROR_ACCESS_CONFLICT`) after
+/// `populate_segments:851 sys_map_ta_bin`.
+///
+/// The cause is address-space *placement*, not the padding check. LiteBox's
+/// own VMA allocator hands out the highest free range, so the anonymous
+/// mapping `ldelf` asks for with `addr == 0` is packed flush against the
+/// bottom of the 1 MiB TA stack allocated moments earlier. Three runs with
+/// three different `pad_begin` values (49152, 204800, 385024 -- `ldelf`
+/// randomises it) all placed the image's usable start at exactly
+/// `0x7fffffcdc000`, which is what "flush against whatever is above" looks
+/// like: the base moves with `pad_begin`, the top does not. The third
+/// segment's `pad_end` then runs from `0x7fffffcee000` to `0x7fffffcfb000`
+/// and the last two pages of that are inside the stack.
+///
+/// Under `litebox_runner_optee_on_linux_userland` the identical sequence
+/// succeeds because the mappings are Linux's, and Linux does not place an
+/// anonymous mapping against the stack. So this is a gap in the KVM port's
+/// memory-manager placement policy -- a real one, worth an issue -- and not
+/// something the binary-loading work here introduced or could fix. The other
+/// four TAs load through the same code path.
+#[test]
+#[ignore = "ldelf exits TEE_ERROR_ACCESS_CONFLICT: the KVM VMA allocator packs \
+            the TA image flush against the TA stack, so the third segment's \
+            pad_end overlaps it. Not a channel or loader-protocol failure; see \
+            the doc comment."]
+fn runs_the_hello3seg_ta() {
+    let (status, console) = run_ta("hello3seg-ta");
+    assert_ta_succeeded("hello3seg-ta", status, &console);
+}
+
+/// `random-ta`, the first TA here to fill a `memref_output`.
+///
+/// `-cpu max` is required and `run.sh` supplies it: the default `qemu64` model
+/// has no `RDRAND` and the guest's `CrngProvider` needs it.
+#[test]
+fn runs_the_random_ta() {
+    let (status, console) = run_ta("random-ta");
+    assert_console_contains(&console, "Generating random data over 64 bytes.");
+    // All 64 bytes came back. The buffer was sent empty and 64 bytes long, so
+    // this can only be what the TA wrote into user memory.
+    assert_console_contains(&console, "memref_output buffer_size=64 len=64 hex=");
+    assert!(
+        !console.contains(&"00".repeat(64)),
+        "the 64 'random' bytes are all zero, so nothing was written.\n\
+         --- output ---\n{console}",
+    );
+    assert_ta_succeeded("random-ta", status, &console);
+}
+
+/// `aes-ta`, and the strongest claim in this file.
+///
+/// The sequence sets AES-128-CTR up, loads a key and an IV, and enciphers 32
+/// bytes. The expected ciphertext below is not copied from a passing run: it
+/// is what AES-128-CTR produces for that key, IV and plaintext, computed
+/// independently. So it holds the whole memref path to an external standard --
+/// a `memref_input` that reached the TA byte-exact and a `memref_output` read
+/// back out of ring 3 byte-exact -- rather than to whatever this port happens
+/// to do.
+///
+///     key        9f4ff5a1c4ea8d662407078db96e3b28
+///     iv         13005df291b9e575b0ab2a7a0a06b5f4
+///     plaintext  428224303f3d80b2cc52bcee17e9cb09325a8a45ec842c2cfc85797133f5185a
+#[test]
+fn runs_the_aes_ta() {
+    let (status, console) = run_ta("aes-ta");
+    assert_console_contains(
+        &console,
+        "memref_output buffer_size=32 len=32 \
+         hex=4ccc41d75eb8e3b316fdf0eaa358384366f8d878e040f448bf695dd37ae40068",
+    );
+    assert_ta_succeeded("aes-ta", status, &console);
+}
+
+/// `kmpp-ta`. It passes, and it passes *while* the platform refuses it a
+/// derived key -- so this test pins both halves.
+///
+/// `DerivedKeyProvider` for `KvmGuest` returns `UnsupportedRebootPersistentKey`
+/// (there is no platform root key on a plain KVM guest) and
+/// `litebox_shim_optee/src/syscalls/pta.rs` maps that to
+/// `TeeResult::NotSupported`. The TA sees `0xffff000a` out of
+/// `derive_unique_key`, logs `Failed to get machine secret`, cannot encrypt
+/// the private key it was asked to import, and returns that failure to its
+/// caller *inside the output memref* -- while `TA_InvokeCommandEntryPoint`
+/// itself returns 0. Under `litebox_runner_optee_on_linux_userland` the
+/// derivation succeeds and none of those log lines appear.
+///
+/// So the userland runner's standard -- `ctx.rax == 0` after every command --
+/// is met here for a materially different reason, and asserting only on it
+/// would let this test claim parity it does not have. The refusal is asserted
+/// on directly instead. If a platform root key ever arrives, this assertion
+/// fails and someone has to come and read this comment, which is the point.
+#[test]
+fn runs_the_kmpp_ta() {
+    let (status, console) = run_ta("kmpp-ta");
+    // The TA really ran: it imports an EC private key twice, opening and
+    // closing a session around each.
+    assert_console_contains(&console, "KeyIso_SERVER_import_private_key");
+    // ... and the platform refused it a derived key, for the documented
+    // reason. `ffff000a` is TEE_ERROR_NOT_SUPPORTED.
+    assert_console_contains(&console, "derive_unique_key failed: returned ffff000a");
+    assert_console_contains(&console, "Failed to get machine secret");
+    assert_ta_succeeded("kmpp-ta", status, &console);
 }
