@@ -412,6 +412,8 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
+    /// VTL1's window of trusting VTL0; meaningless without a VTL0 peer.
+    #[cfg(feature = "host_lvbs")]
     end_of_boot: core::sync::atomic::AtomicBool,
 }
 
@@ -645,16 +647,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(base_pt),
             vtl1_phys_frame_range: vtl1_range,
+            #[cfg(feature = "host_lvbs")]
             end_of_boot: core::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     /// Whether VTL1's window of trusting VTL0 has closed.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn end_of_boot_reached(&self) -> bool {
         self.end_of_boot.load(core::sync::atomic::Ordering::SeqCst)
     }
 
     /// Close VTL1's window of trusting VTL0. One-way.
+    #[cfg(feature = "host_lvbs")]
     pub(crate) fn signal_end_of_boot(&self) {
         self.end_of_boot
             .store(true, core::sync::atomic::Ordering::SeqCst);

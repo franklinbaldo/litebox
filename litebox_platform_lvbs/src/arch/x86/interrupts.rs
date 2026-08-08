@@ -45,6 +45,7 @@ unsafe extern "C" {
     fn isr_x87_floating_point();
     fn isr_alignment_check();
     fn isr_simd_floating_point();
+    #[cfg(feature = "host_lvbs")]
     fn isr_hyperv_sint();
     #[cfg(feature = "host_lvbs")]
     fn isr_stimer();
