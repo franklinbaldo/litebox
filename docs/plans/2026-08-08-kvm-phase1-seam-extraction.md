@@ -401,6 +401,31 @@ git commit -m "Add skeleton KvmGuest host behind host_kvm feature"
 - Modify: `litebox_platform_lvbs/src/arch/x86/interrupts.rs:20,91-92`
 - Modify: `litebox_platform_lvbs/src/arch/x86/interrupts.S` (the `isr_hyperv_sint` stub)
 
+**Step 0 (added during execution)** — make `Platform` the host alias.
+
+Task 3 revealed three hardcoded `crate::host::LvbsLinuxKernel` references outside
+`mshv/`, which gating `mod mshv` alone does not clear:
+
+- `lib.rs:467` — `impl GlobalVmapManager for Vmap { type Manager = ... }`
+- `lib.rs:597` — the hvcall-page `va_to_pa` (inside a `#[cfg(not(test))]` block that
+  becomes `host_lvbs`-only in Step 3 anyway, so it needs no separate fix)
+- `lib.rs:2013` — `pub type Platform = crate::host::LvbsLinuxKernel;`
+
+`Platform` already exists and is exactly the alias we need. Make it host-selected:
+
+```rust
+#[cfg(feature = "host_lvbs")]
+pub type Platform = crate::host::LvbsLinuxKernel;
+#[cfg(feature = "host_kvm")]
+pub type Platform = crate::host::KvmGuest;
+```
+
+then change `lib.rs:467` to `type Manager = crate::Platform;`.
+
+This also **collapses Task 9 into this task**: `mm/mod.rs:64` can bind
+`PageTable<ALIGN>` to `crate::Platform` with no `cfg` at all, since `Platform` now
+resolves per host. Task 9 becomes a one-line change.
+
 **Step 1** — `lib.rs:45`: `#[cfg(feature = "host_lvbs")] pub mod mshv;`
 
 **Step 2** — `host/mod.rs`: put `#[cfg(feature = "host_lvbs")]` on both
@@ -594,7 +619,12 @@ git commit -am "Gate Hyper-V synthetic timer behind host_lvbs"
 
 ---
 
-### Task 9: Bind `PageTable<ALIGN>` per host (seam 9)
+### Task 9: Bind `PageTable<ALIGN>` per host
+
+> **Reduced by Task 4 Step 0.** `crate::Platform` is now host-selected, so this is a
+> single substitution with no new `cfg` arms. Ignore the two-arm version below if
+> Task 4 already made `Platform` generic; just point `PageTable` at `crate::Platform`
+> and add the stub `MemoryProvider` impl for `KvmGuest`. (seam 9)
 
 **Files:**
 - Modify: `litebox_platform_lvbs/src/mm/mod.rs:63-68`
