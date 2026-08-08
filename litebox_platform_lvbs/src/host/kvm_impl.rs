@@ -60,6 +60,23 @@
 //!   reboot-persistence guarantee callers depend on. `Unsupported` is the
 //!   truthful answer, and callers can handle it.
 //!
+//! ## Compiled out silently — no panic to read
+//!
+//! One gap is in none of the categories above, which is exactly why it is
+//! called out separately: it neither works nor fails.
+//!
+//! * **The preemption timer.** `crate::run_thread` arms it under
+//!   `#[cfg(feature = "host_lvbs")]` only (`lib.rs:1505`), because the LVBS
+//!   implementation is built on Hyper-V synthetic timers and there is no such
+//!   thing here. On `host_kvm` the call simply is not emitted. Nothing panics
+//!   and nothing logs; a TA that loops in ring 3 is never interrupted and
+//!   wedges the machine permanently, with no diagnostic connecting the hang to
+//!   this line. Replacing it needs an APIC-deadline source. Until then, ring-3
+//!   code here is trusted not to loop -- which is tolerable for a test vehicle
+//!   running TAs we build, and is not a production posture. See the
+//!   "Not a production posture yet" section of
+//!   `docs/plans/2026-08-08-litebox-on-kvm-design.md`.
+//!
 //! ## Absent entirely
 //!
 //! `litebox::platform::ThreadLocalStorageProvider` and `init_task` are
