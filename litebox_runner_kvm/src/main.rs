@@ -23,6 +23,10 @@ extern crate alloc;
 mod boot;
 mod memmap;
 mod pci;
+// Nothing calls the codec until the request loop does, one commit from now.
+// Compiled from here regardless, so the target build and clippy cover it.
+#[allow(dead_code, reason = "wired up by the request loop in the next commit")]
+mod proto;
 mod ta;
 mod virtio;
 
