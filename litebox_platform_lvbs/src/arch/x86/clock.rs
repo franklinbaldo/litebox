@@ -451,13 +451,17 @@ pub fn pit_reference_interval_nanos() -> Option<u64> {
 /// Panics if no source yields a plausible frequency, reporting what each one
 /// returned. Guessing instead would yield a clock that never fails loudly and
 /// is wrong by an unknown factor.
+/// A named TSC-frequency source: a label for the boot log and a probe that
+/// returns the frequency in Hz, or `None` if this machine does not offer it.
+type FrequencySource = (&'static str, fn() -> Option<u64>);
+
 fn discover() -> TscScale {
     // Function pointers, not an array of already-computed `Option<u64>`: an
     // array literal evaluates every element before the loop runs, so the
     // ~55 ms PIT calibration and the pvclock MSR enable/disable pair would be
     // paid on every boot even when CPUID answered first. Only the *selection*
     // would be ordered, not the work.
-    let candidates: [(&'static str, fn() -> Option<u64>); 5] = [
+    let candidates: [FrequencySource; 5] = [
         ("CPUID 0x40000010 (KVM paravirt)", kvm_paravirt_hz),
         ("CPUID 0x15 (core crystal ratio)", crystal_ratio_hz),
         ("CPUID 0x16 (processor base frequency)", base_frequency_hz),

@@ -75,12 +75,20 @@ pub fn enable_fsgsbase() {
 /// Enable CPU extended states such as XMM and instructions to use and manage them
 /// such as SSE and XSAVE
 ///
-/// VTL0 and VTL1 share the same XCR0 register. This function verifies that XCR0 already
-/// has x87 and SSE enabled (by VTL0) rather than modifying it.
+/// `CR0` and `CR4` are configured identically for both hosts. `XCR0` is where they
+/// differ, because ownership of that register differs:
+///
+/// - Under `host_lvbs`, VTL0 and VTL1 share `XCR0`, so this function *verifies* that
+///   VTL0 has already enabled x87 and SSE rather than modifying it, and panics if it
+///   has not.
+/// - Under `host_kvm`, LiteBox is the sole owner of `XCR0` and boots from reset, where
+///   it is architecturally `0x1` (x87 only). There is no VTL0 to have set it, so this
+///   function enables x87 and SSE itself and cannot panic.
 ///
 /// # Panics
 ///
-/// Panics if XCR0 (from the VTL0 kernel) does not have x87 and SSE enabled.
+/// Under `host_lvbs` only: panics if `XCR0` (from the VTL0 kernel) does not have x87
+/// and SSE enabled.
 #[cfg(target_arch = "x86_64")]
 pub fn enable_extended_states() {
     let mut flags = x86_64::registers::control::Cr0::read();
@@ -122,6 +130,11 @@ pub fn enable_extended_states() {
     // requested bit. AVX is deliberately not enabled: the KVM target sets
     // `-avx,-avx2,-avx512f`, so nothing generates state beyond x87 and SSE.
     #[cfg(feature = "host_kvm")]
+    // SAFETY: `XCr0::write` is unsafe because enabling a state component whose
+    // XSAVE area the OS has not provisioned corrupts memory on the next
+    // `xsave`. Only x87 and SSE are enabled here, and `allocate_xsave_area`
+    // sizes its buffer from `VTL1_XSAVE_MASK` (0b11), which is exactly those
+    // two. `CR4.OSXSAVE` was set above, so the write is architecturally legal.
     unsafe {
         let mut xcr0 = x86_64::registers::xcontrol::XCr0::read();
         xcr0.insert(x86_64::registers::xcontrol::XCr0Flags::X87);
