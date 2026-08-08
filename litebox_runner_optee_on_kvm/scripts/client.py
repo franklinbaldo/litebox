@@ -1,4 +1,4 @@
-#! /usr/bin/env python3
+#!/usr/bin/env python3
 
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
@@ -22,7 +22,7 @@ field names are `func_id`, `cmd_id`, `args`, `param_type`, `value_a`,
 `value_b`, `data_base64` and `buffer_size`; see `TaCommandBase64` in that
 crate's `src/tests.rs`, which is the definition this mirrors.
 
-The wire format is `litebox_runner_kvm/src/proto.rs`. It is small enough to
+The wire format is `litebox_runner_optee_on_kvm/src/proto.rs`. It is small enough to
 restate here rather than generate, and restating it means this script has no
 dependencies beyond the standard library -- which matters because it runs in
 CI next to a QEMU and a nightly toolchain and should not also need a Python
@@ -45,7 +45,7 @@ import sys
 import time
 
 # --------------------------------------------------------------------------
-# The wire format. Must agree with litebox_runner_kvm/src/proto.rs.
+# The wire format. Must agree with litebox_runner_optee_on_kvm/src/proto.rs.
 # --------------------------------------------------------------------------
 
 VERSION = 1

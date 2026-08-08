@@ -11,13 +11,13 @@
 	"linker": "rust-lld",
 	"pre-link-args": {
 		"ld": [
-			"-Tlitebox_runner_kvm/x86_64_kvm.ld",
+			"-Tlitebox_runner_optee_on_kvm/x86_64_kvm.ld",
 			"--gc-sections",
 			"--static",
 			"--pie"
 		],
 		"ld.lld": [
-			"--script=litebox_runner_kvm/x86_64_kvm.ld",
+			"--script=litebox_runner_optee_on_kvm/x86_64_kvm.ld",
 			"--gc-sections",
 			"--static",
 			"--pie"

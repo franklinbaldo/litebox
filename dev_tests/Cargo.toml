@@ -16,7 +16,7 @@ ignore = "0.4.25"
 
 [features]
 # Opt in to the QEMU boot test. It needs `qemu-system-x86_64` and the nightly
-# toolchain pinned by `litebox_runner_kvm/rust-toolchain.toml` (with `rust-src`),
+# toolchain pinned by `litebox_runner_optee_on_kvm/rust-toolchain.toml` (with `rust-src`),
 # neither of which the default `Build and Test` CI job has, so the test target
 # below is not built unless this is enabled. `--all-features` sweeps still
 # compile and lint it.

@@ -1415,9 +1415,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             // peer kernel exists that could tamper with these pages, so there is nothing for a
             // per-page protection change to defend against and this call is correctly a no-op.
             //
-            // The boundary this defers to is established by `litebox_runner_kvm`, not assumed:
+            // The boundary this defers to is established by `litebox_runner_optee_on_kvm`, not assumed:
             //
-            // * `enable_smep_smap()` (`litebox_runner_kvm::main`) sets CR4.SMEP and CR4.SMAP, so
+            // * `enable_smep_smap()` (`litebox_runner_optee_on_kvm::main`) sets CR4.SMEP and CR4.SMAP, so
             //   the kernel can neither execute nor read ring-3 pages. It asserts CPUID support
             //   first, and the runner re-reads CR4 afterwards and panics if either bit is clear.
             // * CR0.WP is set by the runner before it switches CR3. PVH hands off with WP clear,

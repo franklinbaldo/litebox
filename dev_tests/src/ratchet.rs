@@ -14,7 +14,7 @@ fn ratchet_transmutes() -> Result<()> {
             ("dev_tests/", 2),
             ("litebox/", 8),
             ("litebox_platform_linux_userland/", 2),
-            ("litebox_runner_kvm/", 1),
+            ("litebox_runner_optee_on_kvm/", 1),
         ],
         |file| {
             Ok(file
@@ -38,13 +38,20 @@ fn ratchet_globals() -> Result<()> {
             ("litebox/", 9),
             ("litebox_platform_linux_kernel/", 6),
             ("litebox_platform_linux_userland/", 5),
-            // 23 for the Hyper-V host, plus 4 for the KVM host: the TSC scale,
+            // 23 for the Hyper-V host, plus 5 for the KVM host: the TSC scale,
             // the pvclock page (needed before there is a heap), the KVM heap
-            // allocator and the RDRAND-backed CRNG.
-            ("litebox_platform_lvbs/", 27),
+            // allocator, the RDRAND-backed CRNG, and the development platform
+            // root key. Each is a root of trust or an allocator that must exist
+            // before a heap does, so none can be a local.
+            ("litebox_platform_lvbs/", 28),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
-            ("litebox_runner_kvm/", 15),
+            // Linker symbols (_text_start/_end, _rela_start/_end, _memory_base,
+            // _heap_start) that must be statics to be addressable at all, the
+            // embedded ldelf/TA used by the no-device path, the boot-time
+            // probes, the PVH note, the logger, and the virtio MMIO window
+            // bump-pointer.
+            ("litebox_runner_optee_on_kvm/", 16),
             ("litebox_runner_lvbs/", 6),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),

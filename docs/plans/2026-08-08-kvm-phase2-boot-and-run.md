@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Boot `litebox_runner_kvm` under `qemu-system-x86_64 -kernel`, load a static OP-TEE TA, execute it in ring 3, and exit with a distinguishable code.
+**Goal:** Boot `litebox_runner_optee_on_kvm` under `qemu-system-x86_64 -kernel`, load a static OP-TEE TA, execute it in ring 3, and exit with a distinguishable code.
 
 **Architecture:** A new `no_std`/`no_main` runner crate targeting `litebox_platform_lvbs` with `host_kvm`. QEMU enters a PVH ELF entry point in 32-bit protected mode; we build early page tables, reach long mode, relocate, seed a heap from the firmware memory map, bring up per-CPU state, then drive the OP-TEE shim directly the way `litebox_runner_optee_on_linux_userland` does.
 
@@ -168,8 +168,8 @@ If you change shared code in `litebox_platform_lvbs`, this hash WILL move. That 
 **Gate P2 — the KVM build:**
 ```bash
 cargo +nightly-2025-12-31 build -Z build-std-features=compiler-builtins-mem \
-  -Z build-std=core,alloc --manifest-path=litebox_runner_kvm/Cargo.toml \
-  --target litebox_runner_kvm/x86_64_kvm.json
+  -Z build-std=core,alloc --manifest-path=litebox_runner_optee_on_kvm/Cargo.toml \
+  --target litebox_runner_optee_on_kvm/x86_64_kvm.json
 ```
 
 **Gate P3 — it actually boots.** From Task 2 onward every task ends with a QEMU run. A task that compiles but does not boot is not done.
@@ -180,7 +180,7 @@ cat > /tmp/kvm-run.sh <<'EOF'
 #!/bin/sh
 # Boot the KVM runner. Pass --kvm to use hardware acceleration.
 cd /workspace/litebox-kvm/.worktrees/kvm-seams
-BIN=target/x86_64_kvm/debug/litebox_runner_kvm
+BIN=target/x86_64_kvm/debug/litebox_runner_optee_on_kvm
 ACCEL=""
 [ "$1" = "--kvm" ] && ACCEL="-enable-kvm -cpu host"
 timeout 30 qemu-system-x86_64 -machine q35 $ACCEL -m 512M \
@@ -200,16 +200,16 @@ Note on `isa-debug-exit`: QEMU exits with `(value << 1) | 1`. So writing `0` giv
 ### Task 1: Crate skeleton, PVH note, linker script
 
 **Files:**
-- Create: `litebox_runner_kvm/Cargo.toml`
-- Create: `litebox_runner_kvm/x86_64_kvm.json`
-- Create: `litebox_runner_kvm/x86_64_kvm.ld`
-- Create: `litebox_runner_kvm/rust-toolchain.toml`
-- Create: `litebox_runner_kvm/src/main.rs`
+- Create: `litebox_runner_optee_on_kvm/Cargo.toml`
+- Create: `litebox_runner_optee_on_kvm/x86_64_kvm.json`
+- Create: `litebox_runner_optee_on_kvm/x86_64_kvm.ld`
+- Create: `litebox_runner_optee_on_kvm/rust-toolchain.toml`
+- Create: `litebox_runner_optee_on_kvm/src/main.rs`
 - Modify: `Cargo.toml` (workspace `members`; do **not** add to `default-members` — it needs a custom target, like `litebox_runner_lvbs`)
 
 **Step 1: `rust-toolchain.toml`** — copy `litebox_runner_lvbs/rust-toolchain.toml` verbatim (`nightly-2025-12-31`).
 
-**Step 2: `x86_64_kvm.json`** — copy `litebox_runner_lvbs/x86_64_vtl1.json`, changing only the linker script paths to `litebox_runner_kvm/x86_64_kvm.ld`.
+**Step 2: `x86_64_kvm.json`** — copy `litebox_runner_lvbs/x86_64_vtl1.json`, changing only the linker script paths to `litebox_runner_optee_on_kvm/x86_64_kvm.ld`.
 
 **Step 3: `x86_64_kvm.ld`** — start from `litebox_runner_lvbs/x86_64_vtl1.ld` with three changes:
 
@@ -257,8 +257,8 @@ Use raw `out dx, al` in the naked asm. Do not call into Rust yet — you are not
 **Step 6: verify the note is actually in the binary**
 
 ```bash
-readelf -n target/x86_64_kvm/debug/litebox_runner_kvm
-readelf -l target/x86_64_kvm/debug/litebox_runner_kvm | grep NOTE
+readelf -n target/x86_64_kvm/debug/litebox_runner_optee_on_kvm
+readelf -l target/x86_64_kvm/debug/litebox_runner_optee_on_kvm | grep NOTE
 ```
 You must see a `PT_NOTE` segment and a `Xen` note of type `0x12`. **If `PT_NOTE` is absent, QEMU will silently fall back to another boot protocol and nothing will work** — do not proceed past this check.
 
@@ -271,13 +271,13 @@ Expected: `PVH` on the console. Then `/tmp/kvm-run.sh --kvm` — same output.
 
 If nothing appears, debug with `-d int,cpu_reset` and check whether QEMU took the PVH path at all.
 
-**Step 8: commit** — `Add litebox_runner_kvm skeleton with PVH entry point`
+**Step 8: commit** — `Add litebox_runner_optee_on_kvm skeleton with PVH entry point`
 
 ---
 
 ### Task 2: 32-to-64-bit trampoline
 
-**Files:** Modify `litebox_runner_kvm/src/main.rs`
+**Files:** Modify `litebox_runner_optee_on_kvm/src/main.rs`
 
 Build early page tables in `.bss`, enter long mode, reach Rust.
 
@@ -303,7 +303,7 @@ Build early page tables in `.bss`, enter long mode, reach Rust.
 
 ### Task 3: Relocation and the serial logger
 
-**Files:** Modify `litebox_runner_kvm/src/main.rs`
+**Files:** Modify `litebox_runner_optee_on_kvm/src/main.rs`
 
 **Step 1** — port the `.rela.dyn` `R_X86_64_RELATIVE` loop from `litebox_runner_lvbs/src/main.rs` (search `Elf64Rela`). The image is PIE; until this runs, no absolute address in a static is valid. Read the LVBS "two-phase relocation" comments carefully — they explain why linker symbols return high-canonical VAs afterwards.
 
@@ -351,7 +351,7 @@ Build early page tables in `.bss`, enter long mode, reach Rust.
 
 ### Task 6: Heap from the PVH memory map
 
-**Files:** Create `litebox_runner_kvm/src/memmap.rs`; modify `litebox_platform_lvbs/src/host/kvm_impl.rs`
+**Files:** Create `litebox_runner_optee_on_kvm/src/memmap.rs`; modify `litebox_platform_lvbs/src/host/kvm_impl.rs`
 
 > **Mandatory first step: delete `NoAllocatorYet`.** Task 3 had to link
 > `litebox_platform_lvbs`, which fails to *compile* without a `#[global_allocator]`
@@ -385,7 +385,7 @@ Getting this wrong gives an allocator that hands out memory you are executing fr
 
 ### Task 7: Per-CPU state, GDT, IDT, syscall entry
 
-**Files:** Modify `litebox_runner_kvm/src/main.rs`
+**Files:** Modify `litebox_runner_optee_on_kvm/src/main.rs`
 
 Follow `common_start` in `litebox_runner_lvbs/src/main.rs:396-430` — the ordering there is load-bearing.
 
@@ -418,7 +418,7 @@ Do not skip this. An IDT that is silently wrong will present later as an inexpli
 
 ### Task 8: Platform construction and DEP page tables
 
-**Files:** Modify `litebox_runner_kvm/src/main.rs`
+**Files:** Modify `litebox_runner_optee_on_kvm/src/main.rs`
 
 **Step 1** — mirror `litebox_runner_lvbs/src/lib.rs:94` `init()`: compute `text_phys_start`/`text_phys_end` from the linker symbols, call `Platform::new(phys_start, phys_end, text_phys_start, text_phys_end)`.
 
@@ -454,7 +454,7 @@ Use the `platform_kvm` feature added at the end of Phase 1 — that is exactly w
 
 ### Task 10: Load and run an OP-TEE TA
 
-**Files:** Modify `litebox_runner_kvm/src/main.rs`; add `litebox_shim_optee` to `litebox_runner_kvm/Cargo.toml`
+**Files:** Modify `litebox_runner_optee_on_kvm/src/main.rs`; add `litebox_shim_optee` to `litebox_runner_optee_on_kvm/Cargo.toml`
 
 **Model this on `litebox_runner_optee_on_linux_userland/src/lib.rs:105-149`, not on the LVBS runner.** The LVBS runner waits for VTL0 to make requests; on KVM nobody will.
 
@@ -506,7 +506,7 @@ For each failure, fix the cause. **If you find yourself adding a stub to make th
 
 ### Task 11: Integration test
 
-**Files:** Create `litebox_runner_kvm/tests/boot.rs` (or a `dev_tests` entry, matching repo convention — check where `litebox_runner_lvbs`-adjacent tests live first)
+**Files:** Create `litebox_runner_optee_on_kvm/tests/boot.rs` (or a `dev_tests` entry, matching repo convention — check where `litebox_runner_lvbs`-adjacent tests live first)
 
 **Step 1** — a test that shells out to QEMU with the same arguments as `/tmp/kvm-run.sh`, captures stdout, and asserts:
 - the process exit code equals the Task 9 success value
@@ -526,11 +526,11 @@ For each failure, fix the cause. **If you find yourself adding a stub to make th
 
 **Files:** Modify `.github/workflows/ci.yml`
 
-**Step 1** — add a `litebox_runner_kvm` build using the nightly toolchain and `-Z build-std`, modelled on the existing `build_and_test_lvbs` job (around line 156).
+**Step 1** — add a `litebox_runner_optee_on_kvm` build using the nightly toolchain and `-Z build-std`, modelled on the existing `build_and_test_lvbs` job (around line 156).
 
 **Step 2** — add the Task 11 integration test, with `qemu-system-x86_64` installed via apt in the job. TCG only — do not assume runners expose `/dev/kvm`.
 
-**Step 3** — `litebox_runner_kvm` needs the same exclusions `litebox_runner_lvbs` has from the workspace-wide sweeps (custom target, `no_std`). Check every place `litebox_runner_lvbs` is excluded and add the new crate alongside it. Phase 1 touched four such sites; expect the same four.
+**Step 3** — `litebox_runner_optee_on_kvm` needs the same exclusions `litebox_runner_lvbs` has from the workspace-wide sweeps (custom target, `no_std`). Check every place `litebox_runner_lvbs` is excluded and add the new crate alongside it. Phase 1 touched four such sites; expect the same four.
 
 **Step 4** — verify the whole CI file locally: run every command you added, and re-check `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`.
 

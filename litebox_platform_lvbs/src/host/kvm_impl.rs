@@ -6,7 +6,7 @@
 //! Unlike LVBS, LiteBox here *is* the kernel: there is no VTL0 peer to delegate
 //! to. The security boundary is ring 0 vs ring 3, enforced by page tables,
 //! SMEP/SMAP and the syscall gate — a conventional OS threat model rather than
-//! a VBS one. `litebox_runner_kvm` establishes that boundary; see the
+//! a VBS one. `litebox_runner_optee_on_kvm` establishes that boundary; see the
 //! `set_physical_memory_protections` comment in `crate::lib` for the argument
 //! and where each half of it is set up.
 //!

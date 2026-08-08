@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runs `litebox_runner_kvm`'s wire-protocol tests on the host.
+//! Runs `litebox_runner_optee_on_kvm`'s wire-protocol tests on the host.
 //!
-//! `litebox_runner_kvm` builds only for the bare-metal `x86_64_kvm.json`
+//! `litebox_runner_optee_on_kvm` builds only for the bare-metal `x86_64_kvm.json`
 //! target, with `-Z build-std`, on a pinned nightly. `cargo test -p
-//! litebox_runner_kvm` therefore cannot work: there is no test harness, no
+//! litebox_runner_optee_on_kvm` therefore cannot work: there is no test harness, no
 //! std, and no way to run the resulting binary except under QEMU.
 //!
 //! `src/proto.rs` is the one part of that crate which is pure: it depends on
@@ -26,5 +26,5 @@
 // in the extern prelude of a std crate, so it is declared here.
 extern crate alloc;
 
-#[path = "../../litebox_runner_kvm/src/proto.rs"]
+#[path = "../../litebox_runner_optee_on_kvm/src/proto.rs"]
 mod proto;

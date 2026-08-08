@@ -797,7 +797,7 @@ git commit -am "Verify host_kvm compiles; check both hosts in CI"
 
 ## Out of scope for this phase
 
-PVH boot, the page allocator over the firmware memmap, `litebox_runner_kvm`, the
+PVH boot, the page allocator over the firmware memmap, `litebox_runner_optee_on_kvm`, the
 OP-TEE TA, and the QEMU integration test. Those are Phase 2 onward — see
 `docs/plans/2026-08-08-litebox-on-kvm-design.md` section 6.
 

@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Boot `litebox_runner_kvm` under QEMU and assert on what the guest actually did.
+//! Boot `litebox_runner_optee_on_kvm` under QEMU and assert on what the guest actually did.
 //!
-//! # Why this lives in `dev_tests` rather than `litebox_runner_kvm/tests/`
+//! # Why this lives in `dev_tests` rather than `litebox_runner_optee_on_kvm/tests/`
 //!
-//! `litebox_runner_kvm` only builds for `x86_64_kvm.json`, a bare-metal
+//! `litebox_runner_optee_on_kvm` only builds for `x86_64_kvm.json`, a bare-metal
 //! `no_std` target with no test harness and no way to run a host binary. A
 //! `tests/` directory inside it would be compiled for that target and could
 //! never execute. The harness has to be a *host* program that shells out to
@@ -41,7 +41,7 @@
 //!   that needs a second process racing QEMU for a unix socket, so those tests
 //!   (`a_client_drives_the_ta_over_the_channel`,
 //!   `the_channel_rejects_a_command_without_a_session`) shell out to
-//!   `litebox_runner_kvm/scripts/run.sh -c` instead of reassembling that
+//!   `litebox_runner_optee_on_kvm/scripts/run.sh -c` instead of reassembling that
 //!   orchestration. See `run_channel_session` for the full argument.
 
 use std::path::Path;
@@ -75,7 +75,7 @@ fn repo_root() -> PathBuf {
 /// `--manifest-path`, and we run from the repo root (whose `rust-toolchain.toml`
 /// says `stable`), so the channel has to be passed explicitly as `cargo +...`.
 fn runner_toolchain(root: &Path) -> String {
-    let path = root.join("litebox_runner_kvm/rust-toolchain.toml");
+    let path = root.join("litebox_runner_optee_on_kvm/rust-toolchain.toml");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let (_, channel) = text
@@ -106,15 +106,15 @@ fn build_runner(root: &Path) -> PathBuf {
             "build-std-features=compiler-builtins-mem",
             "-Z",
             "build-std=core,alloc",
-            "--manifest-path=litebox_runner_kvm/Cargo.toml",
+            "--manifest-path=litebox_runner_optee_on_kvm/Cargo.toml",
             "--target",
-            "litebox_runner_kvm/x86_64_kvm.json",
+            "litebox_runner_optee_on_kvm/x86_64_kvm.json",
         ])
         .output()
         .expect("failed to spawn `cargo`; is it on PATH?");
     assert!(
         output.status.success(),
-        "building litebox_runner_kvm failed ({}).\n\
+        "building litebox_runner_optee_on_kvm failed ({}).\n\
          Requires the `{toolchain}` toolchain with the `rust-src` component.\n\
          --- stdout ---\n{}\n--- stderr ---\n{}",
         output.status,
@@ -122,7 +122,7 @@ fn build_runner(root: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let binary = root.join("target/x86_64_kvm/debug/litebox_runner_kvm");
+    let binary = root.join("target/x86_64_kvm/debug/litebox_runner_optee_on_kvm");
     assert!(
         binary.is_file(),
         "cargo reported success but {} does not exist",
@@ -294,7 +294,7 @@ fn require_python3() {
     assert!(
         found,
         "`python3` is required: the channel tests drive the guest with \
-         litebox_runner_kvm/scripts/client.py, which is the only host-side \
+         litebox_runner_optee_on_kvm/scripts/client.py, which is the only host-side \
          implementation of the wire protocol. Install python3 (it is \
          preinstalled on GitHub-hosted runners) or skip these tests.",
     );
@@ -367,7 +367,7 @@ fn run_channel_session_with(
     let socket = dir.join("optee.sock");
     let ldelf = ta_artifact("ldelf.elf");
 
-    let script = root.join("litebox_runner_kvm/scripts/run.sh");
+    let script = root.join("litebox_runner_optee_on_kvm/scripts/run.sh");
     assert!(script.is_file(), "{} does not exist", script.display());
 
     let output = Command::new("timeout")

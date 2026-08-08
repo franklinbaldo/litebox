@@ -13,7 +13,7 @@ members = [
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_lvbs",
-    "litebox_runner_kvm",
+    "litebox_runner_optee_on_kvm",
     "litebox_runner_optee_on_linux_userland",
     "litebox_shim_linux",
     "litebox_service_heki",
@@ -49,7 +49,7 @@ default-members = [
     "dev_tests",
     "dev_bench",
 ]
-# We exclude `litebox_runner_lvbs` and `litebox_runner_kvm` from
+# We exclude `litebox_runner_lvbs` and `litebox_runner_optee_on_kvm` from
 # `default-members` because they require a custom target and `-Z build-std`,
 # which requires a nightly toolchain.
 

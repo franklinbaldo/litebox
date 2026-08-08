@@ -3,7 +3,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-# Build litebox_runner_kvm and boot it under QEMU, end to end.
+# Build litebox_runner_optee_on_kvm and boot it under QEMU, end to end.
 #
 # The runner boots via the PVH boot protocol, brings up a full kernel
 # environment (heap, GDT/IDT, DEP page tables, SMEP/SMAP), loads OP-TEE's
@@ -114,7 +114,7 @@ done
 
 TARGET_JSON="$CRATE_DIR/x86_64_kvm.json"
 TARGET_NAME=$( basename "$TARGET_JSON" .json )
-BIN="$REPO_ROOT/target/$TARGET_NAME/$PROFILE/litebox_runner_kvm"
+BIN="$REPO_ROOT/target/$TARGET_NAME/$PROFILE/litebox_runner_optee_on_kvm"
 
 # ---------------------------------------------------------------------------
 # Build.
@@ -139,7 +139,7 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     RELEASE_FLAG=""
     [ "$PROFILE" = "release" ] && RELEASE_FLAG="--release"
 
-    info "Building litebox_runner_kvm ($PROFILE, $CHANNEL)"
+    info "Building litebox_runner_optee_on_kvm ($PROFILE, $CHANNEL)"
     ( cd "$REPO_ROOT" && cargo "+$CHANNEL" build $RELEASE_FLAG \
         -Z build-std-features=compiler-builtins-mem \
         -Z build-std=core,alloc \

@@ -47,7 +47,7 @@ After every task:
 
 ```bash
 /tmp/lvbs-check.sh      # LVBS invariant; expect Gate A' de61da67… MATCH, 12599 MATCH
-./litebox_runner_kvm/scripts/run.sh          # still boots and runs the TA
+./litebox_runner_optee_on_kvm/scripts/run.sh          # still boots and runs the TA
 cargo +nightly-2025-12-31 nextest run -p dev_tests --features kvm_qemu --test kvm_qemu_boot
 ```
 
@@ -59,7 +59,7 @@ Tasks 1-5 must not change observable behaviour: the runner still runs its embedd
 
 ### Task 1: 32-bit port I/O and PCI config access
 
-**Files:** `litebox_platform_lvbs/src/arch/x86/ioport.rs` (host-neutral additions), new `litebox_runner_kvm/src/pci.rs`
+**Files:** `litebox_platform_lvbs/src/arch/x86/ioport.rs` (host-neutral additions), new `litebox_runner_optee_on_kvm/src/pci.rs`
 
 **Step 1** — `ioport.rs` has private `inb`/`outb` and no 32-bit forms. Add `inl`/`outl`. These are architectural, so they are **not** host-gated — but that means they land in the LVBS build too. Adding unused `pub` functions should not move the LVBS gate; **verify, and if it moves, gate them `host_kvm` and say so.**
 
@@ -75,7 +75,7 @@ Commit: `Add PCI configuration access over legacy port I/O`
 
 ### Task 2: virtio PCI capability parsing
 
-**Files:** `litebox_runner_kvm/src/pci.rs`, new `litebox_runner_kvm/src/virtio/mod.rs`
+**Files:** `litebox_runner_optee_on_kvm/src/pci.rs`, new `litebox_runner_optee_on_kvm/src/virtio/mod.rs`
 
 Walk the PCI capability list for vendor-specific capabilities (ID `0x09`) with the virtio structure layout: `cfg_type`, `bar`, `offset`, `length`. Locate:
 
@@ -96,7 +96,7 @@ Commit: `Parse virtio PCI capability structures`
 
 ### Task 3: map BAR MMIO
 
-**Files:** `litebox_runner_kvm/src/virtio/mod.rs`, possibly `litebox_runner_kvm/src/boot/mod.rs`
+**Files:** `litebox_runner_optee_on_kvm/src/virtio/mod.rs`, possibly `litebox_runner_optee_on_kvm/src/boot/mod.rs`
 
 Measured facts from Task 2, which correct this plan as first written:
 
@@ -117,7 +117,7 @@ Commit: `Map virtio BAR MMIO into the kernel window`
 
 ### Task 4: device initialisation and virtqueue setup
 
-**Files:** `litebox_runner_kvm/src/virtio/mod.rs`, new `litebox_runner_kvm/src/virtio/queue.rs`
+**Files:** `litebox_runner_optee_on_kvm/src/virtio/mod.rs`, new `litebox_runner_optee_on_kvm/src/virtio/queue.rs`
 
 **Step 1** — the virtio 1.0 status handshake: `ACKNOWLEDGE`, `DRIVER`, negotiate features, `FEATURES_OK`, read back to confirm, set up queues, `DRIVER_OK`. Fail loudly at each step rather than proceeding.
 
@@ -139,7 +139,7 @@ Commit: `Bring up the virtio device and its virtqueues`
 
 ### Task 5: the wire protocol
 
-**Files:** new `litebox_runner_kvm/src/proto.rs`
+**Files:** new `litebox_runner_optee_on_kvm/src/proto.rs`
 
 Length-prefixed framing, because virtio-console is a byte stream and does not preserve message boundaries.
 
@@ -161,7 +161,7 @@ Commit: `Add the virtio message-channel wire protocol`
 
 ### Task 6: drive the shim from the channel
 
-**Files:** `litebox_runner_kvm/src/ta.rs`, `litebox_runner_kvm/src/main.rs`
+**Files:** `litebox_runner_optee_on_kvm/src/ta.rs`, `litebox_runner_optee_on_kvm/src/main.rs`
 
 Replace the hardcoded open/invoke/close sequence with a request loop:
 
@@ -191,7 +191,7 @@ Commit: `Drive the OP-TEE shim from the virtio message channel`
 
 ### Task 7: host client
 
-**Files:** new `litebox_runner_kvm/scripts/client.py`
+**Files:** new `litebox_runner_optee_on_kvm/scripts/client.py`
 
 A small Python client that connects to the unix socket and issues a command sequence, reusing the JSON shape of `litebox_runner_optee_on_linux_userland/tests/hello-ta-cmds.json` so the existing files work unchanged.
 

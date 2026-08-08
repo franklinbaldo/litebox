@@ -48,7 +48,7 @@ litebox_platform_lvbs/
   src/host/mod.rs              mod kvm_impl (cfg-gated)
   src/mm/layout.rs       NEW   PAGE_SIZE etc. hoisted out of mshv::vtl1_mem_layout
   src/mshv/                    unchanged, gated behind feature = "host_lvbs"
-litebox_runner_kvm/      NEW   no_std/no_main PVH runner, OP-TEE shim
+litebox_runner_optee_on_kvm/      NEW   no_std/no_main PVH runner, OP-TEE shim
 litebox_platform_multiplex/    feature platform_kvm
 litebox_shim_optee/            feature platform_kvm
 ```
@@ -168,7 +168,7 @@ permanently and by hand.
 
 ### Security note on seam 4
 
-Dropping VSM page protection does not leave `litebox_runner_kvm` without a boundary;
+Dropping VSM page protection does not leave `litebox_runner_optee_on_kvm` without a boundary;
 it relocates the boundary. LiteBox on KVM is a conventional OS kernel, so the
 security boundary is **ring 0 vs ring 3**, enforced by page tables, SMEP/SMAP and the
 syscall gate. All of that is in the shared code and stays live: `enable_smep_smap`,
@@ -186,7 +186,7 @@ virtio-net are therefore real roadmap features, not test scaffolding.
 ## 4. Runner
 
 ```
-litebox_runner_kvm/
+litebox_runner_optee_on_kvm/
   src/main.rs       #![no_std] #![no_main], PVH entry, boot → shim → TA
   x86_64_kvm.json   target spec, copied from x86_64_vtl1.json
   x86_64_kvm.ld     as x86_64_vtl1.ld, minus .hvcall_page, with KEEP(.note.*)

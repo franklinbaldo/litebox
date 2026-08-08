@@ -132,7 +132,7 @@ pub(crate) extern "C" fn kvm_long_mode_entry() -> ! {
     // up. Raise this to Trace when debugging the allocator itself.
     log::set_max_level(log::LevelFilter::Debug);
 
-    log::info!("litebox_runner_kvm: long mode, relocations applied");
+    log::info!("litebox_runner_optee_on_kvm: long mode, relocations applied");
     log::info!("load bias  {load_bias:#018X}");
 
     // Evidence of 64-bit execution: %rip is a high-canonical address with bits

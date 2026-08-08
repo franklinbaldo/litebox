@@ -1,7 +1,7 @@
 # Multi-segment TA loading fails under LiteBox's VMA allocator
 
 Date: 2026-08-08
-Status: diagnosed, not fixed. Affects `litebox_runner_lvbs` and `litebox_runner_kvm`.
+Status: diagnosed, not fixed. Affects `litebox_runner_lvbs` and `litebox_runner_optee_on_kvm`.
 Not a KVM-specific issue; recorded here because that is where it surfaced.
 
 ## Summary
@@ -111,5 +111,5 @@ nothing relevant here and its failure is unrelated to what it was written for.
 
 ```sh
 T=litebox_runner_optee_on_linux_userland/tests
-./litebox_runner_kvm/scripts/run.sh -l $T/ldelf.elf -a $T/hello3seg-ta.elf -c $T/hello3seg-ta-cmds.json
+./litebox_runner_optee_on_kvm/scripts/run.sh -l $T/ldelf.elf -a $T/hello3seg-ta.elf -c $T/hello3seg-ta-cmds.json
 ```
