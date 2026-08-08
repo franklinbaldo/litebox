@@ -8,8 +8,9 @@
 //! SMEP/SMAP and the syscall gate — a conventional OS threat model rather than
 //! a VBS one.
 //!
-//! The heap, the logger, the clock and the CRNG are real. The remaining
-//! methods are still stubs; they land with the rest of the boot path.
+//! The heap, the logger, the clock, the CRNG and the exit path are real. The
+//! remaining methods are still stubs; they land with the rest of the boot
+//! path.
 //!
 use crate::{Errno, HostInterface, arch::ioport::serial_print_string};
 use digest::Digest;
@@ -133,6 +134,68 @@ pub unsafe fn heap_add_region(start: usize, size: usize) {
     unsafe { heap::KVM_ALLOCATOR.fill_pages(start, size) };
 }
 
+// ---------------------------------------------------------------------------
+// Stopping the machine.
+//
+// QEMU's `isa-debug-exit` device is the only way a `-kernel` guest can end the
+// emulator with a value of its own choosing. The runner puts it on the command
+// line as `-device isa-debug-exit,iobase=0xf4,iosize=0x04`; a single write to
+// that port terminates QEMU.
+//
+// **QEMU does not use the written value as the process exit status.** It calls
+// `exit((value << 1) | 1)`. The low bit is forced set precisely so that a guest
+// can never produce status 0, which is reserved for "QEMU itself finished
+// normally" -- i.e. a guest that never wrote to the port at all. So:
+//
+//     written 0x10 (DEBUG_EXIT_SUCCESS) -> shell sees 33 (0x21)
+//     written 0x20 (DEBUG_EXIT_FAILURE) -> shell sees 65 (0x41)
+//
+// This is why "success" here is *not* exit code 0, and cannot be made to be.
+// Callers outside the guest must compare against the transformed values; the
+// two constants below are the guest-side halves, and the transform is applied
+// by QEMU.
+//
+// The values themselves are arbitrary but deliberately not 0 and 1: those
+// transform to 1 and 3, which collide with the exit statuses of a QEMU that
+// failed to start and of a shell reporting a signal. 33 and 65 collide with
+// nothing we produce.
+// ---------------------------------------------------------------------------
+
+/// The `isa-debug-exit` I/O port, matching `iobase=0xf4` on the QEMU command
+/// line.
+pub const DEBUG_EXIT_PORT: u16 = 0xf4;
+
+/// Value written to end the guest successfully. QEMU turns this into process
+/// exit status 33.
+pub const DEBUG_EXIT_SUCCESS: u32 = 0x10;
+
+/// Value written to end the guest with a failure. QEMU turns this into process
+/// exit status 65.
+pub const DEBUG_EXIT_FAILURE: u32 = 0x20;
+
+/// Writes `value` to the `isa-debug-exit` port, then halts.
+///
+/// The halt is not dead code. If the device is absent -- someone running the
+/// image under a QEMU invocation without `-device isa-debug-exit`, or under a
+/// different VMM entirely -- the `out` is discarded and execution continues.
+/// Falling into `hlt_loop` keeps the `-> !` signature honest and leaves the
+/// machine in a defined, quiet state rather than running off the end of the
+/// function.
+pub fn debug_exit(value: u32) -> ! {
+    // SAFETY: a 32-bit write to the `isa-debug-exit` port. The port is either
+    // the debug-exit device, in which case this write does not return, or
+    // unclaimed, in which case the write is discarded. Neither touches memory.
+    unsafe {
+        core::arch::asm!(
+            "out dx, eax",
+            in("dx") DEBUG_EXIT_PORT,
+            in("eax") value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    crate::arch::instrs::hlt_loop()
+}
+
 impl HostInterface for HostKvmInterface {
     fn log(msg: &str) {
         serial_print_string(msg);
@@ -155,12 +218,26 @@ impl HostInterface for HostKvmInterface {
         unreachable!("nothing was ever obtained from a host to return")
     }
 
+    /// Ends the guest successfully.
+    ///
+    /// On LVBS `exit()` returns to VTL0 and execution resumes later. There is
+    /// nobody to return to here, so the only meaningful "exit" is to stop the
+    /// machine -- see [`debug_exit`] for how, and for why the process exit code
+    /// is not the value written.
     fn exit() -> ! {
-        unimplemented!("isa-debug-exit lands in Phase 2")
+        debug_exit(DEBUG_EXIT_SUCCESS)
     }
 
-    fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
-        unimplemented!("isa-debug-exit lands in Phase 2")
+    /// Ends the guest with a failure indication.
+    ///
+    /// The reason is logged rather than encoded in the exit code: the
+    /// `isa-debug-exit` device is one byte wide and QEMU mangles even that (see
+    /// [`debug_exit`]), so there is no room for a `(set, code)` pair. The
+    /// console is the channel that can carry it, and on this platform the
+    /// console is the primary output anyway.
+    fn terminate(reason_set: u64, reason_code: u64) -> ! {
+        crate::serial_println!("terminate: reason set {reason_set:#X}, code {reason_code:#X}");
+        debug_exit(DEBUG_EXIT_FAILURE)
     }
 
     fn wake_many(_mutex: &core::sync::atomic::AtomicU32, _n: usize) -> Result<usize, Errno> {

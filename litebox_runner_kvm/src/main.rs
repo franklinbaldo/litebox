@@ -1819,18 +1819,22 @@ impl core::fmt::Display for HexBytes<'_> {
     }
 }
 
-/// Disables interrupts and halts this CPU forever.
-fn halt() -> ! {
-    loop {
-        // SAFETY: `cli`/`hlt` only disable interrupts and halt this CPU.
-        unsafe {
-            core::arch::asm!("cli; hlt", options(nomem, nostack));
-        }
-    }
-}
-
+/// A panicking guest ends the machine with the failure code, rather than
+/// halting.
+///
+/// Halting was right while nothing could stop QEMU: it at least left the log
+/// readable. Now that `isa-debug-exit` works, halting is actively harmful --
+/// the run only ends when the 60-second `timeout` kills it, so a panic is
+/// reported to the shell as 124 ("timed out"), indistinguishable from a hang,
+/// and it costs a minute of CI time per failure. Exiting makes a panic fail
+/// fast and fail distinguishably (status 65).
+///
+/// `debug_exit` falls through to a halt loop if the device is absent, so the
+/// old behaviour is still what happens when there is nothing to exit through.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     serial_println!("PANIC: {info}");
-    halt()
+    litebox_platform_lvbs::host::kvm_impl::debug_exit(
+        litebox_platform_lvbs::host::kvm_impl::DEBUG_EXIT_FAILURE,
+    )
 }
