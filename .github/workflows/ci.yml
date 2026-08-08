@@ -59,8 +59,8 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
-          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs
-          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs,linux_syscall,devbox,preemption_test_quantum
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm,linux_syscall,devbox,preemption_test_quantum
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
@@ -70,6 +70,9 @@ jobs:
           # features. `build_and_test_lvbs` covers it.
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; check each host separately.
+          # Only those two are mutually exclusive, so each host run must also carry
+          # `linux_syscall,devbox,preemption_test_quantum` -- dropping the crate from the
+          # `--all-features` sweep is what stopped covering them, and for a while nothing did.
           # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
           # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
           # select those two hosts, so `--all-features` turns both on at once.
@@ -89,14 +92,17 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: |
           ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
-          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs
-          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs,linux_syscall,devbox,preemption_test_quantum
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm,linux_syscall,devbox,preemption_test_quantum
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --no-default-features --features platform_kvm
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; document each host separately.
+          # Only those two are mutually exclusive, so each host run must also carry
+          # `linux_syscall,devbox,preemption_test_quantum` -- dropping the crate from the
+          # `--all-features` sweep is what stopped covering them, and for a while nothing did.
           # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
           # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
           # select those two hosts, so `--all-features` turns both on at once.
@@ -169,14 +175,17 @@ jobs:
       - run: |
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; check each host separately.
+          # Only those two are mutually exclusive, so each host run must also carry
+          # `linux_syscall,devbox,preemption_test_quantum` -- dropping the crate from the
+          # `--all-features` sweep is what stopped covering them, and for a while nothing did.
           # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
           # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
           # select those two hosts, so `--all-features` turns both on at once.
           # The remaining exclusions restore the default member selection, which
           # `--workspace` (required by `--exclude`) would otherwise widen.
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
-          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs
-          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs,linux_syscall,devbox,preemption_test_quantum
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm,linux_syscall,devbox,preemption_test_quantum
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
@@ -201,12 +210,15 @@ jobs:
         run: |
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; document each host separately.
+          # Only those two are mutually exclusive, so each host run must also carry
+          # `linux_syscall,devbox,preemption_test_quantum` -- dropping the crate from the
+          # `--all-features` sweep is what stopped covering them, and for a while nothing did.
           # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
           # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
           # select those two hosts, so `--all-features` turns both on at once.
           ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
-          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs
-          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs,linux_syscall,devbox,preemption_test_quantum
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm,linux_syscall,devbox,preemption_test_quantum
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
