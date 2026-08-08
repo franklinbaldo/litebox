@@ -41,6 +41,8 @@ PROFILE="debug"
 MEMORY="512M"
 TIMEOUT=120
 INITRD=""
+COMMANDS=""
+SOCKET=""
 
 usage() {
     cat 1>&2 <<EOF
@@ -56,6 +58,12 @@ Usage: $0 [options]
             allocation-failure path.
   -i FILE   Attach FILE as an initrd. Exercises the module-reservation path
             in the memory map, which must withhold it from the heap.
+  -c FILE   Drive the guest over the virtio message channel with the JSON
+            command sequence in FILE, instead of letting it run its embedded
+            TA sequence. Adds a virtio-serial-pci device and a unix-socket
+            chardev to the QEMU line and runs scripts/client.py against it.
+            Try litebox_runner_optee_on_linux_userland/tests/hello-ta-cmds.json.
+  -S PATH   Socket path for -c (default: a fresh one under \$TMPDIR).
   -t SECS   Timeout in seconds (default: $TIMEOUT)
   -d        Add QEMU interrupt/reset tracing (-d int,cpu_reset). Useful when
             the guest triple-faults, which is otherwise silent.
@@ -64,10 +72,14 @@ Exit status mirrors the guest:
   $EXIT_SUCCESS  guest completed successfully
   $EXIT_GUEST_FAILURE  guest panicked
   $EXIT_TIMEOUT  timed out (hung, or triple-faulted into a reset loop)
+
+With -c the script's own status is 0 only if *both* the client and the guest
+succeeded; the client's failure is reported in preference to the guest's,
+because it is the one that says what went wrong with the exchange.
 EOF
 }
 
-while getopts ":hkrbsm:i:t:d" opt; do
+while getopts ":hkrbsm:i:t:dc:S:" opt; do
     case $opt in
         h) usage; exit 0 ;;
         k) ACCEL=1 ;;
@@ -76,6 +88,8 @@ while getopts ":hkrbsm:i:t:d" opt; do
         s) SKIP_BUILD=1 ;;
         m) MEMORY="$OPTARG" ;;
         i) INITRD="$OPTARG" ;;
+        c) COMMANDS="$OPTARG" ;;
+        S) SOCKET="$OPTARG" ;;
         t) TIMEOUT="$OPTARG" ;;
         d) DEBUG_QEMU=1 ;;
         \?) usage; fatal "Unknown option: -$OPTARG" ;;
@@ -155,6 +169,33 @@ QEMU_ARGS=(
     QEMU_ARGS+=( -initrd "$INITRD" )
 }
 
+# The virtio message channel.
+#
+# `disable-legacy=on` makes the device modern-only (PCI device id 0x1043
+# rather than the transitional 0x1003). The guest driver only ever spoke the
+# modern interface; saying so on the command line makes that a contract
+# instead of an accident.
+#
+# QEMU is the socket *server* (`server=on`) and does not wait for a peer
+# (`wait=off`), so the guest boots whether or not a client ever connects.
+# That leaves the client racing QEMU's socket creation, which is why
+# client.py retries the connection rather than sleeping.
+if [ -n "$COMMANDS" ]; then
+    [ -f "$COMMANDS" ] || fatal "command sequence not found: $COMMANDS"
+    command -v python3 >/dev/null || fatal "python3 not found, but -c needs it"
+    CLIENT="$SCRIPT_DIR/client.py"
+    [ -f "$CLIENT" ] || fatal "client not found at $CLIENT"
+    if [ -z "$SOCKET" ]; then
+        SOCKET="${TMPDIR:-/tmp}/litebox-optee-$$.sock"
+    fi
+    rm -f "$SOCKET"
+    QEMU_ARGS+=(
+        -chardev "socket,id=optee,path=$SOCKET,server=on,wait=off"
+        -device virtio-serial-pci,id=vs0,disable-legacy=on
+        -device virtconsole,chardev=optee,bus=vs0.0
+    )
+fi
+
 [ "$DEBUG_QEMU" -eq 1 ] && QEMU_ARGS+=( -d int,cpu_reset )
 
 PRIVILEGE=""
@@ -197,11 +238,45 @@ echo 1>&2
 # own status rather than a filter's, nothing buffers or reorders the guest's
 # output, and the serial console stays interactive.
 set +e
-$PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}"
-STATUS=$?
+if [ -n "$COMMANDS" ]; then
+    # QEMU in the background, the client in the foreground. The client owns
+    # the conversation and ends it with a Shutdown, so the guest exits on its
+    # own; the `wait` below collects its status rather than killing it.
+    #
+    # QEMU keeps stdout and stderr, so the guest's serial log still
+    # interleaves with the client's output in the order things happened,
+    # which is the whole value of having both.
+    $PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" \
+        qemu-system-x86_64 "${QEMU_ARGS[@]}" </dev/null &
+    QEMU_PID=$!
+    python3 "$CLIENT" "$SOCKET" "$COMMANDS" --timeout "$TIMEOUT"
+    CLIENT_STATUS=$?
+    # A client that gave up will never send the Shutdown the guest is waiting
+    # for, so waiting for the guest would cost its whole request deadline and
+    # then report a panic that is a consequence of the failure rather than the
+    # failure. Kill it and report the client's verdict.
+    if [ "$CLIENT_STATUS" -ne 0 ]; then
+        kill "$QEMU_PID" 2>/dev/null
+    fi
+    wait "$QEMU_PID"
+    STATUS=$?
+    rm -f "$SOCKET"
+else
+    $PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" qemu-system-x86_64 "${QEMU_ARGS[@]}"
+    STATUS=$?
+    CLIENT_STATUS=0
+fi
 set -e
 
 echo 1>&2
+
+# The client's verdict comes first. A guest that exited cleanly while the
+# client was reporting a protocol or TA error is still a failed run, and the
+# client's message is the one that says why.
+if [ "$CLIENT_STATUS" -ne 0 ]; then
+    fatal "Client failed (exit $CLIENT_STATUS). The [client] FAILED line above has the reason."
+fi
+
 case "$STATUS" in
     "$EXIT_SUCCESS")
         info "Guest completed successfully (exit $STATUS)"
