@@ -485,6 +485,10 @@ pub fn pit_reference_interval_nanos() -> Option<u64> {
 // Discovery and the public clock.
 // ---------------------------------------------------------------------------
 
+/// A named TSC-frequency source: a label for the boot log and a probe that
+/// returns the frequency in Hz, or `None` if this machine does not offer it.
+type FrequencySource = (&'static str, fn() -> Option<u64>);
+
 /// Discovers the TSC frequency and derives the nanosecond conversion factor.
 ///
 /// # Panics
@@ -492,10 +496,6 @@ pub fn pit_reference_interval_nanos() -> Option<u64> {
 /// Panics if no source yields a plausible frequency, reporting what each one
 /// returned. Guessing instead would yield a clock that never fails loudly and
 /// is wrong by an unknown factor.
-/// A named TSC-frequency source: a label for the boot log and a probe that
-/// returns the frequency in Hz, or `None` if this machine does not offer it.
-type FrequencySource = (&'static str, fn() -> Option<u64>);
-
 fn discover() -> TscScale {
     // Function pointers, not an array of already-computed `Option<u64>`: an
     // array literal evaluates every element before the loop runs, so the
