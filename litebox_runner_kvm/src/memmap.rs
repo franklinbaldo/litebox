@@ -201,6 +201,55 @@ pub struct RamInfo {
     pub mapped_limit: u64,
 }
 
+/// Panics unless the firmware's usable-RAM regions are mutually disjoint.
+///
+/// [`Regions::add`] subtracts the *reserved* list from each usable region, but
+/// it treats the usable regions themselves as independent and has no memory of
+/// what earlier calls emitted. Two overlapping usable entries would therefore
+/// each emit the shared span, and `heap_add_region` would be handed the same
+/// physical pages twice -- after which the allocator can satisfy two different
+/// callers with the same address. That is precisely the failure this module's
+/// header calls "the worst available bug here", and it is silent: the accepted
+/// byte total would simply look larger than RAM.
+///
+/// QEMU's PVH map does not produce overlaps, so this is defensive. It is a
+/// panic rather than a merge because an overlap means the firmware described
+/// memory in a way nobody here has reasoned about, and quietly repairing it
+/// would be guessing about which description is true. Consistent with the
+/// module's rule of excluding conservatively and failing audibly.
+///
+/// O(n^2) over at most [`crate::boot::MAX_RAM_REGIONS`] entries -- nine in
+/// practice -- which
+/// needs no sorted copy of a list that arrives in firmware order.
+///
+/// # Panics
+///
+/// Panics naming both ranges if any two usable regions overlap.
+fn assert_usable_regions_disjoint(usable: &[Range]) {
+    for (i, a) in usable.iter().enumerate() {
+        // Empty entries cover nothing and cannot overlap anything.
+        if a.start >= a.end {
+            continue;
+        }
+        for b in &usable[i + 1..] {
+            if b.start >= b.end {
+                continue;
+            }
+            // Half-open ranges overlap iff each starts before the other ends.
+            assert!(
+                a.start >= b.end || b.start >= a.end,
+                "firmware reported overlapping usable RAM: \
+                 pa {:#014X}..{:#014X} and pa {:#014X}..{:#014X}. \
+                 Accepting both would hand the shared pages to the heap twice",
+                a.start,
+                a.end,
+                b.start,
+                b.end
+            );
+        }
+    }
+}
+
 /// Gives every usable region the firmware reported to the heap, minus
 /// everything that must be withheld.
 ///
@@ -253,6 +302,8 @@ pub fn init_heap(info: &BootInfo) -> RamInfo {
         ram_end: 0,
         mapped_limit: info.mapped_limit,
     };
+
+    assert_usable_regions_disjoint(&info.usable);
 
     for r in &info.usable {
         regions.add(r.start, r.end);
