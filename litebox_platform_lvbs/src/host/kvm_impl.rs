@@ -8,9 +8,9 @@
 //! SMEP/SMAP and the syscall gate — a conventional OS threat model rather than
 //! a VBS one.
 //!
-//! Phase 1 note: every method below is still a stub. Real implementations land
-//! with the boot path in Phase 2.
-
+//! The heap, the logger, the clock and the CRNG are real. The remaining
+//! methods are still stubs; they land with the rest of the boot path.
+//!
 use crate::{Errno, HostInterface, arch::ioport::serial_print_string};
 use digest::Digest;
 use rand_core::{RngCore, SeedableRng};
@@ -20,26 +20,117 @@ pub type KvmGuest = crate::LinuxKernel<HostKvmInterface>;
 
 pub struct HostKvmInterface;
 
-/// Phase 1 stub. Phase 2 implements a real page allocator over the memory map
-/// handed to us by the PVH firmware entry point.
+// ---------------------------------------------------------------------------
+// The heap.
+//
+// Structurally this mirrors the `alloc` module in `lvbs_impl.rs`: a
+// `SafeZoneAllocator` (buddy allocator for pages, slab allocator for small
+// objects) registered as the `#[global_allocator]` and wired to both
+// `litebox::mm::allocator::MemoryProvider` and `crate::mm::MemoryProvider`.
+//
+// The one substantive difference is where the memory comes from. LVBS runs in
+// VTL1 with VTL0 as a peer that can be asked for more pages, so its
+// `MemoryProvider::alloc` rescue hook has somewhere to go (in practice LVBS
+// has not implemented it either -- it `panic!`s). Here LiteBox *is* the
+// kernel: the guest's RAM is described exactly once, by the PVH memory map at
+// boot, and there is no higher authority to ask. So the runner walks that map
+// and hands every usable region to `heap_add_region` up front, and the rescue
+// hook honestly reports exhaustion rather than pretending.
+// ---------------------------------------------------------------------------
+
+/// Maximum buddy order.
+///
+/// The buddy allocator keeps `ORDER` free lists and can therefore serve a
+/// single block of at most `1 << (ORDER - 1)` bytes. LVBS uses 25 (16 MiB),
+/// sized for the fixed slice VTL0 hands it.
+///
+/// A KVM guest instead owns all of its RAM, and we boot with `-m 512M`. 30
+/// gives a 512 MiB maximum block, which is the entire machine: no allocation
+/// that could possibly be backed will be rejected for being too large, and
+/// the rescue hook's `unimplemented!("requested size ... is too large")` arm
+/// becomes unreachable for any request that RAM could satisfy. The cost is one
+/// `LinkedList` (a single pointer) per extra order -- 40 bytes of `.bss` over
+/// LVBS -- so there is no reason to be stingy. Raise it if the guest is ever
+/// given more than 512 MiB and someone wants a single allocation larger than
+/// that.
+const HEAP_ORDER: usize = 30;
+
+#[cfg(not(test))]
+mod heap {
+    use super::HEAP_ORDER;
+
+    #[global_allocator]
+    pub(super) static KVM_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
+        'static,
+        HEAP_ORDER,
+        super::KvmGuest,
+    > = litebox::mm::allocator::SafeZoneAllocator::new();
+
+    impl litebox::mm::allocator::MemoryProvider for super::KvmGuest {
+        fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+            <super::HostKvmInterface as crate::HostInterface>::alloc(layout)
+        }
+
+        unsafe fn free(addr: usize) {
+            unsafe { <super::HostKvmInterface as crate::HostInterface>::free(addr) }
+        }
+    }
+
+    impl crate::mm::MemoryProvider for super::KvmGuest {
+        /// A plain higher-half offset; nothing VSM-specific about it, so it
+        /// matches the LVBS value.
+        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
+        /// A plain KVM guest has no memory-encryption bit to set in the PTE.
+        const PRIVATE_PTE_MASK: u64 = 0;
+
+        fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
+            KVM_ALLOCATOR.allocate_pages(order)
+        }
+
+        unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
+            unsafe { KVM_ALLOCATOR.free_pages(ptr, order) };
+        }
+
+        unsafe fn mem_fill_pages(start: usize, size: usize) {
+            unsafe { KVM_ALLOCATOR.fill_pages(start, size) };
+        }
+    }
+}
+
+#[cfg(test)]
 impl crate::mm::MemoryProvider for KvmGuest {
-    /// A plain higher-half offset; nothing VSM-specific about it, so it matches
-    /// the LVBS value.
     const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
-    /// A plain KVM guest has no memory-encryption bit to set in the PTE.
     const PRIVATE_PTE_MASK: u64 = 0;
 
     fn mem_allocate_pages(_order: u32) -> Option<*mut u8> {
-        unimplemented!("KVM page allocator lands in Phase 2")
+        unimplemented!("not used in tests")
     }
 
     unsafe fn mem_free_pages(_ptr: *mut u8, _order: u32) {
-        unimplemented!("KVM page allocator lands in Phase 2")
+        unimplemented!("not used in tests")
     }
 
     unsafe fn mem_fill_pages(_start: usize, _size: usize) {
-        unimplemented!("KVM page allocator lands in Phase 2")
+        unimplemented!("not used in tests")
     }
+}
+
+/// Gives the heap ownership of the half-open kernel-virtual range
+/// `[start, start + size)`.
+///
+/// The boot path calls this once per usable region of the PVH memory map,
+/// before anything allocates. There is no other way to grow the heap: see the
+/// module comment above.
+///
+/// # Safety
+///
+/// The caller must ensure the range is mapped, writable, and not used by
+/// anything else for the lifetime of the kernel -- in particular that it does
+/// not overlap the loaded image, the page tables, or any stack. The heap takes
+/// ownership and will hand the bytes out to arbitrary callers.
+#[cfg(not(test))]
+pub unsafe fn heap_add_region(start: usize, size: usize) {
+    unsafe { heap::KVM_ALLOCATOR.fill_pages(start, size) };
 }
 
 impl HostInterface for HostKvmInterface {
@@ -47,12 +138,21 @@ impl HostInterface for HostKvmInterface {
         serial_print_string(msg);
     }
 
+    /// The buddy allocator's rescue hook, called only once the heap is empty.
+    ///
+    /// There is nothing to do. On LVBS this would be a request to VTL0; here
+    /// LiteBox is the kernel and every byte of RAM the PVH memory map
+    /// described was handed to the heap at boot. Returning `None` reports
+    /// genuine exhaustion, which is the truth, rather than `panic!`-ing on a
+    /// path that a caller may be prepared to handle.
     fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        unimplemented!("KVM host allocator lands in Phase 2")
+        None
     }
 
+    /// Unreachable: [`Self::alloc`] never hands out a region, so nothing can
+    /// be given back.
     unsafe fn free(_addr: usize) {
-        unimplemented!("KVM host allocator lands in Phase 2")
+        unreachable!("nothing was ever obtained from a host to return")
     }
 
     fn exit() -> ! {

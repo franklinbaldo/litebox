@@ -13,6 +13,10 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod memmap;
+
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
@@ -132,6 +136,39 @@ pub fn hvm_start_info_addr() -> u64 {
     // thereafter; no other CPU has been started, so there is no concurrency.
     // The high-canonical alias used here is mapped by the early page tables.
     unsafe { (slot as *const u64).read() }
+}
+
+/// Physical address of `_heap_start`: one page past the end of everything the
+/// linker script places, which is the image followed by the boot scratch
+/// region.
+///
+/// Nothing below this is ever offered to the heap. The single bound covers
+/// `.text`, `.data`, `.bss`, `.rela.dyn`, the early page tables, the GDT, the
+/// saved `hvm_start_info` pointer and the boot stack, because the linker
+/// script puts `_heap_start` above all of them.
+///
+/// The symbol's address is taken with a RIP-relative `lea` rather than by
+/// reading a static, for the same reason [`apply_relocations`] does: it must
+/// not depend on an absolute address. The result is the high-canonical VA, so
+/// subtracting [`KERNEL_OFFSET`] recovers the PA. That subtraction is exact
+/// because the image's load bias *is* `KERNEL_OFFSET` -- the linker script
+/// starts at `. = 0x0`, so link-time addresses are physical addresses.
+pub fn heap_start_pa() -> u64 {
+    unsafe extern "C" {
+        static _heap_start: u8;
+    }
+
+    let va: u64;
+    // SAFETY: `lea` with a RIP-relative operand only computes an address into
+    // a register; it reads no memory and touches no flags.
+    unsafe {
+        core::arch::asm!(
+            "lea {}, [rip + _heap_start]",
+            out(reg) va,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    va - KERNEL_OFFSET
 }
 
 // ---------------------------------------------------------------------------
@@ -344,38 +381,6 @@ _start:
 );
 
 // ---------------------------------------------------------------------------
-// Global allocator placeholder.
-//
-// Depending on `litebox_platform_lvbs` pulls in `alloc`, and rustc then
-// demands a `#[global_allocator]` at link time. Under `host_lvbs` the platform
-// crate supplies one (`host/lvbs_impl.rs`); under `host_kvm` it deliberately
-// does not, because the KVM heap needs the PVH memory map, which Task 6 parses.
-//
-// So this is a placeholder that cannot silently paper over the gap: every
-// entry point panics. Nothing on the Task 3 path allocates, so it is never
-// reached. TASK 6 MUST REPLACE THIS with the real `SafeZoneAllocator` wired to
-// the PVH memory map.
-// ---------------------------------------------------------------------------
-
-/// Placeholder allocator: panics on any use. See the module comment above.
-struct NoAllocatorYet;
-
-// SAFETY: Every method diverges, so the trait's contract about returned
-// pointers is vacuously upheld -- nothing is ever returned.
-unsafe impl core::alloc::GlobalAlloc for NoAllocatorYet {
-    unsafe fn alloc(&self, _layout: core::alloc::Layout) -> *mut u8 {
-        panic!("heap allocation before the KVM allocator exists (Task 6)")
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
-        panic!("heap deallocation before the KVM allocator exists (Task 6)")
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: NoAllocatorYet = NoAllocatorYet;
-
-// ---------------------------------------------------------------------------
 // Relocation.
 //
 // The target links `--pie` (`relocation-model: "pie"` in x86_64_kvm.json), so
@@ -579,7 +584,10 @@ extern "C" fn kvm_long_mode_entry() -> ! {
     // Statics are now trustworthy, so the logger -- itself reached through a
     // `&'static` -- can be installed.
     let _ = log::set_logger(&HOST_LOGGER);
-    log::set_max_level(log::LevelFilter::Trace);
+    // Debug rather than Trace: slabmalloc logs every single slab allocation
+    // and deallocation at Trace, which buries the boot log once the heap is
+    // up. Raise this to Trace when debugging the allocator itself.
+    log::set_max_level(log::LevelFilter::Debug);
 
     log::info!("litebox_runner_kvm: long mode, relocations applied");
     log::info!("load bias  {load_bias:#018X}");
@@ -617,6 +625,11 @@ extern "C" fn kvm_long_mode_entry() -> ! {
 
     check_clock();
     check_crng();
+
+    // The heap. Everything after this point may allocate; nothing before it
+    // may.
+    let usable = memmap::init_heap_from_pvh(hvm_start_info_addr());
+    check_heap(usable);
 
     halt();
 }
@@ -734,6 +747,166 @@ fn check_crng() {
 
     assert_ne!(first, second, "CRNG returned the same block twice");
     assert!(first != [0u8; 32], "CRNG returned all zeroes");
+}
+
+// ---------------------------------------------------------------------------
+// Heap checks.
+//
+// "It did not panic" is not evidence that an allocator works. An allocator
+// that hands out the same block twice, or memory it does not own, or that
+// leaks every block, all survive a single `Box::new`. So each check below is
+// chosen to fail loudly on a specific way of being wrong.
+// ---------------------------------------------------------------------------
+
+/// Elements pushed into the growth-test `Vec`. `Vec` doubles from a capacity
+/// of 4, so this forces ten reallocations, crossing from the slab into the
+/// buddy allocator on the way.
+const HEAP_VEC_ELEMS: u64 = 4096;
+
+/// Size of the oversized allocation. Larger than the slab's 2 MiB backing
+/// page, so it cannot be served from a slab at all and must come straight
+/// from the buddy allocator.
+const HEAP_BIG_BYTES: usize = 3 * 1024 * 1024;
+
+/// Size of the large-object allocation. `ZoneAllocator::MAX_BASE_ALLOC_SIZE`
+/// is 256 bytes and `MAX_ALLOC_SIZE` is 128 KiB, so 64 KiB lands in the
+/// large-object slab, whose refill path allocates a 2 MiB `LargeObjectPage`
+/// from the buddy allocator.
+const HEAP_LARGE_BYTES: usize = 64 * 1024;
+
+/// Exercises the heap and prints enough to tell a working allocator from a
+/// plausible-looking broken one.
+fn check_heap(usable_bytes: u64) {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    // 1. Growth. Repeated reallocation is what shakes out an allocator that
+    //    mishandles copy-and-free, and the checksum catches one that returns
+    //    overlapping blocks: a `Vec` whose backing store was aliased would
+    //    come back with the wrong sum, not merely the wrong length.
+    let mut v: Vec<u64> = Vec::new();
+    let mut caps = 0_u32;
+    let mut last_cap = 0;
+    for i in 0..HEAP_VEC_ELEMS {
+        v.push(i.wrapping_mul(2_654_435_761));
+        if v.capacity() != last_cap {
+            last_cap = v.capacity();
+            caps += 1;
+        }
+    }
+    let checksum = v.iter().fold(0_u64, |a, x| a.rotate_left(7) ^ x);
+    let expected = (0..HEAP_VEC_ELEMS).fold(0_u64, |a, i| {
+        a.rotate_left(7) ^ i.wrapping_mul(2_654_435_761)
+    });
+    log::info!(
+        "heap vec   len {} cap {} after {caps} reallocations, checksum {checksum:#018X}",
+        v.len(),
+        v.capacity()
+    );
+    assert_eq!(v.len() as u64, HEAP_VEC_ELEMS, "Vec lost elements");
+    assert_eq!(checksum, expected, "Vec contents were corrupted");
+    assert!(caps > 1, "Vec never reallocated; the test proved nothing");
+    drop(v);
+
+    // 2. The page path, both ways in.
+    //
+    //    A 64 KiB block exceeds the slab's 256-byte base class, so the zone
+    //    allocator refills from a 2 MiB `LargeObjectPage` taken from the
+    //    buddy allocator -- the case the LVBS comment warns needs >= 2 MB of
+    //    backing. A 3 MiB block exceeds the slab's maximum outright and comes
+    //    from the buddy allocator directly.
+    //
+    //    Both are written end to end and read back, because an allocator that
+    //    returns a pointer to memory it does not actually own will happily
+    //    return the pointer and only misbehave when the bytes are touched.
+    let mut large: Vec<u8> = Vec::with_capacity(HEAP_LARGE_BYTES);
+    large.resize(HEAP_LARGE_BYTES, 0xA5);
+    large[0] = 0x11;
+    large[HEAP_LARGE_BYTES - 1] = 0x22;
+    log::info!(
+        "heap large {HEAP_LARGE_BYTES} B at {:#018X}, ends {:#04X}/{:#04X}",
+        large.as_ptr() as u64,
+        large[0],
+        large[HEAP_LARGE_BYTES - 1]
+    );
+    assert!(
+        large[1..HEAP_LARGE_BYTES - 1].iter().all(|&b| b == 0xA5),
+        "large-object slab allocation did not survive being written"
+    );
+    drop(large);
+
+    let mut big: Vec<u8> = Vec::with_capacity(HEAP_BIG_BYTES);
+    big.resize(HEAP_BIG_BYTES, 0x5A);
+    big[0] = 0x33;
+    big[HEAP_BIG_BYTES - 1] = 0x44;
+    let big_ptr = big.as_ptr() as u64;
+    log::info!(
+        "heap big   {HEAP_BIG_BYTES} B at {big_ptr:#018X}, ends {:#04X}/{:#04X}",
+        big[0],
+        big[HEAP_BIG_BYTES - 1]
+    );
+    assert!(
+        big[1..HEAP_BIG_BYTES - 1].iter().all(|&b| b == 0x5A),
+        "buddy allocation did not survive being written"
+    );
+
+    // 3. Reuse. Free the 3 MiB block and ask for another the same size. If
+    //    the buddy allocator is merely bumping a pointer and leaking, the
+    //    second address differs -- and 512 MiB of RAM would let that go
+    //    unnoticed for a long time. Getting the same address back is direct
+    //    evidence the free path works.
+    drop(big);
+    let again: Vec<u8> = Vec::with_capacity(HEAP_BIG_BYTES);
+    let again_ptr = again.as_ptr() as u64;
+    log::info!(
+        "heap reuse freed {big_ptr:#018X}, reallocated {again_ptr:#018X} -- {}",
+        if again_ptr == big_ptr {
+            "same block, memory is reused"
+        } else {
+            "DIFFERENT block, memory was leaked"
+        }
+    );
+    assert_eq!(
+        again_ptr, big_ptr,
+        "freed memory was not reused; the buddy allocator is leaking"
+    );
+    drop(again);
+
+    // 4. Provenance. A `Box` is the smallest allocation there is, so it comes
+    //    from the slab -- a different path from everything above. Its address
+    //    must be high-canonical (we run in the `KERNEL_OFFSET` alias, so a low
+    //    or non-canonical pointer means the region was added with a physical
+    //    address by mistake) and must lie above `_heap_start` and below the
+    //    1 GiB mapping limit, which is the tightest bound the exclusion set
+    //    guarantees.
+    let boxed = Box::new(0xDEAD_BEEF_u64);
+    let addr = (&raw const *boxed) as u64;
+    let pa = addr.wrapping_sub(KERNEL_OFFSET);
+    log::info!(
+        "heap box   va {addr:#018X} -> pa {pa:#014X}, value {:#X}",
+        *boxed
+    );
+    assert!(
+        addr >= KERNEL_OFFSET,
+        "heap pointer {addr:#018X} is not in the high-canonical kernel alias"
+    );
+    assert!(
+        pa >= heap_start_pa(),
+        "heap pointer pa {pa:#014X} is below _heap_start ({:#014X}): the \
+         allocator is handing out the image or the boot scratch region",
+        heap_start_pa()
+    );
+    assert!(
+        pa < memmap::MAPPED_LIMIT,
+        "heap pointer pa {pa:#014X} is outside the mapped low 1 GiB"
+    );
+    assert_eq!(*boxed, 0xDEAD_BEEF, "Box contents were corrupted");
+    drop(boxed);
+
+    log::info!(
+        "heap ok    all four checks passed against {} MiB usable",
+        usable_bytes / (1024 * 1024)
+    );
 }
 
 /// Formats a byte slice as lower-case hex without allocating.
