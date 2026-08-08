@@ -29,26 +29,30 @@ Resist refactoring urges — they defeat the verification gates below.
 
 Two gates. Learn both; every task names which one applies.
 
-**Gate A — byte-identical build (for pure code moves).**
-The bare-metal build is byte-reproducible. If a task is a pure move, the output hash
-must not change.
+**Gate A — `.text` byte-identity (for pure code moves).**
+The bare-metal build is reproducible. If a task is a pure move, the emitted
+instructions must not change.
+
+Compare **`.text` only, never the whole ELF.** Debug builds embed
+`#[track_caller]` `core::panic::Location` records in `.data`, so changing the
+line *count* of any file shifts those `u32` line numbers without altering a
+single instruction. Whole-ELF hashing therefore reports false failures on
+essentially every edit. (Measured: Task 1 shifts exactly 4 bytes in `.data` —
+`47→48`, `54→55`, and `77→75` twice — with `.text` bit-identical.)
 
 ```bash
-cd /workspace/litebox-kvm/.worktrees/kvm-seams
-cargo +nightly-2025-12-31 build \
-  -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc \
-  --manifest-path=litebox_runner_lvbs/Cargo.toml \
-  --target litebox_runner_lvbs/x86_64_vtl1.json
-sha256sum target/x86_64_vtl1/debug/litebox_runner_lvbs
+BIN=target/x86_64_vtl1/debug/litebox_runner_lvbs
+objcopy -O binary --only-section=.text "$BIN" /tmp/check.text
+sha256sum /tmp/check.text
 ```
 
-Baseline hash (recorded at `655833c8`):
+Baseline `.text` hash (recorded at `655833c8`):
 ```
-54a7272f9ee857ce8972cde4494023fc8027be850f928252142bac84620f929a
+293dc2d00ea51d892d5e31d07fe22f5a2a101ef8aa2ec2ef1b191bae173b64ad
 ```
 
 **Gate B — builds and tests pass (for restructuring tasks).**
-Same build command must succeed, plus:
+The bare-metal build must succeed, plus:
 
 ```bash
 cargo test -p litebox_platform_lvbs
@@ -58,6 +62,9 @@ Expected: `15 passed; 0 failed; 4 ignored`.
 Note the host test suite is a *weak* gate — much mshv-coupled code is `#[cfg(not(test))]`
 and never compiled during `cargo test`. The bare-metal build is the load-bearing check.
 
+Gate A does not apply from Task 4 onward: introducing `cfg` attributes legitimately
+perturbs codegen. Those tasks use Gate B.
+
 Save yourself typing:
 
 ```bash
@@ -65,11 +72,13 @@ cat > /tmp/lvbs-check.sh <<'EOF'
 #!/bin/sh
 set -e
 cd /workspace/litebox-kvm/.worktrees/kvm-seams
+BIN=target/x86_64_vtl1/debug/litebox_runner_lvbs
 cargo +nightly-2025-12-31 build -Z build-std-features=compiler-builtins-mem \
   -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml \
-  --target litebox_runner_lvbs/x86_64_vtl1.json
-sha256sum target/x86_64_vtl1/debug/litebox_runner_lvbs
-cargo test -p litebox_platform_lvbs 2>&1 | grep "^test result"
+  --target litebox_runner_lvbs/x86_64_vtl1.json 2>&1 | tail -2
+objcopy -O binary --only-section=.text "$BIN" /tmp/check.text
+printf '.text  '; sha256sum /tmp/check.text | cut -d' ' -f1
+cargo test -p litebox_platform_lvbs 2>&1 | grep "^test result" | head -1
 EOF
 chmod +x /tmp/lvbs-check.sh
 ```
@@ -153,7 +162,7 @@ use crate::mm::layout::PAGE_SIZE;
 
 Run `/tmp/lvbs-check.sh`.
 
-Expected hash: `54a7272f9ee857ce8972cde4494023fc8027be850f928252142bac84620f929a`
+Expected `.text` hash: `293dc2d00ea51d892d5e31d07fe22f5a2a101ef8aa2ec2ef1b191bae173b64ad`
 Expected tests: `15 passed; 0 failed; 4 ignored`
 
 If the hash differs, you changed behaviour. Stop and find out why before continuing.
@@ -220,7 +229,7 @@ compile_error!(
 **Step 3: Verify with Gate A**
 
 Run `/tmp/lvbs-check.sh`. The default feature set is unchanged in effect, so the hash
-must still be `54a7272f9ee857ce8972cde4494023fc8027be850f928252142bac84620f929a`.
+must still be `293dc2d00ea51d892d5e31d07fe22f5a2a101ef8aa2ec2ef1b191bae173b64ad`.
 
 **Step 4: Verify the guard rail actually fires**
 
@@ -347,7 +356,7 @@ impl HostInterface for HostKvmInterface {
 
 **Step 3: Verify with Gate A**
 
-Run `/tmp/lvbs-check.sh`. `host_kvm` is off by default, so the hash must be unchanged.
+Run `/tmp/lvbs-check.sh`. `host_kvm` is off by default, so the `.text` hash must be unchanged.
 
 **Step 4: Commit**
 
@@ -387,9 +396,9 @@ assembly in place (it is harmless and unreferenced) rather than trying to `cfg` 
 
 **Step 5: Verify with Gate B**
 
-Run `/tmp/lvbs-check.sh`. This task changes cfg structure, so the hash *may* shift —
+Run `/tmp/lvbs-check.sh`. This task changes cfg structure, so the `.text` hash *may* shift —
 that is acceptable here, but the build must succeed and tests must stay at
-`15 passed; 0 failed`. If the hash is unchanged, better still.
+`15 passed; 0 failed`. If `.text` is unchanged, better still.
 
 **Step 6: Commit**
 
