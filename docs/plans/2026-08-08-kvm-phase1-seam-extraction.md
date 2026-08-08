@@ -458,6 +458,70 @@ git commit -am "Gate mshv module, hypercall page and Hyper-V SINT vector behind 
 
 ---
 
+### Task 4b: Finish the Task 1 constant hoist (discovered during execution)
+
+`host/bootparam.rs:4` still imports `PAGE_SIZE` from `mshv::vtl1_mem_layout`. Task 1
+repointed `mm/pgtable.rs` and `mm/vmap.rs` but missed this third consumer, because the
+original grep only covered `src/mm/`.
+
+**Files:** Modify `litebox_platform_lvbs/src/host/bootparam.rs:4`
+
+Change `use crate::mshv::vtl1_mem_layout::PAGE_SIZE;` to `use crate::mm::layout::PAGE_SIZE;`.
+It is used only for alignment checks at lines 31 and 33.
+
+Verify with Gate A' + Gate B, then commit.
+
+Before committing, re-grep for any other stragglers:
+```bash
+grep -rn "vtl1_mem_layout::\(PAGE_SIZE\|PAGE_SHIFT\|PTES_PER_PAGE\)" litebox_platform_lvbs/src --include=*.rs | grep -v "^litebox_platform_lvbs/src/mshv/"
+```
+Expected after the fix: no output.
+
+---
+
+### Task 4c: Split Hyper-V state out of `PerCpuVariables` (seam 10, discovered during execution)
+
+**This seam was missed by the original analysis.** `host/per_cpu_variables.rs` does not
+merely call into `mshv`; it embeds Hyper-V types in a struct that generic kernel code
+(GDT, TLS, kernel/exception/double-fault stacks, `MAX_CORES`) depends on.
+
+Two facts make it tractable:
+1. Every *external* consumer of the Hyper-V fields lives inside `src/mshv/`, which is
+   already gated as of Task 4. The blast radius is this one file.
+2. All assembly offsets are computed with `offset_of!` (see `PerCpuVariablesAsm::*_offset()`,
+   lines 357-380), so removing fields adjusts them automatically. There are no
+   hand-maintained offset constants to resynchronise.
+
+**Files:** Modify `litebox_platform_lvbs/src/host/per_cpu_variables.rs`
+
+**Step 1** — gate the import block at lines 6-12 so only `PAGE_SIZE` (now from
+`crate::mm::layout`) and the `arch` imports remain under `host_kvm`.
+
+**Step 2** — put `#[cfg(feature = "host_lvbs")]` on these `PerCpuVariables` fields:
+`hv_vp_assist_page`, `hv_simp_page`, `hvcall_input`, `hvcall_output` (lines 42-45),
+`vtl0_state` (51), `vtl0_locked_regs` (52), `vp_index` (58).
+
+**Step 3** — gate the four `offset_of!` page-alignment assertions at lines 71-74; they
+reference fields that no longer exist under `host_kvm`.
+
+**Step 4** — gate `PerCpuVariablesAsm::vtl_return_addr` and its
+`vtl_return_addr_offset()` accessor. Check whether `vtl0_state_top_addr` is also
+VTL-only; if the VTL-switch assembly is its only consumer, gate it too.
+
+**Step 5** — gate any `impl` methods that touch the gated fields (e.g. a `vp_index()`
+accessor doing `rdmsr(HV_REGISTER_VP_INDEX)`). Find them:
+```bash
+grep -n "hv_vp_assist_page\|hv_simp_page\|hvcall_input\|hvcall_output\|vtl0_state\|vtl0_locked_regs\|vp_index\|vtl_return_addr" litebox_platform_lvbs/src/host/per_cpu_variables.rs
+```
+
+**Step 6** — verify with Gate A' + Gate B. Gate A' is especially load-bearing here:
+this task changes a struct layout, so if any LVBS symbol changes size, you have
+altered the LVBS build and must stop.
+
+**Step 7** — commit as `Split Hyper-V state out of PerCpuVariables under host_kvm`.
+
+---
+
 ### Task 5: Neutralise VSM page protection (seams 3 and 4)
 
 Under KVM there is no VTL0 peer, so there is nothing to protect pages *from*. These
