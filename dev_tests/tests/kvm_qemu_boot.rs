@@ -26,6 +26,23 @@
 //! QEMU's `isa-debug-exit` turns a written value `v` into process status
 //! `(v << 1) | 1`. The runner writes `0x10` on success (33) and `0x20` on
 //! failure (65). `timeout(1)` reports 124 if the guest hangs.
+//!
+//! # The two guest paths, and why the tests reach them differently
+//!
+//! The runner has two ways of running a TA, and both are covered here:
+//!
+//! * *No virtio device on the QEMU line*: the runner logs `no virtio device`
+//!   and runs `ta::run()`, its embedded, hard-coded sequence. That is still
+//!   the default, and `boots_and_runs_the_ta` /
+//!   `a_panicking_guest_reports_failure` drive it by building the QEMU command
+//!   line here, directly, with no device.
+//! * *A virtio-serial device present*: the runner hands the channel to
+//!   `ta::serve()` and does nothing until a host client tells it to. Driving
+//!   that needs a second process racing QEMU for a unix socket, so those tests
+//!   (`a_client_drives_the_ta_over_the_channel`,
+//!   `the_channel_rejects_a_command_without_a_session`) shell out to
+//!   `litebox_runner_kvm/scripts/run.sh -c` instead of reassembling that
+//!   orchestration. See `run_channel_session` for the full argument.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -170,8 +187,18 @@ fn assert_console_contains(console: &str, needle: &str) {
     );
 }
 
-/// The success path: the guest boots, loads `ldelf`, runs `hello-ta` in ring 3
-/// and exits with the success code.
+/// The success path *of the no-device configuration*: with no virtio device on
+/// the QEMU line the runner falls back to `ta::run()`, its embedded sequence,
+/// which boots, loads `ldelf`, runs `hello-ta` in ring 3 and exits with the
+/// success code.
+///
+/// That fallback is still the default and still the only path that needs no
+/// host-side peer, so it keeps its own test even now that the channel exists;
+/// `a_client_drives_the_ta_over_the_channel` covers `ta::serve()` alongside it.
+/// Note the QEMU line below deliberately has no `-device virtio-serial-pci`:
+/// adding one here would silently move this test onto the *other* path and
+/// leave the embedded sequence untested, which is what the `no virtio device`
+/// assertion below is there to prevent.
 ///
 /// The exit status alone would be far too weak a claim -- a guest that reached
 /// long mode and immediately wrote `0x10` would satisfy it -- so this also
@@ -183,6 +210,7 @@ fn boots_and_runs_the_ta() {
     let binary = build_runner(&root);
     let (status, console) = run_guest(&binary, "512M");
 
+    assert_console_contains(&console, "no virtio device");
     assert_console_contains(&console, "Hello World!");
     assert_console_contains(&console, "Goodbye!");
     assert_console_contains(&console, "TA CloseSession returned");
@@ -215,5 +243,223 @@ fn a_panicking_guest_reports_failure() {
     assert_eq!(
         status, EXIT_FAILURE,
         "expected the failure exit status.\n--- console ---\n{console}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The virtio message channel.
+// ---------------------------------------------------------------------------
+
+/// Wall-clock budget handed to `run.sh -t`, covering both the guest and the
+/// client's bounded connect retry. A whole channel session takes about ten
+/// seconds under TCG.
+const CHANNEL_TIMEOUT_SECS: &str = "90";
+
+/// Status `run.sh` exits with when the client reported a failure.
+///
+/// The script prefers the client's verdict to the guest's, because the client
+/// is the side that knows what went wrong with the exchange.
+const SCRIPT_CLIENT_FAILURE: i32 = 1;
+
+/// A private directory for one channel test's socket and command file.
+///
+/// Two things need to be unique per test. The unix socket, because two QEMUs
+/// binding the same path would collide; and the command file, because each
+/// test drives a different sequence. The `kvm-qemu` nextest group
+/// (`max-threads = 1`, see `.config/nextest.toml`) already serialises this
+/// binary, so uniqueness is belt and braces -- but it is cheap, and it means a
+/// developer running two `cargo test` invocations side by side, or a future
+/// edit to that group, cannot produce a confusing cross-test failure.
+fn scratch_dir(test_name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "litebox-kvm-channel-{test_name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("cannot create {}: {e}", dir.display()));
+    dir
+}
+
+/// Fail loudly and early if `python3` is missing, rather than inside QEMU.
+///
+/// `run.sh` also checks, but only after it has built and while its message is
+/// competing with a guest's serial log for attention. Checking here means the
+/// test's *first* line of output says what is wrong.
+fn require_python3() {
+    let found = Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    assert!(
+        found,
+        "`python3` is required: the channel tests drive the guest with \
+         litebox_runner_kvm/scripts/client.py, which is the only host-side \
+         implementation of the wire protocol. Install python3 (it is \
+         preinstalled on GitHub-hosted runners) or skip these tests.",
+    );
+}
+
+/// Drive one channel session with `commands`; return `(exit status, output)`.
+///
+/// # Why this shells out to `scripts/run.sh` and `scripts/client.py`
+///
+/// The channel needs three things the other tests do not: a virtio-serial
+/// device and unix-socket chardev on the QEMU line, a second process speaking
+/// the protocol, and a bounded retry because QEMU is the socket *server* and
+/// the client necessarily races its creation. `run.sh -c` already does all
+/// three. Reimplementing the protocol in Rust here was the alternative and was
+/// rejected twice over: it would be a second encoder/decoder to keep in step
+/// with `src/proto.rs` by hand, and -- worse -- it would leave `run.sh` and
+/// `client.py`, the path every developer actually uses, with no test at all,
+/// free to rot until someone tried them. Shelling out means the tested path
+/// and the developer path are the same path.
+///
+/// The cost is the `python3` dependency, which `require_python3` turns into a
+/// clear assertion rather than a mysterious one.
+///
+/// `-s` skips the script's own build: the caller has already built through
+/// `build_runner`, which is the function that owns the "never run a stale
+/// binary" guarantee. Letting the script rebuild would be harmless but would
+/// put a second, differently-spelled build command in the freshness story.
+///
+/// The outer `timeout` is a backstop. `run.sh -t` bounds the guest and the
+/// client individually, so this should never be what fires; if it does, the
+/// script's own bounding is broken, and 124 says so distinctly instead of
+/// hanging the job.
+fn run_channel_session(root: &Path, name: &str, commands: &str) -> (i32, String) {
+    require_python3();
+    let binary = build_runner(root);
+    assert!(binary.is_file(), "{} vanished", binary.display());
+
+    let dir = scratch_dir(name);
+    let socket = dir.join("optee.sock");
+    let command_file = dir.join("commands.json");
+    std::fs::write(&command_file, commands)
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", command_file.display()));
+
+    let script = root.join("litebox_runner_kvm/scripts/run.sh");
+    assert!(script.is_file(), "{} does not exist", script.display());
+
+    let output = Command::new("timeout")
+        .current_dir(root)
+        .args([
+            "--foreground",
+            "--kill-after=10",
+            GUEST_TIMEOUT_SECS,
+            script.to_str().expect("script path must be UTF-8"),
+            "-s",
+            "-t",
+            CHANNEL_TIMEOUT_SECS,
+            "-c",
+            command_file.to_str().expect("command path must be UTF-8"),
+            "-S",
+            socket.to_str().expect("socket path must be UTF-8"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to spawn `timeout`/`run.sh`; is QEMU installed?");
+
+    let mut console = String::from_utf8_lossy(&output.stdout).into_owned();
+    console.push_str(&String::from_utf8_lossy(&output.stderr));
+    let console = console.replace('\r', "");
+
+    let status = output
+        .status
+        .code()
+        .unwrap_or_else(|| panic!("run.sh was killed by a signal: {}", output.status));
+    assert_ne!(
+        status, EXIT_TIMEOUT,
+        "the channel session did not finish within {GUEST_TIMEOUT_SECS}s, so \
+         run.sh's own -t {CHANNEL_TIMEOUT_SECS} bound did not hold.\n\
+         --- output ---\n{console}",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    (status, console)
+}
+
+/// The channel success path: a host client opens a session, invokes two
+/// commands and closes it, and the TA's *own* arithmetic comes back.
+///
+/// `hello-ta` increments the first `value_inout` on command 0 and decrements
+/// it on command 1, so 100 comes back as 101 (`0x65`) and 200 as 199
+/// (`0xc7`). Those two numbers are the point of the test. An exit status, or
+/// even a `status=0` reply, would be satisfied by a runner that acknowledged
+/// the requests and ran nothing; `0x65` and `0xc7` can only appear if the
+/// request was decoded into `UteeParams`, the TA really executed in ring 3,
+/// and its *output* parameters were read back out of user memory and encoded
+/// into the reply. That is the whole channel, end to end.
+///
+/// The sequence is the same one `hello-ta-cmds.json` holds for the userland
+/// runner, restated inline rather than read from that crate: the assertions
+/// below hard-code the results of 100 and 200, so a test that loaded its
+/// inputs from a file somebody else owns could quietly start checking
+/// arithmetic on numbers that are no longer the ones it was given.
+#[test]
+fn a_client_drives_the_ta_over_the_channel() {
+    let root = repo_root();
+    let commands = r#"[
+      { "func_id": "open_session", "client_identity": { "login": "user" } },
+      { "func_id": "invoke_command", "cmd_id": 0,
+        "args": [ { "param_type": "value_inout", "value_a": 100, "value_b": 0 } ] },
+      { "func_id": "invoke_command", "cmd_id": 1,
+        "args": [ { "param_type": "value_inout", "value_a": 200, "value_b": 0 } ] },
+      { "func_id": "close_session" }
+    ]"#;
+    let (status, console) = run_channel_session(&root, "drives-the-ta", commands);
+
+    // The guest took the channel path, not the embedded fallback.
+    assert_console_contains(&console, "channel    serving requests");
+    // The TA's own results, read back out of ring 3.
+    assert_console_contains(&console, "[0] value_inout value_a=0x65");
+    assert_console_contains(&console, "[0] value_inout value_a=0xc7");
+    // The client, and then the guest, both got all the way to the end.
+    assert_console_contains(&console, "[client] sequence completed");
+    assert_console_contains(&console, "Guest completed successfully");
+    assert_eq!(
+        status, 0,
+        "expected run.sh to report success.\n--- output ---\n{console}",
+    );
+}
+
+/// The channel failure path: a request that arrives out of order is refused,
+/// cleanly and immediately.
+///
+/// Without this, `a_client_drives_the_ta_over_the_channel` only proves the
+/// runner *can* answer `status=0`; it says nothing about whether success is
+/// ever withheld, and a `serve()` loop that replied `status=0` to everything
+/// would pass it. `InvokeCommand` with no preceding `OpenSession` is the
+/// cheapest way to ask for something the runner must refuse.
+///
+/// "Cleanly" is the load-bearing word, and is why the exit status is checked
+/// too. The refusal must be a *reply* -- the runner keeps serving, the client
+/// gets a diagnosis, and both sides end in a few seconds. A guest that
+/// panicked, or one that dropped the frame and left the client blocked on a
+/// read until the deadline, would also "not succeed", and neither is
+/// acceptable. Those outcomes stay distinguishable: a panic exits 65 through
+/// the guest branch of `run.sh` rather than 1 through the client branch, and a
+/// hang trips `EXIT_TIMEOUT` in `run_channel_session` with a message that says
+/// which bound failed.
+#[test]
+fn the_channel_rejects_a_command_without_a_session() {
+    let root = repo_root();
+    let commands = r#"[
+      { "func_id": "invoke_command", "cmd_id": 0,
+        "args": [ { "param_type": "value_inout", "value_a": 100, "value_b": 0 } ] }
+    ]"#;
+    let (status, console) = run_channel_session(&root, "no-session", commands);
+
+    // The runner rejected it, and said why, in a reply rather than by dying.
+    assert_console_contains(&console, "channel    response error: no session is open");
+    assert_console_contains(&console, "[client] <- status=1");
+    assert_console_contains(&console, "[client] FAILED: InvokeCommand failed");
+    // It really did refuse: the TA never ran.
+    assert!(
+        !console.contains("value_inout value_a=0x65"),
+        "the TA ran despite there being no session.\n--- output ---\n{console}",
+    );
+    assert_eq!(
+        status, SCRIPT_CLIENT_FAILURE,
+        "expected run.sh to report the client's failure.\n--- output ---\n{console}",
     );
 }
