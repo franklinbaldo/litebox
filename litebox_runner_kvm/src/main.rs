@@ -3,15 +3,17 @@
 
 //! LiteBox runner for a KVM/QEMU guest.
 //!
-//! Booted via the PVH boot protocol: QEMU's `-kernel` finds an
-//! `XEN_ELFNOTE_PHYS32_ENTRY` note in this ELF and enters [`_start`] in 32-bit
-//! protected mode with paging off, A20 on, a flat GDT, and `%ebx` pointing at
-//! an `hvm_start_info` structure.
+//! This file is everything that happens *after* bootloading: the first 64-bit
+//! Rust entry point, the bring-up self-checks, platform initialisation and the
+//! panic handler. It is firmware-neutral throughout, and deliberately so --
+//! most runners in this repo begin here, and this one should differ only in
+//! having a boot path at all.
 //!
-//! The entry stub saves `%ebx`, builds early 2 MiB page tables, enters long
-//! mode, relocates execution into the high-canonical alias of the image, and
-//! calls into 64-bit Rust, which applies `.rela.dyn` before touching any
-//! pointer-bearing static and then brings up serial logging.
+//! The boot path itself lives in [`boot`]. [`boot`] documents precisely what
+//! state the machine is in by the time [`kvm_long_mode_entry`] is entered;
+//! [`boot::pvh`] is the one backend that implements it today, and BIOS and
+//! UEFI backends are meant to be additive to it rather than changes to this
+//! file.
 
 #![no_std]
 #![no_main]
@@ -32,39 +34,6 @@ use litebox_platform_lvbs::{Instant, serial_println};
 use litebox_platform_multiplex::Platform;
 
 use crate::boot::KERNEL_OFFSET;
-
-/// Physical address of `_heap_start`: one page past the end of everything the
-/// linker script places, which is the image followed by the boot scratch
-/// region.
-///
-/// Nothing below this is ever offered to the heap. The single bound covers
-/// `.text`, `.data`, `.bss`, `.rela.dyn`, the early page tables, the GDT, the
-/// saved `hvm_start_info` pointer and the boot stack, because the linker
-/// script puts `_heap_start` above all of them.
-///
-/// The symbol's address is taken with a RIP-relative `lea` rather than by
-/// reading a static, for the same reason [`boot::apply_relocations`] does: it must
-/// not depend on an absolute address. The result is the high-canonical VA, so
-/// subtracting [`KERNEL_OFFSET`] recovers the PA. That subtraction is exact
-/// because the image's load bias *is* `KERNEL_OFFSET` -- the linker script
-/// starts at `. = 0x0`, so link-time addresses are physical addresses.
-pub fn heap_start_pa() -> u64 {
-    unsafe extern "C" {
-        static _heap_start: u8;
-    }
-
-    let va: u64;
-    // SAFETY: `lea` with a RIP-relative operand only computes an address into
-    // a register; it reads no memory and touches no flags.
-    unsafe {
-        core::arch::asm!(
-            "lea {}, [rip + _heap_start]",
-            out(reg) va,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    va - KERNEL_OFFSET
-}
 
 // ---------------------------------------------------------------------------
 // Relocation probe.
@@ -164,7 +133,6 @@ pub(crate) extern "C" fn kvm_long_mode_entry() -> ! {
         core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nomem, nostack));
     }
     log::info!("rip        {rip:#018X}");
-    log::info!("start_info {:#018X}", boot::pvh::hvm_start_info_addr());
 
     // Relocation proof. `probe_before` is the raw word as the linker left it
     // in the image; `probe_after` is the same slot once `.rela.dyn` has been
@@ -212,9 +180,14 @@ pub(crate) extern "C" fn kvm_long_mode_entry() -> ! {
     litebox_platform_lvbs::arch::enable_fsgsbase();
     litebox_platform_lvbs::arch::enable_extended_states();
 
+    // Ask the active boot backend what the firmware said about memory. This
+    // is the last thing on the boot path that is firmware-specific; from here
+    // down, nothing in this file knows how we were booted.
+    let boot_info = boot::boot_info();
+
     // The heap. Everything after this point may allocate; nothing before it
     // may.
-    let ram = memmap::init_heap_from_pvh(boot::pvh::hvm_start_info_addr());
+    let ram = memmap::init_heap(&boot_info);
 
     allocate_per_cpu_variables();
     init_per_cpu_variables();
@@ -249,6 +222,7 @@ pub(crate) extern "C" fn kvm_long_mode_entry() -> ! {
             kernel_main = sym kernel_main,
             in("rdi") ram.usable_bytes,
             in("rsi") ram.ram_end_pa,
+            in("rdx") ram.mapped_limit,
             options(noreturn),
         );
     }
@@ -258,7 +232,7 @@ pub(crate) extern "C" fn kvm_long_mode_entry() -> ! {
 ///
 /// Reached only via the stack switch at the end of [`kvm_long_mode_entry`],
 /// with `%rsp` inside this core's `PerCpuVariables::kernel_stack`.
-extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
+extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! {
     // The XSAVE areas are allocated here rather than beside
     // `allocate_per_cpu_variables` for the reason the platform's own doc
     // comment gives: the CPUID queries and `avec!` allocations use more stack
@@ -309,7 +283,7 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64) -> ! {
     litebox_platform_lvbs::arch::enable_smep_smap();
 
     check_crng();
-    check_heap(usable);
+    check_heap(usable, mapped_limit);
     check_cpu_state();
     check_interrupts();
 
@@ -1365,7 +1339,7 @@ const HEAP_LARGE_BYTES: usize = 64 * 1024;
 
 /// Exercises the heap and prints enough to tell a working allocator from a
 /// plausible-looking broken one.
-fn check_heap(usable_bytes: u64) {
+fn check_heap(usable_bytes: u64, mapped_limit: u64) {
     use alloc::boxed::Box;
     use alloc::vec::Vec;
 
@@ -1507,8 +1481,8 @@ fn check_heap(usable_bytes: u64) {
     //    must be high-canonical (we run in the `KERNEL_OFFSET` alias, so a low
     //    or non-canonical pointer means the region was added with a physical
     //    address by mistake) and must lie above `_heap_start` and below the
-    //    1 GiB mapping limit, which is the tightest bound the exclusion set
-    //    guarantees.
+    //    backend's mapping limit, which is the tightest bound the exclusion
+    //    set guarantees.
     let boxed = Box::new(0xDEAD_BEEF_u64);
     let addr = (&raw const *boxed) as u64;
     let pa = addr.wrapping_sub(KERNEL_OFFSET);
@@ -1521,14 +1495,15 @@ fn check_heap(usable_bytes: u64) {
         "heap pointer {addr:#018X} is not in the high-canonical kernel alias"
     );
     assert!(
-        pa >= heap_start_pa(),
+        pa >= memmap::heap_start_pa(),
         "heap pointer pa {pa:#014X} is below _heap_start ({:#014X}): the \
          allocator is handing out the image or the boot scratch region",
-        heap_start_pa()
+        memmap::heap_start_pa()
     );
     assert!(
-        pa < memmap::MAPPED_LIMIT,
-        "heap pointer pa {pa:#014X} is outside the mapped low 1 GiB"
+        pa < mapped_limit,
+        "heap pointer pa {pa:#014X} is outside the {mapped_limit:#014X} bytes \
+         of physical memory the boot backend mapped"
     );
     assert_eq!(*boxed, 0xDEAD_BEEF, "Box contents were corrupted");
     drop(boxed);

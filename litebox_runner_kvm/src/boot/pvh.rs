@@ -10,7 +10,8 @@
 //!
 //! This module is everything that is specific to that: the note, the fixed
 //! entry address, the 32-bit stub, the early 2 MiB page tables, the 32-to-64
-//! trampoline, and the saved pointer to `hvm_start_info`.
+//! trampoline, and the parsing of `hvm_start_info` into a firmware-neutral
+//! [`BootInfo`].
 //!
 //! None of it is universal. BIOS would need its own stub and its own e820
 //! parsing; UEFI hands over 64-bit long mode with paging already enabled and
@@ -19,11 +20,11 @@
 //!
 //! Everything here that reads guest memory does so through the high-canonical
 //! alias (`VA = PA + KERNEL_OFFSET`) that the stub installs, which covers the
-//! low 1 GiB and nothing else.
+//! low 1 GiB and nothing else -- see [`MAPPED_LIMIT`].
 
 use core::arch::global_asm;
 
-use super::KERNEL_OFFSET;
+use super::{BootInfo, KERNEL_OFFSET, MAX_FIRMWARE_RESERVED, MAX_RAM_REGIONS, Range};
 
 /// Physical address of [`_start`].
 ///
@@ -127,10 +128,10 @@ static PVH_NOTE: PvhNote = PvhNote {
 ///
 /// `%ebx` is the only pointer to that structure and is trivially clobbered, so
 /// the entry stub stores it in the scratch region before touching any other
-/// register. The memory map reader consumes this.
+/// register. [`boot_info`] consumes this.
 ///
 /// Returns zero if the hypervisor passed a null `%ebx`.
-pub fn hvm_start_info_addr() -> u64 {
+fn hvm_start_info_addr() -> u64 {
     let slot = u64::from(BOOT_SCRATCH_BASE + OFF_HVM_START_INFO) + KERNEL_OFFSET;
     // SAFETY: The slot is inside the linker-reserved boot scratch region, so
     // nothing else owns it. It is naturally aligned, is written exactly once
@@ -370,4 +371,347 @@ pub(super) fn boot_stack_range() -> (u64, u64) {
 /// Reported through [`super::image_limit_pa`].
 pub(super) fn image_limit_pa() -> u64 {
     u64::from(BOOT_SCRATCH_BASE)
+}
+
+// ---------------------------------------------------------------------------
+// The `hvm_start_info` wire format, and reading it.
+//
+// Field order and offsets are fixed by the PVH boot specification
+// (`xen/include/public/arch-x86/hvm/start_info.h`). These are wire formats, so
+// they are `#[repr(C)]` and must not be reordered.
+// ---------------------------------------------------------------------------
+
+/// `hvm_start_info.magic`: "xEn3" little-endian.
+const HVM_START_MAGIC_VALUE: u32 = 0x336e_c578;
+
+/// `hvm_memmap_table_entry.type_` for usable RAM. Mirrors the E820 encoding.
+const HVM_MEMMAP_TYPE_RAM: u32 = 1;
+
+/// The `memmap_paddr`/`memmap_entries` fields exist from version 1.
+const HVM_START_INFO_MEMMAP_VERSION: u32 = 1;
+
+/// One past the highest physical address the early page tables map.
+///
+/// The stub above builds a single PD of [`PD_ENTRIES`] 2 MiB leaves, so
+/// exactly the low 1 GiB is addressable through the high-canonical alias.
+///
+/// This is the PVH backend's own value, used by [`read_phys`] while parsing --
+/// which happens before a [`BootInfo`](super::BootInfo) exists to carry it.
+/// It is also what this backend reports as
+/// [`BootInfo::mapped_limit`](super::BootInfo::mapped_limit), so consumers
+/// downstream never name it.
+pub const MAPPED_LIMIT: u64 = 1 << 30;
+
+/// The PVH boot information structure, version 1.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HvmStartInfo {
+    magic: u32,
+    version: u32,
+    flags: u32,
+    nr_modules: u32,
+    modlist_paddr: u64,
+    cmdline_paddr: u64,
+    rsdp_paddr: u64,
+    /// Present only when `version >= 1`.
+    memmap_paddr: u64,
+    /// Present only when `version >= 1`.
+    memmap_entries: u32,
+    reserved: u32,
+}
+
+/// One entry of the PVH memory map.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HvmMemmapTableEntry {
+    addr: u64,
+    size: u64,
+    type_: u32,
+    reserved: u32,
+}
+
+/// One entry of the PVH module list, pointed at by
+/// `HvmStartInfo::modlist_paddr`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HvmModlistEntry {
+    paddr: u64,
+    size: u64,
+    cmdline_paddr: u64,
+    reserved: u64,
+}
+
+/// Translates a physical address into the high-canonical alias the kernel runs
+/// in.
+const fn pa_to_va(pa: u64) -> u64 {
+    pa.wrapping_add(KERNEL_OFFSET)
+}
+
+/// Reads a `T` from physical address `pa` through the high-canonical alias.
+///
+/// # Panics
+///
+/// Panics if the object does not lie wholly within the mapped low 1 GiB.
+/// Faulting instead would be a silent triple fault, since there is no IDT.
+///
+/// # Safety
+///
+/// `pa` must name a `T` that the firmware actually placed there, correctly
+/// aligned. `read_unaligned` is used regardless, so only the "is it really a
+/// `T`" half of that is on the caller.
+unsafe fn read_phys<T>(pa: u64) -> T {
+    let end = pa
+        .checked_add(size_of::<T>() as u64)
+        .expect("physical address overflows");
+    assert!(
+        end <= MAPPED_LIMIT,
+        "physical read at {pa:#X}..{end:#X} is outside the mapped low 1 GiB; \
+         extend the early page tables before reading it"
+    );
+    // SAFETY: The range was just checked to lie inside the low 1 GiB, which
+    // the early page tables map read/write through `KERNEL_OFFSET`.
+    // `read_unaligned` imposes no alignment requirement of its own.
+    unsafe { (pa_to_va(pa) as *const T).read_unaligned() }
+}
+
+/// Reads and validates the `hvm_start_info` handed to us at boot.
+///
+/// # Panics
+///
+/// Panics if the magic does not match. A wrong pointer here would have us
+/// treat arbitrary memory as a memory map and then feed the results to the
+/// heap, so this must be fatal rather than best-effort.
+fn read_start_info(pa: u64) -> HvmStartInfo {
+    assert!(pa != 0, "PVH passed a null hvm_start_info pointer in %ebx");
+
+    // SAFETY: The address comes from `%ebx` as the PVH boot protocol defines
+    // it, saved by the entry stub before anything could clobber it.
+    // `read_phys` bounds-checks it against the mapping, and the magic check
+    // below rejects a structure that is not really one.
+    let info: HvmStartInfo = unsafe { read_phys(pa) };
+
+    assert!(
+        info.magic == HVM_START_MAGIC_VALUE,
+        "hvm_start_info at {:#X} has magic {:#010X}, expected {:#010X}",
+        pa,
+        info.magic,
+        HVM_START_MAGIC_VALUE
+    );
+    info
+}
+
+/// Reads memory map entry `index`.
+///
+/// # Safety
+///
+/// `info` must have been validated by [`read_start_info`], `info.version` must
+/// be at least [`HVM_START_INFO_MEMMAP_VERSION`], and `index` must be less
+/// than `info.memmap_entries`.
+unsafe fn read_memmap_entry(info: &HvmStartInfo, index: u32) -> HvmMemmapTableEntry {
+    let offset = u64::from(index) * size_of::<HvmMemmapTableEntry>() as u64;
+    // SAFETY: The table pointer is from a magic-validated `hvm_start_info`,
+    // and the caller guarantees `index` is in range. `read_phys` bounds-checks
+    // the resulting address against the mapping.
+    unsafe { read_phys(info.memmap_paddr.saturating_add(offset)) }
+}
+
+/// Longest command line this will scan for a terminator.
+///
+/// `cmdline_paddr` names a NUL-terminated string with no length field, so the
+/// only way to know how much to withhold is to find the NUL. A missing one
+/// must not turn into an unbounded walk over guest memory.
+const MAX_CMDLINE: u64 = 4096;
+
+/// Length in bytes of the NUL-terminated string at `pa`, including the NUL.
+///
+/// # Panics
+///
+/// Panics if no terminator appears within [`MAX_CMDLINE`] bytes: the string
+/// is then not one, and guessing how much memory to withhold on its behalf is
+/// exactly the kind of silent assumption this module exists to avoid.
+fn cstr_len(pa: u64) -> u64 {
+    for i in 0..MAX_CMDLINE {
+        // SAFETY: A `u8` is valid at any address, and `read_phys` bounds
+        // -checks each one against the mapped low 1 GiB before dereferencing.
+        let byte: u8 = unsafe { read_phys(pa.saturating_add(i)) };
+        if byte == 0 {
+            return i + 1;
+        }
+    }
+    panic!("string at {pa:#X} has no NUL in {MAX_CMDLINE} bytes; refusing to guess its extent");
+}
+
+/// Largest module count this will reason about.
+///
+/// Nothing we boot uses modules at all; the cap exists so that a bogus
+/// `nr_modules` becomes a loud assertion rather than an overrun of
+/// [`MAX_FIRMWARE_RESERVED`].
+const MAX_MODULES: u32 = 8;
+
+/// Parses the `hvm_start_info` handed to us at boot into a [`BootInfo`].
+///
+/// # What is withheld, and why
+///
+/// The reserved ranges reported here are the *firmware's own* structures, and
+/// nothing else. `crate::memmap` adds the firmware-neutral exclusions -- the
+/// first megabyte and the loaded image -- because those are facts about an x86
+/// PC and about our own link, not about PVH.
+///
+/// Each is named individually rather than merged, because the reason each one
+/// is here is the interesting part and a merged list cannot be reviewed.
+///
+/// # Panics
+///
+/// Panics if the `hvm_start_info` magic is wrong, if its version predates the
+/// memory map table, if it reports more modules than [`MAX_MODULES`], or if it
+/// reports more usable-RAM regions than [`MAX_RAM_REGIONS`]. Every one of these
+/// would otherwise end in the heap being handed memory that is not free.
+pub(super) fn boot_info() -> BootInfo {
+    let start_info_pa = hvm_start_info_addr();
+    log::info!("start_info {start_info_pa:#018X}");
+    let info = read_start_info(start_info_pa);
+
+    log::info!(
+        "start_info magic {:#010X} version {} flags {:#010X} nr_modules {}",
+        info.magic,
+        info.version,
+        info.flags,
+        info.nr_modules
+    );
+    log::info!(
+        "start_info cmdline {:#X} rsdp {:#X} modlist {:#X}",
+        info.cmdline_paddr,
+        info.rsdp_paddr,
+        info.modlist_paddr
+    );
+
+    assert!(
+        info.version >= HVM_START_INFO_MEMMAP_VERSION,
+        "hvm_start_info version {} predates the memory map table; there is no \
+         other description of guest RAM to fall back on",
+        info.version
+    );
+    log::info!(
+        "memmap     {} entries at pa {:#X}",
+        info.memmap_entries,
+        info.memmap_paddr
+    );
+
+    let mut reserved: arrayvec::ArrayVec<Range, MAX_FIRMWARE_RESERVED> = arrayvec::ArrayVec::new();
+
+    // 1. The `hvm_start_info` structure itself. Nothing reads it after boot,
+    //    but it costs one page to keep it intact and makes a post-mortem
+    //    possible.
+    reserved.push(Range {
+        start: start_info_pa,
+        end: start_info_pa.saturating_add(size_of::<HvmStartInfo>() as u64),
+    });
+
+    // 2. The memory map table. Same reasoning; also, it is read while deciding
+    //    what to accept, so it must survive the walk.
+    let bytes = u64::from(info.memmap_entries) * size_of::<HvmMemmapTableEntry>() as u64;
+    reserved.push(Range {
+        start: info.memmap_paddr,
+        end: info.memmap_paddr.saturating_add(bytes),
+    });
+
+    // 3. The kernel command line. QEMU happens to place it at 0x11C0, below
+    //    `_heap_start`, so the image range already covers it today -- but
+    //    nothing in the boot protocol promises that, and the day it moves above
+    //    the heap floor the heap would start writing free-list nodes over it.
+    //    Withhold it explicitly, measured to its terminator rather than
+    //    assumed.
+    if info.cmdline_paddr != 0 {
+        let len = cstr_len(info.cmdline_paddr);
+        reserved.push(Range {
+            start: info.cmdline_paddr,
+            end: info.cmdline_paddr.saturating_add(len),
+        });
+    }
+
+    // 4. The module list and every module image it names. QEMU's PVH loader
+    //    places an `-initrd` payload in RAM and reports it as *type 1*, so
+    //    without this the heap is handed the module image and writes into it
+    //    immediately.
+    assert!(
+        info.nr_modules <= MAX_MODULES,
+        "hvm_start_info reports {} modules, more than the {} this can withhold \
+         from the heap; raise MAX_MODULES and MAX_FIRMWARE_RESERVED together",
+        info.nr_modules,
+        MAX_MODULES
+    );
+    if info.nr_modules != 0 {
+        assert!(
+            info.modlist_paddr != 0,
+            "hvm_start_info reports {} modules but a null modlist_paddr; there \
+             is no way to find them and therefore no way to withhold them",
+            info.nr_modules
+        );
+
+        let entry_size = size_of::<HvmModlistEntry>() as u64;
+        let bytes = u64::from(info.nr_modules) * entry_size;
+
+        // The array itself, for the same reason as the memmap table: it is
+        // read during the walk that decides what the heap gets.
+        reserved.push(Range {
+            start: info.modlist_paddr,
+            end: info.modlist_paddr.saturating_add(bytes),
+        });
+
+        for i in 0..info.nr_modules {
+            let at = info.modlist_paddr.saturating_add(u64::from(i) * entry_size);
+            // SAFETY: `at` is the `i`th element of an `nr_modules`-long array
+            // of `HvmModlistEntry` named by a magic-validated
+            // `hvm_start_info`, and `read_phys` bounds-checks it against the
+            // mapping before dereferencing.
+            let module: HvmModlistEntry = unsafe { read_phys(at) };
+
+            log::info!(
+                "module {i}  pa {:#X}..{:#X}  cmdline {:#X}",
+                module.paddr,
+                module.paddr.saturating_add(module.size),
+                module.cmdline_paddr
+            );
+
+            reserved.push(Range {
+                start: module.paddr,
+                end: module.paddr.saturating_add(module.size),
+            });
+        }
+    }
+
+    // The memory map itself. Every entry is logged, accepted or not, so the
+    // decision can be checked from outside rather than trusted -- which is why
+    // this loop reports entries it does not collect.
+    let mut usable: arrayvec::ArrayVec<Range, MAX_RAM_REGIONS> = arrayvec::ArrayVec::new();
+    for index in 0..info.memmap_entries {
+        // SAFETY: `info` passed the magic check, its version carries a memory
+        // map, and `index < info.memmap_entries`.
+        let entry = unsafe { read_memmap_entry(&info, index) };
+        let end = entry.addr.saturating_add(entry.size);
+        log::info!(
+            "  entry   pa {:#014X}..{:#014X}  type {}",
+            entry.addr,
+            end,
+            entry.type_
+        );
+        if entry.type_ == HVM_MEMMAP_TYPE_RAM {
+            assert!(
+                !usable.is_full(),
+                "hvm_start_info reports more than {MAX_RAM_REGIONS} usable-RAM \
+                 regions; raise MAX_RAM_REGIONS rather than silently dropping \
+                 memory the heap would then never see"
+            );
+            usable.push(Range {
+                start: entry.addr,
+                end,
+            });
+        }
+    }
+
+    BootInfo {
+        usable,
+        reserved,
+        mapped_limit: MAPPED_LIMIT,
+    }
 }
