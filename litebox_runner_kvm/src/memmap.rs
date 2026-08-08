@@ -81,6 +81,20 @@ pub struct HvmMemmapTableEntry {
     pub reserved: u32,
 }
 
+/// One entry of the PVH module list, pointed at by
+/// [`HvmStartInfo::modlist_paddr`].
+///
+/// Same wire format caveat as [`HvmStartInfo`]: fixed by the PVH boot
+/// specification, so `#[repr(C)]` and not to be reordered.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HvmModlistEntry {
+    pub paddr: u64,
+    pub size: u64,
+    pub cmdline_paddr: u64,
+    pub reserved: u64,
+}
+
 /// Translates a physical address into the high-canonical alias the kernel runs
 /// in.
 const fn pa_to_va(pa: u64) -> u64 {
@@ -152,7 +166,7 @@ unsafe fn read_memmap_entry(info: &HvmStartInfo, index: u32) -> HvmMemmapTableEn
     // SAFETY: The table pointer is from a magic-validated `hvm_start_info`,
     // and the caller guarantees `index` is in range. `read_phys` bounds-checks
     // the resulting address against the mapping.
-    unsafe { read_phys(info.memmap_paddr + offset) }
+    unsafe { read_phys(info.memmap_paddr.saturating_add(offset)) }
 }
 
 /// A half-open physical range `[start, end)`.
@@ -164,9 +178,43 @@ struct Range {
 
 /// Number of ranges that may be withheld from the heap.
 ///
-/// Four are fixed (see [`reserved_ranges`]); the slack is there so that adding
-/// one more does not require thinking about this number.
-const MAX_RESERVED: usize = 8;
+/// Four are unconditional, plus the command line, the module list, and up to
+/// [`MAX_MODULES`] module images (see [`reserved_ranges`]); the slack is there
+/// so that adding one more does not require thinking about this number.
+const MAX_RESERVED: usize = 16;
+
+/// Largest module count this will reason about.
+///
+/// Nothing we boot uses modules at all; the cap exists so that a bogus
+/// `nr_modules` becomes a loud assertion rather than an overrun of
+/// [`MAX_RESERVED`].
+const MAX_MODULES: u32 = 8;
+
+/// Longest command line this will scan for a terminator.
+///
+/// `cmdline_paddr` names a NUL-terminated string with no length field, so the
+/// only way to know how much to withhold is to find the NUL. A missing one
+/// must not turn into an unbounded walk over guest memory.
+const MAX_CMDLINE: u64 = 4096;
+
+/// Length in bytes of the NUL-terminated string at `pa`, including the NUL.
+///
+/// # Panics
+///
+/// Panics if no terminator appears within [`MAX_CMDLINE`] bytes: the string
+/// is then not one, and guessing how much memory to withhold on its behalf is
+/// exactly the kind of silent assumption this module exists to avoid.
+fn cstr_len(pa: u64) -> u64 {
+    for i in 0..MAX_CMDLINE {
+        // SAFETY: A `u8` is valid at any address, and `read_phys` bounds
+        // -checks each one against the mapped low 1 GiB before dereferencing.
+        let byte: u8 = unsafe { read_phys(pa.saturating_add(i)) };
+        if byte == 0 {
+            return i + 1;
+        }
+    }
+    panic!("string at {pa:#X} has no NUL in {MAX_CMDLINE} bytes; refusing to guess its extent");
+}
 
 /// The physical ranges that must never reach the heap.
 ///
@@ -212,6 +260,71 @@ fn reserved_ranges(
             start: info.memmap_paddr,
             end: info.memmap_paddr.saturating_add(bytes),
         });
+    }
+
+    // 5. The kernel command line. QEMU happens to place it at 0x11C0, below
+    //    `_heap_start`, so range 2 already covers it today -- but nothing in
+    //    the boot protocol promises that, and the day it moves above the heap
+    //    floor the heap would start writing free-list nodes over it. Withhold
+    //    it explicitly, measured to its terminator rather than assumed.
+    if info.cmdline_paddr != 0 {
+        let len = cstr_len(info.cmdline_paddr);
+        out.push(Range {
+            start: info.cmdline_paddr,
+            end: info.cmdline_paddr.saturating_add(len),
+        });
+    }
+
+    // 6. The module list and every module image it names. QEMU's PVH loader
+    //    places an `-initrd` payload in RAM and reports it as *type 1*, so
+    //    without this the heap is handed the module image and writes into it
+    //    immediately. `nr_modules` was previously read, logged, and then
+    //    ignored, which is the whole bug.
+    assert!(
+        info.nr_modules <= MAX_MODULES,
+        "hvm_start_info reports {} modules, more than the {} this can withhold \
+         from the heap; raise MAX_MODULES and MAX_RESERVED together",
+        info.nr_modules,
+        MAX_MODULES
+    );
+    if info.nr_modules != 0 {
+        assert!(
+            info.modlist_paddr != 0,
+            "hvm_start_info reports {} modules but a null modlist_paddr; there \
+             is no way to find them and therefore no way to withhold them",
+            info.nr_modules
+        );
+
+        let entry_size = size_of::<HvmModlistEntry>() as u64;
+        let bytes = u64::from(info.nr_modules) * entry_size;
+
+        // The array itself, for the same reason as the memmap table: it is
+        // read during the walk that decides what the heap gets.
+        out.push(Range {
+            start: info.modlist_paddr,
+            end: info.modlist_paddr.saturating_add(bytes),
+        });
+
+        for i in 0..info.nr_modules {
+            let at = info.modlist_paddr.saturating_add(u64::from(i) * entry_size);
+            // SAFETY: `at` is the `i`th element of an `nr_modules`-long array
+            // of `HvmModlistEntry` named by a magic-validated
+            // `hvm_start_info`, and `read_phys` bounds-checks it against the
+            // mapping before dereferencing.
+            let module: HvmModlistEntry = unsafe { read_phys(at) };
+
+            log::info!(
+                "module {i}  pa {:#X}..{:#X}  cmdline {:#X}",
+                module.paddr,
+                module.paddr.saturating_add(module.size),
+                module.cmdline_paddr
+            );
+
+            out.push(Range {
+                start: module.paddr,
+                end: module.paddr.saturating_add(module.size),
+            });
+        }
     }
 
     out
@@ -299,9 +412,11 @@ impl Regions {
         // aligned, below `MAPPED_LIMIT` and therefore mapped read/write
         // through `KERNEL_OFFSET`, and disjoint from every range in
         // `reserved` -- which covers the image, the boot scratch region
-        // (page tables, GDT and the live stack), the first megabyte, and the
-        // boot structures. Nothing else has been handed this memory: this is
-        // the only caller of `heap_add_region` and each range is emitted once.
+        // (page tables, GDT and the live stack), the first megabyte, the
+        // boot structures, the command line, and every module image the
+        // module list names. Nothing else has been handed this memory: this
+        // is the only caller of `heap_add_region` and each range is emitted
+        // once.
         unsafe {
             litebox_platform_lvbs::host::kvm_impl::heap_add_region(
                 usize::try_from(pa_to_va(start)).expect("64-bit target"),
