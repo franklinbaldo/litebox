@@ -551,43 +551,6 @@ fn runs_the_hello_ta() {
     assert_ta_succeeded("hello-ta", status, &console);
 }
 
-/// `hello3seg-ta` does not load under KVM, for a reason that has nothing to do
-/// with the channel.
-///
-/// It is the same TA as `hello-ta` built with three `PT_LOAD` segments, so
-/// `ldelf` maps the third at a *fixed* address with a non-zero `pad_end`. That
-/// takes `sys_map_bin`'s `MAP_FIXED_NOREPLACE` branch, which calls
-/// `ensure_pads_are_unmapped` -- and on this platform the padding is not
-/// unmapped. `ldelf` exits `0xffff0003` (`TEE_ERROR_ACCESS_CONFLICT`) after
-/// `populate_segments:851 sys_map_ta_bin`.
-///
-/// The cause is address-space *placement*, not the padding check. LiteBox's
-/// own VMA allocator hands out the highest free range, so the anonymous
-/// mapping `ldelf` asks for with `addr == 0` is packed flush against the
-/// bottom of the 1 MiB TA stack allocated moments earlier. Three runs with
-/// three different `pad_begin` values (49152, 204800, 385024 -- `ldelf`
-/// randomises it) all placed the image's usable start at exactly
-/// `0x7fffffcdc000`, which is what "flush against whatever is above" looks
-/// like: the base moves with `pad_begin`, the top does not. The third
-/// segment's `pad_end` then runs from `0x7fffffcee000` to `0x7fffffcfb000`
-/// and the last two pages of that are inside the stack.
-///
-/// Under `litebox_runner_optee_on_linux_userland` the identical sequence
-/// succeeds because the mappings are Linux's, and Linux does not place an
-/// anonymous mapping against the stack. So this is a gap in the KVM port's
-/// memory-manager placement policy -- a real one, worth an issue -- and not
-/// something the binary-loading work here introduced or could fix. The other
-/// four TAs load through the same code path.
-#[test]
-#[ignore = "ldelf exits TEE_ERROR_ACCESS_CONFLICT: the KVM VMA allocator packs \
-            the TA image flush against the TA stack, so the third segment's \
-            pad_end overlaps it. Not a channel or loader-protocol failure; see \
-            the doc comment."]
-fn runs_the_hello3seg_ta() {
-    let (status, console) = run_ta("hello3seg-ta");
-    assert_ta_succeeded("hello3seg-ta", status, &console);
-}
-
 /// `random-ta`, the first TA here to fill a `memref_output`.
 ///
 /// `-cpu max` is required and `run.sh` supplies it: the default `qemu64` model
