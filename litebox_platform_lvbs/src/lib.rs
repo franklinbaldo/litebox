@@ -1444,6 +1444,11 @@ fn run_thread_inner(
     //
     // Arm the preemption timer for this user-thread execution. This function is
     // idempotent, so `reenter` does not change the timeout.
+    //
+    // TODO(Phase 2): `host_kvm` has no preemption timer, because the LVBS one is built
+    // on Hyper-V synthetic timers. Until an APIC-deadline source replaces it, a ring-3
+    // infinite loop on KVM is unkillable. This is a known Phase 1 gap, not a decision
+    // that preemption is unnecessary.
     #[cfg(feature = "host_lvbs")]
     crate::arch::timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
@@ -1970,6 +1975,9 @@ unsafe extern "C" fn exception_handler(
     };
     // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
     // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
+    //
+    // TODO(Phase 2): absent under `host_kvm` for the same reason as `arm_preemption`
+    // above — there is no synthetic timer to fire, so no timeout kill can occur.
     #[cfg(feature = "host_lvbs")]
     if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
         crate::arch::timer::eoi();
