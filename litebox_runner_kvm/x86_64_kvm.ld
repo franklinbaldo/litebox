@@ -64,6 +64,32 @@ SECTIONS
     }
 
     . = ALIGN(0x1000);
+    _image_end = .;
+
+    /* Early boot scratch: PML4/PDPT/PD, the 64-bit GDT and its pseudo-
+       descriptor, the saved hvm_start_info pointer, and the boot stack.
+
+       This sits at a *fixed* physical address because the 32-bit entry stub
+       has to name it, and 32-bit code has no RIP-relative addressing. The
+       target links --pie, where a 32-bit absolute relocation against an
+       ordinary symbol needs a dynamic relocation that nothing applies this
+       early (rust-lld rejects them outright). A hardcoded address lets the
+       stub use plain immediates instead. Keep in sync with
+       BOOT_SCRATCH_BASE and the OFF_* constants in src/main.rs.
+
+       NOLOAD: the stub initialises every field it uses at runtime, so there
+       is nothing to put in the file. */
+    ASSERT(_image_end <= 0x1000000,
+           "image has grown into the boot scratch region at 0x1000000")
+    . = 0x1000000;
+    _boot_scratch_base = .;
+    .boot_scratch (NOLOAD) : {
+        . = . + 0x8000;
+    }
+    _boot_scratch_end = .;
+
+    /* The heap starts above the scratch region so the two cannot collide. */
+    . = ALIGN(0x1000);
     _heap_start = .;
     
     /DISCARD/ :
