@@ -176,11 +176,11 @@ fn check_smap() {
         // rather than fatal.
         unsafe { litebox::mm::exception_table::read_u64_fallible(probe) }
     });
-    match with_ac {
-        Ok(v) => log::info!("smap       read inside stac/clac succeeded, value {v:#018X}"),
-        Err(_) => panic!(
+    let Ok(v) = with_ac else {
+        panic!(
             "a supervisor read of user page {user_va:#018X} faulted even inside \
              stac/clac: the fault in step 2 was not SMAP"
-        ),
-    }
+        )
+    };
+    log::info!("smap       read inside stac/clac succeeded, value {v:#018X}");
 }

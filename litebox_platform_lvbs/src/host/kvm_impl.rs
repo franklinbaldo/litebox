@@ -39,26 +39,28 @@ pub struct HostKvmInterface;
 // hook honestly reports exhaustion rather than pretending.
 // ---------------------------------------------------------------------------
 
-/// Maximum buddy order.
-///
-/// The buddy allocator keeps `ORDER` free lists and can therefore serve a
-/// single block of at most `1 << (ORDER - 1)` bytes. LVBS uses 25 (16 MiB),
-/// sized for the fixed slice VTL0 hands it.
-///
-/// A KVM guest instead owns all of its RAM, and we boot with `-m 512M`. 30
-/// gives a 512 MiB maximum block, which is the entire machine: no allocation
-/// that could possibly be backed will be rejected for being too large, and
-/// the rescue hook's `unimplemented!("requested size ... is too large")` arm
-/// becomes unreachable for any request that RAM could satisfy. The cost is one
-/// `LinkedList` (a single pointer) per extra order -- 40 bytes of `.bss` over
-/// LVBS -- so there is no reason to be stingy. Raise it if the guest is ever
-/// given more than 512 MiB and someone wants a single allocation larger than
-/// that.
-const HEAP_ORDER: usize = 30;
-
 #[cfg(not(test))]
 mod heap {
-    use super::HEAP_ORDER;
+    /// Maximum buddy order.
+    ///
+    /// The buddy allocator keeps `ORDER` free lists and can therefore serve a
+    /// single block of at most `1 << (ORDER - 1)` bytes. LVBS uses 25 (16 MiB),
+    /// sized for the fixed slice VTL0 hands it.
+    ///
+    /// A KVM guest instead owns all of its RAM, and we boot with `-m 512M`. 30
+    /// gives a 512 MiB maximum block, which is the entire machine: no allocation
+    /// that could possibly be backed will be rejected for being too large, and
+    /// the rescue hook's `unimplemented!("requested size ... is too large")` arm
+    /// becomes unreachable for any request that RAM could satisfy. The cost is one
+    /// `LinkedList` (a single pointer) per extra order -- 40 bytes of `.bss` over
+    /// LVBS -- so there is no reason to be stingy. Raise it if the guest is ever
+    /// given more than 512 MiB and someone wants a single allocation larger than
+    /// that.
+    ///
+    /// Declared inside this module rather than beside it so it does not become
+    /// dead code under `cfg(test)`, where the allocator is not compiled;
+    /// `lvbs_impl` does the same.
+    const HEAP_ORDER: usize = 30;
 
     #[global_allocator]
     pub(super) static KVM_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<

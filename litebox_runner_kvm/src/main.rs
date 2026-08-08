@@ -1195,14 +1195,13 @@ fn first_user_page() -> Option<u64> {
         None
     }
 
-    descend(read_cr3() & PTE_ADDR_MASK, 4, 0).map(|va| {
+    descend(read_cr3() & PTE_ADDR_MASK, 4, 0).inspect(|&va| {
         // Lower half only, so no sign extension is needed; assert that rather
         // than assume it.
         assert!(
             va < (1 << 47),
             "user page {va:#018X} is not in the lower half"
         );
-        va
     })
 }
 
@@ -1690,9 +1689,9 @@ const SPIN_ITERS: u32 = 10_000_000;
 const CALIBRATED_WAIT_NANOS: u64 = 1_000_000_000;
 
 /// Nanoseconds between two [`Instant`]s.
-fn elapsed_nanos(start: &Instant, end: &Instant) -> u64 {
+fn elapsed_nanos(start: Instant, end: Instant) -> u64 {
     use litebox::platform::Instant as _;
-    end.checked_duration_since(start)
+    end.checked_duration_since(&start)
         .expect("clock went backwards")
         .as_nanos()
         .try_into()
@@ -1715,7 +1714,7 @@ fn check_clock() {
         core::hint::spin_loop();
     }
     let end = Instant::now();
-    let spin_nanos = elapsed_nanos(&start, &end);
+    let spin_nanos = elapsed_nanos(start, end);
     log::info!("spin       {SPIN_ITERS} iters -> {spin_nanos} ns");
     assert!(
         spin_nanos > 0,
@@ -1727,14 +1726,11 @@ fn check_clock() {
     log::info!("wait 1s    start");
     let start = Instant::now();
     let mut end = Instant::now();
-    while elapsed_nanos(&start, &end) < CALIBRATED_WAIT_NANOS {
+    while elapsed_nanos(start, end) < CALIBRATED_WAIT_NANOS {
         core::hint::spin_loop();
         end = Instant::now();
     }
-    log::info!(
-        "wait 1s    done, measured {} ns",
-        elapsed_nanos(&start, &end)
-    );
+    log::info!("wait 1s    done, measured {} ns", elapsed_nanos(start, end));
 
     // Cross-check against the PIT. This is the part that actually proves the
     // TSC scaling is right rather than merely self-consistent: the PIT is a
@@ -1747,7 +1743,7 @@ fn check_clock() {
     let end = Instant::now();
     match pit_nanos {
         Some(pit_nanos) => {
-            let tsc_nanos = elapsed_nanos(&start, &end);
+            let tsc_nanos = elapsed_nanos(start, end);
             // Integer permille error, avoiding floating point.
             let error_permille =
                 (tsc_nanos.abs_diff(pit_nanos)).saturating_mul(1000) / pit_nanos.max(1);

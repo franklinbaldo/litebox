@@ -294,11 +294,14 @@ fn frequency_from_pvclock(mul: u32, shift: i8) -> Option<u64> {
     }
     // `shift` is small in practice (-3..=1); bound it anyway so the shift
     // below cannot overflow regardless of what the hypervisor publishes.
-    let shift_amount = i32::from(SCALE_SHIFT as i32).checked_sub(i32::from(shift))?;
+    let shift_amount = i32::try_from(SCALE_SHIFT)
+        .ok()?
+        .checked_sub(i32::from(shift))?;
     if !(0..=96).contains(&shift_amount) {
         return None;
     }
-    let numerator = 1_000_000_000u128.checked_shl(shift_amount as u32)?;
+    // Non-negative by the range check above, so this cannot fail.
+    let numerator = 1_000_000_000u128.checked_shl(u32::try_from(shift_amount).ok()?)?;
     u64::try_from(numerator / u128::from(mul)).ok()
 }
 
@@ -350,7 +353,7 @@ const PIT_CALIBRATION_COUNT: u16 = 0xFFFF;
 /// with no PIT at all falls through to the panic instead of hanging forever.
 const PIT_WAIT_SPINS: u64 = 1_000_000_000;
 
-#[inline(always)]
+#[inline]
 fn inb(port: u16) -> u8 {
     let value: u8;
     // SAFETY: Reading the PIT and NMI-control ports has no memory effects.
@@ -360,7 +363,7 @@ fn inb(port: u16) -> u8 {
     value
 }
 
-#[inline(always)]
+#[inline]
 fn outb(port: u16, value: u8) {
     // SAFETY: The ports written here are the PIT's own registers and channel
     // 2's gate. Channel 2 drives only the PC speaker, which is left disabled
@@ -462,7 +465,13 @@ fn discover() -> TscScale {
             && plausible(hz)
         {
             // `hz` passed the plausibility range, so it is non-zero and this
-            // can neither divide by zero nor produce a zero `mult`.
+            // can neither divide by zero nor produce a zero `mult`. The
+            // plausible floor also keeps the quotient under 2^64: the numerator
+            // is 10^9 * 2^32, so any `hz` above 1 fits comfortably.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "bounded by `plausible(hz)`; see above"
+            )]
             let mult = ((1_000_000_000u128 << SCALE_SHIFT) / u128::from(hz)) as u64;
             return TscScale { hz, mult, source };
         }
@@ -553,5 +562,11 @@ pub fn monotonic_nanos() -> u64 {
     // `ticks * mult` leaves the 64-bit range after roughly five seconds of
     // uptime. The shift brings the product back into `u64`, where it does not
     // overflow until ~584 years of nanoseconds.
-    ((u128::from(read_tsc()) * u128::from(scale.mult)) >> SCALE_SHIFT) as u64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the right shift by SCALE_SHIFT brings the product back into u64; see above"
+    )]
+    {
+        ((u128::from(read_tsc()) * u128::from(scale.mult)) >> SCALE_SHIFT) as u64
+    }
 }
