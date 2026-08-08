@@ -5,6 +5,7 @@
 
 use crate::arch::{PhysAddr, VirtAddr};
 
+pub mod layout;
 pub(crate) mod pgtable;
 pub(crate) mod vmap;
 

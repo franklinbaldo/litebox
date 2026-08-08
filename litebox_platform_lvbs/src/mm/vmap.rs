@@ -16,7 +16,7 @@ use spin::Once;
 use spin::mutex::SpinMutex;
 use x86_64::VirtAddr;
 
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use crate::mm::layout::PAGE_SIZE;
 
 /// Errors of `VmapRegionAllocator`
 #[derive(Debug, thiserror::Error)]
