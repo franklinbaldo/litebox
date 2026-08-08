@@ -58,14 +58,21 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_shim_optee --no-default-features --features platform_kvm
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           # We exclude `litebox_runner_lvbs` because it requires a custom target and nightly
           # features. `build_and_test_lvbs` covers it.
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; check each host separately.
+          # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
+          # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
+          # select those two hosts, so `--all-features` turns both on at once.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
           # feature unification (`optee_syscall` versus `linux_syscall`). Build it separately for now.
       - run: |
@@ -81,11 +88,18 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: |
-          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --no-default-features --features platform_kvm
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; document each host separately.
+          # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
+          # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
+          # select those two hosts, so `--all-features` turns both on at once.
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
@@ -155,11 +169,18 @@ jobs:
       - run: |
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; check each host separately.
+          # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
+          # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
+          # select those two hosts, so `--all-features` turns both on at once.
           # The remaining exclusions restore the default member selection, which
           # `--workspace` (required by `--exclude`) would otherwise widen.
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_lvbs
           ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
+          ./.github/tools/github_actions_run_cargo clippy --all-targets -p litebox_shim_optee --no-default-features --features platform_kvm
           # Run clippy for lvbs with custom target (requires build-std)
           ./.github/tools/github_actions_run_cargo clippy -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
       - run: |
@@ -175,9 +196,64 @@ jobs:
         run: |
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive; document each host separately.
-          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          # `litebox_platform_multiplex` and `litebox_shim_optee` are excluded for the
+          # same reason at one remove: their `platform_lvbs` and `platform_kvm` features
+          # select those two hosts, so `--all-features` turns both on at once.
+          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_lvbs
           ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_lvbs --no-default-features --features host_kvm
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --features platform_linux_userland,platform_windows_userland,platform_lvbs,platform_linux_snp,platform_linux_userland_with_linux_syscall,platform_linux_userland_with_optee_syscall,platform_lvbs_with_linux_syscall,platform_lvbs_with_optee_syscall
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_platform_multiplex --no-default-features --features platform_kvm_with_linux_syscall
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --features platform_linux_userland,platform_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --document-private-items -p litebox_shim_optee --no-default-features --features platform_kvm
+
+  build_and_test_kvm:
+    name: Build and Test KVM
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v6
+      # `litebox_runner_kvm` needs a nightly toolchain for the same reasons as
+      # `litebox_runner_lvbs`: a custom bare-metal target (`x86_64_kvm.json`)
+      # that `-Z build-std` must compile core/alloc for, with SSE, because the
+      # built-in soft-float `x86_64-unknown-none` is ABI-incompatible with the
+      # crypto dependencies. See `build_and_test_lvbs` for the long form.
+      - name: Set up Rust
+        run: |
+          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_kvm/rust-toolchain.toml)
+          rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
+          rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
+          rustup default ${RUST_CHANNEL}
+          rustup override set ${RUST_CHANNEL}
+          rustup show
+      - name: Set up Nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          # Clippy the runner on its own target; it cannot be built for the host
+          # triple, which is why it is `--exclude`d from the workspace sweeps.
+          ./.github/tools/github_actions_run_cargo clippy -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_kvm/Cargo.toml --target litebox_runner_kvm/x86_64_kvm.json --all-features
+      - run: |
+          ./.github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_kvm/Cargo.toml --target litebox_runner_kvm/x86_64_kvm.json
+      - run: |
+          # Boot the runner under QEMU and check what the guest actually did.
+          #
+          # TCG only: no `-enable-kvm`, because GitHub-hosted runners do not
+          # expose `/dev/kvm`. The test rebuilds the runner itself, so it can
+          # never run against a stale binary; the build step above is kept
+          # because a compile error should fail before we reach QEMU.
+          #
+          # `kvm_qemu` is a `required-features` gate on the test target, so the
+          # other jobs (which have neither QEMU nor nightly) do not build it.
+          ./.github/tools/github_actions_run_cargo nextest -p dev_tests --features kvm_qemu --test kvm_qemu_boot
 
   build_and_test_windows:
     name: Build and Test Windows
@@ -233,7 +309,7 @@ jobs:
           # `litebox_platform_lvbs` is excluded from the `--all-features` sweep because
           # `host_lvbs` and `host_kvm` are mutually exclusive. The `build_and_test_lvbs`
           # job documents each host separately.
-          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs
+          ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_kvm --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp --exclude litebox_platform_lvbs --exclude litebox_platform_multiplex --exclude litebox_shim_optee
 
   confirm_no_std:
     name: Confirm no_std
@@ -295,6 +371,10 @@ jobs:
           # - `litebox_runner_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
+          # - `litebox_runner_kvm` has a custom target (`no_std`), so it does
+          #   not work with the current no_std checker, for the same reason as
+          #   `litebox_runner_lvbs`.
+          #
           # - `litebox_runner_optee_on_linux_userland` is allowed to have `std`
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
@@ -330,6 +410,7 @@ jobs:
             -not -path './litebox_platform_multiplex/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
+            -not -path './litebox_runner_kvm/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \

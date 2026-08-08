@@ -868,9 +868,13 @@ impl<Host: HostInterface> RawMutex<Host> {
 /// An implementation of [`litebox::platform::Instant`].
 ///
 /// Holds an opaque reading of the host's monotonic counter. One tick of that
-/// counter is [`Instant::TICK_NANOS`] nanoseconds; *which* counter, and hence
+/// counter is `Instant::TICK_NANOS` nanoseconds; *which* counter, and hence
 /// what a tick is worth, is host-specific and is declared alongside
-/// [`Instant::now`] in the per-host `impl` blocks below.
+/// `Instant::now` in the per-host `impl` blocks below.
+///
+/// Both are deliberately spelled as code rather than as intra-doc links: they
+/// are private, so linking to them from this public item is a rustdoc error
+/// even under `--document-private-items`.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 

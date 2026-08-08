@@ -9,7 +9,7 @@
 //! discovered; there is no architectural "read the TSC frequency" instruction.
 //!
 //! Three sources are tried, in the order below, and the first that yields a
-//! frequency passing [`plausible`] wins. Which one won is logged at boot.
+//! frequency passing `plausible` wins. Which one won is logged at boot.
 //!
 //! 1. **CPUID.** Leaf `0x15` (TSC / core-crystal ratio) and leaf `0x16`
 //!    (processor base frequency), plus the KVM paravirt leaf `0x4000_0010`
@@ -513,7 +513,7 @@ fn discover() -> TscScale {
 ///
 /// # Panics
 ///
-/// Panics if no source reports a plausible frequency; see [`discover`].
+/// Panics if no source reports a plausible frequency; see `discover`.
 pub fn tsc_hz() -> u64 {
     TSC_SCALE.call_once(discover).hz
 }
@@ -523,7 +523,7 @@ pub fn tsc_hz() -> u64 {
 ///
 /// # Panics
 ///
-/// Panics if no source reports a plausible frequency; see [`discover`].
+/// Panics if no source reports a plausible frequency; see `discover`.
 pub fn tsc_source() -> &'static str {
     TSC_SCALE.call_once(discover).source
 }
@@ -554,7 +554,7 @@ fn read_tsc() -> u64 {
 /// # Panics
 ///
 /// Panics on the first call if no source reports a plausible frequency; see
-/// [`discover`].
+/// `discover`.
 pub fn monotonic_nanos() -> u64 {
     let scale = TSC_SCALE.call_once(discover);
 
