@@ -84,7 +84,7 @@ SECTIONS
     . = 0x1000000;
     _boot_scratch_base = .;
     .boot_scratch (NOLOAD) : {
-        . = . + 0x8000;
+        . = . + 0x80000;
     }
     _boot_scratch_end = .;
 

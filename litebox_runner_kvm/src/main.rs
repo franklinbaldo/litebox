@@ -82,7 +82,20 @@ const OFF_GDTR: u32 = 0x3020;
 const OFF_HVM_START_INFO: u32 = 0x3030;
 /// Offset one past the end of the boot stack. The stack grows down, so this is
 /// the initial `%rsp`.
-const OFF_STACK_TOP: u32 = 0x8000;
+///
+/// This leaves roughly 500 KiB between the top of the page tables (`OFF_GDTR`
+/// and below) and the initial `%rsp`. The original 32 KiB region gave the
+/// stack only about 20 KiB, which a debug build of the ChaCha20 CRNG
+/// exhausted: `%rsp` ran down past `BOOT_SCRATCH_BASE`, overwrote the PML4,
+/// PDPT and PD sitting at the bottom of this very region, and triple-faulted
+/// on the next instruction fetch.
+///
+/// Note what makes that failure mode nasty: the stack grows *towards* the page
+/// tables, so an overflow corrupts the mapping that would be needed to report
+/// it. A real guard page needs 4 KiB granularity, which the 2 MiB early tables
+/// cannot express; Task 6 owns proper memory setup and should add one. Until
+/// then this is headroom, not a fix.
+const OFF_STACK_TOP: u32 = 0x80000;
 
 /// An ELF note with a 4-byte name and a 4-byte descriptor.
 #[repr(C, align(4))]
@@ -266,6 +279,31 @@ _start:
        we are running in. It grows down, hence the top of the region. */
     mov rsp, {scratch} + {off_stack_top}
     add rsp, rcx
+
+    /* Enable SSE before any Rust runs.
+
+       SSE2 is part of the x86-64 ABI baseline, so the compiler may emit xmm
+       instructions in *any* function without asking. On reset CR0.EM is set
+       and CR4.OSFXSR is clear, which makes every one of them #UD. Nothing
+       caught this earlier only because the boot path so far happened to be
+       plain integer code; the first library that vectorises anything (here
+       rand_chacha, via `xorps %xmm0,%xmm0`) triple-faults instead, with no
+       output, because there is no IDT to report the #UD.
+
+       CR0.EM off / CR0.MP on selects FPU rather than emulation; CR4.OSFXSR
+       tells the CPU the OS will manage xmm state via FXSAVE, and
+       CR4.OSXMMEXCPT routes SIMD FP exceptions to vector 19 instead of #UD.
+
+       AVX is deliberately not enabled: the target sets `-avx,-avx2,-avx512f`,
+       so nothing needs XCR0 and this can stay a two-register change. */
+    mov rax, cr0
+    and rax, ~(1 << 2)                /* CR0.EM  = 0 */
+    or  rax, 1 << 1                   /* CR0.MP  = 1 */
+    mov cr0, rax
+
+    mov rax, cr4
+    or  rax, (1 << 9) | (1 << 10)     /* CR4.OSFXSR | CR4.OSXMMEXCPT */
+    mov cr4, rax
 
     /* Terminate the frame chain so any future unwinder or backtrace stops
        here rather than walking into garbage. */
