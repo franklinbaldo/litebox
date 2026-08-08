@@ -4,10 +4,17 @@
 //! Different host implementations of [`super::HostInterface`]
 pub mod bootparam;
 pub mod linux;
+#[cfg(feature = "host_kvm")]
+pub mod kvm_impl;
+#[cfg(feature = "host_lvbs")]
 pub mod lvbs_impl;
 pub mod per_cpu_variables;
 
+#[cfg(feature = "host_kvm")]
+pub use kvm_impl::KvmGuest;
+#[cfg(feature = "host_lvbs")]
 pub use lvbs_impl::LvbsLinuxKernel;
+#[cfg(feature = "host_lvbs")]
 pub(crate) use lvbs_impl::set_platform_root_key;
 
 #[cfg(test)]
