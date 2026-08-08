@@ -1411,10 +1411,24 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             // cannot read or write pages that VTL1 relies on.
             //
             // Under KVM there is no VTL0 peer: LiteBox *is* the kernel. The security boundary
-            // is ring 0 vs ring 3, enforced by the page tables, SMEP/SMAP and the syscall gate,
-            // which is the conventional OS threat model. No lower-privilege peer kernel exists
-            // that could tamper with these pages, so there is nothing for a per-page protection
-            // change to defend against and this call is correctly a no-op.
+            // is ring 0 vs ring 3, which is the conventional OS threat model. No lower-privilege
+            // peer kernel exists that could tamper with these pages, so there is nothing for a
+            // per-page protection change to defend against and this call is correctly a no-op.
+            //
+            // The boundary this defers to is established by `litebox_runner_kvm`, not assumed:
+            //
+            // * `enable_smep_smap()` (`litebox_runner_kvm::main`) sets CR4.SMEP and CR4.SMAP, so
+            //   the kernel can neither execute nor read ring-3 pages. It asserts CPUID support
+            //   first, and the runner re-reads CR4 afterwards and panics if either bit is clear.
+            // * CR0.WP is set by the runner before it switches CR3. PVH hands off with WP clear,
+            //   which would let supervisor writes silently bypass read-only page-table entries
+            //   and quietly defeat the DEP mapping below it.
+            // * The 4 KiB page tables the runner installs carry NX and the USER bit, and the
+            //   syscall gate (`Platform::enable_syscall_support`) is the only entry back.
+            //
+            // Enforcement is checked empirically, not merely configured: a supervisor read of a
+            // user page faults with error code 0x1 (present + protection violation), and the same
+            // read succeeds between `with_user_memory_access`'s `stac` and `clac`.
             let _ = (pages, perms);
         }
 
