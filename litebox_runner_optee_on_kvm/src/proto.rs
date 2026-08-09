@@ -91,6 +91,36 @@ pub const MAX_BINARY_LEN: usize = 8 * 1024 * 1024;
 /// module stays dependency-free. `crate::ta` asserts the two agree.
 pub const MAX_PARAMS: usize = 4;
 
+/// Bytes a response spends on framing rather than on payload, worst case.
+///
+/// Frame header and length prefix (8), `status` (4), `ta_return` (4), the
+/// parameter count (1), and per parameter a tag, a `buffer_size` and a length
+/// prefix (13 x [`MAX_PARAMS`]), plus the message's length prefix (4).
+const RESPONSE_OVERHEAD: usize = 8 + 4 + 4 + 1 + 13 * MAX_PARAMS + 4;
+
+/// Largest `Response::message` that will be framed; longer ones are truncated.
+///
+/// A message is diagnostic text, so losing the tail of an unusually long one
+/// costs nothing, and bounding it here is what lets the memref budget below be
+/// a constant rather than something that depends on the message.
+pub const MAX_MESSAGE_LEN: usize = 8 * 1024;
+
+/// Total bytes of memref payload a single response may carry, across *all* its
+/// parameters.
+///
+/// This is a whole-response budget, deliberately, because the thing it has to
+/// keep inside [`MAX_FRAME_LEN`] is the whole response. A per-parameter clamp
+/// does not: there are up to [`MAX_PARAMS`] memrefs, so four parameters each
+/// clamped to a megabyte sum to four, and the frame assertion then fires on a
+/// response the guest built itself.
+///
+/// The value is [`MAX_FRAME_LEN`] less everything that is not memref bytes, so
+/// a response that respects it cannot fail to frame. It reserves room for a
+/// full-length message *and* four full parameters at once, which no single
+/// response uses -- a success carries no message and an error carries no
+/// parameters -- so the reservation is slack rather than a real reduction.
+pub const MAX_RESPONSE_MEMREF_BYTES: usize = MAX_FRAME_LEN - RESPONSE_OVERHEAD - MAX_MESSAGE_LEN;
+
 /// Bytes of framing that precede the payload: `len`, `version`, `opcode`.
 pub const HEADER_LEN: usize = 8;
 
@@ -629,15 +659,21 @@ impl Response {
     ///
     /// # Panics
     ///
-    /// Panics if the encoded frame would exceed [`MAX_FRAME_LEN`]. The guest
-    /// builds these itself, out of at most four parameters whose memrefs it
-    /// bounded when it accepted the request, so this is a local invariant.
+    /// Panics if the encoded frame would exceed [`MAX_FRAME_LEN`]. That is a
+    /// local invariant, and the two things that could break it are both closed
+    /// here: the memref bytes are budgeted across the whole response by
+    /// [`MAX_RESPONSE_MEMREF_BYTES`] when `crate::ta` collects them, and the
+    /// message is truncated to [`MAX_MESSAGE_LEN`] just below. The budget
+    /// leaves room for both at once, so the sum cannot reach the limit.
     pub fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&self.status.to_le_bytes());
         payload.extend_from_slice(&self.ta_return.to_le_bytes());
         put_params(&mut payload, &self.params);
-        put_bytes(&mut payload, self.message.as_bytes());
+        // Truncated rather than asserted on: a message is diagnostic text, and
+        // a response that cannot be sent tells the client nothing at all,
+        // which is strictly worse than one whose explanation is cut short.
+        put_bytes(&mut payload, truncate_message(&self.message).as_bytes());
         frame(Opcode::Response, &payload)
     }
 
@@ -732,6 +768,21 @@ fn open_frame(buf: &[u8]) -> Result<(Opcode, Reader<'_>), Error> {
     }
     let opcode = Opcode::from_raw(r.u16()?)?;
     Ok((opcode, r))
+}
+
+/// Truncates a message to [`MAX_MESSAGE_LEN`], on a character boundary.
+///
+/// Splitting a `str` mid-character would not compile as a slice, so the cut
+/// walks back to the nearest boundary. At most three bytes are given up.
+fn truncate_message(message: &str) -> &str {
+    if message.len() <= MAX_MESSAGE_LEN {
+        return message;
+    }
+    let mut end = MAX_MESSAGE_LEN;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    &message[..end]
 }
 
 /// Wraps `payload` in the length prefix, version and opcode.
@@ -1338,6 +1389,81 @@ mod tests {
             assert_eq!(chunk.is_last(), received.len() == TOTAL);
         }
         assert_eq!(received, source);
+    }
+
+    /// A response that spends the whole memref budget across the maximum
+    /// number of parameters still frames. This is the coherence property the
+    /// budget exists for: the old per-parameter clamp let four memrefs of
+    /// `MAX_FRAME_LEN` each be collected, and the frame assertion then killed
+    /// the guest on a response it had built itself.
+    #[test]
+    fn a_response_spending_the_whole_memref_budget_frames() {
+        let share = MAX_RESPONSE_MEMREF_BYTES / MAX_PARAMS;
+        let params: Vec<Param> = (0..MAX_PARAMS)
+            .map(|_| Param::MemrefOutput {
+                buffer_size: share as u64,
+                data: vec![0xAB; share].into_boxed_slice(),
+            })
+            .collect();
+        let encoded = Response::ok(0, params).encode();
+        assert!(
+            encoded.len() <= MAX_FRAME_LEN,
+            "{} bytes exceeds the {MAX_FRAME_LEN}-byte frame limit",
+            encoded.len()
+        );
+        // And it survives the round trip, so the budget bounds a response that
+        // is actually usable rather than merely one that encodes.
+        let decoded = Response::decode(&encoded).expect("a response this end built");
+        assert_eq!(decoded.params.len(), MAX_PARAMS);
+    }
+
+    /// The budget leaves room for a full-length message alongside a full set
+    /// of parameters, which is what makes it safe to reason about the two
+    /// independently.
+    #[test]
+    fn the_budget_and_a_full_message_fit_together() {
+        let share = MAX_RESPONSE_MEMREF_BYTES / MAX_PARAMS;
+        let params: Vec<Param> = (0..MAX_PARAMS)
+            .map(|_| Param::MemrefInout {
+                buffer_size: share as u64,
+                data: vec![0x5A; share].into_boxed_slice(),
+            })
+            .collect();
+        let response = Response {
+            status: STATUS_OK,
+            ta_return: 0,
+            params,
+            message: "m".repeat(MAX_MESSAGE_LEN),
+        };
+        assert!(response.encode().len() <= MAX_FRAME_LEN);
+    }
+
+    /// An over-long message is truncated rather than asserted on: a response
+    /// that cannot be sent tells the client nothing, which is worse than one
+    /// whose explanation is cut short.
+    #[test]
+    fn an_over_long_message_is_truncated() {
+        let response = Response::error("x".repeat(MAX_MESSAGE_LEN * 3));
+        let decoded = Response::decode(&response.encode()).expect("a truncated message still fits");
+        assert_eq!(decoded.message.len(), MAX_MESSAGE_LEN);
+    }
+
+    /// Truncation lands on a character boundary, so a multi-byte character
+    /// straddling the cut is dropped whole rather than split.
+    #[test]
+    fn truncation_respects_character_boundaries() {
+        // 'é' is two bytes, so a limit that is odd cuts one of them in half.
+        let message = "é".repeat(MAX_MESSAGE_LEN);
+        let truncated = truncate_message(&message);
+        assert!(truncated.len() <= MAX_MESSAGE_LEN);
+        assert!(message.starts_with(truncated));
+        // Every character survived whole.
+        assert!(truncated.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn a_short_message_is_left_alone() {
+        assert_eq!(truncate_message("brief"), "brief");
     }
 
     #[test]

@@ -740,6 +740,12 @@ fn read_ta_params(params_address: usize) -> Result<Vec<Param>, String> {
         .ok_or_else(|| format!("could not read UteeParams at {params_address:#x}"))?;
 
     let mut out = Vec::with_capacity(UteeParams::TEE_NUM_PARAMS);
+    // One budget for the whole response, spent down as the memrefs are read.
+    // Per-parameter clamps do not compose: there are up to four memrefs, so
+    // four clamped to the frame limit each sum to four times it, and the
+    // encoder's whole-frame assertion then fires on a response the guest built
+    // itself. See `proto::MAX_RESPONSE_MEMREF_BYTES`.
+    let mut budget = proto::MAX_RESPONSE_MEMREF_BYTES;
     for index in 0..UteeParams::TEE_NUM_PARAMS {
         let param_type = params
             .get_type(index)
@@ -758,22 +764,23 @@ fn read_ta_params(params_address: usize) -> Result<Vec<Param>, String> {
             // the TA left there, so the bytes have to be copied out of user
             // memory before the answer can carry them.
             TeeParamType::MemrefInput => Param::MemrefInput {
-                data: read_user_bytes(value_a, value_b),
+                data: read_user_bytes(value_a, value_b, &mut budget)?,
             },
             TeeParamType::MemrefOutput => Param::MemrefOutput {
                 buffer_size: value_b,
-                data: read_user_bytes(value_a, value_b),
+                data: read_user_bytes(value_a, value_b, &mut budget)?,
             },
             TeeParamType::MemrefInout => Param::MemrefInout {
                 buffer_size: value_b,
-                data: read_user_bytes(value_a, value_b),
+                data: read_user_bytes(value_a, value_b, &mut budget)?,
             },
         });
     }
     Ok(out)
 }
 
-/// Copies `len` bytes out of the TA's address space.
+/// Copies `len` bytes out of the TA's address space, charging them to
+/// `budget`.
 ///
 /// A read that fails yields no bytes rather than an error: the parameter is
 /// still worth reporting, and a memref the TA left pointing nowhere is its
@@ -781,19 +788,30 @@ fn read_ta_params(params_address: usize) -> Result<Vec<Param>, String> {
 /// validates the range and brackets the copy in `stac`/`clac`, so a bad
 /// address is `None` rather than a fault.
 ///
-/// The length is clamped to the frame budget for the same reason every other
-/// length in this path is bounded: `value_b` comes from a TA, and a TA that
-/// left `u64::MAX` there must not become an allocation.
-fn read_user_bytes(addr: u64, len: u64) -> Box<[u8]> {
-    let len = usize::try_from(len)
-        .unwrap_or(usize::MAX)
-        .min(proto::MAX_FRAME_LEN);
-    if len == 0 {
-        return Box::from(&[][..]);
+/// Exceeding the budget *is* an error, and a different kind. `value_b` comes
+/// from a TA, which is trusted -- production TAs are signed -- so a response
+/// that does not fit is a TA legitimately returning more output than this
+/// protocol carries, not an attack. The right answer is to tell the client so.
+/// Silently truncating would hand back a short buffer the client cannot tell
+/// from a real one, and the previous per-parameter clamp did exactly that
+/// while still letting four parameters sum past the frame limit and panic.
+fn read_user_bytes(addr: u64, len: u64, budget: &mut usize) -> Result<Box<[u8]>, String> {
+    let len = usize::try_from(len).unwrap_or(usize::MAX);
+    if len > *budget {
+        return Err(format!(
+            "the TA returned a {len}-byte memref, but only {} bytes of the \
+             {}-byte response budget remain",
+            *budget,
+            proto::MAX_RESPONSE_MEMREF_BYTES
+        ));
     }
-    UserConstPtr::<u8>::from_usize(addr.trunc())
+    *budget -= len;
+    if len == 0 {
+        return Ok(Box::from(&[][..]));
+    }
+    Ok(UserConstPtr::<u8>::from_usize(addr.trunc())
         .to_owned_slice(len)
-        .unwrap_or_else(|| Box::from(&[][..]))
+        .unwrap_or_else(|| Box::from(&[][..])))
 }
 
 /// Converts the wire's parameters into the shim's, padding to
