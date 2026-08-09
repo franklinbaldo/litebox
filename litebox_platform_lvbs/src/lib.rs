@@ -42,8 +42,6 @@ extern crate alloc;
 pub mod arch;
 pub mod host;
 pub mod mm;
-#[cfg(feature = "host_lvbs")]
-pub mod mshv;
 
 pub mod syscall_entry;
 
@@ -65,7 +63,7 @@ compile_error!(
 /// ring 0 vs ring 3. There are therefore no foreign writers to guard against, so the guard carries
 /// no state and is the unit type.
 #[cfg(feature = "host_lvbs")]
-type ProtectedFrameAccess = crate::mshv::vsm::ProtectedFrameAccessGuard<'static>;
+type ProtectedFrameAccess = crate::host::lvbs::mshv::vsm::ProtectedFrameAccessGuard<'static>;
 #[cfg(feature = "host_kvm")]
 type ProtectedFrameAccess = ();
 
@@ -608,7 +606,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
         #[cfg(all(not(test), feature = "host_lvbs"))]
         {
-            use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
+            use crate::host::lvbs::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
             // get_hvcall_page_start_address() now returns a virtual address (two-phase relocation).
             let hvcall_phys = <crate::host::LvbsLinuxKernel as crate::mm::MemoryProvider>::va_to_pa(
                 x86_64::VirtAddr::new(get_hvcall_page_start_address()),
@@ -928,7 +926,7 @@ impl Instant {
     const TICK_NANOS: u64 = crate::arch::REF_COUNTER_TICK_NANOS;
 
     fn now() -> Self {
-        Instant(crate::arch::timer::reference_time_100ns())
+        Instant(crate::host::lvbs::timer::reference_time_100ns())
     }
 }
 
@@ -947,9 +945,9 @@ impl Instant {
     /// # Panics
     ///
     /// Panics on first use if the TSC frequency cannot be determined from
-    /// CPUID; see [`crate::arch::clock::tsc_hz`].
+    /// CPUID; see [`crate::host::kvm::clock::tsc_hz`].
     pub fn now() -> Self {
-        Instant(crate::arch::clock::monotonic_nanos())
+        Instant(crate::host::kvm::clock::monotonic_nanos())
     }
 }
 
@@ -1202,7 +1200,10 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
             // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
             // but does not support re-entry into a VTL protection change.
-            Some(crate::mshv::vsm::protected_frame_registry().acquire_access_guard(pages)?)
+            Some(
+                crate::host::lvbs::mshv::vsm::protected_frame_registry()
+                    .acquire_access_guard(pages)?,
+            )
         } else {
             None
         };
@@ -1384,14 +1385,14 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
 
             let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
                 // VTL1 needs writable access, so deny VTL0 all access.
-                crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
+                crate::host::lvbs::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
             } else if perms.contains(PhysPageMapPermissions::READ) {
                 // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-                crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
-                    | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
+                crate::host::lvbs::mshv::HvPageProtFlags::HV_PAGE_READABLE
+                    | crate::host::lvbs::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
             } else {
                 // VTL1 no longer protects the pages.
-                crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
+                crate::host::lvbs::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
             };
 
             for range in range_set.iter() {
@@ -1399,7 +1400,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                     PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                     PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
                 );
-                crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
+                crate::host::lvbs::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
                     .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
             }
         }
@@ -1508,7 +1509,7 @@ fn run_thread_inner(
     // infinite loop on KVM is unkillable. This is a known Phase 1 gap, not a decision
     // that preemption is unnecessary.
     #[cfg(feature = "host_lvbs")]
-    crate::arch::timer::arm_preemption();
+    crate::host::lvbs::timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
     unsafe {
@@ -2080,9 +2081,9 @@ unsafe extern "C" fn exception_handler(
     // TODO(Phase 2): absent under `host_kvm` for the same reason as `arm_preemption`
     // above — there is no synthetic timer to fire, so no timeout kill can occur.
     #[cfg(feature = "host_lvbs")]
-    if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
-        crate::arch::timer::eoi();
-        crate::arch::timer::mark_user_timeout_kill();
+    if !kernel_mode && info.exception.0 == crate::host::lvbs::timer::STIMER_VECTOR {
+        crate::host::lvbs::timer::eoi();
+        crate::host::lvbs::timer::mark_user_timeout_kill();
     }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {

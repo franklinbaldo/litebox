@@ -607,7 +607,7 @@ fn runs_the_aes_ta() {
 /// 0. The test pinned that refusal deliberately, so that whoever installed a
 /// key would be forced to come and read this comment. That has now happened.
 ///
-/// `litebox_platform_lvbs::host::kvm_impl::install_development_platform_root_key`
+/// `litebox_platform_lvbs::host::kvm::install_development_platform_root_key`
 /// installs an emulated PRK at boot, so derivation takes the real path and
 /// `KeyIso_SERVER_import_private_key` runs to completion. The assertions below
 /// are the inverses of the old ones: the two failure lines must be *absent*,

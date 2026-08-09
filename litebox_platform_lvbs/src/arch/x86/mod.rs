@@ -1,23 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-/// TSC-based monotonic clock. KVM guests have no Hyper-V reference counter,
-/// so the TSC is the only cheap monotonic source available.
-#[cfg(feature = "host_kvm")]
-pub mod clock;
 pub mod gdt;
 pub mod instrs;
 pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
-/// Hyper-V synthetic-timer (STIMER) preemption timer.
-///
-/// Note: roughly half of this module is architectural x2APIC bring-up code
-/// (`IA32_APIC_BASE`, `X2APIC_SVR`, `X2APIC_EOI`) that is not Hyper-V specific
-/// and is worth lifting out when an APIC-timer preemption source lands.
-#[cfg(feature = "host_lvbs")]
-pub mod timer;
 
 /// Ticks per microsecond of the *Hyper-V partition reference counter*
 /// (`HV_X64_MSR_TIME_REF_COUNT`): 100 ns per tick, i.e. 10 per microsecond.

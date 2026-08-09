@@ -10,12 +10,12 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
     arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, instrs::hlt_loop},
     host::{
-        bootparam::save_boot_info,
+        lvbs::bootparam::save_boot_info,
+        lvbs::mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
         per_cpu_variables::{
             PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
         },
     },
-    mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
     serial_println,
 };
 use x86_64::VirtAddr;

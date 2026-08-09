@@ -4,7 +4,7 @@
 //! I/O Port-based serial communication
 
 #[cfg(feature = "host_lvbs")]
-use crate::mshv::ringbuffer::ringbuffer;
+use crate::host::lvbs::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
 use spin::{Mutex, Once};
 

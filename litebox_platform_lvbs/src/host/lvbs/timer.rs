@@ -25,15 +25,15 @@
 //! -> kill) with a rare in-kernel safety net (`interrupts::stimer_handler_impl`,
 //! which re-arms via `rearm_preemption`).
 
-use super::SPURIOUS_VECTOR;
-use super::instrs::{rdmsr, wrmsr};
-use crate::host::per_cpu_variables::with_per_cpu_variables;
-use crate::mshv::{
+use crate::arch::SPURIOUS_VECTOR;
+use crate::arch::instrs::{rdmsr, wrmsr};
+use crate::host::lvbs::mshv::{
     HV_FEATURE_REFERENCE_COUNTER, HV_FEATURE_STIMER_DIRECT, HV_FEATURE_SYNTHETIC_TIMER,
     HV_STIMER_CONFIG_DIRECT_MODE, HV_STIMER_CONFIG_ENABLE, HV_STIMER_CONFIG_VECTOR_SHIFT,
     HV_X64_MSR_STIMER0_CONFIG, HV_X64_MSR_STIMER0_COUNT, HV_X64_MSR_TIME_REF_COUNT,
     HYPERV_CPUID_FEATURES, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
 };
+use crate::host::per_cpu_variables::with_per_cpu_variables;
 use core::arch::x86_64::__cpuid_count as cpuid_count;
 
 /// Vector the preemption timer fires on. Above the 0..31 exception range and
@@ -69,7 +69,7 @@ const QUANTUM_MICROS: u64 = 50_000_000; // 50 s
 const QUANTUM_MICROS: u64 = 10_000; // 10 ms
 
 /// Quantum as a reference-counter tick count (STIMER deadlines are in ticks).
-const QUANTUM_100NS: u64 = QUANTUM_MICROS * super::REF_TICKS_PER_MICRO;
+const QUANTUM_100NS: u64 = QUANTUM_MICROS * crate::arch::REF_TICKS_PER_MICRO;
 
 /// Read the Hyper-V partition reference counter (`HV_X64_MSR_TIME_REF_COUNT`).
 ///

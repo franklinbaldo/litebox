@@ -41,7 +41,7 @@
 //!   that TAs exercise the real derivation path instead of the refusal path,
 //!   and it warns loudly on every boot that it is doing so. Whether it is
 //!   "implemented" depends on what you were asking: the *mechanism* is real
-//!   and mirrors `lvbs_impl` (no raw PRK getter, shim-supplied KDF required);
+//!   and mirrors `host::lvbs` (no raw PRK getter, shim-supplied KDF required);
 //!   the *root of trust* is absent, and a real deployment needs a TPM-sealed
 //!   key. See "Not built yet" below for what that would cost.
 //!
@@ -103,6 +103,11 @@
 //! the omission compiles. Neither is LVBS-specific (TLS is just `pcv.tls`), so
 //! both are straightforward ports whenever a caller first needs them.
 //!
+
+/// TSC-based monotonic clock. KVM guests have no Hyper-V reference counter,
+/// so the TSC is the only cheap monotonic source available.
+pub mod clock;
+
 use crate::{Errno, HostInterface, arch::ioport::serial_print_string};
 use digest::Digest;
 use rand_core::{RngCore, SeedableRng};
@@ -115,7 +120,7 @@ pub struct HostKvmInterface;
 // ---------------------------------------------------------------------------
 // The heap.
 //
-// Structurally this mirrors the `alloc` module in `lvbs_impl.rs`: a
+// Structurally this mirrors the `alloc` module in `host/lvbs/mod.rs`: a
 // `SafeZoneAllocator` (buddy allocator for pages, slab allocator for small
 // objects) registered as the `#[global_allocator]` and wired to both
 // `litebox::mm::allocator::MemoryProvider` and `crate::mm::MemoryProvider`.
@@ -150,7 +155,7 @@ mod heap {
     ///
     /// Declared inside this module rather than beside it so it does not become
     /// dead code under `cfg(test)`, where the allocator is not compiled;
-    /// `lvbs_impl` does the same.
+    /// `host::lvbs` does the same.
     const HEAP_ORDER: usize = 30;
 
     #[global_allocator]
@@ -362,7 +367,7 @@ impl HostInterface for HostKvmInterface {
 // ---------------------------------------------------------------------------
 // Cryptographic RNG.
 //
-// Structurally this mirrors `LvbsCrng` in `lvbs_impl.rs`: a ChaCha20 stream
+// Structurally this mirrors `LvbsCrng` in `host/lvbs/mod.rs`: a ChaCha20 stream
 // seeded from RDRAND and periodically reseeded from RDRAND mixed with its own
 // current state, with a backoff when RDRAND is temporarily dry.
 //
@@ -489,7 +494,7 @@ const DEV_PRK_DERIVATION_STRING: &[u8] =
 /// The emulated platform root key, installed by
 /// [`install_development_platform_root_key`].
 ///
-/// Deliberately mirrors `lvbs_impl`'s `PRK_ONCE`, including the absence of a
+/// Deliberately mirrors `host::lvbs`'s `PRK_ONCE`, including the absence of a
 /// raw getter: there is no `get_platform_root_key` here either, so the only
 /// way to reach the key material is through [`DerivedKeyProvider::derive_key`]
 /// with a shim-supplied KDF. That property is worth keeping even for a key
@@ -561,7 +566,7 @@ pub fn install_development_platform_root_key() {
             "prk        installing a DEVELOPMENT platform root key with NO SECURITY VALUE"
         );
         litebox_util_log::warn!(
-            "prk        it is SHA-256 of a fixed string in kvm_impl.rs, public and identical \
+            "prk        it is SHA-256 of a fixed string in host/kvm/mod.rs, public and identical \
              on every LiteBox-on-KVM guest; anything sealed with a key derived from it is \
              sealed against nobody"
         );
@@ -580,7 +585,7 @@ pub fn install_development_platform_root_key() {
 /// Reboot-persistent key derivation, rooted in a development key with no
 /// security value.
 ///
-/// Mirrors `lvbs_impl`'s implementation exactly, including the insistence that
+/// Mirrors `host::lvbs`'s implementation exactly, including the insistence that
 /// the shim supply the KDF: the raw PRK never leaves this module. The only
 /// difference is where the key came from, which is
 /// [`install_development_platform_root_key`] and its warning.

@@ -6,12 +6,12 @@
 use crate::arch::gdt;
 #[cfg(feature = "host_lvbs")]
 use crate::arch::instrs::rdmsr;
-use crate::mm::layout::PAGE_SIZE;
 #[cfg(feature = "host_lvbs")]
-use crate::mshv::{
+use crate::host::lvbs::mshv::{
     HV_REGISTER_VP_INDEX, HvMessage, HvMessagePage, HvVpAssistPage, vsm::ControlRegMap,
     vtl_switch::VtlState,
 };
+use crate::mm::layout::PAGE_SIZE;
 use aligned_vec::avec;
 use alloc::boxed::Box;
 use core::cell::Cell;
@@ -68,11 +68,11 @@ pub struct PerCpuVariables {
     /// Uses `u32::MAX` as the "uninitialized" sentinel.
     #[cfg(feature = "host_lvbs")]
     vp_index: Cell<u32>,
-    /// Set once this CPU's preemption timer is configured (see `arch::timer`).
+    /// Set once this CPU's preemption timer is configured (see `host::lvbs::timer`).
     /// Zero-initialized to `false`.
     #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_timer_enabled: Cell<bool>,
-    /// True while the preemption timer is armed (see `arch::timer`).
+    /// True while the preemption timer is armed (see `host::lvbs::timer`).
     /// Zero-initialized to `false`.
     #[cfg(feature = "host_lvbs")]
     pub(crate) preemption_armed: Cell<bool>,

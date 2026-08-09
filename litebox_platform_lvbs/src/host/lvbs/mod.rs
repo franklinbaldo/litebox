@@ -2,6 +2,27 @@
 // Licensed under the MIT license.
 
 //! An implementation of [`HostInterface`] for LVBS
+//!
+//! Submodules here are LVBS-only by construction; see [`crate::host`] for the
+//! invariant that makes that checkable.
+
+/// VTL1 memory info recorded by the LVBS boot path.
+///
+/// LVBS-only: the only consumers are `mshv::vsm` and `litebox_runner_lvbs`. A
+/// KVM guest gets its memory layout from the PVH memory map instead, so this
+/// module has no reader there. Its items are `pub`, so `dead_code` never fired
+/// and `-Dwarnings` did not catch it compiling for nothing.
+pub mod bootparam;
+/// The Linux `cpu_online_mask` ABI, read from VTL0 to drive AP boots.
+pub mod cpu_mask;
+/// Hyper-V hypercall, VSM and VTL-switch support.
+pub mod mshv;
+/// Hyper-V synthetic-timer (STIMER) preemption timer.
+///
+/// Note: roughly half of this module is architectural x2APIC bring-up code
+/// (`IA32_APIC_BASE`, `X2APIC_SVR`, `X2APIC_EOI`) that is not Hyper-V specific
+/// and is worth lifting out when an APIC-timer preemption source lands.
+pub mod timer;
 
 use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,

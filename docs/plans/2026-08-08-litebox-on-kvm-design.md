@@ -1,5 +1,24 @@
 # LiteBox on KVM/QEMU — Design
 
+> **Path note (later restructure).** After this document was written,
+> `litebox_platform_lvbs` was reorganised so that all host-specific code lives
+> under `src/host/<name>/`. Paths named below are the ones that were current at
+> the time and are kept as written, because they are part of the record of what
+> was decided. The mapping to today's tree is:
+>
+> | then | now |
+> |---|---|
+> | `src/mshv/` | `src/host/lvbs/mshv/` |
+> | `src/arch/x86/timer.rs` | `src/host/lvbs/timer.rs` |
+> | `src/arch/x86/clock.rs` | `src/host/kvm/clock.rs` |
+> | `src/host/lvbs_impl.rs` | `src/host/lvbs/mod.rs` |
+> | `src/host/kvm_impl.rs` | `src/host/kvm/mod.rs` |
+> | `src/host/bootparam.rs` | `src/host/lvbs/bootparam.rs` |
+> | `host::linux::CpuMask` | `host::lvbs::cpu_mask::CpuMask` |
+>
+> Public paths moved correspondingly: `litebox_platform_lvbs::mshv` is now
+> `litebox_platform_lvbs::host::lvbs::mshv`.
+
 Date: 2026-08-08
 Branch: `sanghle/kvm`
 Supersedes: `sanghle/hypervisor/bootloader_v2`

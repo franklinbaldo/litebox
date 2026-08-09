@@ -3,14 +3,14 @@
 
 //! VTL switch related functions
 
-use crate::host::{
-    hv_hypercall_page_address,
-    per_cpu_variables::{PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables},
-};
-use crate::mshv::{
+use crate::host::lvbs::mshv::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
     VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
     hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
+};
+use crate::host::{
+    hv_hypercall_page_address,
+    per_cpu_variables::{PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables},
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
@@ -425,8 +425,8 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
 
     loop {
         // Never hand the VP back to VTL0 with the preemption timer live.
-        crate::arch::timer::disarm_preemption();
-        if crate::arch::timer::take_user_timeout_kill() {
+        crate::host::lvbs::timer::disarm_preemption();
+        if crate::host::lvbs::timer::take_user_timeout_kill() {
             crate::serial_println!(
                 "Terminated user-mode code which exceeded its execution quantum"
             );

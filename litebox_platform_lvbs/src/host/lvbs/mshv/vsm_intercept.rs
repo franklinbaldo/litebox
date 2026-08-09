@@ -2,8 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::{
-    host::per_cpu_variables::with_per_cpu_variables,
-    mshv::{
+    host::lvbs::mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
         HV_X64_REGISTER_GDTR, HV_X64_REGISTER_IDTR, HV_X64_REGISTER_LDTR, HV_X64_REGISTER_LSTAR,
@@ -14,6 +13,7 @@ use crate::{
         MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_EIP, MSR_IA32_SYSENTER_ESP, MSR_LSTAR, MSR_STAR,
         MSR_SYSCALL_MASK, X86Cr0Flags, X86Cr4Flags, hvcall_vp::hvcall_set_vp_vtl0_registers,
     },
+    host::per_cpu_variables::with_per_cpu_variables,
 };
 use litebox_common_lvbs::HypervCallError;
 use num_enum::TryFromPrimitive;
@@ -64,7 +64,7 @@ pub fn vsm_handle_intercept() {
             {
                 let int_msg = unsafe {
                     let ptr = core::ptr::addr_of!(msg.payload)
-                        .cast::<crate::mshv::HvMemInterceptMessage>();
+                        .cast::<crate::host::lvbs::mshv::HvMemInterceptMessage>();
                     &*ptr
                 };
                 let gpa = int_msg.gpa;

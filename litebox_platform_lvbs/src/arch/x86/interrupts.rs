@@ -18,9 +18,9 @@
 
 use super::SPURIOUS_VECTOR;
 #[cfg(feature = "host_lvbs")]
-use super::timer::STIMER_VECTOR;
+use crate::host::lvbs::mshv::HYPERVISOR_CALLBACK_VECTOR;
 #[cfg(feature = "host_lvbs")]
-use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
+use crate::host::lvbs::timer::STIMER_VECTOR;
 use core::ops::IndexMut;
 use litebox_common_linux::PtRegs;
 use spin::Once;
@@ -240,9 +240,9 @@ extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
 #[unsafe(no_mangle)]
 extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
     use crate::host::per_cpu_variables::with_per_cpu_variables;
-    super::timer::eoi();
+    crate::host::lvbs::timer::eoi();
     if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
-        super::timer::rearm_preemption();
+        crate::host::lvbs::timer::rearm_preemption();
     }
 }
 

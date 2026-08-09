@@ -18,13 +18,13 @@ use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
-use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
+use litebox_platform_lvbs::host::lvbs::mshv::vsm::{
+    LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate,
+};
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts, timer},
+    arch::{gdt, instrs::hlt_loop, interrupts},
     debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
-    mm::MemoryProvider,
-    mshv::{
+    host::lvbs::mshv::{
         hvcall,
         vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
@@ -36,6 +36,9 @@ use litebox_platform_lvbs::{
             get_text_start_address,
         },
     },
+    host::lvbs::timer,
+    host::{lvbs::bootparam::get_vtl1_memory_info, per_cpu_variables},
+    mm::MemoryProvider,
     serial_println,
 };
 use litebox_platform_multiplex::Platform;
@@ -335,7 +338,7 @@ fn optee_smc_handler_entry_inner(
 ) -> Result<i64, litebox_common_linux::errno::Errno> {
     let smc_args_pfn: usize = smc_args_pfn.trunc();
     let smc_args_addr = smc_args_pfn
-        .checked_mul(1usize << litebox_platform_lvbs::mshv::vtl1_mem_layout::PAGE_SHIFT)
+        .checked_mul(1usize << litebox_platform_lvbs::host::lvbs::mshv::vtl1_mem_layout::PAGE_SHIFT)
         .ok_or(litebox_common_linux::errno::Errno::EINVAL)?;
     let smc_args_updated = optee_smc_handler(smc_args_addr);
 

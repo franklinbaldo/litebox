@@ -135,7 +135,7 @@ the contract.
 
 `KvmGuest` installs a **fixed development key**, so TAs that derive keys (such
 as `kmpp-ta`) exercise the real path rather than an error path. It is
-`SHA-256` of a public string in `kvm_impl.rs`, identical on every LiteBox-on-KVM
+`SHA-256` of a public string in `host/kvm/mod.rs`, identical on every LiteBox-on-KVM
 guest, and the guest says so three times at boot. Anything sealed with a key
 derived from it is sealed against nobody.
 

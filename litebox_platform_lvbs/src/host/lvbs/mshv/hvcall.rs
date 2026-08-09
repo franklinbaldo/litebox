@@ -6,9 +6,7 @@
 use crate::{
     arch::instrs::{rdmsr, wrmsr},
     debug_serial_println,
-    host::{LvbsLinuxKernel, hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
-    mm::MemoryProvider,
-    mshv::{
+    host::lvbs::mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
         HV_HYPERCALL_REP_START_OFFSET, HV_HYPERCALL_RESULT_MASK, HV_HYPERCALL_VARHEAD_OFFSET,
         HV_STATUS_SUCCESS, HV_X64_MSR_GUEST_OS_ID, HV_X64_MSR_HYPERCALL,
@@ -18,13 +16,15 @@ use crate::{
         HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
         HYPERVISOR_CALLBACK_VECTOR, HvSynicSint, vsm,
     },
+    host::{LvbsLinuxKernel, hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables},
+    mm::MemoryProvider,
 };
 use core::arch::asm;
 use litebox_common_lvbs::HypervCallError;
 use thiserror::Error;
 
 #[cfg(debug_assertions)]
-use crate::mshv::HV_REGISTER_VP_INDEX;
+use crate::host::lvbs::mshv::HV_REGISTER_VP_INDEX;
 
 const CPU_VERSION_INFO: u32 = 1;
 const HV_CPUID_SIGNATURE_EAX: u32 = 0x31237648;

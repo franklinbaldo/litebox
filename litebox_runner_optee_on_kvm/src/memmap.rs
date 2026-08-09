@@ -176,7 +176,7 @@ impl Regions {
         // Nothing else has been handed this memory: this is the only caller
         // of `heap_add_region` and each range is emitted once.
         unsafe {
-            litebox_platform_lvbs::host::kvm_impl::heap_add_region(
+            litebox_platform_lvbs::host::kvm::heap_add_region(
                 usize::try_from(pa_to_va(start)).expect("64-bit target"),
                 usize::try_from(size).expect("64-bit target"),
             );

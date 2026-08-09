@@ -4,11 +4,10 @@
 //! Enabling Virtual Secure Mode (VSM) using Hyper-V hypercalls to
 //! secure both VTL0 and VTL1.
 
-use crate::host::linux::CpuMask;
+use crate::host::lvbs::cpu_mask::CpuMask;
 use crate::{
     debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::with_per_cpu_variables},
-    mshv::{
+    host::lvbs::mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
         HV_REGISTER_VSM_VP_SECURE_CONFIG_VTL0, HV_X64_REGISTER_APIC_BASE, HV_X64_REGISTER_CR0,
@@ -21,6 +20,7 @@ use crate::{
         hvcall_vp::{hvcall_get_vp_vtl0_registers, hvcall_set_vp_registers},
         vtl_switch::mshv_vsm_get_code_page_offsets,
     },
+    host::{lvbs::bootparam::get_vtl1_memory_info, per_cpu_variables::with_per_cpu_variables},
 };
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -709,7 +709,8 @@ impl Vtl0Gate for LvbsVtl0Gate {
     }
 
     fn install_ringbuffer(&self, pa: u64, size: u64) {
-        let _ = crate::mshv::ringbuffer::set_ringbuffer(PhysAddr::new(pa), size.trunc());
+        let _ =
+            crate::host::lvbs::mshv::ringbuffer::set_ringbuffer(PhysAddr::new(pa), size.trunc());
     }
 
     fn end_of_boot_reached(&self) -> bool {
@@ -762,7 +763,9 @@ impl Vtl1Gate for LvbsVtl1Gate {
         // Best-effort: attempt every online CPU, surfacing the last init failure.
         let mut error = None;
         cpu_online_mask.for_each_cpu(|cpu_id| {
-            if let Err(e) = crate::mshv::hvcall_vp::init_vtl_ap(TruncateExt::<u32>::trunc(cpu_id)) {
+            if let Err(e) =
+                crate::host::lvbs::mshv::hvcall_vp::init_vtl_ap(TruncateExt::<u32>::trunc(cpu_id))
+            {
                 error = Some(e);
             }
         });

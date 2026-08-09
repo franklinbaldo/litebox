@@ -302,7 +302,7 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     // value every single boot, which is the intended cost. See
     // `install_development_platform_root_key` for why it is not behind a
     // feature.
-    litebox_platform_lvbs::host::kvm_impl::install_development_platform_root_key();
+    litebox_platform_lvbs::host::kvm::install_development_platform_root_key();
 
     check_heap(usable, mapped_limit);
     check_cpu_state();
@@ -1301,8 +1301,8 @@ fn elapsed_nanos(start: Instant, end: Instant) -> u64 {
 fn check_clock() {
     log::info!(
         "tsc freq   {} Hz via {}",
-        litebox_platform_lvbs::arch::clock::tsc_hz(),
-        litebox_platform_lvbs::arch::clock::tsc_source()
+        litebox_platform_lvbs::host::kvm::clock::tsc_hz(),
+        litebox_platform_lvbs::host::kvm::clock::tsc_source()
     );
 
     // A short spin. Checks the clock advances, and by an amount whose order of
@@ -1353,7 +1353,7 @@ fn check_clock() {
     // conversion (a wrong `SCALE_SHIFT`, a lost widening to u128, an overflow),
     // which is arithmetic downstream of the frequency and so does *not* cancel.
     let start = Instant::now();
-    let pit_nanos = litebox_platform_lvbs::arch::clock::pit_reference_interval_nanos();
+    let pit_nanos = litebox_platform_lvbs::host::kvm::clock::pit_reference_interval_nanos();
     let end = Instant::now();
     match pit_nanos {
         Some(pit_nanos) => {
@@ -1370,7 +1370,7 @@ fn check_clock() {
                  {MAX_PIT_ERROR_PERMILLE}): pit {pit_nanos} ns vs tsc {tsc_nanos} ns. \
                  The TSC scale (source: {}) is wrong, or the tick-to-nanosecond \
                  conversion is",
-                litebox_platform_lvbs::arch::clock::tsc_source()
+                litebox_platform_lvbs::host::kvm::clock::tsc_source()
             );
         }
         None => log::warn!("pit check  PIT unavailable, cross-check skipped"),
@@ -1385,15 +1385,15 @@ fn check_crng() {
     // something weaker. Skip the self-check loudly in that case: provoking a
     // deliberate panic would tell us nothing we did not already know from
     // CPUID, and would stop the rest of boot.
-    if !litebox_platform_lvbs::host::kvm_impl::rdrand_supported() {
+    if !litebox_platform_lvbs::host::kvm::rdrand_supported() {
         log::warn!("crng       RDRAND absent (CPUID.1:ECX bit 30 clear), check skipped");
         return;
     }
 
     let mut first = [0u8; 32];
     let mut second = [0u8; 32];
-    litebox_platform_lvbs::host::kvm_impl::fill_bytes_crng(&mut first);
-    litebox_platform_lvbs::host::kvm_impl::fill_bytes_crng(&mut second);
+    litebox_platform_lvbs::host::kvm::fill_bytes_crng(&mut first);
+    litebox_platform_lvbs::host::kvm::fill_bytes_crng(&mut second);
 
     log::info!("crng #1    {}", HexBytes(&first));
     log::info!("crng #2    {}", HexBytes(&second));
@@ -1647,12 +1647,12 @@ fn panic(info: &PanicInfo) -> ! {
             "nx         instruction fetch from {probe:#018X} faulted as expected; \
              DEP is enforced and the run is complete"
         );
-        litebox_platform_lvbs::host::kvm_impl::debug_exit(
-            litebox_platform_lvbs::host::kvm_impl::DEBUG_EXIT_SUCCESS,
+        litebox_platform_lvbs::host::kvm::debug_exit(
+            litebox_platform_lvbs::host::kvm::DEBUG_EXIT_SUCCESS,
         )
     }
 
-    litebox_platform_lvbs::host::kvm_impl::debug_exit(
-        litebox_platform_lvbs::host::kvm_impl::DEBUG_EXIT_FAILURE,
+    litebox_platform_lvbs::host::kvm::debug_exit(
+        litebox_platform_lvbs::host::kvm::DEBUG_EXIT_FAILURE,
     )
 }

@@ -1,5 +1,24 @@
 # LiteBox on KVM — Phase 2: Boot and Run a TA
 
+> **Path note (later restructure).** After this document was written,
+> `litebox_platform_lvbs` was reorganised so that all host-specific code lives
+> under `src/host/<name>/`. Paths named below are the ones that were current at
+> the time and are kept as written, because they are part of the record of what
+> was decided. The mapping to today's tree is:
+>
+> | then | now |
+> |---|---|
+> | `src/mshv/` | `src/host/lvbs/mshv/` |
+> | `src/arch/x86/timer.rs` | `src/host/lvbs/timer.rs` |
+> | `src/arch/x86/clock.rs` | `src/host/kvm/clock.rs` |
+> | `src/host/lvbs_impl.rs` | `src/host/lvbs/mod.rs` |
+> | `src/host/kvm_impl.rs` | `src/host/kvm/mod.rs` |
+> | `src/host/bootparam.rs` | `src/host/lvbs/bootparam.rs` |
+> | `host::linux::CpuMask` | `host::lvbs::cpu_mask::CpuMask` |
+>
+> Public paths moved correspondingly: `litebox_platform_lvbs::mshv` is now
+> `litebox_platform_lvbs::host::lvbs::mshv`.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Boot `litebox_runner_optee_on_kvm` under `qemu-system-x86_64 -kernel`, load a static OP-TEE TA, execute it in ring 3, and exit with a distinguishable code.

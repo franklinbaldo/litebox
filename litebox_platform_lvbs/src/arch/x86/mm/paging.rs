@@ -61,7 +61,7 @@ pub(crate) const KERNEL_PML4_START: usize =
 /// also see the invalidation.
 #[cfg(all(not(test), feature = "host_lvbs"))]
 fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
-    use crate::mshv::{hvcall_mm, is_hvcall_ready};
+    use crate::host::lvbs::mshv::{hvcall_mm, is_hvcall_ready};
 
     if count == 0 {
         return;

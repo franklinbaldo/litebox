@@ -9,8 +9,7 @@ use crate::{
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
     debug_serial_println,
-    host::per_cpu_variables::with_per_cpu_variables,
-    mshv::{
+    host::lvbs::mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
         HvGetVpRegistersOutput, HvInputVtl, HvSetVpRegistersInput, SegmentRegisterAttributeFlags,
@@ -19,6 +18,7 @@ use crate::{
             PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
         },
     },
+    host::per_cpu_variables::with_per_cpu_variables,
     serial_println,
 };
 use litebox_common_lvbs::HypervCallError;

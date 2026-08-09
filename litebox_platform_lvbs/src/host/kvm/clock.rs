@@ -48,7 +48,7 @@
 //! fabricated frequency. The max-leaf guards are load-bearing; do not remove
 //! them.
 
-use super::instrs::wrmsr;
+use crate::arch::instrs::wrmsr;
 use core::arch::x86_64::{__cpuid_count as cpuid_count, _rdtsc};
 
 /// CPUID standard feature-information leaf.
