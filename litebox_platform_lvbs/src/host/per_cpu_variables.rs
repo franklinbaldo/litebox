@@ -233,17 +233,26 @@ impl PerCpuVariables {
         // Here, we cache VTL0's XSAVE mask for better performance. This is safe because
         // Linux kernel (VTL0) initializes XCR0 during boot and does not expands it to
         // cover other extended states (which require nontrivial per-CPU xsave buffer changes).
+        // VTL0's mask, and the area sized from it, exist only to save and
+        // restore the *other* VTL's extended state across a VTL switch. A KVM
+        // guest has no VTL0, so the read is meaningless, the assertion has no
+        // premise, and the area would be a per-CPU allocation that nothing
+        // ever reads -- `mshv::vtl_switch` is its only consumer.
+        #[cfg(feature = "host_lvbs")]
         let vtl0_xsave_mask = xgetbv0();
         let vtl1_xsave_mask = PerCpuVariables::VTL1_XSAVE_MASK;
+        #[cfg(feature = "host_lvbs")]
         assert_eq!(
             vtl1_xsave_mask & !vtl0_xsave_mask,
             0,
             "VTL1 cannot have extended states that VTL0 does not enable"
         );
+        #[cfg(feature = "host_lvbs")]
         let vtl0_xsave_area_size = get_xsave_area_size();
         // Leaking `xsave_area` buffers are okay because they are never reused
         // until the core gets reset.
         // TODO: let's revisit this if VTL0 is allowed to modify XCR0 such that xsave area size may change.
+        #[cfg(feature = "host_lvbs")]
         let vtl0_xsave_area = Box::leak(
             avec![[{ Self::XSAVE_ALIGNMENT }] | 0u8; vtl0_xsave_area_size]
                 .into_boxed_slice()
@@ -260,7 +269,9 @@ impl PerCpuVariables {
                 .into(),
         );
         // Store VTL0 xsave values directly in PerCpuVariablesAsm for assembly access
+        #[cfg(feature = "host_lvbs")]
         pcv_asm.set_vtl0_xsave_area_addr(vtl0_xsave_area.as_ptr() as usize);
+        #[cfg(feature = "host_lvbs")]
         pcv_asm.set_vtl0_xsave_mask(vtl0_xsave_mask);
         // Store VTL1 kernel and user xsave area addresses in PerCpuVariablesAsm for assembly access
         pcv_asm.set_vtl1_kernel_xsave_area_addr(vtl1_kernel_xsave_area.as_ptr() as usize);
@@ -310,10 +321,13 @@ pub struct PerCpuVariablesAsm {
     /// Top address of the user context area
     user_context_top_addr: Cell<usize>,
     /// Address of the VTL0 XSAVE area
+    #[cfg(feature = "host_lvbs")]
     vtl0_xsave_area_addr: Cell<usize>,
     /// Lower 32 bits of VTL0 XSAVE mask (for eax in xsave/xrstor)
+    #[cfg(feature = "host_lvbs")]
     vtl0_xsave_mask_lo: Cell<u32>,
     /// Upper 32 bits of VTL0 XSAVE mask (for edx in xsave/xrstor)
+    #[cfg(feature = "host_lvbs")]
     vtl0_xsave_mask_hi: Cell<u32>,
     /// Address of the VTL1 kernel XSAVE area (saved/restored in run_thread_arch)
     vtl1_kernel_xsave_area_addr: Cell<usize>,
@@ -367,9 +381,11 @@ impl PerCpuVariablesAsm {
     pub fn set_vtl0_state_top_addr(&self, addr: usize) {
         self.vtl0_state_top_addr.set(addr);
     }
+    #[cfg(feature = "host_lvbs")]
     pub fn set_vtl0_xsave_area_addr(&self, addr: usize) {
         self.vtl0_xsave_area_addr.set(addr);
     }
+    #[cfg(feature = "host_lvbs")]
     pub fn set_vtl0_xsave_mask(&self, mask: u64) {
         self.vtl0_xsave_mask_lo.set((mask & 0xffff_ffff) as u32);
         self.vtl0_xsave_mask_hi
@@ -418,12 +434,15 @@ impl PerCpuVariablesAsm {
     pub const fn user_context_top_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, user_context_top_addr)
     }
+    #[cfg(feature = "host_lvbs")]
     pub const fn vtl0_xsave_area_addr_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl0_xsave_area_addr)
     }
+    #[cfg(feature = "host_lvbs")]
     pub const fn vtl0_xsave_mask_lo_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl0_xsave_mask_lo)
     }
+    #[cfg(feature = "host_lvbs")]
     pub const fn vtl0_xsave_mask_hi_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, vtl0_xsave_mask_hi)
     }
@@ -598,6 +617,7 @@ pub fn init_per_cpu_variables() {
 /// XCR0. If VTL1 should program XCR0, we need to save and restore VTL0's XCR0 and call
 /// this function against the stored value.
 /// In addition, HVCI/HEKI prevents VTL0 from modifying XCR0.
+#[cfg(feature = "host_lvbs")]
 fn get_xsave_area_size() -> usize {
     let cpuid = raw_cpuid::CpuId::new();
     let finfo = cpuid
@@ -612,6 +632,7 @@ fn get_xsave_area_size() -> usize {
 
 #[allow(clippy::inline_always)]
 #[inline(always)]
+#[cfg(feature = "host_lvbs")]
 fn xgetbv0() -> u64 {
     let eax: u32;
     let edx: u32;
