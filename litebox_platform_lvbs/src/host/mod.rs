@@ -41,13 +41,14 @@
 //! collapsing them into traits is separate work. A seam is acceptable there. A
 //! whole host-specific module is not.
 //!
-//! `linux.rs` is shared: it holds host-agnostic Linux ABI structs. The one
-//! LVBS-only type it used to carry, `CpuMask`, now lives in
-//! `host/lvbs/cpu_mask.rs` for exactly the reason above.
+//! `CpuMask` used to sit in a shared `linux.rs` alongside `pt_regs` and
+//! `Timespec`. Those two turned out to be dead legacy from the SNP platform,
+//! which sandboxes a normal-world Linux in VMPL1: nothing imported them, and
+//! `Timespec` duplicated `litebox_common_linux::Timespec`. They are gone, and
+//! `CpuMask` now lives in `host/lvbs/cpu_mask.rs` for exactly the reason above.
 
 #[cfg(feature = "host_kvm")]
 pub mod kvm;
-pub mod linux;
 #[cfg(feature = "host_lvbs")]
 pub mod lvbs;
 pub mod per_cpu_variables;
