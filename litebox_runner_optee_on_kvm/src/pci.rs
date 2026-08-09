@@ -22,6 +22,10 @@
 
 use litebox_platform_lvbs::arch::ioport::{inl, outl};
 
+mod bar;
+
+pub use bar::BAR_MEM_ADDR_MASK;
+
 /// Configuration address port. A dword written here selects the register that
 /// the next access to [`CONFIG_DATA`] reads or writes.
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -409,16 +413,13 @@ impl DeviceHeader {
             (probe_low, probe_high)
         };
 
-        // Mask off the low bits, which are the type field rather than address
-        // bits and read back as they were written -- counting them would
-        // report a size 16 bytes too small on every BAR.
-        let mask = (u64::from(probe_high) << 32) | u64::from(probe_low & BAR_MEM_ADDR_MASK);
-        // A BAR that decodes nothing reads back as all-zero here; `!mask + 1`
-        // would be 1, which is not a plausible size. Report it as absent.
-        if mask == 0 {
-            return None;
-        }
-        Some((base, (!mask).wrapping_add(1)))
+        // The complement is taken at the BAR's own width -- see
+        // [`bar::size_from_probe`]. Doing it in 64 bits for a 32-bit BAR, which
+        // has no upper dword, sets all 32 upper bits and reports an absurd
+        // size. A BAR that decodes nothing reads back as all-zero and is
+        // reported as absent rather than as a size of 1.
+        let size = bar::size_from_probe(probe_low, probe_high, is_64bit)?;
+        Some((base, size))
     }
 
     /// Iterates the capability list, calling `visit` with the offset and ID of
@@ -471,8 +472,6 @@ pub const BAR_MEM_TYPE_MASK: u32 = 0b110;
 pub const BAR_MEM_TYPE_64: u32 = 0b100;
 /// Memory BAR bit 3: prefetchable.
 pub const BAR_MEM_PREFETCHABLE: u32 = 1 << 3;
-/// Address bits of a memory BAR (31:4).
-pub const BAR_MEM_ADDR_MASK: u32 = 0xFFFF_FFF0;
 /// Address bits of an I/O BAR (31:2).
 pub const BAR_IO_ADDR_MASK: u32 = 0xFFFF_FFFC;
 
