@@ -293,7 +293,13 @@ impl Channel {
             else {
                 return Err(ChannelError::Timeout);
             };
-            let len = (len as usize).min(CHANNEL_BUF_SIZE);
+            // No clamp here. `receive_deadline` bounds the returned length by
+            // the capacity it submitted, which is itself bounded by the
+            // buffer's own length, and `read_into` checks it a second time
+            // against that length. The bound now lives with the allocation, so
+            // repeating it here would only restate a guarantee this code no
+            // longer has to remember to provide.
+            let len = len as usize;
             let mut bytes = [0_u8; CHANNEL_BUF_SIZE];
             self.rx.read_into(&mut bytes, len);
             // The accumulated buffer is bounded by the same maximum the codec
@@ -314,7 +320,7 @@ impl Channel {
     fn send(&mut self, response: &Response) -> Result<(), ChannelError> {
         let frame = response.encode();
         for chunk in frame.chunks(CHANNEL_BUF_SIZE) {
-            self.tx.fill(chunk, CHANNEL_BUF_SIZE);
+            self.tx.fill(chunk);
             let len = u32::try_from(chunk.len()).expect("chunk is at most one page");
             if !self.console.send_blocking(&self.tx, len) {
                 return Err(ChannelError::TransmitStalled);

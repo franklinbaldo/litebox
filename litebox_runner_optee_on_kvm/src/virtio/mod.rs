@@ -1021,8 +1021,14 @@ impl Console {
     /// # Panics
     ///
     /// Panics if the transmit queue has no free descriptor, which with a
-    /// synchronous single-buffer caller cannot happen.
+    /// synchronous single-buffer caller cannot happen, or if `len` exceeds the
+    /// buffer's capacity. `len` is this driver's own, so that is a bug here.
     pub fn send_blocking(&mut self, buffer: &queue::Dma, len: u32) -> bool {
+        assert!(
+            len as usize <= buffer.len(),
+            "transmit of {len} bytes exceeds the {}-byte buffer",
+            buffer.len()
+        );
         // SAFETY: the buffer outlives the call -- it is borrowed for the whole
         // of it, and the call does not return until the device has handed the
         // descriptor back -- and it is submitted device-readable, so the
@@ -1080,9 +1086,16 @@ impl Console {
         use litebox::platform::Instant as _;
         use litebox_platform_lvbs::Instant;
 
-        // SAFETY: as `receive_polling` -- the buffer is borrowed mutably for
-        // the whole call, submitted device-writable, and not read until the
-        // completion says the device has finished with it.
+        // Never authorize the device to write past the end of the buffer. The
+        // descriptor's length is the device's *permission*, so it is bounded
+        // by what the allocation actually holds rather than by whatever the
+        // caller asked for.
+        let capacity = capacity.min(u32::try_from(buffer.len()).unwrap_or(u32::MAX));
+
+        // SAFETY: the buffer is borrowed mutably for the whole call, submitted
+        // device-writable, and not read until the completion says the device
+        // has finished with it. `capacity` is bounded by the buffer's own
+        // length just above.
         let head = unsafe { self.receive.submit(buffer.pa(), capacity, true) }
             .expect("receive queue has no free descriptor");
         self.transport.notify(&self.receive);
@@ -1092,7 +1105,18 @@ impl Console {
             if let Some((completed, written)) = self.receive.take_used()
                 && completed == head
             {
-                return Some(written);
+                // `written` is written by the device, which is untrusted --
+                // in the two-VM arrangement it is the normal world. A device
+                // that reports more than it was given room for is lying, and
+                // the lie must produce a clamp at this boundary rather than an
+                // over-long read out of the buffer later.
+                if written > capacity {
+                    log::warn!(
+                        "virtio     device reported {written} bytes written into a \
+                         {capacity}-byte receive buffer; clamping"
+                    );
+                }
+                return Some(written.min(capacity));
             }
             let elapsed = Instant::now()
                 .checked_duration_since(&start)

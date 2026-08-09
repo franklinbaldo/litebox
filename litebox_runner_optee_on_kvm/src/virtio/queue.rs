@@ -95,6 +95,21 @@ pub struct Dma {
     /// `expect` for `cast_ptr_alignment` rather than an alignment check.
     va: *mut u8,
     pa: u64,
+    /// Usable capacity in bytes: what the allocation was *asked* for, not what
+    /// it was rounded up to.
+    ///
+    /// This is what makes a length check possible at all. `used_elem.len` is
+    /// written by the device, and the device is untrusted -- in the two-VM
+    /// arrangement it is the normal world -- so a completion may report more
+    /// bytes than the buffer can hold. Without a length recorded here, the
+    /// safe `pub` [`Self::read_into`] and [`Self::fill`] have nothing to check
+    /// against and depend on every caller remembering to clamp, which is a
+    /// guarantee no signature expresses. Keeping the capacity with the
+    /// allocation moves the check to where the fact lives.
+    ///
+    /// The requested size rather than the rounded-up one: the rounding to
+    /// whole pages is slack, not capacity to be relied on.
+    len: usize,
 }
 
 impl Dma {
@@ -132,6 +147,7 @@ impl Dma {
         Self {
             pa: Platform::va_to_pa(x86_64::VirtAddr::new(va as u64)).as_u64(),
             va,
+            len: usize::try_from(bytes).expect("64-bit target"),
         }
     }
 
@@ -149,21 +165,31 @@ impl Dma {
         self.pa
     }
 
+    /// The usable capacity of the allocation, in bytes.
+    ///
+    /// This is the bound every device-supplied length is checked against, and
+    /// the most a descriptor naming this buffer may ever be given.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     /// Copies `bytes` into the start of the allocation.
     ///
     /// # Panics
     ///
-    /// Panics if `bytes` is longer than the allocation's *requested* size.
-    /// The rounding up to whole pages is slack, not capacity to be relied on.
-    pub fn fill(&mut self, bytes: &[u8], capacity: usize) {
+    /// Panics if `bytes` is longer than the allocation's capacity. That length
+    /// comes from this driver, not from the device, so exceeding it is a bug
+    /// here rather than something a peer can provoke.
+    pub fn fill(&mut self, bytes: &[u8]) {
         assert!(
-            bytes.len() <= capacity,
-            "{} bytes do not fit in a {capacity}-byte DMA buffer",
-            bytes.len()
+            bytes.len() <= self.len,
+            "{} bytes do not fit in a {}-byte DMA buffer",
+            bytes.len(),
+            self.len
         );
-        // SAFETY: `self.va` is a live allocation of at least `capacity` bytes
+        // SAFETY: `self.va` is a live allocation of at least `self.len` bytes
         // (rounded up to whole pages), exclusively owned, and `bytes` is a
-        // distinct borrow.
+        // distinct borrow. The assert above bounds the copy by that length.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.va, bytes.len()) };
     }
 
@@ -173,11 +199,25 @@ impl Dma {
     ///
     /// # Panics
     ///
-    /// Panics if `out` is shorter than `len`.
+    /// Panics if `len` exceeds the allocation's capacity, or if `out` is
+    /// shorter than `len`.
+    ///
+    /// The first of those is a backstop, not the primary defence. `len`
+    /// originates in `used_elem.len`, which the untrusted device writes, so it
+    /// is clamped to the submitted capacity at the boundary where the
+    /// completion is consumed -- see `Console::receive_deadline`. Checking it
+    /// again here is what makes this safe `pub` function sound *on its own*,
+    /// rather than sound only as long as every caller remembers to clamp.
     pub fn read_into(&self, out: &mut [u8], len: usize) {
+        assert!(
+            len <= self.len,
+            "{len} bytes were requested from a {}-byte DMA buffer",
+            self.len
+        );
         assert!(out.len() >= len, "output slice is shorter than {len} bytes");
-        // SAFETY: as `fill`; the caller has bounded `len` by the buffer's size
-        // through the descriptor it submitted.
+        // SAFETY: `len` is bounded by both the allocation's capacity and the
+        // output slice's length by the asserts above, and the two regions are
+        // distinct allocations.
         unsafe { core::ptr::copy_nonoverlapping(self.va, out.as_mut_ptr(), len) };
     }
 }
