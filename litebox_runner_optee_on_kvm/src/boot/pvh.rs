@@ -163,6 +163,25 @@ _start:
     mov dword ptr [{scratch} + {off_sinfo}], ebx
     mov dword ptr [{scratch} + {off_sinfo} + 4], 0
 
+    /* Step 1b: our own stack, before anything is pushed.
+
+       The PVH boot ABI fixes %ebx and the segment selectors -- all flat, base
+       0, limit 4 GiB -- but says nothing about %esp. It was left at whatever
+       the firmware happened to have, and the far return below pushes two
+       dwords through it, so those writes landed at an unspecified address.
+       That is arbitrary memory corruption; it worked only because QEMU
+       happens to leave a usable stack behind.
+
+       This is the same boot stack `.Lhigh_half` switches to, just named by its
+       *physical* address: paging is off at this point, and even once it is on
+       we execute out of the identity map until the jump to the high alias, so
+       a 32-bit %esp must be the physical address either way. %ss is already
+       flat per the ABI, so %esp alone is the whole fix.
+
+       Two dwords at the very top of a ~500 KiB stack come nowhere near the
+       page tables at the bottom of the region -- see OFF_STACK_TOP. */
+    mov esp, {scratch} + {off_stack_top}
+
     /* Liveness marker: proof the hypervisor reached this entry point at all,
        emitted before anything that could plausibly fail. */
     mov dx, 0x3F8
@@ -255,7 +274,9 @@ _start:
     lgdt [{scratch} + {off_gdtr}]
 
     /* A far return rather than `ljmp`: same effect, no far-pointer syntax to
-       get wrong. Pushes CS then EIP; in 32-bit mode both are 4 bytes. */
+       get wrong. Pushes CS then EIP; in 32-bit mode both are 4 bytes. Both
+       pushes and the `retf` itself use the stack established in step 1b, not
+       the firmware's. */
     mov eax, offset .Lpa_compat
     push 0x08
     push eax
