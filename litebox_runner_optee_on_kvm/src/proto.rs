@@ -261,6 +261,15 @@ impl BinaryTarget {
     }
 
     /// The name used in log lines and error messages.
+    ///
+    /// `allow` rather than `expect`: this file is compiled twice, once into
+    /// the guest -- where `ta.rs` calls this -- and once into
+    /// `dev_tests/tests/kvm_proto.rs`, which exercises the codec only. It is
+    /// genuinely dead in the second, and `expect` would then fire in the first.
+    #[allow(
+        dead_code,
+        reason = "used by ta.rs in the guest build, not by the codec tests"
+    )]
     pub fn name(self) -> &'static str {
         match self {
             Self::Ldelf => "ldelf",
@@ -1303,9 +1312,13 @@ mod tests {
     fn chunks_reassemble_a_binary_larger_than_a_frame() {
         const TOTAL: usize = 2_500_000;
         const CHUNK: usize = 256 * 1024;
-        assert!(TOTAL > MAX_FRAME_LEN, "the point of the test");
+        // A compile-time check, not a runtime one: both operands are consts, so
+        // this states the premise of the test rather than testing anything.
+        const _: () = assert!(TOTAL > MAX_FRAME_LEN);
 
-        let source: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let source: Vec<u8> = (0..TOTAL)
+            .map(|i| u8::try_from(i % 251).expect("i % 251 is at most 250"))
+            .collect();
         let mut received = Vec::new();
         for (index, piece) in source.chunks(CHUNK).enumerate() {
             let encoded = Request::load(LoadChunk {

@@ -3,6 +3,21 @@
 
 //! Different host implementations of [`super::HostInterface`]
 //!
+//! # Planned: rename the crate to `litebox_platform_kernel`
+//!
+//! `litebox_platform_lvbs` is now a misnomer: half of it is a generic x86_64
+//! kernel, and a KVM guest that never touches VTL still depends on a crate
+//! named after it. The intended name is `litebox_platform_kernel`, with the
+//! `Lvbs`-prefixed shared types (`LvbsPhysPageMapInfo`, `LvbsValidateAccess`)
+//! and the VTL language in shared doc comments renamed with it. Deferred, not
+//! forgotten.
+//!
+//! Two items still sit outside `host/` that the invariant below says belong
+//! inside it: `arch::x86::REF_TICKS_PER_MICRO` and `REF_COUNTER_TICK_NANOS`,
+//! whose own docs describe them as properties of a Hyper-V synthetic MSR
+//! rather than of x86. They are `pub(crate)` consts with no symbols, so moving
+//! them is free whenever someone is in here.
+//!
 //! # Invariant: host-specific code lives under `host/<name>/`
 //!
 //! Everything specific to a single host lives under `host/lvbs/` (Hyper-V
