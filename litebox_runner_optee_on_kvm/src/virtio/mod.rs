@@ -1070,24 +1070,30 @@ impl Console {
     /// Submits `bytes` on the transmit queue and waits for the device to hand
     /// the descriptor back.
     ///
-    /// Returns `false` if the completion never arrived.
+    /// Returns `false` if the completion never arrived, in which case
+    /// `buffer` is emptied -- see [`Self::receive_deadline`] for why.
     ///
     /// # Panics
     ///
-    /// Panics if the transmit queue has no free descriptor, which with a
-    /// synchronous single-buffer caller cannot happen, or if `len` exceeds the
-    /// buffer's capacity. `len` is this driver's own, so that is a bug here.
-    pub fn send_blocking(&mut self, buffer: &queue::Dma, len: u32) -> bool {
+    /// Panics if the buffer has already been given up, if the transmit queue
+    /// has no free descriptor -- which with a synchronous single-buffer caller
+    /// cannot happen -- or if `len` exceeds the buffer's capacity. `len` is
+    /// this driver's own, so that is a bug here.
+    pub fn send_blocking(&mut self, buffer: &mut Option<queue::Dma>, len: u32) -> bool {
+        let dma = buffer
+            .as_ref()
+            .expect("the transmit buffer was given up by an earlier stalled transmit");
         assert!(
-            len as usize <= buffer.len(),
+            len as usize <= dma.len(),
             "transmit of {len} bytes exceeds the {}-byte buffer",
-            buffer.len()
+            dma.len()
         );
-        // SAFETY: the buffer outlives the call -- it is borrowed for the whole
-        // of it, and the call does not return until the device has handed the
-        // descriptor back -- and it is submitted device-readable, so the
-        // device only reads it while this function refrains from writing it.
-        let head = unsafe { self.transmit.submit(buffer.pa(), len, false) }
+        // SAFETY: the buffer is borrowed for the whole of the call and is
+        // submitted device-readable, so the device only reads it while this
+        // function refrains from writing it. If the call returns without a
+        // completion the buffer is taken out of `buffer` below rather than
+        // handed back, so no later writer can reach it either.
+        let head = unsafe { self.transmit.submit(dma.pa(), len, false) }
             .expect("transmit queue has no free descriptor");
         self.transport.notify(&self.transmit);
 
@@ -1106,6 +1112,9 @@ impl Console {
             }
             core::hint::spin_loop();
         }
+
+        self.transmit.abandon(head);
+        forget_posted_buffer(buffer);
         false
     }
 
@@ -1128,29 +1137,61 @@ impl Console {
     /// between TCG and KVM. A wall-clock deadline is checkable against the
     /// client's own patience.
     ///
+    /// # Who owns the buffer, and why it is an `Option`
+    ///
+    /// A timeout ends the caller's `&mut` borrow but does *not* end the
+    /// device's claim. The descriptor is still posted and still marked
+    /// device-writable, so the device may write into the buffer at any later
+    /// moment -- while the guest, having got its `None` back, considers the
+    /// buffer free to reuse, to read, or to hand to the allocator. That is the
+    /// same defect as the High finding about a borrow outliving a posted
+    /// descriptor, and a `&mut` signature cannot express the fix, because the
+    /// fix is that ownership does not come back.
+    ///
+    /// Nor can it be resolved by resetting the queue: virtio 1.0 without
+    /// `VIRTIO_F_RING_RESET`, which this driver deliberately does not
+    /// negotiate, has no per-queue reset, and a device reset would discard the
+    /// other queue and the whole negotiated state with it. The honest model is
+    /// therefore that a timed-out buffer is *lost*: `Queue::abandon` records
+    /// the descriptor as permanently outstanding, and the `Dma` is taken out of
+    /// the caller's `Option` and leaked, so its pages are never freed and never
+    /// handed to anything else. The caller is left holding `None`, which is not
+    /// a discipline it has to remember -- there is simply nothing there to
+    /// misuse.
+    ///
+    /// One page per timeout is a price worth paying, and in this runner it is
+    /// paid at most once: `Channel::recv` turns the `None` into
+    /// `ChannelError::Timeout`, which `serve` treats as fatal.
+    ///
     /// # Panics
     ///
-    /// Panics if the receive queue has no free descriptor.
+    /// Panics if the buffer has already been given up by an earlier timeout,
+    /// or if the receive queue has no free descriptor.
     pub fn receive_deadline(
         &mut self,
-        buffer: &mut queue::Dma,
+        buffer: &mut Option<queue::Dma>,
         capacity: u32,
         timeout_nanos: u64,
     ) -> Option<u32> {
         use litebox::platform::Instant as _;
         use litebox_platform_lvbs::Instant;
 
+        let dma = buffer
+            .as_ref()
+            .expect("the receive buffer was given up by an earlier timeout");
+
         // Never authorize the device to write past the end of the buffer. The
         // descriptor's length is the device's *permission*, so it is bounded
         // by what the allocation actually holds rather than by whatever the
         // caller asked for.
-        let capacity = capacity.min(u32::try_from(buffer.len()).unwrap_or(u32::MAX));
+        let capacity = capacity.min(u32::try_from(dma.len()).unwrap_or(u32::MAX));
 
         // SAFETY: the buffer is borrowed mutably for the whole call, submitted
         // device-writable, and not read until the completion says the device
         // has finished with it. `capacity` is bounded by the buffer's own
-        // length just above.
-        let head = unsafe { self.receive.submit(buffer.pa(), capacity, true) }
+        // length just above. On the timeout path the allocation is not handed
+        // back to the caller at all, so the device keeps exclusive use of it.
+        let head = unsafe { self.receive.submit(dma.pa(), capacity, true) }
             .expect("receive queue has no free descriptor");
         self.transport.notify(&self.receive);
 
@@ -1176,10 +1217,42 @@ impl Console {
                 .checked_duration_since(&start)
                 .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
             if elapsed >= timeout_nanos {
+                self.receive.abandon(head);
+                forget_posted_buffer(buffer);
                 return None;
             }
             core::hint::spin_loop();
         }
+    }
+}
+
+/// Permanently gives up the buffer the caller posted.
+///
+/// The allocation is *leaked* on purpose: its physical address is still in a
+/// posted descriptor, so freeing it would let the guest's allocator hand those
+/// pages to something else while the device is still entitled to write them.
+/// There is nothing else that can be done about that -- see
+/// [`Console::receive_deadline`] -- and taking it out of the caller's `Option`
+/// is what makes the leak the *only* consequence.
+fn forget_posted_buffer(buffer: &mut Option<queue::Dma>) {
+    // `Dma` has no `Drop`: `mem_allocate_pages` is never given back, so simply
+    // dropping the value here is already the leak this function wants. That is
+    // a property of `Dma` today rather than a promise, so it is asserted -- if
+    // `Dma` ever learns to free its pages, this is the one call site that must
+    // not let it, and this stops being a silent hazard and becomes a build
+    // failure.
+    const _: () = assert!(
+        !core::mem::needs_drop::<queue::Dma>(),
+        "Dma now has a Drop: forget_posted_buffer must suppress it, or a buffer the device \
+         still owns will be returned to the allocator"
+    );
+    if let Some(dma) = buffer.take() {
+        log::error!(
+            "virtio     giving up a {}-byte DMA buffer at pa {:#014X}: its descriptor is still \
+             posted, so the pages are leaked rather than risk being reissued",
+            dma.len(),
+            dma.pa()
+        );
     }
 }
 

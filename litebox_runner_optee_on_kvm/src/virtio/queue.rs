@@ -245,6 +245,11 @@ enum DescState {
     Free,
     /// Handed to the device and not yet completed.
     InFlight,
+    /// Handed to the device, and then given up on -- see [`Queue::abandon`].
+    /// The device may still write the buffer it names, so that buffer is never
+    /// reused; a late completion for it is legitimate and returns the
+    /// descriptor (but not the buffer) to service.
+    Abandoned,
 }
 
 /// A split virtqueue, sized and allocated but not yet registered with the
@@ -506,10 +511,48 @@ impl Queue {
         Some(head)
     }
 
+    /// Gives up on an outstanding descriptor.
+    ///
+    /// There is no way to withdraw a published descriptor. Virtio 1.0 without
+    /// `VIRTIO_F_RING_RESET` -- which this driver does not negotiate -- has no
+    /// per-queue reset, and the only reset that exists is of the whole device.
+    /// So giving up on a descriptor means giving up on its *buffer*,
+    /// permanently: the descriptor stays posted, and the device is entitled to
+    /// write into that buffer at any point from now on. The caller must never
+    /// touch, free or reuse it again.
+    ///
+    /// What this records is that fact, so that the late completion which may
+    /// still arrive is recognised as legitimate rather than treated as a
+    /// replayed id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `head` is not outstanding: abandoning something the queue does
+    /// not hold means the caller has lost track of what it submitted.
+    pub fn abandon(&mut self, head: u16) {
+        assert_eq!(
+            self.states.get(head as usize).copied(),
+            Some(DescState::InFlight),
+            "queue {}: descriptor {head} is not in flight and cannot be abandoned",
+            self.index
+        );
+        self.states[head as usize] = DescState::Abandoned;
+        log::error!(
+            "virtio     queue {}: descriptor {head} abandoned while still posted; its buffer \
+             belongs to the device from now on and is never reused",
+            self.index
+        );
+    }
+
     /// Takes one completion off the used ring, if there is one.
     ///
     /// Returns the head descriptor index and the number of bytes the device
     /// wrote, and returns the descriptor to the free list.
+    ///
+    /// A completion for an abandoned descriptor returns the *descriptor* to the
+    /// free list -- the device has finished with it, so it is safe to hand out
+    /// again -- but is not reported as a completion, because nobody is waiting
+    /// on it and its buffer stays given up.
     ///
     /// A completion naming a descriptor that is not outstanding is **not** a
     /// completion: it is the untrusted device replaying an `id`, and honouring
@@ -542,14 +585,22 @@ impl Queue {
             return None;
         };
 
-        if self.states[head as usize] != DescState::InFlight {
-            log::error!(
-                "virtio     queue {}: completion for descriptor {head}, which is not in \
-                 flight; the device is replaying a used-ring id. Ignored -- honouring it \
-                 would self-link the free list.",
+        match self.states[head as usize] {
+            DescState::InFlight => {}
+            DescState::Abandoned => log::warn!(
+                "virtio     queue {}: late completion for abandoned descriptor {head}; the \
+                 descriptor is reclaimed, its buffer is not",
                 self.index
-            );
-            return None;
+            ),
+            DescState::Free => {
+                log::error!(
+                    "virtio     queue {}: completion for descriptor {head}, which is not in \
+                     flight; the device is replaying a used-ring id. Ignored -- honouring it \
+                     would self-link the free list.",
+                    self.index
+                );
+                return None;
+            }
         }
 
         // Return the chain -- one descriptor, since nothing chains here -- to
@@ -565,8 +616,11 @@ impl Queue {
         );
         self.free_head = head;
         self.num_free += 1;
-        self.states[head as usize] = DescState::Free;
+        let was = core::mem::replace(&mut self.states[head as usize], DescState::Free);
 
-        Some((head, elem.len))
+        // An abandoned descriptor has no caller waiting on it, so reporting it
+        // as a completion would make it look like the answer to whatever the
+        // caller submitted most recently.
+        (was == DescState::InFlight).then_some((head, elem.len))
     }
 }

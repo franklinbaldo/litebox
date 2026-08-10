@@ -221,10 +221,18 @@ const CHANNEL_BUF_SIZE: usize = 4096;
 /// arrive as 40 one-byte completions, and two frames may arrive in one. So
 /// received bytes are accumulated and [`proto::bytes_needed`] is asked, after
 /// every completion, whether a whole frame is present yet.
+///
+/// The two DMA buffers are `Option`s because a timeout or a stalled transmit
+/// does not give a buffer back: the descriptor naming it stays posted and the
+/// device may still write it, so it is taken away rather than returned. See
+/// [`virtio::Console::receive_deadline`]. Both of those outcomes are fatal to
+/// the channel, so in practice the `None` is observed only by the panic that
+/// follows it -- but it is the type, not the caller's memory, that guarantees
+/// the buffer is not reused in between.
 struct Channel {
     console: virtio::Console,
-    rx: Dma,
-    tx: Dma,
+    rx: Option<Dma>,
+    tx: Option<Dma>,
     /// Bytes received but not yet consumed by a decoded frame.
     pending: Vec<u8>,
 }
@@ -261,8 +269,8 @@ impl Channel {
     fn new(console: virtio::Console) -> Self {
         Self {
             console,
-            rx: Dma::alloc(CHANNEL_BUF_SIZE as u64),
-            tx: Dma::alloc(CHANNEL_BUF_SIZE as u64),
+            rx: Some(Dma::alloc(CHANNEL_BUF_SIZE as u64)),
+            tx: Some(Dma::alloc(CHANNEL_BUF_SIZE as u64)),
             pending: Vec::new(),
         }
     }
@@ -314,7 +322,10 @@ impl Channel {
             // longer has to remember to provide.
             let len = len as usize;
             let mut bytes = [0_u8; CHANNEL_BUF_SIZE];
-            self.rx.read_into(&mut bytes, len);
+            self.rx
+                .as_ref()
+                .expect("the receive buffer survives a completed receive")
+                .read_into(&mut bytes, len);
             // The accumulated buffer is bounded by the same maximum the codec
             // enforces, so a peer that streams megabytes without ever
             // completing a frame cannot exhaust the heap. In practice
@@ -338,9 +349,12 @@ impl Channel {
     fn send(&mut self, response: &Response) -> Result<(), ChannelError> {
         let frame = response.encode();
         for chunk in frame.chunks(CHANNEL_BUF_SIZE) {
-            self.tx.fill(chunk);
+            let Some(tx) = self.tx.as_mut() else {
+                return Err(ChannelError::TransmitStalled);
+            };
+            tx.fill(chunk);
             let len = u32::try_from(chunk.len()).expect("chunk is at most one page");
-            if !self.console.send_blocking(&self.tx, len) {
+            if !self.console.send_blocking(&mut self.tx, len) {
                 return Err(ChannelError::TransmitStalled);
             }
         }
