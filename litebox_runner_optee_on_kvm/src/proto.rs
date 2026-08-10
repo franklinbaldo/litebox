@@ -711,6 +711,11 @@ impl Response {
 /// answerable from a prefix. A buffer shorter than the length prefix needs at
 /// least the rest of the prefix.
 ///
+/// `None` means "at least one whole frame is present", not "exactly one". A
+/// caller that then hands the whole buffer to [`Request::decode`] is wrong
+/// whenever a read delivered two frames; use [`complete_frame_len`], which
+/// says where the first one ends.
+///
 /// # Errors
 ///
 /// [`Error::TooLong`] or [`Error::TooShort`] if the declared length is out of
@@ -722,6 +727,33 @@ pub fn bytes_needed(buf: &[u8]) -> Result<Option<usize>, Error> {
     }
     let total = frame_len(buf)?;
     Ok((buf.len() < total).then(|| total - buf.len()))
+}
+
+/// The length of the complete frame at the front of `buf`, or `None` if `buf`
+/// does not yet hold a whole one.
+///
+/// This is what a stream reader actually needs, and the difference from
+/// [`bytes_needed`] is the whole point. A byte stream has no message
+/// boundaries: one read can deliver half a frame, or a frame and a half, or
+/// three frames. `bytes_needed` answers "is there a frame here", which is not
+/// enough to consume one -- consuming the *buffer* rather than the *frame*
+/// discards whatever followed it, and the next read then starts in the middle
+/// of a frame and never recovers, because a length-prefixed format has no
+/// resynchronisation point.
+///
+/// Returning the length instead lets the caller split, decode the front and
+/// keep the remainder. Everything past `total` belongs to the next frame and
+/// is not looked at here, not even to validate it: it may still be partial.
+///
+/// # Errors
+///
+/// As [`bytes_needed`].
+pub fn complete_frame_len(buf: &[u8]) -> Result<Option<usize>, Error> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let total = frame_len(buf)?;
+    Ok((buf.len() >= total).then_some(total))
 }
 
 /// The total size of the frame whose length prefix is at the front of `buf`,
@@ -1475,5 +1507,171 @@ mod tests {
         put_bytes(&mut payload, &[0xFF, 0xFE]);
         let encoded = frame(Opcode::Response, &payload);
         assert_eq!(Response::decode(&encoded), Err(Error::NotUtf8));
+    }
+    // -----------------------------------------------------------------------
+    // Stream framing.
+    //
+    // The channel is a byte stream with no message boundaries, so these tests
+    // are about the *reader*, not about any one frame. `drain` below is
+    // `Channel::recv`'s inner loop with the transport removed: it holds a
+    // `pending` buffer, asks the codec where the first whole frame ends, splits
+    // there and keeps the remainder. Everything the real loop adds is I/O.
+    // -----------------------------------------------------------------------
+
+    /// Decode every whole frame at the front of `pending`, consuming exactly
+    /// those bytes and leaving the rest. Mirrors `ta::Channel::recv`.
+    fn drain(pending: &mut Vec<u8>) -> Result<Vec<Request>, Error> {
+        let mut out = Vec::new();
+        while let Some(total) = complete_frame_len(pending)? {
+            let rest = pending.split_off(total);
+            let frame = core::mem::replace(pending, rest);
+            out.push(Request::decode(&frame)?);
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn a_complete_frame_reports_its_own_length() {
+        let encoded = Request::simple(Opcode::CloseSession, 0, Vec::new()).encode();
+        assert_eq!(complete_frame_len(&encoded), Ok(Some(encoded.len())));
+    }
+
+    #[test]
+    fn a_partial_frame_is_not_a_frame_yet() {
+        let encoded = Request::simple(Opcode::InvokeCommand, 9, all_params()).encode();
+        for cut in 0..encoded.len() {
+            assert_eq!(
+                complete_frame_len(&encoded[..cut]),
+                Ok(None),
+                "a {cut}-byte prefix was reported as a whole frame"
+            );
+        }
+    }
+
+    /// The bug this pair of functions exists to fix: `bytes_needed` cannot
+    /// distinguish one frame from two, so a caller that consumed the whole
+    /// buffer on `Ok(None)` fed the decoder a frame and a half.
+    #[test]
+    fn two_frames_in_one_read_are_two_frames() {
+        let first = Request::simple(Opcode::OpenSession, 0, Vec::new()).encode();
+        let second = Request::simple(Opcode::InvokeCommand, 7, all_params()).encode();
+        let mut pending = first.clone();
+        pending.extend_from_slice(&second);
+
+        // What the old reader saw, and why it went wrong: "no more bytes
+        // needed", followed by a decode of the whole buffer.
+        assert_eq!(bytes_needed(&pending), Ok(None));
+        assert_eq!(
+            Request::decode(&pending),
+            Err(Error::TrailingBytes {
+                remaining: second.len()
+            })
+        );
+
+        // What it sees now.
+        assert_eq!(complete_frame_len(&pending), Ok(Some(first.len())));
+        let decoded = drain(&mut pending).expect("both frames decode");
+        assert!(pending.is_empty(), "bytes were left over");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].opcode, Opcode::OpenSession);
+        assert_eq!(decoded[1].opcode, Opcode::InvokeCommand);
+        assert_eq!(decoded[1].cmd_id, 7);
+        assert_eq!(decoded[1].params, all_params());
+    }
+
+    /// A frame and a *fragment*: the second frame's tail has not arrived. The
+    /// first must still be delivered, and not one byte of the second consumed.
+    #[test]
+    fn a_frame_and_a_half_yields_the_frame_and_keeps_the_half() {
+        let first = Request::simple(Opcode::OpenSession, 0, Vec::new()).encode();
+        let second = Request::simple(Opcode::InvokeCommand, 7, all_params()).encode();
+        for half in 1..second.len() {
+            let mut pending = first.clone();
+            pending.extend_from_slice(&second[..half]);
+
+            let decoded = drain(&mut pending).expect("the first frame decodes");
+            assert_eq!(decoded.len(), 1, "with {half} bytes of the second frame");
+            assert_eq!(decoded[0].opcode, Opcode::OpenSession);
+            assert_eq!(
+                pending,
+                second[..half],
+                "the {half}-byte fragment of the second frame was not kept intact"
+            );
+
+            // And once the rest arrives, the second frame decodes too.
+            pending.extend_from_slice(&second[half..]);
+            let decoded = drain(&mut pending).expect("the second frame decodes");
+            assert!(pending.is_empty());
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].cmd_id, 7);
+        }
+    }
+
+    /// The general case: an arbitrary run of frames delivered in fixed-size
+    /// chunks, for every chunk size. One byte at a time is the worst case a
+    /// virtio console can actually produce; larger chunks put several frames in
+    /// one delivery.
+    #[test]
+    fn a_run_of_frames_survives_any_chunking() {
+        let requests = [
+            Request::simple(Opcode::OpenSession, 0, Vec::new()),
+            Request::simple(Opcode::InvokeCommand, 1, all_params()),
+            Request::simple(Opcode::InvokeCommand, 2, Vec::new()),
+            Request::simple(Opcode::CloseSession, 0, Vec::new()),
+        ];
+        let mut stream = Vec::new();
+        for request in &requests {
+            stream.extend_from_slice(&request.encode());
+        }
+
+        for chunk_size in 1..=stream.len() {
+            let mut pending = Vec::new();
+            let mut decoded = Vec::new();
+            for chunk in stream.chunks(chunk_size) {
+                pending.extend_from_slice(chunk);
+                decoded.extend(drain(&mut pending).expect("every frame decodes"));
+            }
+            assert!(
+                pending.is_empty(),
+                "{} bytes left over at chunk size {chunk_size}",
+                pending.len()
+            );
+            assert_eq!(decoded.len(), requests.len(), "at chunk size {chunk_size}");
+            for (got, want) in decoded.iter().zip(requests.iter()) {
+                assert_eq!(got.opcode, want.opcode, "at chunk size {chunk_size}");
+                assert_eq!(got.cmd_id, want.cmd_id, "at chunk size {chunk_size}");
+                assert_eq!(got.params, want.params, "at chunk size {chunk_size}");
+            }
+        }
+    }
+
+    /// An absurd declared length is still rejected from the prefix alone,
+    /// rather than waited out. This is the property `bytes_needed` had and
+    /// `complete_frame_len` must not lose.
+    #[test]
+    fn an_absurd_declared_length_is_rejected_before_the_frame_completes() {
+        let mut encoded = Request::simple(Opcode::CloseSession, 0, Vec::new()).encode();
+        encoded[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            complete_frame_len(&encoded),
+            Err(Error::TooLong {
+                declared: u32::MAX as usize
+            })
+        );
+        // ... and a declared length shorter than the header it counts.
+        encoded[..4].copy_from_slice(&3_u32.to_le_bytes());
+        assert_eq!(
+            complete_frame_len(&encoded),
+            Err(Error::TooShort { declared: 3 })
+        );
+    }
+
+    /// Fewer than four bytes is not an error, it is "not yet": the declared
+    /// length is not even readable, so nothing can be judged about it.
+    #[test]
+    fn a_buffer_shorter_than_the_length_prefix_is_pending_not_broken() {
+        for len in 0..4 {
+            assert_eq!(complete_frame_len(&[0xFF_u8; 4][..len]), Ok(None));
+        }
     }
 }

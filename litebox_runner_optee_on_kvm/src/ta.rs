@@ -268,14 +268,27 @@ impl Channel {
     }
 
     /// Reads bytes until a whole frame is present, and decodes it.
+    ///
+    /// A read delivers whatever the device had: half a frame, one frame, or
+    /// several. Only the first frame is taken; the rest stays in `pending` and
+    /// is the first thing looked at on the next call, which is why the codec is
+    /// asked *before* reading rather than after.
     fn recv(&mut self) -> Result<Request, ChannelError> {
         loop {
-            // Ask the codec whether what we already hold is a frame. This is
-            // asked *before* reading, because a previous completion may have
-            // delivered two frames at once and the second is already here.
-            match proto::bytes_needed(&self.pending) {
-                Ok(None) => {
-                    let frame = core::mem::take(&mut self.pending);
+            // Ask the codec whether what we already hold begins with a whole
+            // frame, and if so where it ends. Asked before reading, because a
+            // previous completion may have delivered two frames at once and the
+            // second is already here.
+            match proto::complete_frame_len(&self.pending) {
+                Ok(Some(total)) => {
+                    // Split rather than take. Taking the whole buffer -- which
+                    // is what this used to do -- hands the tail of a second
+                    // frame to the decoder, which reports `TrailingBytes` and
+                    // loses those bytes, leaving every subsequent read starting
+                    // mid-frame with no way back: a length-prefixed format has
+                    // no resynchronisation point.
+                    let rest = self.pending.split_off(total);
+                    let frame = core::mem::replace(&mut self.pending, rest);
                     return Request::decode(&frame).map_err(ChannelError::Protocol);
                 }
                 // A declared length that is absurd is knowable from the
@@ -283,7 +296,7 @@ impl Channel {
                 // out. This is the difference between a clean error and a
                 // hang on a frame that will never complete.
                 Err(error) => return Err(ChannelError::Protocol(error)),
-                Ok(Some(_)) => {}
+                Ok(None) => {}
             }
 
             let capacity = u32::try_from(CHANNEL_BUF_SIZE).expect("small buffer");
@@ -305,8 +318,13 @@ impl Channel {
             // The accumulated buffer is bounded by the same maximum the codec
             // enforces, so a peer that streams megabytes without ever
             // completing a frame cannot exhaust the heap. In practice
-            // `bytes_needed` rejects the oversized length first; this is the
-            // belt to that's braces.
+            // `complete_frame_len` rejects the oversized length first; this is
+            // the belt to that's braces.
+            //
+            // The bound is still exactly one frame even though `pending` may
+            // now carry a remainder: the loop above drains every complete frame
+            // before it ever reads again, so at this point `pending` holds an
+            // incomplete frame's prefix and nothing else.
             if self.pending.len() + len > proto::MAX_FRAME_LEN {
                 return Err(ChannelError::Protocol(proto::Error::TooLong {
                     declared: self.pending.len() + len,
