@@ -623,6 +623,13 @@ mod tests {
     };
     use alloc::vec::Vec;
 
+    /// The index of the dword containing byte `offset` of configuration
+    /// space. Spelling the byte offset out is what makes these tables
+    /// readable against the specification.
+    fn dword(offset: usize) -> usize {
+        offset / 4
+    }
+
     /// `STATUS` write-1-to-clear bits: master data parity error (8), signalled
     /// target abort (11), received target abort (12), received master abort
     /// (13), signalled system error (14), detected parity error (15).
@@ -645,8 +652,8 @@ mod tests {
         let mut regs = [Register::default(); 64];
         let ro = Register::ro;
 
-        regs[0x00 / 4] = ro(0x1043_1AF4); // device 0x1043, vendor 0x1AF4.
-        regs[0x04 / 4] = Register {
+        regs[dword(0x00)] = ro(0x1043_1AF4); // device 0x1043, vendor 0x1AF4.
+        regs[dword(0x04)] = Register {
             value: (u32::from(LATCHED | STATUS_CAPABILITIES_LIST) << 16)
                 | u32::from(COMMAND_INITIAL),
             // Only `COMMAND` is writable. `STATUS`'s other bits are read-only
@@ -655,11 +662,11 @@ mod tests {
             writable: 0x0000_FFFF,
             rw1c: u32::from(STATUS_RW1C) << 16,
         };
-        regs[0x08 / 4] = ro(0x0780_0001); // class 07, subclass 80, rev 1.
-        regs[0x0C / 4] = ro(0x0000_0000); // header type 0, single function.
+        regs[dword(0x08)] = ro(0x0780_0001); // class 07, subclass 80, rev 1.
+        regs[dword(0x0C)] = ro(0x0000_0000); // header type 0, single function.
 
         // BAR1: 4 KiB, 32-bit, non-prefetchable, at 0xFEB0_0000.
-        regs[0x14 / 4] = Register {
+        regs[dword(0x14)] = Register {
             value: 0xFEB0_0000,
             writable: 0xFFFF_F000,
             rw1c: 0,
@@ -667,25 +674,25 @@ mod tests {
         // BAR4/BAR5: 16 KiB, 64-bit, at 0x0000_0000_FE00_0000. The type field
         // (bits 2:1 = 0b10) is read-only, as it is on real hardware, so the
         // probe cannot corrupt it.
-        regs[0x20 / 4] = Register {
+        regs[dword(0x20)] = Register {
             value: 0xFE00_0004,
             writable: 0xFFFF_C000,
             rw1c: 0,
         };
-        regs[0x24 / 4] = Register {
+        regs[dword(0x24)] = Register {
             value: 0x0000_0000,
             writable: 0xFFFF_FFFF,
             rw1c: 0,
         };
         // The Cardbus CIS pointer. Writable, so that a probe which strays into
         // it leaves evidence rather than being silently absorbed.
-        regs[0x28 / 4] = Register {
+        regs[dword(0x28)] = Register {
             value: 0xCA5C_0DE5,
             writable: 0xFFFF_FFFF,
             rw1c: 0,
         };
-        regs[0x2C / 4] = ro(0x0003_1AF4); // subsystem.
-        regs[0x34 / 4] = ro(0x0000_0040); // capabilities pointer.
+        regs[dword(0x2C)] = ro(0x0003_1AF4); // subsystem.
+        regs[dword(0x34)] = ro(0x0000_0040); // capabilities pointer.
 
         Device {
             regs,
@@ -702,8 +709,8 @@ mod tests {
     /// Cardbus CIS pointer.
     fn console_with_64bit_bar5() -> Device {
         let mut device = console();
-        device.regs[0x20 / 4] = Register::default(); // BAR4 unimplemented.
-        device.regs[0x24 / 4] = Register {
+        device.regs[dword(0x20)] = Register::default(); // BAR4 unimplemented.
+        device.regs[dword(0x24)] = Register {
             value: 0xFD00_0004,
             writable: 0xFFFF_0000,
             rw1c: 0,
@@ -913,9 +920,9 @@ mod tests {
 
     /// Places a capability list, and points the header at its first entry.
     fn with_capabilities(device: &mut Device, first: u8, entries: &[(u8, u8, u8)]) {
-        device.regs[0x34 / 4] = Register::ro(u32::from(first));
+        device.regs[dword(0x34)] = Register::ro(u32::from(first));
         for (at, id, next) in entries {
-            let reg = &mut device.regs[usize::from(at >> 2)];
+            let reg = &mut device.regs[dword(usize::from(*at))];
             let lane = u32::from(at & 3) * 8;
             reg.value &= !(0xFFFF << lane);
             reg.value |= (u32::from(*id) | (u32::from(*next) << 8)) << lane;
@@ -959,10 +966,11 @@ mod tests {
         assert_eq!(device.regs[0].value & 0xFF, 0xF4);
         with_capabilities(&mut device, 0xFF, &[]);
         // A capability id at 0xFF, so the walk has something to read there.
-        device.regs[0xFC / 4].value = (device.regs[0xFC / 4].value & 0x00FF_FFFF) | (0x09 << 24);
+        device.regs[dword(0xFC)].value =
+            (device.regs[dword(0xFC)].value & 0x00FF_FFFF) | (0x09 << 24);
         // And one at 0xF4, so that following a wrapped pointer would be
         // visible rather than silent.
-        device.regs[0xF4 / 4].value = 0x0000_0909;
+        device.regs[dword(0xF4)].value = 0x0000_0909;
         fake_bus::install(device);
 
         assert_eq!(
@@ -1009,8 +1017,8 @@ mod tests {
     #[test]
     fn a_device_without_a_capability_list_is_not_walked() {
         let mut device = console();
-        device.regs[0x04 / 4].value &= !(u32::from(STATUS_CAPABILITIES_LIST) << 16);
-        device.regs[0x34 / 4] = Register::ro(0x0000_0040);
+        device.regs[dword(0x04)].value &= !(u32::from(STATUS_CAPABILITIES_LIST) << 16);
+        device.regs[dword(0x34)] = Register::ro(0x0000_0040);
         fake_bus::install(device);
         assert!(header().capabilities_ptr.is_none());
         assert_eq!(walk(header()), []);

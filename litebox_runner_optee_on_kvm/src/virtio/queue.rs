@@ -997,7 +997,7 @@ mod tests {
                     }
                 }
                 1 => {
-                    let bogus = u32::from(SIZE) + (next() as u32 % 1000);
+                    let bogus = u32::from(SIZE) + u32::try_from(next() % 1000).expect("under 1000");
                     device_completes(&mut queue, bogus, 8);
                     assert_eq!(
                         queue.take_used(),
