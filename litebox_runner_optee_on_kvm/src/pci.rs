@@ -444,7 +444,18 @@ impl DeviceHeader {
                 return;
             }
             let id = read_u8(self.address, offset);
-            let next = read_u8(self.address, offset + 1);
+            // `next` is the byte after the id. An `offset` of 0xFF has no byte
+            // after it, and wrapping to 0x00 would read the vendor id as a
+            // capability pointer. Configuration space is device-controlled, so
+            // this is checked rather than assumed.
+            let Some(next_offset) = offset.checked_add(1) else {
+                log::warn!(
+                    "pci        {} capability at {offset:#04X} has no room for a next pointer",
+                    self.address
+                );
+                return;
+            };
+            let next = read_u8(self.address, next_offset);
             visit(offset, id);
             // Capabilities must be dword aligned; a `next` that is not is
             // malformed, and following it would misread the list.

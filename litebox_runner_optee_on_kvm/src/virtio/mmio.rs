@@ -129,17 +129,44 @@ unsafe fn write_entry(table_pa: u64, index: u64, value: u64) {
 /// Panics if the request does not fit in the window, or if a level of the walk
 /// is already occupied by a huge page -- both mean the window is not the
 /// exclusively owned region this assumes.
+///
+/// `pa` and `len` are the device's: they come from a BAR and from a virtio
+/// capability's `length` field. So the span arithmetic is checked rather than
+/// wrapping. A `len` near `u64::MAX` used to make `offset_in_page + len`
+/// overflow to a small number, and a `span` large enough to wrap the window
+/// bound made `va_start + span <= WINDOW_BASE + WINDOW_SIZE` compare two
+/// wrapped values and pass. Either way a device could have had a handful of
+/// pages mapped at an address the caller then treated as covering its whole
+/// declared length.
 pub fn map_device_memory(pa: u64, len: u64) -> u64 {
     let page_pa = pa & !(PAGE_SIZE - 1);
     let offset_in_page = pa - page_pa;
-    let pages = (offset_in_page + len).div_ceil(PAGE_SIZE);
-    let span = pages * PAGE_SIZE;
+    let span = offset_in_page
+        .checked_add(len)
+        .map(|bytes| bytes.div_ceil(PAGE_SIZE))
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+        .unwrap_or_else(|| {
+            panic!("device MMIO request of {len:#X} bytes at pa {pa:#X} does not fit in 64 bits")
+        });
+    assert!(
+        span <= WINDOW_SIZE,
+        "device MMIO request of {span:#X} bytes at pa {pa:#X} is larger than the \
+         {WINDOW_SIZE:#X}-byte window"
+    );
 
+    // Reserved before the bound is checked, so a rejected request still cannot
+    // hand a second caller a range that overlaps a live one. `span` is bounded
+    // by `WINDOW_SIZE` above and `NEXT_VA` never exceeds
+    // `WINDOW_BASE + WINDOW_SIZE` while requests are accepted, so this add
+    // cannot wrap for any request that gets past the assertion below.
     let va_start = NEXT_VA.fetch_add(span, Ordering::SeqCst);
     assert!(
-        va_start + span <= WINDOW_BASE + WINDOW_SIZE,
+        va_start
+            .checked_add(span)
+            .is_some_and(|end| end <= WINDOW_BASE + WINDOW_SIZE),
         "device MMIO window exhausted mapping {span:#X} bytes at pa {pa:#X}"
     );
+    let pages = span / PAGE_SIZE;
 
     let cr3 = read_cr3() & PTE_ADDR_MASK;
     for page in 0..pages {

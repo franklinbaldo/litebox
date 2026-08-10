@@ -96,6 +96,30 @@ mod cap {
     /// Length of a `virtio_pci_cfg_cap`, which appends a `pci_cfg_data`
     /// window of the same width.
     pub const PCI_CFG_LEN: u8 = 20;
+
+    /// The configuration-space offset of field `field` of the capability at
+    /// `cap_offset`, or `None` if it would fall outside the 256-byte space.
+    ///
+    /// `cap_offset` comes out of the capability list, which is device-supplied,
+    /// and the largest field offset here is 16. `cap_offset + FIELD` therefore
+    /// overflows `u8` for any capability that declares itself past 0xEF, and a
+    /// wrapped offset addresses the *standard header* -- the vendor id, the
+    /// command register, a BAR -- which would be read as though it were part of
+    /// the capability.
+    pub fn field(cap_offset: u8, field: u8) -> Option<u8> {
+        cap_offset.checked_add(field)
+    }
+
+    /// The in-range configuration-space offsets of one capability's fields, as
+    /// resolved by [`field`].
+    pub struct Fields {
+        pub len: u8,
+        pub cfg_type: u8,
+        pub bar: u8,
+        pub id: u8,
+        pub offset: u8,
+        pub length: u8,
+    }
 }
 
 /// One virtio structure, as described by its capability.
@@ -155,29 +179,59 @@ impl VirtioDevice {
                 return;
             }
 
-            let cap_len = pci::read_u8(header.address, cap_offset + cap::LEN);
-            let cfg_type =
-                CfgType::from_raw(pci::read_u8(header.address, cap_offset + cap::CFG_TYPE));
+            // Every field this capability has, checked into range before any
+            // of them is read. A capability that declares itself so close to
+            // the end of configuration space that its own fields do not fit is
+            // malformed, and reading it would wrap into the standard header.
+            let Some(field) = (|| {
+                Some(cap::Fields {
+                    len: cap::field(cap_offset, cap::LEN)?,
+                    cfg_type: cap::field(cap_offset, cap::CFG_TYPE)?,
+                    bar: cap::field(cap_offset, cap::BAR)?,
+                    id: cap::field(cap_offset, cap::ID)?,
+                    // `offset` and `length` are u32s, so it is their last byte
+                    // that has to be in range, not their first.
+                    offset: cap::field(cap_offset, cap::OFFSET)
+                        .and(cap::field(cap_offset, cap::OFFSET + 3))
+                        .map(|_| cap_offset + cap::OFFSET)?,
+                    length: cap::field(cap_offset, cap::LENGTH)
+                        .and(cap::field(cap_offset, cap::LENGTH + 3))
+                        .map(|_| cap_offset + cap::LENGTH)?,
+                })
+            })() else {
+                log::warn!(
+                    "virtio     {} vendor capability at {cap_offset:#04X} does not fit in \
+                     configuration space; ignored",
+                    header.address
+                );
+                return;
+            };
+
+            let cap_len = pci::read_u8(header.address, field.len);
+            let cfg_type = CfgType::from_raw(pci::read_u8(header.address, field.cfg_type));
 
             // Read only for the notify capability, and only if it declared
-            // itself long enough to have the field.
+            // itself long enough to have the field -- and only if that field
+            // is inside configuration space at all.
             //
-            // Both halves matter. `virtio_pci_cfg_cap` is the same 20 bytes
+            // All three matter. `virtio_pci_cfg_cap` is the same 20 bytes
             // but its trailing dword is `pci_cfg_data`, a live access window
             // -- reading that as a multiplier would report nonsense and
             // perform a stray device access besides. And a notify capability
             // that declared itself short has no such field at all, so reading
             // it would take four bytes belonging to the next capability.
             let notify_off_multiplier = (cfg_type == CfgType::Notify && cap_len >= cap::NOTIFY_LEN)
-                .then(|| pci::read_u32(header.address, cap_offset + cap::NOTIFY_OFF_MULTIPLIER));
+                .then(|| cap::field(cap_offset, cap::NOTIFY_OFF_MULTIPLIER + 3))
+                .flatten()
+                .map(|_| pci::read_u32(header.address, cap_offset + cap::NOTIFY_OFF_MULTIPLIER));
 
             let parsed = VirtioCap {
                 cap_offset,
                 cfg_type,
-                bar: pci::read_u8(header.address, cap_offset + cap::BAR),
-                id: pci::read_u8(header.address, cap_offset + cap::ID),
-                offset: pci::read_u32(header.address, cap_offset + cap::OFFSET),
-                length: pci::read_u32(header.address, cap_offset + cap::LENGTH),
+                bar: pci::read_u8(header.address, field.bar),
+                id: pci::read_u8(header.address, field.id),
+                offset: pci::read_u32(header.address, field.offset),
+                length: pci::read_u32(header.address, field.length),
                 notify_off_multiplier,
                 cap_len,
             };
