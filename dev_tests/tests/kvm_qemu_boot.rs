@@ -360,6 +360,22 @@ fn run_channel_session_with(
     ta: &Path,
     command_file: &Path,
 ) -> (i32, String) {
+    run_channel_session_with_memory(root, dir, ta, command_file, None)
+}
+
+/// As [`run_channel_session_with`], but optionally overriding the guest's
+/// memory size (`run.sh -m`).
+///
+/// Only [`many_open_close_cycles_do_not_exhaust_the_guest`] passes `Some`. It
+/// needs a *small* guest, because the resource it is watching is reclaimed per
+/// session and the only way to see it not being reclaimed is to run out.
+fn run_channel_session_with_memory(
+    root: &Path,
+    dir: &Path,
+    ta: &Path,
+    command_file: &Path,
+    memory: Option<&str>,
+) -> (i32, String) {
     require_python3();
     let binary = build_runner(root);
     assert!(binary.is_file(), "{} vanished", binary.display());
@@ -370,25 +386,29 @@ fn run_channel_session_with(
     let script = root.join("litebox_runner_optee_on_kvm/scripts/run.sh");
     assert!(script.is_file(), "{} does not exist", script.display());
 
-    let output = Command::new("timeout")
-        .current_dir(root)
-        .args([
-            "--foreground",
-            "--kill-after=10",
-            GUEST_TIMEOUT_SECS,
-            script.to_str().expect("script path must be UTF-8"),
-            "-s",
-            "-t",
-            CHANNEL_TIMEOUT_SECS,
-            "-c",
-            command_file.to_str().expect("command path must be UTF-8"),
-            "-l",
-            ldelf.to_str().expect("ldelf path must be UTF-8"),
-            "-a",
-            ta.to_str().expect("TA path must be UTF-8"),
-            "-S",
-            socket.to_str().expect("socket path must be UTF-8"),
-        ])
+    let mut command = Command::new("timeout");
+    command.current_dir(root).args([
+        "--foreground",
+        "--kill-after=10",
+        GUEST_TIMEOUT_SECS,
+        script.to_str().expect("script path must be UTF-8"),
+        "-s",
+        "-t",
+        CHANNEL_TIMEOUT_SECS,
+        "-c",
+        command_file.to_str().expect("command path must be UTF-8"),
+        "-l",
+        ldelf.to_str().expect("ldelf path must be UTF-8"),
+        "-a",
+        ta.to_str().expect("TA path must be UTF-8"),
+        "-S",
+        socket.to_str().expect("socket path must be UTF-8"),
+    ]);
+    if let Some(memory) = memory {
+        command.args(["-m", memory]);
+    }
+
+    let output = command
         .stdin(std::process::Stdio::null())
         .output()
         .expect("failed to spawn `timeout`/`run.sh`; is QEMU installed?");
@@ -493,6 +513,110 @@ fn the_channel_rejects_a_command_without_a_session() {
     assert_eq!(
         status, SCRIPT_CLIENT_FAILURE,
         "expected run.sh to report the client's failure.\n--- output ---\n{console}",
+    );
+}
+
+/// Sessions are cheap to open and close repeatedly, because closing one gives
+/// its resources back.
+///
+/// # What used to happen
+///
+/// `ta::open_session` called `SessionToken::disarm()` without the
+/// `register_new_session` that makes disarming correct, and nothing ever
+/// released the user mappings `load_ldelf` made. So every open/close pair
+/// stranded a session id, a client-identity map entry, and -- overwhelmingly
+/// the largest of the three -- about 1.3 MiB of ldelf and TA images that stayed
+/// mapped for the rest of the boot. Measured before the fix, with
+/// `open_session` / `close_session` pairs and nothing else:
+///
+/// | guest memory | died on session |
+/// |--------------|-----------------|
+/// | 512 MiB      | 416             |
+/// | 64 MiB       | 27              |
+///
+/// with a `handle_alloc_error` panic out of the guest's allocator. After the
+/// fix, 600 pairs complete at *both* sizes and the guest's post-run heap probe
+/// lands at the same address either way -- the heap does not grow at all.
+///
+/// # Why 64 MiB and [`OPEN_CLOSE_CYCLES`] cycles
+///
+/// The leak was a *rate*, so a test for it has to be a race between that rate
+/// and a bound. Shrinking the bound is much cheaper than lengthening the run:
+/// at 512 MiB it takes over 400 sessions to prove anything, at 64 MiB it takes
+/// 27. [`OPEN_CLOSE_CYCLES`] is set several times higher than 27 so that a
+/// partial regression -- something that leaks less per session than the
+/// original did -- is still caught, and the whole test still runs in about ten
+/// seconds under TCG because a session costs far less than the boot does.
+///
+/// 64 MiB is the smallest round size this guest boots in at all; 48 MiB fails
+/// during bring-up, before any session exists.
+///
+/// # Why the assertion is on the *last* session, not just the exit status
+///
+/// A guest that answered `status=0` to the first request and then quietly
+/// stopped opening sessions would exit cleanly. So the console is checked for
+/// the TA's own arithmetic on the final cycle: `hello-ta` turns 100 into 101,
+/// and that line can only appear if session number [`OPEN_CLOSE_CYCLES`]
+/// really loaded, entered ring 3 and returned its output parameter.
+#[test]
+fn many_open_close_cycles_do_not_exhaust_the_guest() {
+    /// How many open/invoke/close cycles the client drives.
+    const OPEN_CLOSE_CYCLES: usize = 120;
+    /// Guest memory for this test. See the function's documentation.
+    const GUEST_MEMORY: &str = "64M";
+
+    let root = repo_root();
+    let dir = scratch_dir("open-close-cycles");
+    let command_file = dir.join("commands.json");
+
+    let mut commands = String::from("[\n");
+    for cycle in 0..OPEN_CLOSE_CYCLES {
+        if cycle > 0 {
+            commands.push_str(",\n");
+        }
+        commands.push_str(
+            r#"  { "func_id": "open_session", "client_identity": { "login": "user" } },
+  { "func_id": "invoke_command", "cmd_id": 0,
+    "args": [ { "param_type": "value_inout", "value_a": 100, "value_b": 0 } ] },
+  { "func_id": "close_session" }"#,
+        );
+    }
+    commands.push_str("\n]\n");
+    std::fs::write(&command_file, &commands)
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", command_file.display()));
+
+    let (status, console) = run_channel_session_with_memory(
+        &root,
+        &dir,
+        &ta_artifact("hello-ta.elf"),
+        &command_file,
+        Some(GUEST_MEMORY),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_console_contains(&console, "channel    serving requests");
+    // Every cycle ran the TA and every cycle got its answer back. Counting
+    // rather than merely finding one: a guest that stopped after the first
+    // session would still contain the line once.
+    let ran = console.matches("value_inout value_a=0x65").count();
+    assert_eq!(
+        ran, OPEN_CLOSE_CYCLES,
+        "only {ran} of {OPEN_CLOSE_CYCLES} cycles reached the TA.\n\
+         --- output ---\n{console}",
+    );
+    // And every one of them was closed cleanly, releasing its mappings and id.
+    let closed = console.matches("user mappings and id released").count();
+    assert_eq!(
+        closed, OPEN_CLOSE_CYCLES,
+        "only {closed} of {OPEN_CLOSE_CYCLES} sessions were torn down.\n\
+         --- output ---\n{console}",
+    );
+    assert_console_contains(&console, "[client] sequence completed");
+    assert_console_contains(&console, "Guest completed successfully");
+    assert_eq!(
+        status, 0,
+        "the guest did not survive {OPEN_CLOSE_CYCLES} open/close cycles in \
+         {GUEST_MEMORY}.\n--- output ---\n{console}",
     );
 }
 

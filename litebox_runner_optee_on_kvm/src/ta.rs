@@ -38,7 +38,7 @@ use litebox_common_optee::{
     TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
 use litebox_platform_lvbs::{LvbsValidateAccess, reenter_thread_ref, run_thread_ref};
-use litebox_shim_optee::session::session_manager;
+use litebox_shim_optee::session::{SessionToken, session_manager};
 use litebox_shim_optee::{LoadedProgram, OpteeShim, OpteeShimBuilder, UserConstPtr};
 
 use crate::proto::{self, BinaryTarget, LoadChunk, Opcode, Param, Request, Response};
@@ -426,9 +426,40 @@ impl Binaries {
 
 /// The TA state a session owns between an `OpenSession` and its
 /// `CloseSession`.
+///
+/// # Why the token is held rather than disarmed
+///
+/// `litebox_runner_lvbs` calls `SessionToken::disarm` because it hands the
+/// session to `SessionManager::register_new_session` a line earlier: from that
+/// point the *session map* owns the id, and `unregister_session` is what
+/// recycles it. Disarming without registering -- which is what this runner used
+/// to do -- transfers ownership of the id to nobody, so it is never recycled
+/// and its client-identity entry is never cleared.
+///
+/// Registering is not the right mirror here. `register_new_session` takes
+/// ownership of an `OpteeShim` and a task page-table id, and this runner has
+/// neither to give: it holds one shim for the whole boot and never leaves the
+/// base page table, because there is no VTL0 to isolate a TA from and only ever
+/// one session at a time. What *is* the right mirror is the ownership rule
+/// underneath, so the token simply stays armed and stays here. Dropping this
+/// struct then recycles the id and clears the identity, which is exactly what
+/// `unregister_session` does on the LVBS path.
+///
+/// The user *mappings* are the other half and are not the token's business;
+/// see [`close_session`].
 struct Session {
     id: u32,
     loaded: LoadedProgram,
+    /// Deliberately never disarmed. See the type's documentation.
+    ///
+    /// Declared after `loaded` so it drops after it: the id must remain
+    /// reserved for as long as anything derived from the session exists.
+    #[expect(
+        dead_code,
+        reason = "held for its Drop, which recycles the session id and clears the \
+                  client identity; nothing reads it"
+    )]
+    token: SessionToken<'static>,
 }
 
 /// Services requests from the virtio message channel until the client asks to
@@ -578,9 +609,12 @@ fn service(
                 (UteeEntryFunc::CloseSession, None)
             };
             let result = enter_ta(&open.loaded, open.id, func_id, cmd_id, &params);
-            // The session is over whether or not the TA liked being closed.
-            if request.opcode == Opcode::CloseSession {
-                *session = None;
+            // The session is over whether or not the TA liked being closed, so
+            // its resources are reclaimed either way.
+            if request.opcode == Opcode::CloseSession
+                && let Some(open) = session.take()
+            {
+                close_session(shim, open);
             }
             match result {
                 Ok(response) => response,
@@ -597,6 +631,11 @@ fn service(
 
 /// Acquires a session, loads ldelf and the TA, and enters the TA's
 /// `OpenSession` entry point.
+///
+/// Every failure after `load_ldelf` releases the user mappings it made before
+/// returning. Without that, a client that can provoke a failure repeatedly --
+/// a TA whose `TA_OpenSessionEntryPoint` refuses, say -- leaks a TA image per
+/// attempt just as a successful open/close pair used to.
 fn open_session(
     shim: &OpteeShim,
     params: &[UteeParamOwned],
@@ -607,7 +646,12 @@ fn open_session(
     // diagnosis rather than a leaked id.
     let (ldelf, ta) = binaries.ready()?;
 
-    let mut token = session_manager()
+    // Not disarmed anywhere below: this runner never publishes the session to
+    // the session map, so the token stays the owner of the id and of the
+    // client-identity entry for the whole of the session's life. See
+    // [`Session`]. Every `?` from here on therefore recycles the id rather
+    // than stranding it.
+    let token = session_manager()
         .try_acquire_open_session_token()
         .map_err(|e| format!("no open-session token available: {e:?}"))?;
     let session_id = token
@@ -628,10 +672,22 @@ fn open_session(
     let loaded = shim
         .load_ldelf(ldelf, ta_uuid(ta)?, Some(ta))
         .map_err(|e| format!("failed to load ldelf: {e:?}"))?;
+
+    // From here on the shim owns user mappings, so a failure has to release
+    // them. Built once and used by each fallible step below rather than
+    // repeated, because an unreleased path is invisible at the call site.
+    let release_on_error = |message: String| -> String {
+        // SAFETY: this runs only on a path that abandons the session, and
+        // `loaded` is dropped immediately afterwards by the `?`, so nothing
+        // holds a reference into the memory being released.
+        unsafe { shim.release_user_mappings() };
+        message
+    };
+
     let entrypoints = loaded
         .entrypoints
         .as_ref()
-        .ok_or_else(|| String::from("load_ldelf returned no entrypoints"))?;
+        .ok_or_else(|| release_on_error(String::from("load_ldelf returned no entrypoints")))?;
     log::info!(
         "ta         session {session_id}, ldelf loaded, params at {:?}",
         loaded.params_address
@@ -645,7 +701,10 @@ fn open_session(
         run_thread_ref(entrypoints, &mut ctx);
     }
     if ctx.rax != 0 {
-        return Err(format!("ldelf exited with {:#x}", ctx.rax));
+        return Err(release_on_error(format!(
+            "ldelf exited with {:#x}",
+            ctx.rax
+        )));
     }
     log::info!("ta         ldelf returned");
 
@@ -657,24 +716,55 @@ fn open_session(
         check_smap();
     }
 
-    // The session outlives this call, so disarm the token: its drop must not
-    // recycle the id or clear the client identity.
-    token.disarm();
-
     let response = enter_ta(
         &loaded,
         session_id,
         UteeEntryFunc::OpenSession,
         None,
         params,
-    )?;
+    )
+    .map_err(release_on_error)?;
     Ok((
         Session {
             id: session_id,
             loaded,
+            token,
         },
         response,
     ))
+}
+
+/// Ends a session and gives back everything it held.
+///
+/// Two distinct kinds of resource, released in the order `litebox_runner_lvbs`
+/// releases them:
+///
+/// 1. The TA's **user mappings**, which belong to the shim's page manager and
+///    not to `LoadedProgram`. Dropping the loaded program frees the kernel-side
+///    bookkeeping and nothing else, so without this call every session's ldelf
+///    and TA images stay mapped and their backing pages stay allocated for the
+///    rest of the boot. Measured at about 1.3 MiB per session: with `-m 512M`
+///    the guest died of it on the 416th open/close pair, and with `-m 64M` on
+///    the 27th.
+///
+///    `release_user_mappings` releases *everything* the shim has mapped, which
+///    is correct here precisely because this runner is single-session: there is
+///    no second TA whose mappings could be caught by it. The LVBS runner cannot
+///    do this and instead deletes a per-session task page table, because there
+///    it may have siblings.
+///
+/// 2. The **session id and client identity**, released by dropping the token.
+///    See [`Session`].
+fn close_session(shim: &OpteeShim, session: Session) {
+    let id = session.id;
+    // SAFETY: the TA has returned from its `CloseSession` entry point and
+    // `session` -- the only thing holding an entrypoint into that address
+    // space -- is consumed by this function, so no reference into the released
+    // user memory outlives the call. The output parameters were copied out of
+    // user memory by `enter_ta` before this runs.
+    unsafe { shim.release_user_mappings() };
+    drop(session);
+    log::info!("ta         session {id} closed; user mappings and id released");
 }
 
 /// The name of an entry point, for logging. `UteeEntryFunc` has no `Debug`.
