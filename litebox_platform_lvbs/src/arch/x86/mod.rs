@@ -277,10 +277,17 @@ pub fn enable_dep() {
 /// - **CR4.SMAP**: prevents the kernel from accessing user-accessible pages
 ///   unless explicitly overridden (via `STAC`/`CLAC`).
 ///
+/// Under `host_lvbs` no maximum-leaf check is made before reading leaf `0x07`:
+/// VTL1 runs on a partition VTL0 has already brought up and vetted, so the leaf
+/// is known to be in range. Adding the check here would be dead code on the
+/// only path that reaches it. See the `host_kvm` copy below, where nothing has
+/// vetted anything, for why the check is load-bearing there.
+///
 /// # Panics
 ///
 /// Panics if the CPUID does not advertise SMEP or SMAP support.
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "host_lvbs")]
 pub fn enable_smep_smap() {
     // CPUID.07h:EBX bit 7 = SMEP, bit 20 = SMAP
     let structured_features = cpuid_count(0x07, 0);
@@ -291,6 +298,71 @@ pub fn enable_smep_smap() {
     assert!(
         structured_features.ebx & (1 << 20) != 0,
         "CPU does not support SMAP"
+    );
+
+    let mut cr4 = x86_64::registers::control::Cr4::read();
+    cr4.insert(x86_64::registers::control::Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION);
+    cr4.insert(x86_64::registers::control::Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+    unsafe {
+        x86_64::registers::control::Cr4::write(cr4);
+    }
+}
+
+/// Enable Supervisor Mode Execution/Access Prevention (SMEP & SMAP).
+///
+/// - **CR4.SMEP**: prevents the kernel from executing code that resides
+///   in user-accessible pages.
+/// - **CR4.SMAP**: prevents the kernel from accessing user-accessible pages
+///   unless explicitly overridden (via `STAC`/`CLAC`).
+///
+/// Under `host_kvm` LiteBox is entered from reset and nothing has vetted the
+/// CPU model, so the maximum-leaf check before leaf `0x07` is load-bearing.
+/// CPUID does *not* return zero for an unsupported leaf: it returns the highest
+/// supported leaf's data. On a CPU whose maximum standard leaf is below 7,
+/// `cpuid(0x07)` therefore yields some other leaf's contents, and if bits 7 and
+/// 20 of that `EBX` happen to be set the assertions pass, `CR4.SMEP`/`SMAP` are
+/// written anyway, and the resulting `#GP` is a triple fault with no output at
+/// all -- precisely the failure these assertions exist to prevent.
+/// `host/kvm/clock.rs` documents the same hazard at length and guards every
+/// leaf it reads.
+///
+/// Panicking instead is safe here and strictly better: the panic handler writes
+/// to COM1 and exits through `isa-debug-exit` without needing an IDT.
+///
+/// # Panics
+///
+/// Panics if CPUID does not advertise SMEP or SMAP, including when leaf `0x07`
+/// is out of range and so cannot advertise anything.
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "host_kvm")]
+pub fn enable_smep_smap() {
+    /// CPUID leaf 0: `EAX` is the highest supported standard leaf.
+    const MAX_STANDARD_LEAF: u32 = 0;
+    /// Structured extended feature leaf, where SMEP and SMAP are advertised.
+    const STRUCTURED_FEATURES_LEAF: u32 = 0x07;
+
+    // Leaf 0x07 is only meaningful if it is in range; out of range it aliases
+    // to another leaf's data rather than reading zero. See above.
+    let max_standard_leaf = cpuid_count(MAX_STANDARD_LEAF, 0).eax;
+    let leaf_in_range = max_standard_leaf >= STRUCTURED_FEATURES_LEAF;
+    // CPUID.07h:EBX bit 7 = SMEP, bit 20 = SMAP
+    let structured_features_ebx = if leaf_in_range {
+        cpuid_count(STRUCTURED_FEATURES_LEAF, 0).ebx
+    } else {
+        0
+    };
+
+    assert!(
+        leaf_in_range && structured_features_ebx & (1 << 7) != 0,
+        "CPU does not support SMEP (max standard CPUID leaf {max_standard_leaf:#x}, \
+         CPUID.07:EBX bit 7 clear or leaf 0x07 out of range); \
+         pass `-cpu max` to QEMU (or `-cpu host` under KVM)"
+    );
+    assert!(
+        leaf_in_range && structured_features_ebx & (1 << 20) != 0,
+        "CPU does not support SMAP (max standard CPUID leaf {max_standard_leaf:#x}, \
+         CPUID.07:EBX bit 20 clear or leaf 0x07 out of range); \
+         pass `-cpu max` to QEMU (or `-cpu host` under KVM)"
     );
 
     let mut cr4 = x86_64::registers::control::Cr4::read();
