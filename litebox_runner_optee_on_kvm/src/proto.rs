@@ -777,6 +777,103 @@ fn frame_len(buf: &[u8]) -> Result<usize, Error> {
     Ok(total)
 }
 
+// ---------------------------------------------------------------------------
+// The stream reader.
+// ---------------------------------------------------------------------------
+
+/// Where [`recv_frame`] gets its bytes.
+///
+/// This exists so that the reader loop below is separable from the transport
+/// it normally runs on. The guest's implementation wraps the virtio console
+/// (see `ta::Channel::recv`); the tests' implementation is a scripted byte
+/// stream. Both drive *this* loop, so there is one copy of it.
+pub trait ByteSource {
+    /// Reads into `out`, returning how many bytes were placed there, or `None`
+    /// if the source gave up before any arrived.
+    ///
+    /// A return of `Some(0)` is permitted and means "nothing this time"; the
+    /// reader simply asks again, exactly as it does for a short read.
+    fn read(&mut self, out: &mut [u8]) -> Option<usize>;
+}
+
+/// Why [`recv_frame`] could not deliver a frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecvError {
+    /// The source gave up before a whole frame arrived.
+    Timeout,
+    /// The peer's framing was malformed.
+    Protocol(Error),
+}
+
+/// Reads from `source` until a whole frame is present, and decodes it.
+///
+/// `pending` carries bytes across calls: a read delivers whatever the device
+/// had -- half a frame, one frame, or several -- so only the *first* frame is
+/// taken and the rest is left in `pending` for the next call. That is why the
+/// codec is asked before reading rather than after.
+///
+/// `scratch` is the staging buffer a read is delivered into; its length is the
+/// most one read may return. It is the caller's because on the guest it must
+/// match the DMA buffer the transport posts.
+///
+/// # Errors
+///
+/// [`RecvError::Timeout`] if `source` gave up, or [`RecvError::Protocol`] if
+/// the frame at the front of the stream is malformed. A protocol error leaves
+/// `pending` as it was; the caller decides whether to resynchronise (it
+/// cannot: a length-prefixed format has no resynchronisation point) or to
+/// discard.
+pub fn recv_frame<S: ByteSource + ?Sized>(
+    pending: &mut Vec<u8>,
+    scratch: &mut [u8],
+    source: &mut S,
+) -> Result<Request, RecvError> {
+    loop {
+        // Ask the codec whether what we already hold begins with a whole
+        // frame, and if so where it ends. Asked before reading, because a
+        // previous completion may have delivered two frames at once and the
+        // second is already here.
+        match complete_frame_len(pending) {
+            Ok(Some(total)) => {
+                // Split rather than take. Taking the whole buffer -- which is
+                // what this used to do -- hands the tail of a second frame to
+                // the decoder, which reports `TrailingBytes` and loses those
+                // bytes, leaving every subsequent read starting mid-frame with
+                // no way back.
+                let rest = pending.split_off(total);
+                let frame = core::mem::replace(pending, rest);
+                return Request::decode(&frame).map_err(RecvError::Protocol);
+            }
+            // A declared length that is absurd is knowable from the four-byte
+            // prefix, so it is rejected now rather than waited out. This is
+            // the difference between a clean error and a hang on a frame that
+            // will never complete.
+            Err(error) => return Err(RecvError::Protocol(error)),
+            Ok(None) => {}
+        }
+
+        let Some(len) = source.read(scratch) else {
+            return Err(RecvError::Timeout);
+        };
+        // The accumulated buffer is bounded by the same maximum the codec
+        // enforces, so a peer that streams megabytes without ever completing a
+        // frame cannot exhaust the heap. In practice `complete_frame_len`
+        // rejects the oversized length first; this is the belt to that's
+        // braces.
+        //
+        // The bound is still exactly one frame even though `pending` may carry
+        // a remainder: the loop above drains every complete frame before it
+        // ever reads again, so at this point `pending` holds an incomplete
+        // frame's prefix and nothing else.
+        if pending.len() + len > MAX_FRAME_LEN {
+            return Err(RecvError::Protocol(Error::TooLong {
+                declared: pending.len() + len,
+            }));
+        }
+        pending.extend_from_slice(&scratch[..len]);
+    }
+}
+
 /// Validates a complete frame's header and returns its opcode and a reader
 /// positioned at the payload.
 fn open_frame(buf: &[u8]) -> Result<(Opcode, Reader<'_>), Error> {
@@ -1672,6 +1769,351 @@ mod tests {
     fn a_buffer_shorter_than_the_length_prefix_is_pending_not_broken() {
         for len in 0..4 {
             assert_eq!(complete_frame_len(&[0xFF_u8; 4][..len]), Ok(None));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The reader itself.
+    //
+    // Everything above this point is about the codec. These are about
+    // `recv_frame`, which is the loop `ta::Channel::recv` runs -- the same
+    // code, not a copy of it: `Channel::recv` borrows its two fields, wraps
+    // the virtio console in a `ByteSource` and calls straight into here. The
+    // peer is untrusted, so the source below is scripted and hostile: it
+    // decides how the bytes are cut up, and it is free to stop.
+    // -----------------------------------------------------------------------
+
+    /// The size of `ta::CHANNEL_BUF_SIZE`, which is the length of the scratch
+    /// buffer the guest hands `recv_frame`. Repeated rather than shared
+    /// because it is a property of the transport, not of the protocol.
+    const GUEST_SCRATCH: usize = 4096;
+
+    /// A scripted byte source: a queue of deliveries, handed out one call at a
+    /// time.
+    ///
+    /// Models what a virtio console may actually do. A delivery longer than
+    /// the scratch buffer is truncated to it and the remainder stays at the
+    /// front of the queue, exactly as a short read would leave it. An empty
+    /// queue is a timeout, because a source with nothing more to say and a
+    /// source that has stopped are the same thing to a reader.
+    struct Scripted {
+        deliveries: Vec<Vec<u8>>,
+        /// How many times `read` has been called. The point of the assertions
+        /// that use it is that a second frame already in `pending` must be
+        /// returned *without* touching the transport.
+        reads: usize,
+    }
+
+    impl Scripted {
+        fn new<I: IntoIterator<Item = Vec<u8>>>(deliveries: I) -> Self {
+            let mut deliveries: Vec<Vec<u8>> = deliveries.into_iter().collect();
+            deliveries.reverse();
+            Self {
+                deliveries,
+                reads: 0,
+            }
+        }
+
+        /// One delivery per byte, which is the worst case a console can
+        /// produce.
+        fn byte_at_a_time(bytes: &[u8]) -> Self {
+            Self::new(bytes.iter().map(|b| vec![*b]))
+        }
+    }
+
+    impl ByteSource for Scripted {
+        fn read(&mut self, out: &mut [u8]) -> Option<usize> {
+            self.reads += 1;
+            let mut delivery = self.deliveries.pop()?;
+            let taken = delivery.len().min(out.len());
+            out[..taken].copy_from_slice(&delivery[..taken]);
+            if taken < delivery.len() {
+                delivery.drain(..taken);
+                self.deliveries.push(delivery);
+            }
+            Some(taken)
+        }
+    }
+
+    /// The three requests the reader tests stream, and the bytes of each.
+    fn stream_requests() -> [Request; 3] {
+        [
+            Request::simple(Opcode::OpenSession, 0, Vec::new()),
+            Request::simple(Opcode::InvokeCommand, 7, all_params()),
+            Request::simple(Opcode::CloseSession, 0, Vec::new()),
+        ]
+    }
+
+    fn recv(pending: &mut Vec<u8>, source: &mut Scripted) -> Result<Request, RecvError> {
+        let mut scratch = [0_u8; GUEST_SCRATCH];
+        recv_frame(pending, &mut scratch, source)
+    }
+
+    /// The regression `1b56927e` fixed, at the level of the reader rather than
+    /// of the codec.
+    ///
+    /// One delivery carrying two whole frames. The first call must return the
+    /// first frame; the second call must return the second **without reading
+    /// again**, because there is nothing left to read -- the source is empty
+    /// and would time out. The old reader answered `Ok(None)` to
+    /// `bytes_needed`, handed the whole buffer to `Request::decode`, got
+    /// `TrailingBytes`, and the second frame's bytes were gone.
+    #[test]
+    fn two_frames_in_one_delivery_are_both_delivered() {
+        let [first, second, _] = stream_requests();
+        let mut delivery = first.encode();
+        delivery.extend_from_slice(&second.encode());
+
+        let mut source = Scripted::new([delivery]);
+        let mut pending = Vec::new();
+
+        let got = recv(&mut pending, &mut source).expect("the first frame decodes");
+        assert_eq!(got.opcode, Opcode::OpenSession);
+        assert_eq!(source.reads, 1);
+
+        let got = recv(&mut pending, &mut source).expect("the second frame decodes");
+        assert_eq!(got.opcode, Opcode::InvokeCommand);
+        assert_eq!(got.cmd_id, 7);
+        assert_eq!(got.params, all_params());
+        assert_eq!(
+            source.reads, 1,
+            "the second frame was already in `pending`; reading again for it means the \
+             first call consumed more than one frame's worth of bytes"
+        );
+        assert!(pending.is_empty());
+    }
+
+    /// A frame cut across deliveries, at every possible cut.
+    ///
+    /// The delivery carrying the tail of the first frame carries the whole of
+    /// the second as well, which is the shape a console actually produces:
+    /// "several deliveries per frame" and "several frames per delivery" are
+    /// the same stream seen at different moments, and a reader has to survive
+    /// both in one pass.
+    #[test]
+    fn a_frame_split_across_reads_is_reassembled() {
+        let [first, second, _] = stream_requests();
+        let first_bytes = first.encode();
+        let second_bytes = second.encode();
+
+        for cut in 1..first_bytes.len() {
+            let mut tail = first_bytes[cut..].to_vec();
+            tail.extend_from_slice(&second_bytes);
+            let mut source = Scripted::new([first_bytes[..cut].to_vec(), tail]);
+            let mut pending = Vec::new();
+
+            let got = recv(&mut pending, &mut source).expect("the reassembled frame decodes");
+            assert_eq!(got.opcode, Opcode::OpenSession, "cut at {cut}");
+            assert_eq!(source.reads, 2, "cut at {cut}");
+
+            let got = recv(&mut pending, &mut source).expect("the second frame decodes");
+            assert_eq!(got.cmd_id, 7, "cut at {cut}");
+            assert_eq!(
+                source.reads, 2,
+                "the second frame arrived in the same delivery as the first frame's tail, \
+                 so returning it must not need another read (cut at {cut})"
+            );
+            assert!(pending.is_empty(), "cut at {cut}");
+        }
+    }
+
+    /// The general case, driven through the real reader: a run of frames
+    /// delivered one byte at a time. Every frame boundary falls inside a
+    /// delivery in the middle of the stream, so a reader that mishandles
+    /// either "several deliveries per frame" or "several frames per delivery"
+    /// loses a frame.
+    #[test]
+    fn a_run_of_frames_survives_one_byte_deliveries() {
+        let requests = stream_requests();
+        let mut stream = Vec::new();
+        for request in &requests {
+            stream.extend_from_slice(&request.encode());
+        }
+
+        let mut source = Scripted::byte_at_a_time(&stream);
+        let mut pending = Vec::new();
+        for want in &requests {
+            let got = recv(&mut pending, &mut source).expect("every frame decodes");
+            assert_eq!(got.opcode, want.opcode);
+            assert_eq!(got.cmd_id, want.cmd_id);
+            assert_eq!(got.params, want.params);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(recv(&mut pending, &mut source), Err(RecvError::Timeout));
+    }
+
+    /// A whole delivery larger than the scratch buffer, which is what a real
+    /// console read is bounded by. The reader must ask again for the rest
+    /// rather than treat the short read as the whole thing.
+    #[test]
+    fn a_frame_longer_than_one_read_is_reassembled() {
+        // A memref long enough that the encoded frame needs three reads.
+        let data = vec![0xA5_u8; GUEST_SCRATCH * 2 + 17];
+        let request = Request::simple(
+            Opcode::InvokeCommand,
+            3,
+            vec![Param::MemrefInput {
+                data: data.clone().into_boxed_slice(),
+            }],
+        );
+        let encoded = request.encode();
+        assert!(encoded.len() > GUEST_SCRATCH * 2);
+
+        let mut source = Scripted::new([encoded]);
+        let mut pending = Vec::new();
+        let got = recv(&mut pending, &mut source).expect("the long frame decodes");
+        assert_eq!(got.params, request.params);
+        assert!(source.reads >= 3, "{} reads", source.reads);
+    }
+
+    /// A length field **larger** than the payload that follows it.
+    ///
+    /// There is nothing to decode and nothing to resynchronise to, so the
+    /// reader waits and the source's silence becomes a timeout -- not a decode
+    /// of the short bytes, and not a hang. Once the caller discards `pending`,
+    /// as `serve` does, the channel carries the next request.
+    ///
+    /// Nothing follows the lie in the same source, and that is the point: a
+    /// stream reader *cannot* tell an over-declared length from a frame whose
+    /// tail has not arrived, so bytes sent afterwards are legitimately eaten as
+    /// that tail. What is being pinned here is that the reader keeps waiting
+    /// and then reports a timeout, rather than decoding what it has.
+    #[test]
+    fn a_length_larger_than_the_payload_times_out_and_then_recovers() {
+        let [victim, next, _] = stream_requests();
+        let mut truncated = victim.encode();
+        let real_len = truncated.len();
+        // Declare twenty more bytes than are sent.
+        let lie = u32::try_from(real_len - 4 + 20).expect("small");
+        truncated[..4].copy_from_slice(&lie.to_le_bytes());
+
+        let mut source = Scripted::new([truncated.clone()]);
+        let mut pending = Vec::new();
+        assert_eq!(recv(&mut pending, &mut source), Err(RecvError::Timeout));
+        assert_eq!(pending, truncated, "the incomplete frame was not kept");
+
+        // Recovery is the caller's, and is exactly what `serve` does.
+        pending.clear();
+        let mut source = Scripted::new([next.encode()]);
+        let got = recv(&mut pending, &mut source).expect("the next request is served");
+        assert_eq!(got.opcode, Opcode::InvokeCommand);
+    }
+
+    /// A length field **smaller** than the payload that follows it.
+    ///
+    /// The frame is split at the declared length, so the decoder sees a body
+    /// cut short and says so; the bytes past the cut stay in `pending` and are
+    /// read as the next frame, which is what a length-prefixed format obliges
+    /// a reader to do. The reader must report and continue rather than wedge,
+    /// and after the caller discards `pending` the next request is served.
+    #[test]
+    fn a_length_smaller_than_the_payload_is_reported_and_then_recovers() {
+        let [_, victim, next] = stream_requests();
+        let mut short = victim.encode();
+        let honest = short.len();
+        // Still >= 4, so this is a short frame rather than `TooShort`.
+        let lie = u32::try_from(honest - 4 - 8).expect("small");
+        short[..4].copy_from_slice(&lie.to_le_bytes());
+
+        let mut source = Scripted::new([short, next.encode()]);
+        let mut pending = Vec::new();
+        let error = recv(&mut pending, &mut source).expect_err("a short body cannot decode");
+        assert!(
+            matches!(error, RecvError::Protocol(_)),
+            "expected a protocol error, got {error:?}"
+        );
+
+        // `serve` clears `pending` after an unparseable frame, because there
+        // is no resynchronisation point. The channel then carries on.
+        pending.clear();
+        let got = recv(&mut pending, &mut source).expect("the next request is served");
+        assert_eq!(got.opcode, Opcode::CloseSession);
+    }
+
+    /// A declared length below the four bytes it counts is rejected from the
+    /// prefix alone -- the reader never waits for a frame that cannot exist --
+    /// and the channel recovers.
+    #[test]
+    fn an_impossible_declared_length_is_rejected_without_reading_on() {
+        let [_, _, next] = stream_requests();
+        let mut source = Scripted::new([vec![3, 0, 0, 0], next.encode()]);
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            recv(&mut pending, &mut source),
+            Err(RecvError::Protocol(Error::TooShort { declared: 3 }))
+        );
+        assert_eq!(source.reads, 1, "the reader waited for an impossible frame");
+
+        pending.clear();
+        let got = recv(&mut pending, &mut source).expect("the next request is served");
+        assert_eq!(got.opcode, Opcode::CloseSession);
+    }
+
+    /// An absurd declared length is rejected the same way, without allocating
+    /// for it.
+    #[test]
+    fn an_absurd_declared_length_is_rejected_without_reading_on() {
+        let [_, _, next] = stream_requests();
+        let mut source = Scripted::new([u32::MAX.to_le_bytes().to_vec(), next.encode()]);
+        let mut pending = Vec::new();
+
+        assert_eq!(
+            recv(&mut pending, &mut source),
+            Err(RecvError::Protocol(Error::TooLong {
+                declared: u32::MAX as usize
+            }))
+        );
+        assert_eq!(source.reads, 1);
+
+        pending.clear();
+        assert_eq!(
+            recv(&mut pending, &mut source)
+                .expect("the next request is served")
+                .opcode,
+            Opcode::CloseSession
+        );
+    }
+
+    /// A source that stops mid-frame is a timeout, and the partial frame is
+    /// kept rather than decoded.
+    #[test]
+    fn a_source_that_stops_mid_frame_is_a_timeout() {
+        let [first, _, _] = stream_requests();
+        let encoded = first.encode();
+        let mut source = Scripted::new([encoded[..encoded.len() - 1].to_vec()]);
+        let mut pending = Vec::new();
+        assert_eq!(recv(&mut pending, &mut source), Err(RecvError::Timeout));
+        assert_eq!(pending, encoded[..encoded.len() - 1]);
+    }
+
+    /// Every hostile shape above in one stream, with good frames on either
+    /// side of each, driven through one reader: the channel must serve the
+    /// last request no matter what preceded it.
+    #[test]
+    fn the_channel_still_serves_a_request_after_every_bad_frame() {
+        let [good, _, last] = stream_requests();
+
+        let mut bad_too_short = good.encode();
+        bad_too_short[..4].copy_from_slice(&1_u32.to_le_bytes());
+        let mut bad_too_long = good.encode();
+        bad_too_long[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut bad_opcode = good.encode();
+        bad_opcode[6..8].copy_from_slice(&0xBEEF_u16.to_le_bytes());
+        let mut bad_version = good.encode();
+        bad_version[4..6].copy_from_slice(&0xBEEF_u16.to_le_bytes());
+
+        for bad in [bad_too_short, bad_too_long, bad_opcode, bad_version] {
+            let mut source = Scripted::new([bad, last.encode()]);
+            let mut pending = Vec::new();
+
+            let error = recv(&mut pending, &mut source).expect_err("the bad frame is refused");
+            assert!(matches!(error, RecvError::Protocol(_)), "{error:?}");
+
+            // What `serve` does with a `Protocol` error.
+            pending.clear();
+            let got = recv(&mut pending, &mut source).expect("the next request is served");
+            assert_eq!(got.opcode, Opcode::CloseSession);
         }
     }
 }

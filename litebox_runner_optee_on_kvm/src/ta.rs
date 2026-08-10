@@ -266,6 +266,37 @@ impl core::fmt::Display for ChannelError {
     }
 }
 
+/// The virtio console, seen as the byte source [`proto::recv_frame`] reads
+/// from.
+///
+/// Borrows the two fields of [`Channel`] the read path needs, so that
+/// `pending` -- which `recv_frame` also takes mutably -- can be borrowed
+/// separately.
+struct ConsoleSource<'a> {
+    console: &'a mut virtio::Console,
+    rx: &'a mut Option<Dma>,
+}
+
+impl proto::ByteSource for ConsoleSource<'_> {
+    fn read(&mut self, out: &mut [u8]) -> Option<usize> {
+        let capacity = u32::try_from(out.len()).expect("small buffer");
+        let len = self
+            .console
+            .receive_deadline(self.rx, capacity, REQUEST_TIMEOUT_NANOS)?;
+        // No clamp here. `receive_deadline` bounds the returned length by the
+        // capacity it submitted, which is itself bounded by the buffer's own
+        // length, and `read_into` checks it a second time against that length.
+        // The bound lives with the allocation, so repeating it here would only
+        // restate a guarantee this code no longer has to provide.
+        let len = len as usize;
+        self.rx
+            .as_ref()
+            .expect("the receive buffer survives a completed receive")
+            .read_into(out, len);
+        Some(len)
+    }
+}
+
 impl Channel {
     fn new(console: virtio::Console) -> Self {
         Self {
@@ -278,72 +309,27 @@ impl Channel {
 
     /// Reads bytes until a whole frame is present, and decodes it.
     ///
-    /// A read delivers whatever the device had: half a frame, one frame, or
-    /// several. Only the first frame is taken; the rest stays in `pending` and
-    /// is the first thing looked at on the next call, which is why the codec is
-    /// asked *before* reading rather than after.
+    /// The loop itself is [`proto::recv_frame`]; all this adds is the
+    /// transport. That split is deliberate: `ta.rs` cannot be compiled for the
+    /// host -- it is built on the shim and the platform -- whereas `proto.rs`
+    /// is, so a reader that lived here could only ever be tested by
+    /// duplicating it. `ConsoleSource` below is the whole of the difference
+    /// between the guest's reader and a test's.
     fn recv(&mut self) -> Result<Request, ChannelError> {
-        loop {
-            // Ask the codec whether what we already hold begins with a whole
-            // frame, and if so where it ends. Asked before reading, because a
-            // previous completion may have delivered two frames at once and the
-            // second is already here.
-            match proto::complete_frame_len(&self.pending) {
-                Ok(Some(total)) => {
-                    // Split rather than take. Taking the whole buffer -- which
-                    // is what this used to do -- hands the tail of a second
-                    // frame to the decoder, which reports `TrailingBytes` and
-                    // loses those bytes, leaving every subsequent read starting
-                    // mid-frame with no way back: a length-prefixed format has
-                    // no resynchronisation point.
-                    let rest = self.pending.split_off(total);
-                    let frame = core::mem::replace(&mut self.pending, rest);
-                    return Request::decode(&frame).map_err(ChannelError::Protocol);
-                }
-                // A declared length that is absurd is knowable from the
-                // four-byte prefix, so it is rejected now rather than waited
-                // out. This is the difference between a clean error and a
-                // hang on a frame that will never complete.
-                Err(error) => return Err(ChannelError::Protocol(error)),
-                Ok(None) => {}
-            }
-
-            let capacity = u32::try_from(CHANNEL_BUF_SIZE).expect("small buffer");
-            let Some(len) =
-                self.console
-                    .receive_deadline(&mut self.rx, capacity, REQUEST_TIMEOUT_NANOS)
-            else {
-                return Err(ChannelError::Timeout);
-            };
-            // No clamp here. `receive_deadline` bounds the returned length by
-            // the capacity it submitted, which is itself bounded by the
-            // buffer's own length, and `read_into` checks it a second time
-            // against that length. The bound now lives with the allocation, so
-            // repeating it here would only restate a guarantee this code no
-            // longer has to remember to provide.
-            let len = len as usize;
-            let mut bytes = [0_u8; CHANNEL_BUF_SIZE];
-            self.rx
-                .as_ref()
-                .expect("the receive buffer survives a completed receive")
-                .read_into(&mut bytes, len);
-            // The accumulated buffer is bounded by the same maximum the codec
-            // enforces, so a peer that streams megabytes without ever
-            // completing a frame cannot exhaust the heap. In practice
-            // `complete_frame_len` rejects the oversized length first; this is
-            // the belt to that's braces.
-            //
-            // The bound is still exactly one frame even though `pending` may
-            // now carry a remainder: the loop above drains every complete frame
-            // before it ever reads again, so at this point `pending` holds an
-            // incomplete frame's prefix and nothing else.
-            if self.pending.len() + len > proto::MAX_FRAME_LEN {
-                return Err(ChannelError::Protocol(proto::Error::TooLong {
-                    declared: self.pending.len() + len,
-                }));
-            }
-            self.pending.extend_from_slice(&bytes[..len]);
-        }
+        // Split borrow: `recv_frame` takes `pending` mutably and the source
+        // mutably, and they are two fields of the same struct.
+        let Self {
+            console,
+            rx,
+            pending,
+            ..
+        } = self;
+        let mut scratch = [0_u8; CHANNEL_BUF_SIZE];
+        let mut source = ConsoleSource { console, rx };
+        proto::recv_frame(pending, &mut scratch, &mut source).map_err(|error| match error {
+            proto::RecvError::Timeout => ChannelError::Timeout,
+            proto::RecvError::Protocol(error) => ChannelError::Protocol(error),
+        })
     }
 
     /// Sends a response, in as many buffer-fuls as it takes.
