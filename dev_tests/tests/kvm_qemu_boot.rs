@@ -621,9 +621,13 @@ fn many_open_close_cycles_do_not_exhaust_the_guest() {
 }
 
 // ---------------------------------------------------------------------------
-// The four TAs, mirroring `litebox_runner_optee_on_linux_userland/tests/run.rs`.
+// Four of the five TAs driven by
+// `litebox_runner_optee_on_linux_userland/tests/run.rs`. `hello3seg-ta` is
+// excluded: its multi-segment layout hits a loader bug that is written up in
+// `docs/plans/` and deferred, so it would fail here for reasons unrelated to
+// the channel.
 //
-// Same four binaries, same four command sequences, read from the same
+// Same binaries, same command sequences, read from the same
 // directory -- but *unrewritten*, and driven over the channel rather than
 // in-process. The verification standard is the userland runner's: the client
 // raises, and `run.sh` exits non-zero, if any command comes back with a

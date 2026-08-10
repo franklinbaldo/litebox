@@ -559,6 +559,11 @@ impl Queue {
     /// it would self-link the free list and wrap `num_free`. Such an entry is
     /// consumed -- `last_used` still advances, or the ring would never drain --
     /// logged at error level, and otherwise ignored. The same goes for a
+    /// completion naming an `id` outside the descriptor table, which is
+    /// rejected before it can index `states`.
+    ///
+    /// Both rejections return `None`, which a caller cannot tell apart from an
+    /// empty ring; the error log is the only signal.
     pub fn take_used(&mut self) -> Option<(u16, u32)> {
         let idx = self.used_idx();
         if idx == self.last_used {
