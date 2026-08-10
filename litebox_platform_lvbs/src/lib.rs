@@ -1194,7 +1194,7 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     /// A vDSO exists to let userspace avoid the syscall instruction. Here
     /// LiteBox *is* the kernel, so a `syscall` traps directly to
     /// `syscall_entry` and there is nothing to avoid — the same reasoning as
-    /// [`Self::get_syscall_entry_point`] returning 0 above. A static binary
+    /// [`litebox::platform::SystemInfoProvider::get_syscall_entry_point`] returning 0 above. A static binary
     /// simply omits `AT_SYSINFO_EHDR` and calls `syscall`, which is what we
     /// want.
     fn get_vdso_address(&self) -> Option<usize> {

@@ -496,7 +496,7 @@ const DEV_PRK_DERIVATION_STRING: &[u8] =
 ///
 /// Deliberately mirrors `host::lvbs`'s `PRK_ONCE`, including the absence of a
 /// raw getter: there is no `get_platform_root_key` here either, so the only
-/// way to reach the key material is through [`DerivedKeyProvider::derive_key`]
+/// way to reach the key material is through [`litebox::platform::DerivedKeyProvider::derive_key`]
 /// with a shim-supplied KDF. That property is worth keeping even for a key
 /// with no security value, because the day it is replaced by a real one the
 /// call sites must already be correct.
