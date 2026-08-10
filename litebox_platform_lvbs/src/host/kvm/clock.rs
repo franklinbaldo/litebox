@@ -8,29 +8,46 @@
 //! any CPU with the invariant-TSC feature, but *what* that rate is has to be
 //! discovered; there is no architectural "read the TSC frequency" instruction.
 //!
-//! Three sources are tried, in the order below, and the first that yields a
-//! frequency passing `plausible` wins. Which one won is logged at boot.
+//! Sources are tried in *descending order of authority* -- how directly each
+//! one describes the rate the TSC actually advances at in this guest -- and
+//! the first that yields a frequency passing `plausible` wins. Which one won
+//! is logged at boot.
 //!
-//! 1. **CPUID.** Leaf `0x15` (TSC / core-crystal ratio) and leaf `0x16`
-//!    (processor base frequency), plus the KVM paravirt leaf `0x4000_0010`
-//!    (TSC kHz). Authoritative and free when present -- but frequently
-//!    absent. Leaves `0x15`/`0x16` are Intel-only and are *not implemented on
-//!    AMD*, and QEMU does not advertise `0x4000_0010` at all, so on an AMD
-//!    host under QEMU none of the three answers.
-//! 2. **KVM pvclock** (MSR `0x4b564d01`). The hypervisor publishes the exact
-//!    TSC-to-nanoseconds factors it wants the guest to use, which is more
-//!    authoritative than CPUID under TSC scaling or migration. Requires
-//!    `KVM_FEATURE_CLOCKSOURCE2`, so this is unavailable under TCG.
-//! 3. **i8254 PIT calibration.** Count TSC ticks across a gated interval of
+//! 1. **KVM pvclock** (MSR `0x4b564d01`). The hypervisor publishes the exact
+//!    TSC-to-nanoseconds factors it wants the guest to use. This is the
+//!    scaling KVM genuinely applies, so it stays correct under TSC scaling and
+//!    across migration, where every CPUID answer below can be stale. Requires
+//!    `KVM_FEATURE_CLOCKSOURCE2`, so it is unavailable under TCG.
+//! 2. **KVM paravirt CPUID leaf `0x4000_0010`** (TSC kHz). Also KVM-supplied,
+//!    but a static kHz value read once: it is a snapshot, not a live
+//!    conversion, so TSC scaling or a migration can invalidate it. QEMU does
+//!    not advertise this leaf at all in many configurations.
+//! 3. **Intel CPUID leaves `0x15`/`0x16`.** Leaf `0x15` (TSC / core-crystal
+//!    ratio) then leaf `0x16` (processor base frequency, rounded to a whole
+//!    MHz). These describe the *CPU model*, not the guest's TSC scaling, so a
+//!    hypervisor that scales the TSC leaves them wrong. They are also
+//!    Intel-only and *not implemented on AMD*, so on an AMD host under QEMU
+//!    neither answers.
+//! 4. **i8254 PIT calibration.** Count TSC ticks across a gated interval of
 //!    the PIT, whose 1.193182 MHz input is fixed by the hardware definition.
 //!
-//! Source 3 is a *measurement against a fixed reference*, not a guess. That
+//! The ordering is deliberately by correctness, not by cost. pvclock costs an
+//! MSR write and a page mapping where a CPUID read is nearly free, but
+//! `discover` probes lazily: a source that succeeds means every later one is
+//! never run, so the cheap sources only ever pay for themselves when the
+//! authoritative one is absent. Linux orders the same way -- `kvmclock_init`
+//! installs `kvm_get_tsc_khz` as `x86_platform.calibrate_tsc` before the
+//! CPUID-based calibration is consulted.
+//!
+//! Source 4 is a *measurement against a fixed reference*, not a guess. That
 //! distinction matters: hardcoding "assume 2 GHz" would produce a clock that
 //! is confidently wrong, whereas counting TSC ticks against a crystal whose
 //! rate is defined by the i8254's specification produces a real answer whose
 //! only error is sampling noise. Linux calibrates the same way, in
 //! `quick_pit_calibrate()`, for exactly the same reason. It is last only
-//! because it costs ~55 ms of boot time and is less precise than being told.
+//! because it costs ~55 ms of boot time and is less precise than being told:
+//! it is the universal fallback, the one source that needs nothing of the
+//! hypervisor or the CPU model.
 //!
 //! If every source fails, this module panics naming each one and what it
 //! returned. Falling back to a fabricated frequency would produce a clock that
@@ -122,7 +139,11 @@ struct TscScale {
 static TSC_SCALE: spin::Once<TscScale> = spin::Once::new();
 
 // ---------------------------------------------------------------------------
-// Source 1: CPUID.
+// Sources 2 and 3: CPUID.
+//
+// Ordered after pvclock below; see the module docs. Kept first in file order
+// because `kvm_max_leaf` and `hypervisor_present` live here and the pvclock
+// section depends on them.
 // ---------------------------------------------------------------------------
 
 /// Reads the TSC frequency in Hz from the KVM paravirt CPUID leaf.
@@ -212,7 +233,7 @@ fn kvm_max_leaf() -> Option<u32> {
 }
 
 // ---------------------------------------------------------------------------
-// Source 2: KVM pvclock.
+// Source 1: KVM pvclock.
 // ---------------------------------------------------------------------------
 
 /// KVM's `struct pvclock_vcpu_time_info`, the layout the hypervisor writes
@@ -358,7 +379,7 @@ fn kvm_clocksource2_supported() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Source 3: i8254 PIT calibration.
+// Source 4: i8254 PIT calibration.
 // ---------------------------------------------------------------------------
 
 /// The i8254's input clock, in Hz.
@@ -502,11 +523,18 @@ fn discover() -> TscScale {
     // ~55 ms PIT calibration and the pvclock MSR enable/disable pair would be
     // paid on every boot even when CPUID answered first. Only the *selection*
     // would be ordered, not the work.
+    //
+    // Ordered by authority, not by cost; see the module docs. pvclock is the
+    // conversion KVM actually applies, so it survives TSC scaling and
+    // migration; `0x4000_0010` is KVM-supplied but a static snapshot that
+    // scaling can invalidate; `0x15`/`0x16` describe the CPU model and know
+    // nothing of scaling; the PIT is a real measurement and works everywhere,
+    // so it is the universal last resort.
     let candidates: [FrequencySource; 5] = [
+        ("KVM pvclock (MSR 0x4b564d01)", pvclock_hz),
         ("CPUID 0x40000010 (KVM paravirt)", kvm_paravirt_hz),
         ("CPUID 0x15 (core crystal ratio)", crystal_ratio_hz),
         ("CPUID 0x16 (processor base frequency)", base_frequency_hz),
-        ("KVM pvclock (MSR 0x4b564d01)", pvclock_hz),
         ("i8254 PIT calibration", pit_calibrated_hz),
     ];
 
@@ -558,7 +586,7 @@ fn discover() -> TscScale {
          max hypervisor leaf {max_hypervisor_leaf:#x}, \
          KVM signature {is_kvm}, \
          leaf 0x15 eax={:#x} ebx={:#x} ecx={:#x}, leaf 0x16 eax={:#x}. \
-         Candidates: 0x40000010 {:?}, 0x15 {:?}, 0x16 {:?}, pvclock {:?}, PIT {:?}. \
+         Candidates: pvclock {:?}, 0x40000010 {:?}, 0x15 {:?}, 0x16 {:?}, PIT {:?}. \
          Refusing to guess a frequency",
         leaf_15.eax,
         leaf_15.ebx,
