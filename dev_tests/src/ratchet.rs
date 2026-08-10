@@ -52,7 +52,14 @@ fn ratchet_globals() -> Result<()> {
             // embedded ldelf/TA used by the no-device path, the boot-time
             // probes, the PVH note, the logger, and the virtio MMIO window
             // bump-pointer.
-            ("litebox_runner_optee_on_kvm/", 20),
+            //
+            // Plus one that is not in the guest at all: `pci/fake_bus.rs` is
+            // `#[cfg(test)]` and never compiled for `x86_64_kvm.json`. Its
+            // `thread_local!` is the bus a host test's PCI device sits on, and
+            // it has to be a static because the code under test reaches the
+            // bus through `inl`/`outl`, which are free functions with nowhere
+            // to put a handle. The heuristic is textual, so it counts it.
+            ("litebox_runner_optee_on_kvm/", 21),
             ("litebox_runner_lvbs/", 6),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),

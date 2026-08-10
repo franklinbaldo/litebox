@@ -20,7 +20,13 @@
 //! [`Address::function`] exists so that reading them is a matter of passing a
 //! different address, not of changing this code.
 
+#[cfg(test)]
+use fake_bus::{inl, outl};
+#[cfg(not(test))]
 use litebox_platform_lvbs::arch::ioport::{inl, outl};
+
+#[cfg(test)]
+mod fake_bus;
 
 mod bar;
 
@@ -596,5 +602,425 @@ pub fn for_each_device_with_vendor(vendor: u16, mut visit: impl FnMut(&DeviceHea
                 visit(&header);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+//
+// `dev_tests/tests/kvm_pci.rs` compiles this file for the host with
+// `fake_bus` underneath it, so everything below drives the guest's own
+// configuration-space code against a device that answers the way hardware
+// does. See that file and `fake_bus`'s own comment.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::fake_bus::{self, Device, Register};
+    use super::{
+        Address, BAR_COUNT, Bar, COMMAND_BUS_MASTER, COMMAND_MEMORY_SPACE, DeviceHeader,
+        STATUS_CAPABILITIES_LIST, offset, read_u8, read_u16, read_u32, write_command, write_u32,
+    };
+    use alloc::vec::Vec;
+
+    /// `STATUS` write-1-to-clear bits: master data parity error (8), signalled
+    /// target abort (11), received target abort (12), received master abort
+    /// (13), signalled system error (14), detected parity error (15).
+    const STATUS_RW1C: u16 = 0xF900;
+
+    /// The two errors this device has latched before the driver ever touches
+    /// it: detected parity error and signalled target abort. Both are RW1C,
+    /// so both are destroyed by a read-modify-write of the dword they share
+    /// with `COMMAND`.
+    const LATCHED: u16 = 0x8000 | 0x2000;
+
+    /// The `COMMAND` value QEMU leaves on a virtio device: I/O space, memory
+    /// space disabled, and the reserved-but-set bit 8 (SERR# enable).
+    const COMMAND_INITIAL: u16 = 0x0103;
+
+    /// A virtio-console-shaped function: a 4 KiB 32-bit BAR at index 1 and a
+    /// 16 KiB 64-bit BAR at index 4, which are the two the runner actually
+    /// enumerates, plus a capability list.
+    fn console() -> Device {
+        let mut regs = [Register::default(); 64];
+        let ro = Register::ro;
+
+        regs[0x00 / 4] = ro(0x1043_1AF4); // device 0x1043, vendor 0x1AF4.
+        regs[0x04 / 4] = Register {
+            value: (u32::from(LATCHED | STATUS_CAPABILITIES_LIST) << 16)
+                | u32::from(COMMAND_INITIAL),
+            // Only `COMMAND` is writable. `STATUS`'s other bits are read-only
+            // and its RW1C bits are handled separately, which is the whole
+            // distinction the fix turns on.
+            writable: 0x0000_FFFF,
+            rw1c: u32::from(STATUS_RW1C) << 16,
+        };
+        regs[0x08 / 4] = ro(0x0780_0001); // class 07, subclass 80, rev 1.
+        regs[0x0C / 4] = ro(0x0000_0000); // header type 0, single function.
+
+        // BAR1: 4 KiB, 32-bit, non-prefetchable, at 0xFEB0_0000.
+        regs[0x14 / 4] = Register {
+            value: 0xFEB0_0000,
+            writable: 0xFFFF_F000,
+            rw1c: 0,
+        };
+        // BAR4/BAR5: 16 KiB, 64-bit, at 0x0000_0000_FE00_0000. The type field
+        // (bits 2:1 = 0b10) is read-only, as it is on real hardware, so the
+        // probe cannot corrupt it.
+        regs[0x20 / 4] = Register {
+            value: 0xFE00_0004,
+            writable: 0xFFFF_C000,
+            rw1c: 0,
+        };
+        regs[0x24 / 4] = Register {
+            value: 0x0000_0000,
+            writable: 0xFFFF_FFFF,
+            rw1c: 0,
+        };
+        // The Cardbus CIS pointer. Writable, so that a probe which strays into
+        // it leaves evidence rather than being silently absorbed.
+        regs[0x28 / 4] = Register {
+            value: 0xCA5C_0DE5,
+            writable: 0xFFFF_FFFF,
+            rw1c: 0,
+        };
+        regs[0x2C / 4] = ro(0x0003_1AF4); // subsystem.
+        regs[0x34 / 4] = ro(0x0000_0040); // capabilities pointer.
+
+        Device {
+            regs,
+            writes: Vec::new(),
+        }
+    }
+
+    /// The same function, but with BAR4 unimplemented and BAR5 declaring
+    /// itself the low half of a 64-bit BAR.
+    ///
+    /// BAR5 can only be 64-bit on a device whose BAR4 is not, because the
+    /// register a 64-bit BAR4 claims for its upper half *is* BAR5. That is the
+    /// whole malformation: BAR5's own upper half would have to be `0x28`, the
+    /// Cardbus CIS pointer.
+    fn console_with_64bit_bar5() -> Device {
+        let mut device = console();
+        device.regs[0x20 / 4] = Register::default(); // BAR4 unimplemented.
+        device.regs[0x24 / 4] = Register {
+            value: 0xFD00_0004,
+            writable: 0xFFFF_0000,
+            rw1c: 0,
+        };
+        device
+    }
+
+    fn header() -> DeviceHeader {
+        DeviceHeader::read(fake_bus::present()).expect("the fake device is present")
+    }
+
+    // -----------------------------------------------------------------------
+    // `cdd66696`: the COMMAND write must not clear STATUS.
+    // -----------------------------------------------------------------------
+
+    /// The value put on the bus, which is what the fix is about: a dword whose
+    /// upper half -- `STATUS` -- is all zeros, so that every write-1-to-clear
+    /// bit is written zero and therefore left alone.
+    #[test]
+    fn write_command_puts_zeros_in_every_write_1_to_clear_position() {
+        fake_bus::install(console());
+        let address = fake_bus::present();
+
+        let command = read_u16(address, offset::COMMAND);
+        assert_eq!(command, COMMAND_INITIAL);
+        let before = fake_bus::writes().len();
+
+        // SAFETY: the fake device has no decoders to disturb.
+        unsafe { write_command(address, command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER) };
+
+        let new: Vec<(u8, u32)> = fake_bus::writes().split_off(before);
+        assert_eq!(
+            new,
+            [(offset::COMMAND & 0xFC, 0x0000_0107)],
+            "the COMMAND write should be exactly one dword, {:#010X}, with zeros in the \
+             STATUS half",
+            0x0000_0107_u32
+        );
+        for (_, value) in &new {
+            assert_eq!(
+                value >> 16 & u32::from(STATUS_RW1C),
+                0,
+                "a write-1-to-clear STATUS bit was written as 1"
+            );
+        }
+    }
+
+    /// The consequence: the two errors the device had latched are still
+    /// latched afterwards, and `COMMAND` did change.
+    #[test]
+    fn write_command_leaves_a_latched_status_bit_alone() {
+        fake_bus::install(console());
+        let address = fake_bus::present();
+        assert_eq!(read_u16(address, offset::STATUS) & LATCHED, LATCHED);
+
+        let command = read_u16(address, offset::COMMAND);
+        // SAFETY: as above.
+        unsafe { write_command(address, command | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER) };
+
+        assert_eq!(
+            read_u16(address, offset::STATUS) & LATCHED,
+            LATCHED,
+            "enabling the decoders cleared an error the device had latched"
+        );
+        assert_eq!(
+            read_u16(address, offset::COMMAND),
+            COMMAND_INITIAL | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER
+        );
+    }
+
+    /// What the read-modify-write `write_u16` did, spelled out against the
+    /// same device, so the regression is pinned rather than merely absent.
+    /// This is not a call into the driver -- `write_u16` no longer exists --
+    /// it is its two lines.
+    #[test]
+    fn the_read_modify_write_this_replaced_would_have_wiped_the_status() {
+        fake_bus::install(console());
+        let address = fake_bus::present();
+        assert_eq!(read_u16(address, offset::STATUS) & LATCHED, LATCHED);
+
+        let command =
+            read_u16(address, offset::COMMAND) | COMMAND_MEMORY_SPACE | COMMAND_BUS_MASTER;
+        let dword = read_u32(address, offset::COMMAND);
+        let rebuilt = (dword & 0xFFFF_0000) | u32::from(command);
+        // SAFETY: the fake device has no decoders to disturb.
+        unsafe { write_u32(address, offset::COMMAND, rebuilt) };
+
+        assert_eq!(
+            read_u16(address, offset::STATUS) & LATCHED,
+            0,
+            "the device's latched errors survived a write-back of the STATUS half, so this \
+             test is no longer demonstrating anything"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `cdd66696`: a 64-bit BAR in slot 5 must not be probed.
+    // -----------------------------------------------------------------------
+
+    /// Sizing must still work for the BARs the runner actually uses -- the
+    /// guard is not allowed to cost that -- and must restore every register it
+    /// touched, including `COMMAND`, without clearing `STATUS` on the way.
+    #[test]
+    fn the_bars_in_use_still_size_and_are_restored() {
+        fake_bus::install(console());
+        let header = header();
+
+        // SAFETY: nothing is mapped and nothing else is talking to the fake
+        // device.
+        let bar1 = unsafe { header.size_memory_bar(1) };
+        assert_eq!(bar1, Some((0xFEB0_0000, 0x1000)), "the 32-bit BAR");
+
+        // SAFETY: as above.
+        let bar4 = unsafe { header.size_memory_bar(4) };
+        assert_eq!(bar4, Some((0xFE00_0000, 0x4000)), "the 64-bit BAR");
+
+        assert_eq!(read_u32(header.address, offset::BAR0 + 4), 0xFEB0_0000);
+        assert_eq!(read_u32(header.address, offset::BAR0 + 16), 0xFE00_0004);
+        assert_eq!(read_u32(header.address, offset::BAR0 + 20), 0x0000_0000);
+        assert_eq!(read_u16(header.address, offset::COMMAND), COMMAND_INITIAL);
+        assert_eq!(
+            read_u16(header.address, offset::STATUS) & LATCHED,
+            LATCHED,
+            "the two write_command calls inside the probe cleared a latched error"
+        );
+    }
+
+    #[test]
+    fn the_bars_decode_as_a_32_bit_one_and_a_64_bit_one() {
+        fake_bus::install(console());
+        let bars = header().bars();
+        assert!(matches!(bars[0], Bar::Unused));
+        assert!(
+            matches!(
+                bars[1],
+                Bar::Memory {
+                    base: 0xFEB0_0000,
+                    is_64bit: false,
+                    ..
+                }
+            ),
+            "BAR1 decoded as {}",
+            bars[1]
+        );
+        assert!(matches!(bars[2], Bar::Unused));
+        assert!(matches!(bars[3], Bar::Unused));
+        assert!(
+            matches!(
+                bars[4],
+                Bar::Memory {
+                    base: 0xFE00_0000,
+                    is_64bit: true,
+                    ..
+                }
+            ),
+            "BAR4 decoded as {}",
+            bars[4]
+        );
+        // The upper half of BAR4, not a BAR of its own.
+        assert!(matches!(bars[5], Bar::Unused));
+    }
+
+    /// A 64-bit BAR in the last slot has nowhere to put its upper half. The
+    /// register after it is the Cardbus CIS pointer, and probing would write
+    /// `0xFFFFFFFF` into it and then write back whatever it read.
+    #[test]
+    fn a_64_bit_bar5_is_unsizeable_and_the_cardbus_pointer_is_never_touched() {
+        fake_bus::install(console_with_64bit_bar5());
+        let header = header();
+        let cardbus_before = read_u32(header.address, 0x28);
+
+        // SAFETY: nothing is mapped and nothing else is talking to the fake
+        // device.
+        let sized = unsafe { header.size_memory_bar(5) };
+        assert_eq!(sized, None, "a malformed BAR was reported as sizeable");
+
+        assert!(
+            !fake_bus::writes().iter().any(|(o, _)| *o == 0x28),
+            "the probe wrote to the Cardbus CIS pointer: {:#010X?}",
+            fake_bus::writes()
+        );
+        assert_eq!(
+            read_u32(header.address, 0x28),
+            cardbus_before,
+            "the Cardbus CIS pointer changed"
+        );
+    }
+
+    /// The guard applies to the *last* slot, not to 64-bit BARs generally, and
+    /// not to the other BARs on the same device.
+    #[test]
+    fn the_bar5_guard_does_not_catch_the_other_bars() {
+        fake_bus::install(console_with_64bit_bar5());
+        // SAFETY: nothing is mapped and nothing else is talking to the fake
+        // device.
+        let sized = unsafe { header().size_memory_bar(1) };
+        assert_eq!(sized, Some((0xFEB0_0000, 0x1000)));
+        assert!(
+            !fake_bus::writes().iter().any(|(o, _)| *o == 0x28),
+            "sizing BAR1 reached the Cardbus CIS pointer"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `759a187f`: `for_each_capability` reads `next` at `offset + 1`.
+    // -----------------------------------------------------------------------
+
+    /// Places a capability list, and points the header at its first entry.
+    fn with_capabilities(device: &mut Device, first: u8, entries: &[(u8, u8, u8)]) {
+        device.regs[0x34 / 4] = Register::ro(u32::from(first));
+        for (at, id, next) in entries {
+            let reg = &mut device.regs[usize::from(at >> 2)];
+            let lane = u32::from(at & 3) * 8;
+            reg.value &= !(0xFFFF << lane);
+            reg.value |= (u32::from(*id) | (u32::from(*next) << 8)) << lane;
+        }
+    }
+
+    fn walk(header: DeviceHeader) -> Vec<(u8, u8)> {
+        let mut seen = Vec::new();
+        header.for_each_capability(|offset, id| seen.push((offset, id)));
+        seen
+    }
+
+    #[test]
+    fn an_ordinary_capability_list_is_walked_in_order() {
+        let mut device = console();
+        with_capabilities(&mut device, 0x40, &[(0x40, 0x09, 0x50), (0x50, 0x09, 0x00)]);
+        fake_bus::install(device);
+        assert_eq!(walk(header()), [(0x40, 0x09), (0x50, 0x09)]);
+    }
+
+    /// A capability that declares itself at `0xFF` has no byte after it, so
+    /// there is nowhere for a `next` pointer to be, and the walk ends without
+    /// parsing it.
+    ///
+    /// The old code read `offset + 1`. In a release build that wraps to `0x00`
+    /// and takes the low byte of the vendor id -- `0xF4` here -- as the next
+    /// capability pointer, which is above `0x40` and so is followed into the
+    /// middle of nowhere. In a debug build, which is what this project builds,
+    /// it panics on the overflow instead. **Neither is what this asserts.**
+    /// The assertion is that `for_each_capability` *returns*, having read
+    /// nothing past the end of configuration space, which only the checked add
+    /// produces: a panic fails this test, and a visit to `0xF4` fails it too.
+    ///
+    /// `0xFF` can only be reached through the capabilities pointer itself.
+    /// A `next` of `0xFF` is not dword aligned, and that check fires first.
+    #[test]
+    fn a_capability_at_the_last_byte_is_not_parsed_and_does_not_wrap() {
+        let mut device = console();
+        // The low byte of the vendor id, which is what a wrapped read of
+        // `next` would find, and which is a plausible-looking pointer.
+        assert_eq!(device.regs[0].value & 0xFF, 0xF4);
+        with_capabilities(&mut device, 0xFF, &[]);
+        // A capability id at 0xFF, so the walk has something to read there.
+        device.regs[0xFC / 4].value = (device.regs[0xFC / 4].value & 0x00FF_FFFF) | (0x09 << 24);
+        // And one at 0xF4, so that following a wrapped pointer would be
+        // visible rather than silent.
+        device.regs[0xF4 / 4].value = 0x0000_0909;
+        fake_bus::install(device);
+
+        assert_eq!(
+            walk(header()),
+            [],
+            "the capability at 0xFF has no next pointer, so it is refused rather than \
+             parsed; a visit to 0xF4 means `offset + 1` wrapped into the standard header"
+        );
+    }
+
+    /// A `next` that is not dword aligned is malformed; following it would
+    /// misread the list.
+    #[test]
+    fn a_misaligned_next_pointer_ends_the_walk() {
+        let mut device = console();
+        with_capabilities(&mut device, 0x40, &[(0x40, 0x09, 0x51), (0x50, 0x09, 0x00)]);
+        fake_bus::install(device);
+        assert_eq!(walk(header()), [(0x40, 0x09)]);
+    }
+
+    /// A cycle is bounded rather than hanging the guest.
+    #[test]
+    fn a_cyclic_capability_list_terminates() {
+        let mut device = console();
+        with_capabilities(&mut device, 0x40, &[(0x40, 0x09, 0x50), (0x50, 0x09, 0x40)]);
+        fake_bus::install(device);
+        let seen = walk(header());
+        assert_eq!(seen.len(), (256 - 0x40) / 4, "the walk was not bounded");
+    }
+
+    /// An offset below `0x40` would alias the standard header, so it
+    /// terminates the list rather than being read as a capability.
+    #[test]
+    fn a_next_pointer_into_the_standard_header_ends_the_walk() {
+        let mut device = console();
+        with_capabilities(&mut device, 0x40, &[(0x40, 0x09, 0x04)]);
+        fake_bus::install(device);
+        assert_eq!(walk(header()), [(0x40, 0x09)]);
+    }
+
+    /// No capability list at all: the pointer byte is not even read, because
+    /// devices are permitted to leave it as anything when `STATUS` bit 4 is
+    /// clear.
+    #[test]
+    fn a_device_without_a_capability_list_is_not_walked() {
+        let mut device = console();
+        device.regs[0x04 / 4].value &= !(u32::from(STATUS_CAPABILITIES_LIST) << 16);
+        device.regs[0x34 / 4] = Register::ro(0x0000_0040);
+        fake_bus::install(device);
+        assert!(header().capabilities_ptr.is_none());
+        assert_eq!(walk(header()), []);
+    }
+
+    #[test]
+    fn an_absent_function_reads_as_absent() {
+        fake_bus::install(console());
+        assert!(DeviceHeader::read(Address::new(0, 4, 0)).is_none());
+        assert_eq!(BAR_COUNT, 6);
+        assert_eq!(read_u8(fake_bus::present(), offset::REVISION_ID), 0x01);
     }
 }
