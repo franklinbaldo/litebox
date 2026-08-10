@@ -250,16 +250,86 @@ pub fn write_kernel_gsbase_msr(addr: VirtAddr) {
 /// This enables support for the `NO_EXECUTE` page table flag, allowing
 /// data pages to be marked non-executable.
 ///
+/// Under `host_lvbs` no maximum-leaf check is made before reading leaf
+/// `0x8000_0001`: VTL1 runs on a partition VTL0 has already brought up and
+/// vetted, so the leaf is known to be in range. Adding the check here would be
+/// dead code on the only path that reaches it. See the `host_kvm` copy below,
+/// where nothing has vetted anything.
+///
 /// # Panics
 ///
 /// Panics if CPUID does not advertise NX support.
 #[cfg(target_arch = "x86_64")]
+#[cfg(feature = "host_lvbs")]
 pub fn enable_dep() {
     // CPUID.80000001h:EDX bit 20 = NX support
     let ext_features = cpuid_count(0x8000_0001, 0);
     assert!(
         ext_features.edx & (1 << 20) != 0,
         "CPU does not support NX/XD bit"
+    );
+
+    unsafe {
+        let efer = x86_64::registers::model_specific::Efer::read();
+        x86_64::registers::model_specific::Efer::write(
+            efer | x86_64::registers::model_specific::EferFlags::NO_EXECUTE_ENABLE,
+        );
+    }
+}
+
+/// Enable Data Execution Prevention (DEP).
+///
+/// This enables support for the `NO_EXECUTE` page table flag, allowing
+/// data pages to be marked non-executable.
+///
+/// Under `host_kvm` LiteBox is entered from reset and nothing has vetted the
+/// CPU model, so the leaf is range-checked before it is believed. CPUID does
+/// *not* return zero for an unsupported leaf: it returns the highest supported
+/// leaf's data. If leaf `0x8000_0001` were out of range, reading it would yield
+/// some other leaf's contents, and if bit 20 of that `EDX` happened to be set
+/// the assertion would pass, `EFER.NXE` would be written on a CPU without NX,
+/// and the resulting `#GP` would be a triple fault with no output at all --
+/// precisely the failure this assertion exists to prevent. `host/kvm/clock.rs`
+/// documents the same hazard at length and guards every leaf it reads.
+///
+/// Note this is the *extended* CPUID range, so the bound comes from
+/// `CPUID.8000_0000:EAX`, not from `CPUID.0:EAX`. A CPU with no extended leaves
+/// at all reports a maximum below `0x8000_0000`, so the single
+/// `>= 0x8000_0001` comparison covers both "no extended range" and "extended
+/// range too short".
+///
+/// Unlike the leaf `0x07` guards in `enable_fsgsbase` and `enable_smep_smap`,
+/// this one is defence in depth rather than a reachable bug: `EFER.LME` is
+/// itself enumerated by `CPUID.8000_0001:EDX` bit 29, so a CPU that got us into
+/// long mode necessarily implements leaf `0x8000_0001`. The check costs one
+/// CPUID and removes the need to rely on that argument staying true under an
+/// emulator. (Measured under `qemu -cpu max`: `CPUID.8000_0000:EAX` =
+/// 0x8000_000a.)
+///
+/// # Panics
+///
+/// Panics if CPUID does not advertise NX support, including when leaf
+/// `0x8000_0001` is out of range and so cannot advertise anything.
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "host_kvm")]
+pub fn enable_dep() {
+    /// CPUID leaf `0x8000_0000`: `EAX` is the highest supported extended leaf.
+    const MAX_EXTENDED_LEAF: u32 = 0x8000_0000;
+    /// Extended processor info leaf, where NX is advertised.
+    const EXTENDED_FEATURES_LEAF: u32 = 0x8000_0001;
+
+    // Leaf 0x8000_0001 is only meaningful if it is in range; out of range it
+    // aliases to another leaf's data rather than reading zero. See above.
+    let max_extended_leaf = cpuid_count(MAX_EXTENDED_LEAF, 0).eax;
+    let nx = max_extended_leaf >= EXTENDED_FEATURES_LEAF
+        // CPUID.80000001h:EDX bit 20 = NX support
+        && cpuid_count(EXTENDED_FEATURES_LEAF, 0).edx & (1 << 20) != 0;
+
+    assert!(
+        nx,
+        "CPU does not support NX/XD bit (max extended CPUID leaf {max_extended_leaf:#x}, \
+         CPUID.80000001:EDX bit 20 clear or leaf 0x80000001 out of range); \
+         pass `-cpu max` to QEMU (or `-cpu host` under KVM)"
     );
 
     unsafe {
