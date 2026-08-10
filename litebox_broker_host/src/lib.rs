@@ -783,7 +783,6 @@ mod tests {
         fn bind(
             &self,
             address: SocketAddrV4,
-            _kind: litebox_broker_core::socket::PlatformBindKind,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
             let address = if address.port() == 0 {
                 SocketAddrV4::new(*address.ip(), 49152)
@@ -797,6 +796,7 @@ mod tests {
         fn listen(
             &self,
             _backlog: u32,
+            _publication: Option<litebox_broker_core::socket::TcpPortPublicationClaim>,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
             let local_address = self
                 .local_address

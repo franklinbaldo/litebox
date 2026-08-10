@@ -11,4 +11,4 @@
 
 mod socket;
 
-pub use socket::{LinuxSocketProvider, SocketPortMapping};
+pub use socket::LinuxSocketProvider;

@@ -27,6 +27,147 @@ const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOC
 const DEFAULT_TCP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
+/// Portable declaration that publishes one external TCP endpoint as a guest port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpPortPublication {
+    /// Guest-local TCP port eligible for explicit publication.
+    pub guest_port: u16,
+    /// Externally reachable endpoint realized by the platform provider.
+    pub external_address: SocketAddrV4,
+}
+
+/// Broker-assigned identity of one configured TCP port publication.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TcpPortPublicationId(u32);
+
+impl TcpPortPublicationId {
+    /// Returns the provider declaration index for this publication.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Portable lease token authorizing one listener generation to realize a publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpPortPublicationClaim {
+    publication_id: TcpPortPublicationId,
+    generation: u64,
+}
+
+impl TcpPortPublicationClaim {
+    /// Returns the configured publication being claimed.
+    #[must_use]
+    pub const fn publication_id(self) -> TcpPortPublicationId {
+        self.publication_id
+    }
+
+    /// Returns the broker-assigned listener generation.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TcpPortPublicationAuthority {
+    state: Arc<Mutex<Vec<TcpPortPublicationState>>>,
+}
+
+struct TcpPortPublicationState {
+    publication: TcpPortPublication,
+    next_generation: u64,
+    claimed_by: Option<(SessionId, u64)>,
+}
+
+impl TcpPortPublicationAuthority {
+    pub(crate) fn new(publications: &[TcpPortPublication]) -> Result<Self> {
+        let mut state = Vec::new();
+        state
+            .try_reserve_exact(publications.len())
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        for (index, publication) in publications.iter().copied().enumerate() {
+            if publication.guest_port == 0
+                || publication.external_address.port() == 0
+                || publications[..index].iter().any(|existing| {
+                    existing.guest_port == publication.guest_port
+                        || existing.external_address == publication.external_address
+                })
+            {
+                return Err(BrokerError::Internal);
+            }
+            state.push(TcpPortPublicationState {
+                publication,
+                next_generation: 1,
+                claimed_by: None,
+            });
+        }
+        Ok(Self {
+            state: Arc::new(Mutex::new(state)),
+        })
+    }
+
+    fn publication_id(
+        &self,
+        request: CreateSocketRequest,
+        guest_port: u16,
+    ) -> Option<TcpPortPublicationId> {
+        if !is_tcp(request) {
+            return None;
+        }
+        let state = self.state.lock();
+        let index = state
+            .iter()
+            .position(|entry| entry.publication.guest_port == guest_port)?;
+        Some(TcpPortPublicationId(u32::try_from(index).ok()?))
+    }
+
+    fn claim(
+        &self,
+        session_id: SessionId,
+        publication_id: TcpPortPublicationId,
+    ) -> Result<SocketOutcome<TcpPortPublicationReservation>> {
+        let mut state = self.state.lock();
+        let entry = state
+            .get_mut(publication_id.index())
+            .ok_or(BrokerError::Internal)?;
+        if entry.claimed_by.is_some() {
+            return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
+        }
+        let generation = entry.next_generation;
+        entry.next_generation = generation
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        entry.claimed_by = Some((session_id, generation));
+        Ok(SocketOutcome::Completed(TcpPortPublicationReservation {
+            authority: self.clone(),
+            session_id,
+            claim: TcpPortPublicationClaim {
+                publication_id,
+                generation,
+            },
+        }))
+    }
+}
+
+struct TcpPortPublicationReservation {
+    authority: TcpPortPublicationAuthority,
+    session_id: SessionId,
+    claim: TcpPortPublicationClaim,
+}
+
+impl Drop for TcpPortPublicationReservation {
+    fn drop(&mut self) {
+        let mut state = self.authority.state.lock();
+        if let Some(entry) = state.get_mut(self.claim.publication_id.index())
+            && entry.claimed_by == Some((self.session_id, self.claim.generation))
+        {
+            entry.claimed_by = None;
+        }
+    }
+}
+
 #[derive(Default)]
 struct SessionSocketPortState {
     tcp: HashMap<u16, SocketAddrV4>,
@@ -46,7 +187,7 @@ impl SessionSocketPorts {
     /// Reserves one guest TCP port for `requested_address`.
     ///
     /// A zero requested port is allocated from the ephemeral range, skipping
-    /// ports the provider reserved for an explicit host port mapping. The
+    /// ports reserved for explicit TCP publication. The
     /// reservation is released when the returned guard is dropped.
     fn reserve(
         &self,
@@ -141,15 +282,6 @@ pub enum PlatformConnectError {
     PeerIndeterminate(BrokerError),
 }
 
-/// Whether a guest-local binding was requested explicitly or allocated implicitly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlatformBindKind {
-    /// The guest explicitly requested this nonzero local port through `bind`.
-    Explicit,
-    /// The broker allocated the local port for another socket operation.
-    Implicit,
-}
-
 /// Broker socket and endpoint metadata returned by an accept operation.
 pub struct AcceptedBrokerSocket {
     /// Broker handle naming the accepted socket.
@@ -186,13 +318,12 @@ pub struct PlatformDatagramReceive {
 /// bookkeeping shared across the sockets of a broker session. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
-    /// Returns whether a guest port is reserved for an explicit host port mapping.
+    /// Returns the portable TCP publications realized by this provider.
     ///
-    /// Reserved ports are skipped by implicit guest-port allocation but remain
-    /// available to an explicit nonzero `bind` request.
-    fn reserves_guest_port(&self, request: CreateSocketRequest, port: u16) -> bool {
-        let _ = (request, port);
-        false
+    /// The slice and its order must remain stable for the provider's lifetime;
+    /// broker-issued publication IDs index this declaration list.
+    fn tcp_port_publications(&self) -> &[TcpPortPublication] {
+        &[]
     }
 
     /// Creates one nonblocking socket resource for an authenticated session.
@@ -221,16 +352,20 @@ pub trait PlatformSocket: Send + Sync {
     /// nonzero port and must echo it unchanged; the host endpoint backing the
     /// socket is chosen privately by the platform. A datagram socket receives
     /// the address requested by the guest and returns the host-assigned one.
-    fn bind(
-        &self,
-        address: SocketAddrV4,
-        kind: PlatformBindKind,
-    ) -> Result<SocketOutcome<SocketAddrV4>>;
+    fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Makes this socket listen for incoming connections.
     ///
-    /// The returned address is the socket's guest-local address.
-    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>>;
+    /// The returned address is the socket's guest-local address. `publication`
+    /// authorizes realizing exactly one configured external endpoint for this
+    /// listener generation. The platform must retain and compare the complete
+    /// claim through rollback and teardown so stale work cannot detach a newer
+    /// generation. `None` requests an ordinary private listener.
+    fn listen(
+        &self,
+        backlog: u32,
+        publication: Option<TcpPortPublicationClaim>,
+    ) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Accepts one pending connection without waiting.
     fn accept(
@@ -349,6 +484,7 @@ pub fn create(
         readiness,
         _quota: quota,
         port_reservation: Mutex::new(None),
+        tcp_port_publication_reservation: Mutex::new(None),
     });
     let platform_socket = match session.core.socket_provider.create(
         session.session_id,
@@ -444,7 +580,6 @@ pub fn connect(
             create_request,
             &resource,
             DEFAULT_TCP_LOCAL_ADDRESS,
-            PlatformBindKind::Implicit,
         ) {
             Ok(binding) => binding,
             Err(error) => {
@@ -511,51 +646,60 @@ pub fn bind(
     ) {
         Ok(()) => {}
         Err(BrokerError::PolicyDenied) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, None, false);
             return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
         }
         Err(error) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, None, false);
             return Err(error);
         }
     }
-    let bind_kind = if address.port() == 0 {
-        PlatformBindKind::Implicit
-    } else {
-        PlatformBindKind::Explicit
-    };
     if !is_tcp(create_request) {
         // Datagram sockets remain backed directly by a host endpoint.
-        return match resource.bind(address, bind_kind) {
+        return match resource.bind(address) {
             Ok(SocketOutcome::Completed(local_address)) => {
-                finish_configuration(&object, Some(local_address), None, false);
+                finish_configuration(&object, Some(local_address), None, None, false);
                 Ok(SocketOutcome::Completed(local_address))
             }
             Ok(SocketOutcome::Failed(error)) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, None, false);
                 Ok(SocketOutcome::Failed(error))
             }
             Err(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, None, false);
                 Err(error)
             }
         };
     }
-    let binding = match reserve_and_bind(session, create_request, &resource, address, bind_kind) {
+    let binding = match reserve_and_bind(session, create_request, &resource, address) {
         Ok(binding) => binding,
         Err(error) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, None, false);
             return Err(error);
         }
     };
     let (local_address, reservation) = match binding {
         SocketOutcome::Completed(binding) => binding,
         SocketOutcome::Failed(error) => {
-            finish_configuration(&object, None, None, false);
+            finish_configuration(&object, None, None, None, false);
             return Ok(SocketOutcome::Failed(error));
         }
     };
-    finish_configuration(&object, Some(local_address), Some(reservation), false);
+    let publication_id = (address.port() != 0)
+        .then(|| {
+            session
+                .core
+                .tcp_port_publications
+                .publication_id(create_request, local_address.port())
+        })
+        .flatten();
+    finish_configuration(
+        &object,
+        Some(local_address),
+        Some(reservation),
+        publication_id,
+        false,
+    );
     Ok(SocketOutcome::Completed(local_address))
 }
 
@@ -569,7 +713,7 @@ pub fn listen(
         return Err(BrokerError::UnsupportedOperation);
     }
     let object = session.authorized_object(handle, ObjectRights::WRITE)?;
-    let (resource, create_request, existing_local_address) = {
+    let (resource, create_request, existing_local_address, publication_id, was_listening) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
@@ -588,6 +732,8 @@ pub fn listen(
             Arc::clone(&socket.resource),
             socket.create_request,
             socket.local_address,
+            socket.tcp_port_publication_id,
+            socket.listening,
         )
     };
 
@@ -601,11 +747,11 @@ pub fn listen(
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, None, false);
                 return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
             }
             Err(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, None, false);
                 return Err(error);
             }
         }
@@ -614,11 +760,10 @@ pub fn listen(
             create_request,
             &resource,
             DEFAULT_TCP_LISTEN_ADDRESS,
-            PlatformBindKind::Implicit,
         ) {
             Ok(binding) => binding,
             Err(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, None, false);
                 return Err(error);
             }
         };
@@ -628,29 +773,60 @@ pub fn listen(
                 port_reservation = Some(reservation);
             }
             SocketOutcome::Failed(error) => {
-                finish_configuration(&object, None, None, false);
+                finish_configuration(&object, None, None, None, false);
                 return Ok(SocketOutcome::Failed(error));
             }
         }
     }
 
-    match resource.listen(backlog) {
+    let existing_claim = resource.tcp_port_publication_claim();
+    if existing_claim.is_some() != (was_listening && publication_id.is_some()) {
+        finish_configuration(&object, local_address, port_reservation, None, false);
+        return Err(BrokerError::Internal);
+    }
+    let mut new_publication_reservation = None;
+    let publication_claim = if let Some(claim) = existing_claim {
+        Some(claim)
+    } else if let Some(publication_id) = publication_id {
+        match session
+            .core
+            .tcp_port_publications
+            .claim(session.session_id, publication_id)?
+        {
+            SocketOutcome::Completed(reservation) => {
+                let claim = reservation.claim;
+                new_publication_reservation = Some(reservation);
+                Some(claim)
+            }
+            SocketOutcome::Failed(error) => {
+                finish_configuration(&object, local_address, port_reservation, None, false);
+                return Ok(SocketOutcome::Failed(error));
+            }
+        }
+    } else {
+        None
+    };
+
+    match resource.listen(backlog, publication_claim) {
         Ok(SocketOutcome::Completed(address)) => {
             // The guest-local address is broker-authoritative, so a platform
             // that reports a different one is not trustworthy.
             if local_address != Some(address) {
-                finish_configuration(&object, local_address, port_reservation, false);
+                finish_configuration(&object, local_address, port_reservation, None, false);
                 return Err(BrokerError::Internal);
             }
-            finish_configuration(&object, local_address, port_reservation, true);
+            if let Some(reservation) = new_publication_reservation {
+                resource.set_tcp_port_publication_reservation(reservation);
+            }
+            finish_configuration(&object, local_address, port_reservation, None, true);
             Ok(SocketOutcome::Completed(address))
         }
         Ok(SocketOutcome::Failed(error)) => {
-            finish_configuration(&object, local_address, port_reservation, false);
+            finish_configuration(&object, local_address, port_reservation, None, false);
             Ok(SocketOutcome::Failed(error))
         }
         Err(error) => {
-            finish_configuration(&object, local_address, port_reservation, false);
+            finish_configuration(&object, local_address, port_reservation, None, false);
             Err(error)
         }
     }
@@ -696,6 +872,7 @@ pub fn accept(
         readiness,
         _quota: quota,
         port_reservation: Mutex::new(None),
+        tcp_port_publication_reservation: Mutex::new(None),
     });
     let accepted = match listener_resource.accept(resource.readiness.clone()) {
         Ok(SocketOutcome::Completed(accepted)) => accepted,
@@ -922,6 +1099,14 @@ pub fn shutdown(
         )
     };
     let outcome = resource.shutdown(mode);
+    if shuts_down_listener
+        && matches!(
+            &outcome,
+            Ok(SocketOutcome::Completed(()) | SocketOutcome::Failed(SocketError::NotConnected))
+        )
+    {
+        resource.release_tcp_port_publication();
+    }
     if serializes_configuration {
         let mut object = object.write();
         if let ObjectEntry::Socket(socket) = &mut *object {
@@ -1089,7 +1274,6 @@ fn reserve_and_bind(
     create_request: CreateSocketRequest,
     resource: &SocketResource,
     requested_address: SocketAddrV4,
-    kind: PlatformBindKind,
 ) -> Result<SocketOutcome<(SocketAddrV4, GuestPortReservation)>> {
     let (local_address, reservation) =
         match session
@@ -1097,13 +1281,14 @@ fn reserve_and_bind(
             .reserve(create_request, requested_address, |port| {
                 session
                     .core
-                    .socket_provider
-                    .reserves_guest_port(create_request, port)
+                    .tcp_port_publications
+                    .publication_id(create_request, port)
+                    .is_some()
             })? {
             SocketOutcome::Completed(binding) => binding,
             SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
         };
-    match resource.bind(local_address, kind)? {
+    match resource.bind(local_address)? {
         SocketOutcome::Completed(bound_address) if bound_address == local_address => {
             Ok(SocketOutcome::Completed((local_address, reservation)))
         }
@@ -1203,6 +1388,7 @@ fn finish_configuration(
     object: &spin::RwLock<ObjectEntry>,
     local_address: Option<SocketAddrV4>,
     port_reservation: Option<GuestPortReservation>,
+    tcp_port_publication_id: Option<TcpPortPublicationId>,
     listening: bool,
 ) {
     let mut object = object.write();
@@ -1212,6 +1398,7 @@ fn finish_configuration(
         if let Some(port_reservation) = port_reservation {
             socket.resource.set_port_reservation(port_reservation);
         }
+        socket.tcp_port_publication_id = socket.tcp_port_publication_id.or(tcp_port_publication_id);
         socket.listening |= listening;
     }
 }
@@ -1224,6 +1411,7 @@ pub(crate) struct SocketObject {
     connect_in_flight: bool,
     configuration_in_flight: bool,
     listening: bool,
+    tcp_port_publication_id: Option<TcpPortPublicationId>,
     datagram_connect_generation: u64,
 }
 
@@ -1237,6 +1425,7 @@ impl SocketObject {
             connect_in_flight: false,
             configuration_in_flight: false,
             listening: false,
+            tcp_port_publication_id: None,
             datagram_connect_generation: 0,
         }
     }
@@ -1254,6 +1443,7 @@ impl SocketObject {
             connect_in_flight: false,
             configuration_in_flight: false,
             listening: false,
+            tcp_port_publication_id: None,
             datagram_connect_generation: 0,
         }
     }
@@ -1268,6 +1458,7 @@ pub(crate) struct SocketResource {
     readiness: ReadinessRegistration,
     _quota: Arc<SocketQuotaReservation>,
     port_reservation: Mutex<Option<GuestPortReservation>>,
+    tcp_port_publication_reservation: Mutex<Option<TcpPortPublicationReservation>>,
 }
 
 impl SocketResource {
@@ -1281,6 +1472,25 @@ impl SocketResource {
         if slot.is_none() {
             *slot = Some(reservation);
         }
+    }
+
+    fn set_tcp_port_publication_reservation(&self, reservation: TcpPortPublicationReservation) {
+        let mut slot = self.tcp_port_publication_reservation.lock();
+        debug_assert!(slot.is_none());
+        if slot.is_none() {
+            *slot = Some(reservation);
+        }
+    }
+
+    fn tcp_port_publication_claim(&self) -> Option<TcpPortPublicationClaim> {
+        self.tcp_port_publication_reservation
+            .lock()
+            .as_ref()
+            .map(|reservation| reservation.claim)
+    }
+
+    fn release_tcp_port_publication(&self) {
+        self.tcp_port_publication_reservation.lock().take();
     }
 
     fn platform_socket(&self) -> &dyn PlatformSocket {
@@ -1297,16 +1507,16 @@ impl SocketResource {
         self.platform_socket().connect(address)
     }
 
-    fn bind(
-        &self,
-        address: SocketAddrV4,
-        kind: PlatformBindKind,
-    ) -> Result<SocketOutcome<SocketAddrV4>> {
-        self.platform_socket().bind(address, kind)
+    fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
+        self.platform_socket().bind(address)
     }
 
-    fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>> {
-        self.platform_socket().listen(backlog)
+    fn listen(
+        &self,
+        backlog: u32,
+        publication: Option<TcpPortPublicationClaim>,
+    ) -> Result<SocketOutcome<SocketAddrV4>> {
+        self.platform_socket().listen(backlog, publication)
     }
 
     fn accept(
@@ -1445,9 +1655,22 @@ pub(crate) mod tests {
     use std::time::Duration;
     use std::vec;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub(crate) struct TestSocketProvider {
         state: Arc<TestSocketState>,
+        tcp_port_publications: Arc<Vec<TcpPortPublication>>,
+    }
+
+    impl Default for TestSocketProvider {
+        fn default() -> Self {
+            Self {
+                state: Arc::default(),
+                tcp_port_publications: Arc::new(vec![TcpPortPublication {
+                    guest_port: 80,
+                    external_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080),
+                }]),
+            }
+        }
     }
 
     #[test]
@@ -1498,6 +1721,49 @@ pub(crate) mod tests {
         assert_eq!(address.port(), FIRST_EPHEMERAL_PORT + 1);
     }
 
+    #[test]
+    fn tcp_port_publication_configuration_is_bounded_and_unique() {
+        let publication = TcpPortPublication {
+            guest_port: 80,
+            external_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080),
+        };
+        assert!(TcpPortPublicationAuthority::new(&[publication]).is_ok());
+        assert!(matches!(
+            TcpPortPublicationAuthority::new(&[TcpPortPublication {
+                guest_port: 0,
+                ..publication
+            }]),
+            Err(BrokerError::Internal)
+        ));
+        assert!(matches!(
+            TcpPortPublicationAuthority::new(&[TcpPortPublication {
+                external_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                ..publication
+            }]),
+            Err(BrokerError::Internal)
+        ));
+        assert!(matches!(
+            TcpPortPublicationAuthority::new(&[
+                publication,
+                TcpPortPublication {
+                    external_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8081),
+                    ..publication
+                },
+            ]),
+            Err(BrokerError::Internal)
+        ));
+        assert!(matches!(
+            TcpPortPublicationAuthority::new(&[
+                publication,
+                TcpPortPublication {
+                    guest_port: 81,
+                    ..publication
+                },
+            ]),
+            Err(BrokerError::Internal)
+        ));
+    }
+
     #[derive(Default)]
     struct TestSocketState {
         creates: StdMutex<std::vec::Vec<(SessionId, CreateSocketRequest)>>,
@@ -1509,7 +1775,10 @@ pub(crate) mod tests {
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         binds: StdMutex<std::vec::Vec<SocketAddrV4>>,
         listens: StdMutex<std::vec::Vec<u32>>,
+        listen_publications: StdMutex<std::vec::Vec<Option<TcpPortPublicationClaim>>>,
         listen_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+        fail_listen: core::sync::atomic::AtomicBool,
+        error_listen: core::sync::atomic::AtomicBool,
         shutdown_calls: AtomicUsize,
         dropped_sockets: AtomicUsize,
         fail_create: core::sync::atomic::AtomicBool,
@@ -1539,9 +1808,21 @@ pub(crate) mod tests {
         fn fail_next_shutdown(&self) {
             self.state.fail_shutdown.store(true, Ordering::Relaxed);
         }
+
+        fn fail_next_listen(&self) {
+            self.state.fail_listen.store(true, Ordering::Relaxed);
+        }
+
+        fn error_next_listen(&self) {
+            self.state.error_listen.store(true, Ordering::Relaxed);
+        }
     }
 
     impl SocketProvider for TestSocketProvider {
+        fn tcp_port_publications(&self) -> &[TcpPortPublication] {
+            &self.tcp_port_publications
+        }
+
         fn create(
             &self,
             session_id: SessionId,
@@ -1587,11 +1868,7 @@ pub(crate) mod tests {
     }
 
     impl PlatformSocket for TestPlatformSocket {
-        fn bind(
-            &self,
-            address: SocketAddrV4,
-            _kind: PlatformBindKind,
-        ) -> Result<SocketOutcome<SocketAddrV4>> {
+        fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
             self.state.binds.lock().unwrap().push(address);
             if is_tcp(self.create_request) {
                 *self.guest_local_address.lock().unwrap() = Some(address);
@@ -1605,12 +1882,27 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(address))
         }
 
-        fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>> {
+        fn listen(
+            &self,
+            backlog: u32,
+            publication: Option<TcpPortPublicationClaim>,
+        ) -> Result<SocketOutcome<SocketAddrV4>> {
             self.state.listens.lock().unwrap().push(backlog);
+            self.state
+                .listen_publications
+                .lock()
+                .unwrap()
+                .push(publication);
             let listen_block = self.state.listen_block.lock().unwrap().take();
             if let Some((started, release)) = listen_block {
                 started.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if self.state.fail_listen.swap(false, Ordering::Relaxed) {
+                return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
+            }
+            if self.state.error_listen.swap(false, Ordering::Relaxed) {
+                return Err(BrokerError::Internal);
             }
             let local_address = self
                 .guest_local_address
@@ -1762,6 +2054,7 @@ pub(crate) mod tests {
         check_udp_socket_operations(broker, provider);
         check_concurrent_udp_status_does_not_regress_connection(broker, provider);
         check_server_socket_operations(broker, provider);
+        check_tcp_port_publication_lifecycle(broker, provider);
         check_failed_listener_shutdown_preserves_state(broker, provider);
         check_listener_shutdown_does_not_race_listen(broker, provider);
         check_connect_errors_classify_peer_state(broker, provider);
@@ -2185,6 +2478,148 @@ pub(crate) mod tests {
             Some(&auto_bound_address)
         );
         session.close_object_reference(auto_bound).unwrap();
+    }
+
+    fn check_tcp_port_publication_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
+        let first_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let readiness = Arc::new(TestReadinessSink::default());
+        let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let first = create(&first_session, create_request(), readiness.clone()).unwrap();
+        let second = create(&second_session, create_request(), readiness).unwrap();
+        assert_eq!(
+            bind(&first_session, first, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        assert_eq!(
+            bind(&second_session, second, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+
+        let claims_before = provider.state.listen_publications.lock().unwrap().len();
+        provider.fail_next_listen();
+        assert_eq!(
+            listen(&first_session, first, 1),
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+        );
+        assert_eq!(
+            listen(&second_session, second, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        let claims = provider.state.listen_publications.lock().unwrap();
+        let first_claim = claims[claims_before].expect("published listen must carry a claim");
+        let second_claim = claims[claims_before + 1].expect("published listen must carry a claim");
+        assert_eq!(first_claim.publication_id(), second_claim.publication_id());
+        assert_eq!(second_claim.generation(), first_claim.generation() + 1);
+        drop(claims);
+
+        let calls_before_conflict = provider.state.listens.lock().unwrap().len();
+        assert_eq!(
+            listen(&first_session, first, 1),
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+        );
+        assert_eq!(
+            provider.state.listens.lock().unwrap().len(),
+            calls_before_conflict
+        );
+
+        assert_eq!(
+            shutdown(&second_session, second, ShutdownMode::StopListening),
+            Ok(SocketOutcome::Completed(()))
+        );
+        second_session.close_object_reference(second).unwrap();
+        assert_eq!(
+            listen(&first_session, first, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        let third_claim = provider
+            .state
+            .listen_publications
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten()
+            .unwrap();
+        assert_eq!(third_claim.generation(), second_claim.generation() + 1);
+        first_session.close_object_reference(first).unwrap();
+
+        let second = create(
+            &second_session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            bind(&second_session, second, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+
+        provider.error_next_listen();
+        assert_eq!(
+            listen(&second_session, second, 1),
+            Err(BrokerError::Internal)
+        );
+        let failed_claim = provider
+            .state
+            .listen_publications
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten()
+            .unwrap();
+        assert_eq!(failed_claim.generation(), third_claim.generation() + 1);
+
+        let first = create(
+            &first_session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            bind(&first_session, first, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        assert_eq!(
+            listen(&first_session, first, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        let dropped_claim = provider
+            .state
+            .listen_publications
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten()
+            .unwrap();
+        assert_eq!(dropped_claim.generation(), failed_claim.generation() + 1);
+        first_session.close_object_reference(first).unwrap();
+
+        assert_eq!(
+            listen(&second_session, second, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        let final_claim = provider
+            .state
+            .listen_publications
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten()
+            .unwrap();
+        assert_eq!(final_claim.generation(), dropped_claim.generation() + 1);
+        assert_eq!(
+            shutdown(&second_session, second, ShutdownMode::StopListening),
+            Ok(SocketOutcome::Completed(()))
+        );
+        second_session.close_object_reference(second).unwrap();
     }
 
     fn check_concurrent_udp_status_does_not_regress_connection(

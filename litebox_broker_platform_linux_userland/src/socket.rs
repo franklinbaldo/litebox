@@ -16,8 +16,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, PlatformBindKind, PlatformConnectError, PlatformDatagramReceive,
-    PlatformSocket, PlatformStreamReceive, SocketProvider,
+    AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
+    PlatformStreamReceive, SocketProvider, TcpPortPublication, TcpPortPublicationClaim,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -54,22 +54,14 @@ const PENDING_CONNECT_DISCARD_LIFETIME: Duration = Duration::from_mins(5);
 /// immediate nonblocking operation, never for network readiness.
 pub struct LinuxSocketProvider {
     reactor: Arc<ReactorClient>,
-    port_mappings: Vec<SocketPortMapping>,
-}
-
-/// Explicit mapping from one host TCP endpoint to a guest-local TCP port.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SocketPortMapping {
-    /// Guest-local TCP port visible inside one broker session.
-    pub guest_port: u16,
-    /// Host TCP endpoint mapped to the guest port.
-    pub host_address: SocketAddrV4,
+    tcp_port_publications: Vec<TcpPortPublication>,
 }
 
 struct PortMappingState {
-    mapping: SocketPortMapping,
+    mapping: TcpPortPublication,
     reservation: Option<OwnedFd>,
-    claimed_by: Option<u64>,
+    reservation_registered: bool,
+    claimed_by: Option<(u64, TcpPortPublicationClaim)>,
     stale_connections: HashMap<(SocketAddrV4, SocketAddrV4), StaleTcpConnection>,
 }
 
@@ -82,46 +74,46 @@ struct StaleTcpConnection {
 impl LinuxSocketProvider {
     /// Starts a provider with matching global and per-session socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
-        Self::new_with_port_mappings(max_sockets, max_sockets_per_session, &[])
+        Self::new_with_tcp_port_publications(max_sockets, max_sockets_per_session, &[])
     }
 
-    /// Starts a limited provider and reserves every mapped host endpoint immediately.
-    pub fn new_with_port_mappings(
+    /// Starts a limited provider and realizes every TCP publication immediately.
+    pub fn new_with_tcp_port_publications(
         max_sockets: usize,
         max_sockets_per_session: usize,
-        port_mappings: &[SocketPortMapping],
+        tcp_port_publications: &[TcpPortPublication],
     ) -> IoResult<Self> {
-        for (index, mapping) in port_mappings.iter().enumerate() {
-            if mapping.guest_port == 0 || mapping.host_address.port() == 0 {
+        for (index, publication) in tcp_port_publications.iter().enumerate() {
+            if publication.guest_port == 0 || publication.external_address.port() == 0 {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    "mapped guest and host ports must be nonzero",
+                    "published guest and external ports must be nonzero",
                 ));
             }
-            if port_mappings[..index].iter().any(|existing| {
-                existing.guest_port == mapping.guest_port
-                    || existing.host_address == mapping.host_address
+            if tcp_port_publications[..index].iter().any(|existing| {
+                existing.guest_port == publication.guest_port
+                    || existing.external_address == publication.external_address
             }) {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    "mapped guest ports and host endpoints must be unique",
+                    "published guest ports and external endpoints must be unique",
                 ));
             }
         }
-        let port_mappings = port_mappings.to_vec();
+        let tcp_port_publications = tcp_port_publications.to_vec();
         Ok(Self {
             reactor: Arc::new(ReactorClient::start(
                 max_sockets,
                 max_sockets_per_session,
-                port_mappings.clone(),
+                tcp_port_publications.clone(),
             )?),
-            port_mappings,
+            tcp_port_publications,
         })
     }
 }
 
 fn create_port_mapping_reservation(
-    mapping: SocketPortMapping,
+    mapping: TcpPortPublication,
     reuse_address: bool,
     reuse_port: bool,
 ) -> core::result::Result<OwnedFd, Errno> {
@@ -137,12 +129,12 @@ fn create_port_mapping_reservation(
     if reuse_port {
         sockopt::set_socket_reuseport(&socket, true)?;
     }
-    bind(&socket, &mapping.host_address)?;
+    bind(&socket, &mapping.external_address)?;
     Ok(socket)
 }
 
 fn create_replacement_port_mapping_reservation(
-    mapping: SocketPortMapping,
+    mapping: TcpPortPublication,
 ) -> core::result::Result<OwnedFd, Errno> {
     let socket = create_port_mapping_reservation(mapping, true, false)?;
     // Reuse is needed only while replacing a listener that may still have
@@ -153,13 +145,8 @@ fn create_replacement_port_mapping_reservation(
 }
 
 impl SocketProvider for LinuxSocketProvider {
-    fn reserves_guest_port(&self, request: CreateSocketRequest, port: u16) -> bool {
-        if socket_kind(request) != Some(SocketKind::Tcp) {
-            return false;
-        }
-        self.port_mappings
-            .iter()
-            .any(|mapping| mapping.guest_port == port)
+    fn tcp_port_publications(&self) -> &[TcpPortPublication] {
+        &self.tcp_port_publications
     }
 
     fn create(
@@ -212,23 +199,23 @@ struct LinuxSocket {
 }
 
 impl PlatformSocket for LinuxSocket {
-    fn bind(
-        &self,
-        address: SocketAddrV4,
-        kind: PlatformBindKind,
-    ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+    fn bind(&self, address: SocketAddrV4) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         self.reactor.request(|response| ReactorCommand::Bind {
             id: self.id,
             address,
-            kind,
             response,
         })
     }
 
-    fn listen(&self, backlog: u32) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+    fn listen(
+        &self,
+        backlog: u32,
+        publication: Option<TcpPortPublicationClaim>,
+    ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         self.reactor.request(|response| ReactorCommand::Listen {
             id: self.id,
             backlog,
+            publication,
             response,
         })
     }
@@ -409,11 +396,11 @@ impl ReactorClient {
     fn start(
         max_sockets: usize,
         max_sockets_per_session: usize,
-        port_mappings: Vec<SocketPortMapping>,
+        tcp_port_publications: Vec<TcpPortPublication>,
     ) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
-        let port_mappings = port_mappings
+        let port_mappings = tcp_port_publications
             .into_iter()
             .map(|mapping| {
                 let mut stale_connections = HashMap::new();
@@ -421,6 +408,7 @@ impl ReactorClient {
                 Ok(PortMappingState {
                     mapping,
                     reservation: Some(create_port_mapping_reservation(mapping, false, false)?),
+                    reservation_registered: false,
                     claimed_by: None,
                     stale_connections,
                 })
@@ -681,12 +669,12 @@ enum ReactorCommand {
     Bind {
         id: u64,
         address: SocketAddrV4,
-        kind: PlatformBindKind,
         response: SyncSender<BrokerResult<SocketOutcome<SocketAddrV4>>>,
     },
     Listen {
         id: u64,
         backlog: u32,
+        publication: Option<TcpPortPublicationClaim>,
         response: SyncSender<BrokerResult<SocketOutcome<SocketAddrV4>>>,
     },
     Accept {
@@ -847,6 +835,8 @@ struct SocketEntry {
     abortive_close: bool,
     guest_local_address: Option<SocketAddrV4>,
     port_mapping_index: Option<usize>,
+    tcp_port_publication_claim: Option<TcpPortPublicationClaim>,
+    publication_fallback_socket: Option<OwnedFd>,
     tcp_no_delay: bool,
     tcp_keep_alive: bool,
 }
@@ -1295,13 +1285,16 @@ impl fmt::Display for ReactorFailure {
 }
 
 impl Reactor {
-    fn port_mapping_index(&self, kind: SocketKind, guest_port: u16) -> Option<usize> {
-        if kind != SocketKind::Tcp {
-            return None;
-        }
-        self.port_mappings
-            .iter()
-            .position(|state| state.mapping.guest_port == guest_port)
+    fn claimed_tcp_port_publication(&self, id: u64) -> Option<(usize, TcpPortPublicationClaim)> {
+        let socket = self.sockets.get(&id)?;
+        let claim = socket.tcp_port_publication_claim?;
+        let mapping_index = claim.publication_id().index();
+        (socket.port_mapping_index == Some(mapping_index)
+            && self
+                .port_mappings
+                .get(mapping_index)
+                .is_some_and(|state| state.claimed_by == Some((id, claim))))
+        .then_some((mapping_index, claim))
     }
 
     /// Transfers one reserved host endpoint to the socket publishing it.
@@ -1309,16 +1302,26 @@ impl Reactor {
     /// The reservation descriptor keeps the mapped endpoint exclusively owned
     /// between publications, so a claim replaces the socket's descriptor rather
     /// than binding the endpoint again.
-    fn claim_port_mapping(
+    fn realize_tcp_port_publication(
         &mut self,
         id: u64,
-        mapping_index: usize,
+        claim: TcpPortPublicationClaim,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+        let mapping_index = claim.publication_id().index();
+        let guest_port = self
+            .sockets
+            .get(&id)
+            .and_then(|socket| socket.guest_local_address)
+            .ok_or(BrokerError::Internal)?
+            .port();
         let mapping = self
             .port_mappings
             .get(mapping_index)
             .ok_or(BrokerError::Internal)?
             .mapping;
+        if mapping.guest_port != guest_port {
+            return Err(BrokerError::Internal);
+        }
         if self
             .port_mappings
             .get(mapping_index)
@@ -1326,10 +1329,12 @@ impl Reactor {
         {
             match create_replacement_port_mapping_reservation(mapping) {
                 Ok(reservation) => {
-                    self.port_mappings
+                    let state = self
+                        .port_mappings
                         .get_mut(mapping_index)
-                        .ok_or(BrokerError::Internal)?
-                        .reservation = Some(reservation);
+                        .ok_or(BrokerError::Internal)?;
+                    state.reservation = Some(reservation);
+                    state.reservation_registered = false;
                 }
                 Err(error) => {
                     return Ok(SocketOutcome::Failed(socket_operation_error_from_errno(
@@ -1338,7 +1343,7 @@ impl Reactor {
                 }
             }
         }
-        let reservation = {
+        let (reservation, reservation_registered) = {
             let state = self
                 .port_mappings
                 .get_mut(mapping_index)
@@ -1349,7 +1354,9 @@ impl Reactor {
             let Some(reservation) = state.reservation.take() else {
                 return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
             };
-            reservation
+            let reservation_registered = state.reservation_registered;
+            state.reservation_registered = false;
+            (reservation, reservation_registered)
         };
         let preparation = sockopt::set_socket_linger(&reservation, None)
             .map_err(broker_error_from_errno)
@@ -1359,32 +1366,88 @@ impl Reactor {
             Err(error) => {
                 self.port_mappings
                     .get_mut(mapping_index)
-                    .ok_or(BrokerError::Internal)?
-                    .reservation = Some(reservation);
+                    .ok_or(BrokerError::Internal)
+                    .map(|state| {
+                        state.reservation = Some(reservation);
+                        state.reservation_registered = reservation_registered;
+                    })?;
                 return Err(error);
             }
         };
         if !stale_state_drained {
-            self.port_mappings
+            let state = self
+                .port_mappings
                 .get_mut(mapping_index)
-                .ok_or(BrokerError::Internal)?
-                .reservation = Some(reservation);
+                .ok_or(BrokerError::Internal)?;
+            state.reservation = Some(reservation);
+            state.reservation_registered = reservation_registered;
             return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
         }
-        let host_address = match self.replace_socket_descriptor(id, reservation) {
+        let host_address = match local_socket_address(&reservation) {
             Ok(address) => address,
-            Err((error, reservation)) => {
-                self.port_mappings
+            Err(error) => {
+                let state = self
+                    .port_mappings
                     .get_mut(mapping_index)
-                    .ok_or(BrokerError::Internal)?
-                    .reservation = Some(reservation);
+                    .ok_or(BrokerError::Internal)?;
+                state.reservation = Some(reservation);
+                state.reservation_registered = reservation_registered;
                 return Err(error);
             }
         };
+        let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+        if socket.kind != SocketKind::Tcp || socket.publication_fallback_socket.is_some() {
+            let state = self
+                .port_mappings
+                .get_mut(mapping_index)
+                .ok_or(BrokerError::Internal)?;
+            state.reservation = Some(reservation);
+            state.reservation_registered = reservation_registered;
+            return Err(BrokerError::Internal);
+        }
+        if let Err(error) =
+            apply_tcp_options(&reservation, socket.tcp_no_delay, socket.tcp_keep_alive)
+        {
+            let state = self
+                .port_mappings
+                .get_mut(mapping_index)
+                .ok_or(BrokerError::Internal)?;
+            state.reservation = Some(reservation);
+            state.reservation_registered = reservation_registered;
+            return Err(error);
+        }
+        let registration = if reservation_registered {
+            epoll::modify(
+                &self.epoll,
+                &reservation,
+                epoll::EventData::new_u64(id),
+                idle_epoll_events(),
+            )
+        } else {
+            epoll::add(
+                &self.epoll,
+                &reservation,
+                epoll::EventData::new_u64(id),
+                idle_epoll_events(),
+            )
+        };
+        if let Err(error) = registration {
+            let state = self
+                .port_mappings
+                .get_mut(mapping_index)
+                .ok_or(BrokerError::Internal)?;
+            state.reservation = Some(reservation);
+            state.reservation_registered = reservation_registered;
+            return Err(broker_error_from_errno(error));
+        }
+        let fallback = core::mem::replace(&mut socket.socket, reservation);
+        socket.publication_fallback_socket = Some(fallback);
+        socket.port_mapping_index = Some(mapping_index);
+        socket.tcp_port_publication_claim = Some(claim);
         self.port_mappings
             .get_mut(mapping_index)
             .ok_or(BrokerError::Internal)?
-            .claimed_by = Some(id);
+            .claimed_by = Some((id, claim));
         Ok(SocketOutcome::Completed(host_address))
     }
 
@@ -1422,7 +1485,7 @@ impl Reactor {
     }
 
     fn stop_listening_socket(&mut self, id: u64) -> BrokerResult<SocketOutcome<()>> {
-        let mapping_index = {
+        let claimed_publication = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.kind != SocketKind::Tcp || !socket.listening {
                 return self
@@ -1431,29 +1494,28 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)
                     .and_then(|socket| shutdown_socket(socket, ShutdownMode::StopListening));
             }
-            socket.port_mapping_index.filter(|mapping_index| {
-                self.port_mappings
-                    .get(*mapping_index)
-                    .is_some_and(|state| state.claimed_by == Some(id))
-            })
+            self.claimed_tcp_port_publication(id)
         };
-        let Some(mapping_index) = mapping_index else {
+        let Some((mapping_index, claim)) = claimed_publication else {
+            let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
+            if socket.port_mapping_index.is_some() || socket.tcp_port_publication_claim.is_some() {
+                return Err(BrokerError::Internal);
+            }
             return self
                 .sockets
                 .get_mut(&id)
                 .ok_or(BrokerError::Internal)
                 .and_then(|socket| shutdown_socket(socket, ShutdownMode::StopListening));
         };
-        if !self
-            .port_mappings
-            .get(mapping_index)
-            .is_some_and(|state| state.claimed_by == Some(id) && state.reservation.is_none())
-        {
+        if !self.port_mappings.get(mapping_index).is_some_and(|state| {
+            state.claimed_by == Some((id, claim)) && state.reservation.is_none()
+        }) {
             return Err(BrokerError::Internal);
         }
         let (session_id, guest_port, no_delay, keep_alive) = self
             .sockets
             .get(&id)
+            .filter(|socket| socket.publication_fallback_socket.is_none())
             .and_then(|socket| {
                 socket.guest_local_address.map(|guest_address| {
                     (
@@ -1504,6 +1566,7 @@ impl Reactor {
             socket.read_shutdown = true;
             socket.peek_waitall_threshold = None;
             socket.port_mapping_index = None;
+            socket.tcp_port_publication_claim = None;
             reservation
         };
         let state = self
@@ -1512,67 +1575,50 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?;
         state.claimed_by = None;
         state.reservation = Some(reservation);
+        state.reservation_registered = false;
         Ok(SocketOutcome::Completed(()))
     }
 
-    fn release_failed_port_mapping_claim(
+    fn release_failed_tcp_port_publication(
         &mut self,
         id: u64,
-        mapping_index: usize,
+        claim: TcpPortPublicationClaim,
     ) -> BrokerResult<()> {
-        if !self
-            .port_mappings
-            .get(mapping_index)
-            .is_some_and(|state| state.claimed_by == Some(id) && state.reservation.is_none())
-        {
+        let mapping_index = claim.publication_id().index();
+        if !self.port_mappings.get(mapping_index).is_some_and(|state| {
+            state.claimed_by == Some((id, claim)) && state.reservation.is_none()
+        }) {
             return Err(BrokerError::Internal);
         }
-        let (session_id, guest_port, no_delay, keep_alive) = self
+        let (session_id, guest_port) = self
             .sockets
             .get(&id)
             .and_then(|socket| {
-                (!socket.listening).then_some(())?;
-                socket.guest_local_address.map(|guest_address| {
-                    (
-                        socket.session_id,
-                        guest_address.port(),
-                        socket.tcp_no_delay,
-                        socket.tcp_keep_alive,
-                    )
-                })
+                (!socket.listening
+                    && socket.port_mapping_index == Some(mapping_index)
+                    && socket.tcp_port_publication_claim == Some(claim)
+                    && socket.publication_fallback_socket.is_some())
+                .then_some(())?;
+                socket
+                    .guest_local_address
+                    .map(|guest_address| (socket.session_id, guest_address.port()))
             })
             .ok_or(BrokerError::Internal)?;
-        if !self
+        let host_address_is_set = self
             .sessions
             .get(&session_id)
             .and_then(|namespace| namespace.tcp.get(&guest_port))
-            .is_some_and(|binding| binding.socket_id == id && binding.host_mapped)
-        {
-            return Err(BrokerError::Internal);
-        }
-        let replacement = socket_with(
-            LinuxAddressFamily::INET,
-            LinuxSocketType::STREAM,
-            LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
-            Some(ipproto::TCP),
-        )
-        .map_err(broker_error_from_errno)?;
-        apply_tcp_options(&replacement, no_delay, keep_alive)?;
-        epoll::add(
-            &self.epoll,
-            &replacement,
-            epoll::EventData::new_u64(id),
-            idle_epoll_events(),
-        )
-        .map_err(broker_error_from_errno)?;
-        let old_socket = &self.sockets.get(&id).ok_or(BrokerError::Internal)?.socket;
-        if !delete_epoll_registration(&self.epoll, old_socket) {
-            let _ = delete_epoll_registration(&self.epoll, &replacement);
-            return Err(BrokerError::Internal);
-        }
+            .filter(|binding| binding.socket_id == id)
+            .map(|binding| binding.host_mapped);
         let reservation = {
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-            core::mem::replace(&mut socket.socket, replacement)
+            let fallback = socket
+                .publication_fallback_socket
+                .take()
+                .ok_or(BrokerError::Internal)?;
+            socket.port_mapping_index = None;
+            socket.tcp_port_publication_claim = None;
+            core::mem::replace(&mut socket.socket, fallback)
         };
         let state = self
             .port_mappings
@@ -1580,51 +1626,17 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?;
         state.claimed_by = None;
         state.reservation = Some(reservation);
-        self.sessions
-            .get_mut(&session_id)
-            .ok_or(BrokerError::Internal)?
-            .clear_host_address(SocketKind::Tcp, guest_port, id)
-    }
-
-    /// Replaces a socket's descriptor, returning ownership of the replacement on failure.
-    fn replace_socket_descriptor(
-        &mut self,
-        id: u64,
-        replacement: OwnedFd,
-    ) -> core::result::Result<SocketAddrV4, (BrokerError, OwnedFd)> {
-        let host_address = match local_socket_address(&replacement) {
-            Ok(address) => address,
-            Err(error) => return Err((error, replacement)),
+        state.reservation_registered = true;
+        let Some(host_address_is_set) = host_address_is_set else {
+            return Err(BrokerError::Internal);
         };
-        let Some(socket) = self.sockets.get_mut(&id) else {
-            return Err((BrokerError::Internal, replacement));
-        };
-        if socket.kind == SocketKind::Tcp
-            && let Err(error) =
-                apply_tcp_options(&replacement, socket.tcp_no_delay, socket.tcp_keep_alive)
-        {
-            return Err((error, replacement));
+        if host_address_is_set {
+            self.sessions
+                .get_mut(&session_id)
+                .ok_or(BrokerError::Internal)?
+                .clear_host_address(SocketKind::Tcp, guest_port, id)?;
         }
-        let events = if socket.kind == SocketKind::Tcp {
-            idle_epoll_events()
-        } else {
-            active_epoll_events()
-        };
-        if let Err(error) = epoll::add(
-            &self.epoll,
-            &replacement,
-            epoll::EventData::new_u64(id),
-            events,
-        ) {
-            return Err((broker_error_from_errno(error), replacement));
-        }
-        if let Err(error) = epoll::delete(&self.epoll, &socket.socket) {
-            let _ = epoll::delete(&self.epoll, &replacement);
-            return Err((broker_error_from_errno(error), replacement));
-        }
-        let old_socket = core::mem::replace(&mut socket.socket, replacement);
-        drop(old_socket);
-        Ok(host_address)
+        Ok(())
     }
 
     /// Returns whether `address` names a host endpoint backing a guest socket.
@@ -1703,7 +1715,6 @@ impl Reactor {
         &mut self,
         id: u64,
         requested_address: SocketAddrV4,
-        bind_kind: PlatformBindKind,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         let (session_id, kind, already_bound) = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
@@ -1748,9 +1759,6 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?
             .reserve_binding(kind)?;
         let guest_address = SocketAddrV4::new(*requested_address.ip(), guest_port);
-        let port_mapping_index = (bind_kind == PlatformBindKind::Explicit)
-            .then(|| self.port_mapping_index(kind, guest_port))
-            .flatten();
         self.sessions
             .get_mut(&session_id)
             .ok_or(BrokerError::Internal)?
@@ -1768,7 +1776,6 @@ impl Reactor {
             )?;
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
-        socket.port_mapping_index = port_mapping_index;
         socket
             .snapshot
             .lock()
@@ -1781,11 +1788,19 @@ impl Reactor {
         &mut self,
         id: u64,
         backlog: u32,
+        publication_claim: Option<TcpPortPublicationClaim>,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
-        let (session_id, kind, guest_address) = self
+        let (session_id, kind, guest_address, current_claim) = self
             .sockets
             .get(&id)
-            .map(|socket| (socket.session_id, socket.kind, socket.guest_local_address))
+            .map(|socket| {
+                (
+                    socket.session_id,
+                    socket.kind,
+                    socket.guest_local_address,
+                    socket.tcp_port_publication_claim,
+                )
+            })
             .ok_or(BrokerError::Internal)?;
         if kind != SocketKind::Tcp {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1795,14 +1810,30 @@ impl Reactor {
             local_socket_address(&self.sockets.get(&id).ok_or(BrokerError::Internal)?.socket)?
                 .port()
                 == 0;
+        if let Some(current_claim) = current_claim {
+            if publication_claim != Some(current_claim) {
+                return Err(BrokerError::Internal);
+            }
+            let mapping_index = current_claim.publication_id().index();
+            if !self.port_mappings.get(mapping_index).is_some_and(|state| {
+                state.claimed_by == Some((id, current_claim))
+                    && self
+                        .sockets
+                        .get(&id)
+                        .is_some_and(|socket| socket.port_mapping_index == Some(mapping_index))
+            }) {
+                return Err(BrokerError::Internal);
+            }
+        } else if publication_claim.is_some() && !needs_host_bind {
+            return Err(BrokerError::Internal);
+        }
+        let newly_claimed_publication = current_claim
+            .is_none()
+            .then_some(publication_claim)
+            .flatten();
         if needs_host_bind {
-            let port_mapping_index = self
-                .sockets
-                .get(&id)
-                .ok_or(BrokerError::Internal)?
-                .port_mapping_index;
-            let (host_address, host_mapped) = if let Some(mapping_index) = port_mapping_index {
-                match self.claim_port_mapping(id, mapping_index)? {
+            let (host_address, host_mapped) = if let Some(claim) = publication_claim {
+                match self.realize_tcp_port_publication(id, claim)? {
                     SocketOutcome::Completed(address) => (address, true),
                     SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
                 }
@@ -1815,27 +1846,56 @@ impl Reactor {
                     };
                 (address, false)
             };
-            self.sessions
+            if let Err(error) = self
+                .sessions
                 .get_mut(&session_id)
-                .ok_or(BrokerError::Internal)?
-                .set_host_address(kind, guest_address.port(), id, host_address, host_mapped)?;
+                .ok_or(BrokerError::Internal)
+                .and_then(|namespace| {
+                    namespace.set_host_address(
+                        kind,
+                        guest_address.port(),
+                        id,
+                        host_address,
+                        host_mapped,
+                    )
+                })
+            {
+                if let Some(claim) = newly_claimed_publication {
+                    self.release_failed_tcp_port_publication(id, claim)?;
+                }
+                return Err(error);
+            }
         }
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         let host_mapped = socket.port_mapping_index.is_some();
-        let was_listening = socket.listening;
-        let outcome = listen_tcp_socket(&self.epoll, id, socket, backlog, host_mapped)?;
+        let outcome = listen_tcp_socket(&self.epoll, id, socket, backlog, host_mapped);
         match outcome {
-            SocketOutcome::Completed(()) => Ok(SocketOutcome::Completed(guest_address)),
-            SocketOutcome::Failed(error) => {
-                if host_mapped && !was_listening {
-                    let mapping_index = self
-                        .sockets
-                        .get(&id)
-                        .and_then(|socket| socket.port_mapping_index)
-                        .ok_or(BrokerError::Internal)?;
-                    self.release_failed_port_mapping_claim(id, mapping_index)?;
+            Ok(SocketOutcome::Completed(())) => {
+                if let Some(claim) = newly_claimed_publication {
+                    let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+                    if socket.tcp_port_publication_claim != Some(claim) {
+                        return Err(BrokerError::Internal);
+                    }
+                    drop(
+                        socket
+                            .publication_fallback_socket
+                            .take()
+                            .ok_or(BrokerError::Internal)?,
+                    );
+                }
+                Ok(SocketOutcome::Completed(guest_address))
+            }
+            Ok(SocketOutcome::Failed(error)) => {
+                if let Some(claim) = newly_claimed_publication {
+                    self.release_failed_tcp_port_publication(id, claim)?;
                 }
                 Ok(SocketOutcome::Failed(error))
+            }
+            Err(error) => {
+                if let Some(claim) = newly_claimed_publication {
+                    self.release_failed_tcp_port_publication(id, claim)?;
+                }
+                Err(error)
             }
         }
     }
@@ -1857,15 +1917,7 @@ impl Reactor {
                     ))?;
             return connect_datagram_socket(socket, address);
         }
-        let claims_mapping = self
-            .sockets
-            .get(&id)
-            .and_then(|socket| socket.port_mapping_index)
-            .is_some_and(|mapping_index| {
-                self.port_mappings
-                    .get(mapping_index)
-                    .is_some_and(|state| state.claimed_by == Some(id))
-            });
+        let claims_mapping = self.claimed_tcp_port_publication(id).is_some();
         if claims_mapping {
             let status = SocketConnectionStatus::Failed(SocketError::InvalidArgument);
             update_snapshot(
@@ -2057,15 +2109,14 @@ impl Reactor {
     /// Drops a socket, releasing its guest port and any claimed host mapping.
     fn remove_socket(&mut self, id: u64) {
         let port_mapping = self
-            .sockets
-            .get(&id)
-            .and_then(|socket| socket.port_mapping_index)
-            .filter(|mapping_index| {
-                self.port_mappings
-                    .get(*mapping_index)
-                    .is_some_and(|state| state.claimed_by == Some(id))
-            })
-            .map(|mapping_index| (mapping_index, self.port_mappings[mapping_index].mapping));
+            .claimed_tcp_port_publication(id)
+            .map(|(mapping_index, claim)| {
+                (
+                    mapping_index,
+                    claim,
+                    self.port_mappings[mapping_index].mapping,
+                )
+            });
         let retired_listener_address = self.sockets.get(&id).and_then(|socket| {
             (socket.kind == SocketKind::Tcp && socket.listening)
                 .then(|| local_socket_address(&socket.socket).ok())
@@ -2118,7 +2169,7 @@ impl Reactor {
                 }
             };
         if retired_listener_address.is_some()
-            && let Some((mapping_index, _)) = port_mapping
+            && let Some((mapping_index, _, _)) = port_mapping
             && !retain_original
         {
             self.clear_stale_tcp_connections(mapping_index);
@@ -2127,7 +2178,7 @@ impl Reactor {
             if let Some(namespace) = self.sessions.get_mut(&session_id) {
                 let retained_before = namespace.retained_connectors;
                 if let Some(listener_address) = retired_listener_address {
-                    if let Some((mapping_index, _)) = port_mapping {
+                    if let Some((mapping_index, _, _)) = port_mapping {
                         let state = &mut self.port_mappings[mapping_index];
                         if retain_original {
                             namespace.move_tcp_translations_for_listener(
@@ -2241,15 +2292,17 @@ impl Reactor {
             )
         } else {
             drop(socket.take());
-            port_mapping
-                .and_then(|(_, mapping)| create_replacement_port_mapping_reservation(mapping).ok())
+            port_mapping.and_then(|(_, _, mapping)| {
+                create_replacement_port_mapping_reservation(mapping).ok()
+            })
         };
-        if let Some((mapping_index, _)) = port_mapping
+        if let Some((mapping_index, claim, _)) = port_mapping
             && let Some(state) = self.port_mappings.get_mut(mapping_index)
-            && state.claimed_by == Some(id)
+            && state.claimed_by == Some((id, claim))
         {
             state.claimed_by = None;
             state.reservation = replacement_reservation;
+            state.reservation_registered = false;
         }
     }
 
@@ -2348,18 +2401,18 @@ impl Reactor {
                 ReactorCommand::Bind {
                     id,
                     address,
-                    kind,
                     response,
                 } => {
-                    let outcome = self.bind_socket(id, address, kind);
+                    let outcome = self.bind_socket(id, address);
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Listen {
                     id,
                     backlog,
+                    publication,
                     response,
                 } => {
-                    let outcome = self.listen_socket(id, backlog);
+                    let outcome = self.listen_socket(id, backlog, publication);
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Accept {
@@ -2696,6 +2749,8 @@ impl Reactor {
                 abortive_close: false,
                 guest_local_address: None,
                 port_mapping_index: None,
+                tcp_port_publication_claim: None,
+                publication_fallback_socket: None,
                 tcp_no_delay: false,
                 tcp_keep_alive: false,
             },
@@ -3040,6 +3095,8 @@ impl Reactor {
                 abortive_close: false,
                 guest_local_address: Some(local_address),
                 port_mapping_index: None,
+                tcp_port_publication_claim: None,
+                publication_fallback_socket: None,
                 tcp_no_delay: listener_tcp_no_delay,
                 tcp_keep_alive: listener_tcp_keep_alive,
             },
@@ -4245,9 +4302,9 @@ mod tests {
     fn port_mapping_reservation_is_close_on_exec() {
         let host_address = unused_tcp_address();
         let retained = create_port_mapping_reservation(
-            SocketPortMapping {
+            TcpPortPublication {
                 guest_port: 80,
-                host_address,
+                external_address: host_address,
             },
             false,
             false,
@@ -4265,12 +4322,12 @@ mod tests {
     fn unavailable_publish_endpoint_rejects_provider_startup() {
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let host_address = socket_address_v4(occupied.local_addr().unwrap());
-        let error = LinuxSocketProvider::new_with_port_mappings(
+        let error = LinuxSocketProvider::new_with_tcp_port_publications(
             1,
             1,
-            &[SocketPortMapping {
+            &[TcpPortPublication {
                 guest_port: 80,
-                host_address,
+                external_address: host_address,
             }],
         )
         .err()
@@ -4823,12 +4880,12 @@ mod tests {
     fn mapped_tcp_listener_can_be_replaced_while_an_accepted_socket_remains() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_port_mappings(
+            LinuxSocketProvider::new_with_tcp_port_publications(
                 2,
                 2,
-                &[SocketPortMapping {
+                &[TcpPortPublication {
                     guest_port: 80,
-                    host_address,
+                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -4872,9 +4929,9 @@ mod tests {
         );
         assert_eq!(
             create_port_mapping_reservation(
-                SocketPortMapping {
+                TcpPortPublication {
                     guest_port: 80,
-                    host_address,
+                    external_address: host_address,
                 },
                 true,
                 true,
@@ -4904,12 +4961,12 @@ mod tests {
     fn stopped_mapped_listener_cannot_route_into_another_session() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_port_mappings(
+            LinuxSocketProvider::new_with_tcp_port_publications(
                 3,
                 2,
-                &[SocketPortMapping {
+                &[TcpPortPublication {
                     guest_port: 80,
-                    host_address,
+                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -4979,12 +5036,12 @@ mod tests {
     fn mapped_listener_handoff_drains_bounded_stale_connections() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_port_mappings(
+            LinuxSocketProvider::new_with_tcp_port_publications(
                 3,
                 2,
-                &[SocketPortMapping {
+                &[TcpPortPublication {
                     guest_port: 80,
-                    host_address,
+                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5216,12 +5273,12 @@ mod tests {
     fn closing_mapped_listener_discards_more_than_sixty_four_queued_connections() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_port_mappings(
+            LinuxSocketProvider::new_with_tcp_port_publications(
                 2,
                 2,
-                &[SocketPortMapping {
+                &[TcpPortPublication {
                     guest_port: 80,
-                    host_address,
+                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5257,9 +5314,9 @@ mod tests {
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
         assert_eq!(
             create_port_mapping_reservation(
-                SocketPortMapping {
+                TcpPortPublication {
                     guest_port: 80,
-                    host_address,
+                    external_address: host_address,
                 },
                 true,
                 true,
@@ -5655,12 +5712,12 @@ mod tests {
     fn reactor_assigns_a_port_to_an_unbound_tcp_listener() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_port_mappings(
+            LinuxSocketProvider::new_with_tcp_port_publications(
                 2,
                 2,
-                &[SocketPortMapping {
+                &[TcpPortPublication {
                     guest_port: FIRST_GUEST_EPHEMERAL_PORT,
-                    host_address,
+                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5740,9 +5797,9 @@ mod tests {
         );
         assert_eq!(
             create_port_mapping_reservation(
-                SocketPortMapping {
+                TcpPortPublication {
                     guest_port: FIRST_GUEST_EPHEMERAL_PORT,
-                    host_address,
+                    external_address: host_address,
                 },
                 true,
                 true,
@@ -5757,12 +5814,12 @@ mod tests {
     fn reactor_drives_a_loopback_tcp_listener() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_port_mappings(
+            LinuxSocketProvider::new_with_tcp_port_publications(
                 4,
                 4,
-                &[SocketPortMapping {
+                &[TcpPortPublication {
                     guest_port: FIRST_GUEST_EPHEMERAL_PORT,
-                    host_address,
+                    external_address: host_address,
                 }],
             )
             .unwrap(),

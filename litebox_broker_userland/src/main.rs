@@ -20,9 +20,10 @@ use clap::Parser;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
+    socket::TcpPortPublication,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
-use litebox_broker_platform_linux_userland::{LinuxSocketProvider, SocketPortMapping};
+use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
@@ -85,31 +86,31 @@ impl FromStr for AllowedTcpDestination {
     }
 }
 
-/// Command-line description of one host-to-guest TCP port mapping.
+/// Command-line description of one external-to-guest TCP publication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PortMappingArgument {
-    host_address: SocketAddrV4,
+struct TcpPortPublicationArgument {
+    external_address: SocketAddrV4,
     guest_port: u16,
 }
 
-impl FromStr for PortMappingArgument {
+impl FromStr for TcpPortPublicationArgument {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (host_address, guest_port) = value
+        let (external_address, guest_port) = value
             .rsplit_once(':')
             .ok_or_else(|| "expected HOST_IP:HOST_PORT:GUEST_PORT".to_owned())?;
-        let host_address = host_address
+        let external_address = external_address
             .parse::<SocketAddrV4>()
-            .map_err(|error| format!("invalid host IPv4 endpoint: {error}"))?;
+            .map_err(|error| format!("invalid external IPv4 endpoint: {error}"))?;
         let guest_port = guest_port
             .parse::<u16>()
             .map_err(|error| format!("invalid guest port: {error}"))?;
-        if host_address.port() == 0 || guest_port == 0 {
-            return Err("mapped host and guest ports must be nonzero".to_owned());
+        if external_address.port() == 0 || guest_port == 0 {
+            return Err("published external and guest ports must be nonzero".to_owned());
         }
         Ok(Self {
-            host_address,
+            external_address,
             guest_port,
         })
     }
@@ -125,7 +126,7 @@ struct CliArgs {
     allow_tcp_destination: Vec<AllowedTcpDestination>,
     /// Publish a host IPv4 TCP endpoint to a guest-local TCP port.
     #[arg(long, value_name = "HOST_IP:HOST_PORT:GUEST_PORT")]
-    publish_tcp: Vec<PortMappingArgument>,
+    publish_tcp: Vec<TcpPortPublicationArgument>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -143,15 +144,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
-    let port_mappings = configured_port_mappings(&args.publish_tcp);
+    let tcp_port_publications = configured_tcp_port_publications(&args.publish_tcp);
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
             .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         limits,
-        Arc::new(LinuxSocketProvider::new_with_port_mappings(
+        Arc::new(LinuxSocketProvider::new_with_tcp_port_publications(
             limits.max_sockets,
             limits.max_sockets_per_session,
-            &port_mappings,
+            &tcp_port_publications,
         )?),
     )?;
 
@@ -177,11 +178,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn configured_port_mappings(tcp: &[PortMappingArgument]) -> Vec<SocketPortMapping> {
+fn configured_tcp_port_publications(tcp: &[TcpPortPublicationArgument]) -> Vec<TcpPortPublication> {
     tcp.iter()
-        .map(|mapping| SocketPortMapping {
-            guest_port: mapping.guest_port,
-            host_address: mapping.host_address,
+        .map(|publication| TcpPortPublication {
+            guest_port: publication.guest_port,
+            external_address: publication.external_address,
         })
         .collect()
 }
@@ -611,24 +612,34 @@ mod tests {
     }
 
     #[test]
-    fn socket_port_mapping_arguments_name_distinct_host_and_guest_ports() {
-        let mapping = "127.0.0.1:8080:80".parse::<PortMappingArgument>().unwrap();
+    fn tcp_publication_arguments_name_distinct_external_and_guest_ports() {
+        let publication = "127.0.0.1:8080:80"
+            .parse::<TcpPortPublicationArgument>()
+            .unwrap();
 
         assert_eq!(
-            mapping,
-            PortMappingArgument {
-                host_address: "127.0.0.1:8080".parse().unwrap(),
+            publication,
+            TcpPortPublicationArgument {
+                external_address: "127.0.0.1:8080".parse().unwrap(),
                 guest_port: 80,
             }
         );
-        assert!("127.0.0.1:0:80".parse::<PortMappingArgument>().is_err());
-        assert!("127.0.0.1:8080:0".parse::<PortMappingArgument>().is_err());
-        assert!("8080:80".parse::<PortMappingArgument>().is_err());
+        assert!(
+            "127.0.0.1:0:80"
+                .parse::<TcpPortPublicationArgument>()
+                .is_err()
+        );
+        assert!(
+            "127.0.0.1:8080:0"
+                .parse::<TcpPortPublicationArgument>()
+                .is_err()
+        );
+        assert!("8080:80".parse::<TcpPortPublicationArgument>().is_err());
         assert_eq!(
-            configured_port_mappings(&[mapping]),
-            vec![SocketPortMapping {
+            configured_tcp_port_publications(&[publication]),
+            vec![TcpPortPublication {
                 guest_port: 80,
-                host_address: "127.0.0.1:8080".parse().unwrap(),
+                external_address: "127.0.0.1:8080".parse().unwrap(),
             }]
         );
     }
