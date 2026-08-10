@@ -1045,4 +1045,168 @@ mod tests {
             usize::from(SIZE)
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Giving up on an outstanding descriptor -- `172263bc`.
+    //
+    // The half of that fix which lives here is `abandon`: a descriptor given
+    // up on is *still posted*, so it must not be reissued, its buffer must not
+    // be reused, and the late completion that may still arrive must be
+    // recognised as legitimate rather than as a replayed id. The other half --
+    // taking the `Dma` out of the caller's `Option` and leaking it -- is
+    // `virtio::forget_posted_buffer`, which is not hosted; see the report.
+    // -----------------------------------------------------------------------
+
+    /// The fact that makes giving up the buffer necessary: after `abandon` the
+    /// descriptor still names the buffer and is still marked device-writable,
+    /// so the device remains entitled to write into it at any later moment.
+    /// Nothing withdraws it, because virtio 1.0 without `VIRTIO_F_RING_RESET`
+    /// has nothing that could.
+    #[test]
+    fn an_abandoned_descriptor_is_still_posted_against_its_buffer() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+
+        queue.abandon(head);
+
+        let desc = read_desc(&queue, head);
+        assert_eq!(
+            desc.addr,
+            dma.pa(),
+            "the descriptor stopped naming the buffer"
+        );
+        assert_eq!(
+            desc.flags & DESC_F_WRITE,
+            DESC_F_WRITE,
+            "the descriptor is no longer device-writable, which it must remain: nothing \
+             withdrew it"
+        );
+        assert_eq!(
+            queue.states[usize::from(head)],
+            DescState::Abandoned,
+            "the descriptor was not recorded as given up on"
+        );
+        check_invariants(&queue);
+    }
+
+    /// An abandoned descriptor is not free, so it is not reissued -- handing it
+    /// out would point a second buffer at a descriptor the device may write
+    /// through at any moment.
+    ///
+    /// This one does **not** discriminate the fix: before `172263bc` the
+    /// descriptor stayed `InFlight`, which also keeps it off the free list, so
+    /// it passes either way. It is here to state the property, not to pin the
+    /// regression; the tests that pin it are the two either side of this one.
+    #[test]
+    fn an_abandoned_descriptor_is_not_reissued() {
+        const SIZE: u16 = 4;
+        let mut queue = Queue::new(0, SIZE);
+        let buffers: Vec<Dma> = (0..SIZE).map(|_| buffer()).collect();
+
+        let head = submit(&mut queue, &buffers[0]).expect("a fresh queue has descriptors");
+        queue.abandon(head);
+        assert_eq!(queue.num_free, SIZE - 1);
+
+        // The remaining three, and then exhaustion. The abandoned one is never
+        // among them.
+        for dma in &buffers[1..] {
+            let got = submit(&mut queue, dma).expect("three descriptors remain");
+            assert_ne!(got, head, "the abandoned descriptor was handed out again");
+        }
+        assert_eq!(
+            submit(&mut queue, &buffers[0]),
+            None,
+            "the queue handed out a fourth descriptor, which can only be the abandoned one"
+        );
+        check_invariants(&queue);
+        check_free_list(&queue);
+    }
+
+    /// The late completion. The device has finished with the descriptor, so
+    /// the *descriptor* comes back -- but nobody is waiting on it, so it must
+    /// not be reported as a completion, or it would look like the answer to
+    /// whatever was submitted most recently. Its buffer stays given up
+    /// regardless; that is the caller's `None`.
+    #[test]
+    fn a_late_completion_for_an_abandoned_descriptor_reclaims_it_silently() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+        queue.abandon(head);
+
+        // Something else is submitted and completes in the meantime, exactly
+        // as the next request would.
+        let other_dma = buffer();
+        let other = submit(&mut queue, &other_dma).expect("descriptors remain");
+        assert_ne!(other, head);
+
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(
+            queue.take_used(),
+            None,
+            "the abandoned descriptor was reported as a completion, so the caller waiting \
+             for {other} would have taken it for that answer"
+        );
+        assert_eq!(queue.num_free, 3, "the descriptor was not reclaimed");
+        assert_eq!(queue.states[usize::from(head)], DescState::Free);
+        check_invariants(&queue);
+        check_free_list(&queue);
+
+        // The real completion is unaffected.
+        device_completes(&mut queue, u32::from(other), 12);
+        assert_eq!(queue.take_used(), Some((other, 12)));
+        check_invariants(&queue);
+    }
+
+    /// Once the late completion has been taken, the descriptor is free like
+    /// any other -- so a *second* completion for it is a replay again, and is
+    /// refused. Abandoning does not buy the device a permanent licence.
+    #[test]
+    fn a_second_completion_for_an_abandoned_descriptor_is_a_replay() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+        queue.abandon(head);
+
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(queue.take_used(), None);
+        assert_eq!(queue.num_free, 4);
+
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(queue.take_used(), None);
+        assert_eq!(
+            queue.num_free, 4,
+            "the second completion inflated the free count"
+        );
+        check_invariants(&queue);
+        check_free_list(&queue);
+    }
+
+    /// Abandoning something the queue does not hold means the caller has lost
+    /// track of what it submitted, which is a bug here rather than anything a
+    /// device can provoke.
+    #[test]
+    #[should_panic(expected = "is not in flight and cannot be abandoned")]
+    fn abandoning_a_free_descriptor_panics() {
+        let mut queue = Queue::new(0, 4);
+        queue.abandon(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not in flight and cannot be abandoned")]
+    fn abandoning_the_same_descriptor_twice_panics() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+        queue.abandon(head);
+        queue.abandon(head);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not in flight and cannot be abandoned")]
+    fn abandoning_a_descriptor_outside_the_table_panics() {
+        let mut queue = Queue::new(0, 4);
+        queue.abandon(9);
+    }
 }
