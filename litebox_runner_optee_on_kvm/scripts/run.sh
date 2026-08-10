@@ -254,9 +254,10 @@ echo 1>&2
 # `--kill-after`: SIGTERM asks QEMU to exit; if it does not, follow up with
 # SIGKILL rather than leaving a VM running.
 #
-# No pipe: QEMU inherits stdin, stdout and stderr directly, so $? is QEMU's
-# own status rather than a filter's, nothing buffers or reorders the guest's
-# output, and the serial console stays interactive.
+# No pipe on the plain run: QEMU inherits stdin, stdout and stderr directly, so
+# $? is QEMU's own status rather than a filter's, nothing buffers or reorders
+# the guest's output, and the serial console stays interactive. The client path
+# below cannot afford to share stdout; see the note there.
 set +e
 if [ -n "$COMMANDS" ]; then
     # The client starts first because it serves the socket (see above). Both
@@ -264,9 +265,9 @@ if [ -n "$COMMANDS" ]; then
     # first: it is the side that finishes deterministically, and it is the one
     # that can say what went wrong with the exchange.
     #
-    # Both keep stdout and stderr, so the guest's serial log interleaves with
-    # the client's output in the order things happened, which is the whole
-    # value of having both.
+    # Both reach this terminal -- the client directly, QEMU through the `cat`
+    # below -- so the guest's serial log interleaves with the client's output
+    # in the order things happened, which is the whole value of having both.
     python3 "$CLIENT" "$SOCKET" "$LDELF" "$TA" "$COMMANDS" --timeout "$TIMEOUT" &
     CLIENT_PID=$!
 
@@ -281,8 +282,18 @@ if [ -n "$COMMANDS" ]; then
         sleep 0.05
     done
 
+    # QEMU must not share the client's stdout. `-serial stdio` sets O_NONBLOCK
+    # on fd 1, and that flag lives on the *open file description*, which a
+    # shared terminal makes common to both processes. The client then takes
+    # EAGAIN on an ordinary print() as soon as the terminal buffer fills --
+    # which the largest TA reliably does, around 2.5 MB of chunked upload --
+    # and dies with BlockingIOError, including from the handler trying to
+    # report it, because stderr is the same description. Handing QEMU
+    # `>(cat)` puts the flag on a pipe nobody else holds; cat's own stdout is
+    # this terminal, so the logs still interleave. Process substitution, not a
+    # pipeline: $! is still QEMU's and `wait` still reports QEMU's status.
     $PRIVILEGE timeout --foreground --kill-after=10 "$TIMEOUT" \
-        qemu-system-x86_64 "${QEMU_ARGS[@]}" </dev/null &
+        qemu-system-x86_64 "${QEMU_ARGS[@]}" </dev/null > >(cat) 2>&1 &
     QEMU_PID=$!
 
     wait "$CLIENT_PID"
