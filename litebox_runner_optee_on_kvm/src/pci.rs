@@ -168,20 +168,31 @@ pub unsafe fn write_u32(address: Address, offset: u8, value: u32) {
     }
 }
 
-/// Writes a 16-bit register by read-modify-writing the dword containing it.
+/// Writes the `COMMAND` register without disturbing `STATUS`.
+///
+/// `COMMAND` (0x04) and `STATUS` (0x06) share one dword, and configuration
+/// cycles move whole dwords, so writing one means writing the other. The
+/// obvious implementation -- read the dword, replace the low half, write it
+/// back -- writes `STATUS` back with whatever bits were set in it, and half of
+/// `STATUS` is write-1-to-clear: received master abort, signalled target abort,
+/// detected parity error, master data parity error, signalled system error.
+/// Reading a device with an error latched and then enabling its decoders would
+/// silently clear that latch, so the error is gone before anything can report
+/// it -- and gone at the hands of code whose stated purpose is to set two bits
+/// in a different register.
+///
+/// Writing zero to the `STATUS` half instead is not a compromise, it is what
+/// the specification says to do: a zero in a write-1-to-clear bit leaves it
+/// alone, and every other `STATUS` bit is read-only. So the dword is simply
+/// `value` zero-extended.
 ///
 /// # Safety
 ///
-/// As [`write_u32`]. The read-modify-write also rewrites the *other* half of
-/// the dword with the value just read, which is harmless for the command and
-/// status pair used here but would not be for a register with write-1-to-clear
-/// bits in the untouched half.
-pub unsafe fn write_u16(address: Address, offset: u8, value: u16) {
-    let shift = (u32::from(offset) & 2) * 8;
-    let dword = read_u32(address, offset);
-    let merged = (dword & !(0xFFFF << shift)) | (u32::from(value) << shift);
+/// As [`write_u32`]. `COMMAND` controls the device's decoders and its ability
+/// to master the bus; the caller must know what it is turning on or off.
+pub unsafe fn write_command(address: Address, value: u16) {
     // SAFETY: the caller's contract.
-    unsafe { write_u32(address, offset, merged) }
+    unsafe { write_u32(address, offset::COMMAND, u32::from(value)) }
 }
 
 /// Reads a 16-bit register.
@@ -308,9 +319,11 @@ impl DeviceHeader {
             } else if raw & BAR_MEM_TYPE_MASK == BAR_MEM_TYPE_64 {
                 // The upper half lives in the next register, which is why
                 // this loop steps by a variable amount. A 64-bit BAR in slot
-                // 5 has nowhere to put its upper half and is malformed;
-                // treat the missing half as zero rather than reading past the
-                // end of the header.
+                // 5 has nowhere to put its upper half and is malformed: the
+                // register after BAR5 is the Cardbus CIS pointer, not an
+                // address. Treat the missing half as zero rather than reading
+                // it. `size_memory_bar` refuses to probe such a BAR at all,
+                // because probing would also *write* to that register.
                 let high = if index + 1 < BAR_COUNT {
                     self.raw_bar(index + 1)
                 } else {
@@ -375,6 +388,23 @@ impl DeviceHeader {
             Bar::Unused | Bar::Io { .. } => return None,
         };
 
+        // A 64-bit BAR needs two registers, and slot 5 is the last one. The
+        // register after it is 0x28, the Cardbus CIS pointer -- so probing such
+        // a BAR would read the Cardbus pointer as the high dword of a size and,
+        // far worse, *write* 0xFFFFFFFF into it and then write back what it
+        // read. `bars()` already refuses to believe the high half of a slot-5
+        // 64-bit BAR; this refuses to touch the register at all. The BAR is
+        // malformed either way, and reporting it as unsizeable is the honest
+        // answer.
+        if is_64bit && index + 1 >= BAR_COUNT {
+            log::warn!(
+                "pci        {} BAR {index} claims to be 64-bit but is the last register, so \
+                 its upper half would be the Cardbus CIS pointer; not sized",
+                self.address
+            );
+            return None;
+        }
+
         let low_offset = offset::BAR0 + index * 4;
         let high_offset = low_offset + 4;
         let saved_low = read_u32(self.address, low_offset);
@@ -387,11 +417,7 @@ impl DeviceHeader {
         // creates is never live, and every register touched is written back
         // below before decoding is restored.
         let (probe_low, probe_high) = unsafe {
-            write_u16(
-                self.address,
-                offset::COMMAND,
-                command & !COMMAND_MEMORY_SPACE,
-            );
+            write_command(self.address, command & !COMMAND_MEMORY_SPACE);
 
             write_u32(self.address, low_offset, u32::MAX);
             if is_64bit {
@@ -408,7 +434,7 @@ impl DeviceHeader {
             if let Some(high) = saved_high {
                 write_u32(self.address, high_offset, high);
             }
-            write_u16(self.address, offset::COMMAND, command);
+            write_command(self.address, command);
 
             (probe_low, probe_high)
         };

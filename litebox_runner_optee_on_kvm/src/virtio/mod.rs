@@ -641,9 +641,8 @@ pub fn map_transport() -> Option<Transport> {
     // already assigned, and bus mastering so its virtqueue DMA works. Neither
     // moves anything; the BARs were restored by `size_memory_bar`.
     unsafe {
-        pci::write_u16(
+        pci::write_command(
             address,
-            pci::offset::COMMAND,
             command | pci::COMMAND_MEMORY_SPACE | pci::COMMAND_BUS_MASTER,
         );
     }
