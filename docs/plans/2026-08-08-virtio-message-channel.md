@@ -33,6 +33,16 @@ virtio-vsock would *not* work for VM↔VM: vsock is host↔guest by design, CID-
 
 **Why legacy PCI config I/O.** Config space is reachable via ports `0xCF8`/`0xCFC`, so no ECAM mapping is needed. Only the device's BAR MMIO must be mapped, and that is above `MAPPED_LIMIT` — see Task 3.
 
+**Why not `virtio-drivers` and `pci_types`, i.e. why this driver is ours.** The original plan never recorded this, which is a gap: reusing a maintained crate is the better default and should have been the first question. Both were evaluated properly — built for `x86_64_kvm.json`, then driven against the malformed-input tests in `src/virtio/queue.rs` and `src/pci/` — and both were rejected **on correctness**, not on threat model. The peer today is the host, which already owns guest memory; these are ordinary spec and robustness defects that hold against a merely buggy peer.
+
+`pci_types` 0.10.1: `PciHeader::update_command` (`lib.rs:194`) read-modify-writes the whole dword at `0x04`, writing `STATUS` back as read and so clearing RW1C bits — the bug `cdd66696` removed. `CapabilityIterator::next` (`capability/mod.rs:129`) has no bound but `offset == 0`, so a cyclic list hangs. `bar()` sizes without clearing `MEMORY_ENABLE`, aliasing a live BAR, and `lib.rs:380` panics on a device-reported reserved memory type. Net reusable after excluding those: ~40 lines.
+
+`virtio-drivers` 0.13.0: `pop_used` (`queue.rs:536`) returns `WrongToken` *before* advancing `last_used_idx`, so one bogus used-ring id wedges the ring permanently — measured as `recv()` returning `Ok(None)` forever, silently. `recycle_descriptors` (`queue.rs:486`) does an unguarded `num_used -= 1`, self-linking the free list on a replayed id: the same bug `e7b44d29` fixed, still live upstream. `console.rs:208` sets `pending_len` from the device's `len` with no clamp against the 4 KiB buffer, and `console.rs:190` is a bare `assert_ne!` on a device value. Its capability walk (`transport/pci/bus.rs:543`) rejects `next < 64` and misaligned offsets — better than `pci_types` — but has no visited set, so a cycle still hangs. `begin_init` never re-reads `FEATURES_OK`, which virtio 1.0 §3.1.1 step 6 requires and `virtio/mod.rs:990` does.
+
+Two things are *not* the reason, and should not be recycled as arguments: both crates cross-compile to our target cleanly, and `Hal`/`ConfigurationAccess` are both satisfiable here (`ConfigurationAccess` is CF8/CFC-shaped, so the README's "memory-mapped CAM only" is about the provided `MmioCam`, not the trait). Adoption also does not pay for itself: `virtio-drivers` would delete ~375 lines of `Queue` while requiring a ~250-line `Transport` impl, or else pull in its 946-line `bus.rs` alongside the `pci/mod.rs` we keep.
+
+Neither crate has a deadline-bounded receive — no `abandon`/`forget_posted_buffer` equivalent — which `Console::receive_deadline` needs. Revisit if that changes upstream, or if VM↔VM stops being artificial and the hardening has to be re-argued anyway.
+
 ## What this does not solve, and must not pretend to
 
 - Two normal VMs are **symmetrically isolated**. Unlike LVBS, where VTL1 is more privileged and can map arbitrary VTL0 GPAs (which is what `NormalWorldConstPtr = PhysConstPtr<T, ALIGN, Vmap>` relies on), neither VM can reach the other's memory. This channel moves *data by value*; it does not create a shared address space.
