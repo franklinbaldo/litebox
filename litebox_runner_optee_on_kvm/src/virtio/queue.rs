@@ -46,7 +46,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
+#[cfg(not(test))]
 use litebox_platform_lvbs::mm::MemoryProvider as _;
+#[cfg(not(test))]
 use litebox_platform_multiplex::Platform;
 
 /// `VIRTQ_DESC_F_WRITE`: the buffer is written by the device, i.e. it is a
@@ -118,9 +120,7 @@ impl Dma {
     /// Allocates at least `bytes`, rounded up to a power-of-two number of
     /// pages.
     ///
-    /// The buddy allocator hands out whole `1 << order` page blocks that are
-    /// contiguous in both address spaces, which is exactly the property a
-    /// virtqueue needs and the reason nothing smaller-grained is used here.
+    /// Where the pages come from is [`Self::allocate`]'s business.
     ///
     /// # Panics
     ///
@@ -128,16 +128,15 @@ impl Dma {
     fn new(bytes: u64) -> Self {
         let pages = bytes.div_ceil(4096).max(1);
         let order = pages.next_power_of_two().trailing_zeros();
-        let va = Platform::mem_allocate_pages(order)
-            .unwrap_or_else(|| panic!("out of memory allocating {bytes} bytes of DMA memory"));
+        let (va, pa) = Self::allocate(bytes, order);
         let size = usize::try_from(u64::from(1_u32 << order) * 4096).expect("64-bit target");
         // The device reads this memory before the driver writes every byte of
         // it -- `avail.flags`, the used ring's contents and the tail of the
         // descriptor table are all read while still untouched. Zeroing means
         // it reads defined values rather than whatever the heap last held.
         //
-        // SAFETY: `mem_allocate_pages` returned a live, exclusively owned
-        // allocation of exactly this size.
+        // SAFETY: `allocate` returned a live, exclusively owned allocation of
+        // exactly this size.
         unsafe { core::ptr::write_bytes(va, 0, size) };
         // The typed ring accesses elsewhere in this module cast this pointer
         // to `Desc`, `UsedElem` and `u16`. They are sound because the
@@ -147,10 +146,54 @@ impl Dma {
             "DMA allocation {va:p} is not page-aligned"
         );
         Self {
-            pa: Platform::va_to_pa(x86_64::VirtAddr::new(va as u64)).as_u64(),
+            pa,
             va,
             len: usize::try_from(bytes).expect("64-bit target"),
         }
+    }
+
+    /// Obtains `1 << order` contiguous, page-aligned pages, and the physical
+    /// address the device must be given for them.
+    ///
+    /// The buddy allocator hands out whole `1 << order` page blocks that are
+    /// contiguous in both address spaces, which is exactly the property a
+    /// virtqueue needs and the reason nothing smaller-grained is used here.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the allocation fails.
+    #[cfg(not(test))]
+    fn allocate(bytes: u64, order: u32) -> (*mut u8, u64) {
+        let va = Platform::mem_allocate_pages(order)
+            .unwrap_or_else(|| panic!("out of memory allocating {bytes} bytes of DMA memory"));
+        let pa = Platform::va_to_pa(x86_64::VirtAddr::new(va as u64)).as_u64();
+        (va, pa)
+    }
+
+    /// The host stand-in, used only when this module is compiled by
+    /// `dev_tests`.
+    ///
+    /// The one thing `Dma` needs from the platform is a page-aligned,
+    /// physically contiguous block and the physical address of it, and the
+    /// host has an allocator that can provide the first half. There is no
+    /// second half: on the host nothing dereferences a physical address, so
+    /// the virtual one stands in for it. That is enough for every property the
+    /// tests are about -- what goes into a descriptor, and what comes back out
+    /// of the used ring -- and it keeps the rings, the descriptor table and
+    /// `read_into`/`fill` running against real memory rather than a model.
+    ///
+    /// The allocation is deliberately never freed. `Dma` has no `Drop` -- see
+    /// `virtio::forget_posted_buffer`, which depends on that -- so a test that
+    /// allocates one leaks it, exactly as the guest does.
+    #[cfg(test)]
+    fn allocate(_bytes: u64, order: u32) -> (*mut u8, u64) {
+        let size = usize::try_from(u64::from(1_u32 << order) * 4096).expect("64-bit target");
+        let layout = std::alloc::Layout::from_size_align(size, 4096).expect("valid layout");
+        // SAFETY: `size` is non-zero -- `order` counts whole pages -- so this
+        // is a well-formed request, and the result is checked for null.
+        let va = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!va.is_null(), "out of memory allocating {size} test bytes");
+        (va, va as u64)
     }
 
     /// Allocates at least `bytes` of DMA-capable memory.
@@ -627,5 +670,379 @@ impl Queue {
         // as a completion would make it look like the answer to whatever the
         // caller submitted most recently.
         (was == DescState::InFlight).then_some((head, elem.len))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+//
+// The device is the untrusted party here, so these tests *are* the device:
+// they write used-ring entries directly, which is the only thing a device can
+// do to this driver and the only thing the checks in `submit` and `take_used`
+// defend against. Nothing is modelled -- the real `Queue` runs against real
+// rings in real memory, with `Dma::allocate`'s host stand-in underneath.
+//
+// `dev_tests/tests/kvm_virtio_queue.rs` compiles this file for the host; see
+// the comment there.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{DESC_F_WRITE, Desc, DescState, Dma, Queue, UsedElem};
+    use alloc::vec::Vec;
+
+    /// A buffer to submit. Its contents are irrelevant; what matters is that
+    /// the physical address in the descriptor is this one.
+    fn buffer() -> Dma {
+        Dma::alloc(64)
+    }
+
+    /// Everything the untrusted device can do to this driver: write a used
+    /// ring entry and bump `used.idx`.
+    ///
+    /// Deliberately unconditional. `id` is not checked, not bounded and not
+    /// required to name anything outstanding, because none of those is a
+    /// property the device is obliged to have; the whole point of the checks
+    /// under test is that the driver cannot assume otherwise.
+    fn device_completes(queue: &mut Queue, id: u32, len: u32) {
+        let idx = queue.used_idx();
+        let slot = usize::from(idx % queue.size);
+        // SAFETY: the used ring was allocated with room for `size` entries
+        // after its four-byte header, and `slot` is masked into that range.
+        // This is the device's half of the shared memory.
+        unsafe {
+            queue
+                .used
+                .va
+                .add(4)
+                .cast::<UsedElem>()
+                .add(slot)
+                .write_volatile(UsedElem { id, len });
+            queue
+                .used
+                .va
+                .cast::<u16>()
+                .add(1)
+                .write_volatile(idx.wrapping_add(1));
+        }
+    }
+
+    /// One descriptor table entry, as the device would read it.
+    fn read_desc(queue: &Queue, index: u16) -> Desc {
+        // SAFETY: `index` is inside the table, which has room for `size`
+        // entries.
+        unsafe {
+            queue
+                .desc
+                .va
+                .cast::<Desc>()
+                .add(usize::from(index))
+                .read_volatile()
+        }
+    }
+
+    /// Submits `buffer` device-writable and returns the descriptor.
+    fn submit(queue: &mut Queue, buffer: &Dma) -> Option<u16> {
+        // SAFETY: nothing in a host test reads or writes the buffer while it
+        // is posted, which is the whole of the contract; there is no device.
+        unsafe { queue.submit(buffer.pa(), 64, true) }
+    }
+
+    /// The invariant the replay bug destroyed, checked after every step:
+    /// `num_free` counts descriptors, so it can never exceed the table, and it
+    /// must agree with the number of entries recorded `Free`.
+    fn check_invariants(queue: &Queue) {
+        assert!(
+            queue.num_free <= queue.size,
+            "num_free is {} for a {}-descriptor queue",
+            queue.num_free,
+            queue.size
+        );
+        let free = queue
+            .states
+            .iter()
+            .filter(|s| **s == DescState::Free)
+            .count();
+        assert_eq!(
+            usize::from(queue.num_free),
+            free,
+            "num_free is {} but {free} descriptors are recorded free",
+            queue.num_free
+        );
+    }
+
+    /// Walks the free list from its head, and asserts that it is a list of
+    /// `num_free` distinct entries rather than a cycle.
+    ///
+    /// This is the shape the bug produced: pushing an already-free descriptor
+    /// writes `next = free_head` into the entry that *is* `free_head`, making
+    /// a one-element loop that `submit` then walks for ever.
+    fn check_free_list(queue: &Queue) {
+        let mut seen = Vec::new();
+        let mut cursor = queue.free_head;
+        for _ in 0..queue.num_free {
+            assert!(
+                !seen.contains(&cursor),
+                "the free list revisits descriptor {cursor} after {seen:?}"
+            );
+            assert_eq!(
+                queue.states[usize::from(cursor)],
+                DescState::Free,
+                "the free list contains descriptor {cursor}, which is not free"
+            );
+            seen.push(cursor);
+            cursor = read_desc(queue, cursor).next;
+        }
+    }
+
+    #[test]
+    fn a_submitted_descriptor_names_the_buffer() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+        let desc = read_desc(&queue, head);
+        assert_eq!(desc.addr, dma.pa());
+        assert_eq!(desc.len, 64);
+        assert_eq!(desc.flags, DESC_F_WRITE);
+        assert_eq!(queue.num_free, 3);
+        check_invariants(&queue);
+    }
+
+    /// The regression `e7b44d29` fixed.
+    ///
+    /// The device reports one completion twice. The second report used to
+    /// push an already-free descriptor onto the free list, which writes
+    /// `next = free_head` into the entry that *is* `free_head`: the list
+    /// becomes a one-element cycle and `num_free` is incremented past the
+    /// table size. From there `submit` hands the same descriptor to every
+    /// caller for ever.
+    #[test]
+    fn a_replayed_used_id_is_refused() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(queue.take_used(), Some((head, 8)));
+        assert_eq!(queue.num_free, 4);
+        check_invariants(&queue);
+        check_free_list(&queue);
+
+        // The replay.
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(
+            queue.take_used(),
+            None,
+            "a completion for a descriptor that is not in flight was honoured"
+        );
+        assert_eq!(
+            queue.num_free, 4,
+            "the replay inflated the free count past the table size"
+        );
+        check_invariants(&queue);
+        check_free_list(&queue);
+
+        // And the queue still hands out every descriptor exactly once, which
+        // is what the self-linked list made impossible.
+        let buffers: Vec<Dma> = (0..4).map(|_| buffer()).collect();
+        let mut handed = Vec::new();
+        for dma in &buffers {
+            let head = submit(&mut queue, dma).expect("four descriptors remain");
+            assert!(
+                !handed.contains(&head),
+                "descriptor {head} handed out twice"
+            );
+            handed.push(head);
+        }
+        assert_eq!(handed.len(), 4);
+        assert_eq!(submit(&mut queue, &dma), None, "the queue is exhausted");
+        check_invariants(&queue);
+    }
+
+    /// A completion naming a descriptor that was never submitted. There is no
+    /// replay involved: the device simply names a free entry.
+    #[test]
+    fn a_completion_for_a_free_descriptor_is_refused() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+
+        // Every descriptor except the one in flight is free.
+        for id in 0..4 {
+            if id == u32::from(head) {
+                continue;
+            }
+            device_completes(&mut queue, id, 8);
+            assert_eq!(queue.take_used(), None, "descriptor {id} is free");
+            assert_eq!(queue.num_free, 3);
+            check_invariants(&queue);
+            check_free_list(&queue);
+        }
+        // The real completion still works afterwards.
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(queue.take_used(), Some((head, 8)));
+        check_invariants(&queue);
+    }
+
+    /// An `id` outside the descriptor table is rejected before it can index
+    /// `states`, and the entry is still consumed so the ring drains.
+    #[test]
+    fn an_out_of_range_used_id_is_refused_and_consumed() {
+        let mut queue = Queue::new(0, 4);
+        let dma = buffer();
+        let head = submit(&mut queue, &dma).expect("a fresh queue has descriptors");
+
+        for id in [4, 5, 0xFFFF, u32::from(u16::MAX) + 1, u32::MAX] {
+            let before = queue.last_used;
+            device_completes(&mut queue, id, 8);
+            assert_eq!(queue.take_used(), None, "id {id} is out of range");
+            assert_eq!(
+                queue.last_used,
+                before.wrapping_add(1),
+                "the rejected entry was not consumed, so the ring cannot drain"
+            );
+            assert_eq!(queue.num_free, 3);
+            check_invariants(&queue);
+            check_free_list(&queue);
+        }
+
+        device_completes(&mut queue, u32::from(head), 8);
+        assert_eq!(queue.take_used(), Some((head, 8)));
+        check_invariants(&queue);
+    }
+
+    /// Sustained churn with a device that lies at every opportunity.
+    ///
+    /// Each round submits what it can, completes some of it honestly, and then
+    /// adds one hostile entry drawn from the four kinds the driver has to
+    /// survive: a replay of an id just completed, an out-of-range id, a
+    /// completion for a descriptor that is free, and a late completion for one
+    /// that was abandoned. The invariants are checked after every single step,
+    /// so the round in which one first breaks is the one reported.
+    #[test]
+    fn churn_against_a_lying_device_keeps_the_free_list_sound() {
+        const SIZE: u16 = 8;
+        let mut queue = Queue::new(0, SIZE);
+        let buffers: Vec<Dma> = (0..SIZE).map(|_| buffer()).collect();
+        // A deterministic stand-in for randomness: xorshift, so a failure is
+        // reproducible without a seed to record.
+        let mut rng = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut in_flight: Vec<u16> = Vec::new();
+        let mut abandoned: Vec<u16> = Vec::new();
+        let mut last_completed: Option<u16> = None;
+
+        for round in 0..200_u32 {
+            // Submit as many as the round asks for and the queue allows.
+            let wanted = usize::try_from(next() % u64::from(SIZE)).expect("small");
+            for _ in 0..wanted {
+                let Some(head) = submit(&mut queue, &buffers[in_flight.len() % buffers.len()])
+                else {
+                    break;
+                };
+                assert!(
+                    !in_flight.contains(&head) && !abandoned.contains(&head),
+                    "round {round}: descriptor {head} was handed out while still outstanding"
+                );
+                in_flight.push(head);
+                check_invariants(&queue);
+            }
+
+            // Abandon one, occasionally.
+            if !in_flight.is_empty() && next() % 5 == 0 {
+                let victim = in_flight
+                    .swap_remove(usize::try_from(next() % in_flight.len() as u64).expect("small"));
+                queue.abandon(victim);
+                abandoned.push(victim);
+                check_invariants(&queue);
+            }
+
+            // Honest completions.
+            if !in_flight.is_empty() {
+                let done = in_flight
+                    .swap_remove(usize::try_from(next() % in_flight.len() as u64).expect("small"));
+                device_completes(&mut queue, u32::from(done), 8);
+                assert_eq!(
+                    queue.take_used(),
+                    Some((done, 8)),
+                    "round {round}: an honest completion for {done} was refused"
+                );
+                last_completed = Some(done);
+                check_invariants(&queue);
+                check_free_list(&queue);
+            }
+
+            // And one lie.
+            match next() % 4 {
+                0 => {
+                    // Only when it really is free: a descriptor completed in
+                    // an earlier round may since have been submitted again, or
+                    // abandoned, and in either of those cases the "replay" is
+                    // a legitimate completion rather than a lie.
+                    if let Some(replay) =
+                        last_completed.filter(|d| !in_flight.contains(d) && !abandoned.contains(d))
+                    {
+                        device_completes(&mut queue, u32::from(replay), 8);
+                        assert_eq!(
+                            queue.take_used(),
+                            None,
+                            "round {round}: a replayed id {replay} was honoured"
+                        );
+                    }
+                }
+                1 => {
+                    let bogus = u32::from(SIZE) + (next() as u32 % 1000);
+                    device_completes(&mut queue, bogus, 8);
+                    assert_eq!(
+                        queue.take_used(),
+                        None,
+                        "round {round}: an out-of-range id {bogus} was honoured"
+                    );
+                }
+                2 => {
+                    // Any descriptor that is neither in flight nor abandoned
+                    // is free.
+                    if let Some(free) =
+                        (0..SIZE).find(|d| !in_flight.contains(d) && !abandoned.contains(d))
+                    {
+                        device_completes(&mut queue, u32::from(free), 8);
+                        assert_eq!(
+                            queue.take_used(),
+                            None,
+                            "round {round}: a completion for free descriptor {free} was honoured"
+                        );
+                    }
+                }
+                _ => {
+                    // A late completion for something abandoned is
+                    // *legitimate*: the descriptor comes back, but nobody is
+                    // waiting on it, so it is not reported.
+                    if !abandoned.is_empty() {
+                        let late = abandoned.remove(0);
+                        device_completes(&mut queue, u32::from(late), 8);
+                        assert_eq!(
+                            queue.take_used(),
+                            None,
+                            "round {round}: an abandoned descriptor {late} was reported as a \
+                             completion nobody was waiting for"
+                        );
+                    }
+                }
+            }
+            check_invariants(&queue);
+            check_free_list(&queue);
+        }
+
+        // Nothing leaked: every descriptor is accounted for.
+        assert_eq!(
+            usize::from(queue.num_free) + in_flight.len() + abandoned.len(),
+            usize::from(SIZE)
+        );
     }
 }

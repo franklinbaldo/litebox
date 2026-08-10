@@ -7,6 +7,9 @@ edition = "2024"
 [dev-dependencies]
 anyhow = "1.0.99"
 fs-err = "3.1.2"
+# `kvm_virtio_queue.rs` and `kvm_pci.rs` include guest modules that log; the
+# guest crate has `log` as a dependency, and so must anything that hosts them.
+log = { version = "0.4", default-features = false }
 
 [lints]
 workspace = true
