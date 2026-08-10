@@ -42,6 +42,8 @@
               allocation and so aligned for anything; `Dma::new` asserts it"
 )]
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
 use litebox_platform_lvbs::mm::MemoryProvider as _;
@@ -222,6 +224,29 @@ impl Dma {
     }
 }
 
+/// What the driver believes about one descriptor table entry.
+///
+/// The free list alone cannot answer "is this descriptor outstanding?": it is
+/// threaded through the `next` field of the entries that are *on* it, and
+/// asking whether a given index is on a singly-linked list means walking it.
+/// So the state is recorded alongside, one byte per descriptor, and every
+/// transition is checked.
+///
+/// This exists because the device is untrusted -- in the two-VM arrangement it
+/// is the normal world -- and a used-ring entry is a number it chooses. Without
+/// the check, a device that reports the same `id` twice gets that descriptor
+/// pushed onto the free list twice: the second push writes `next = free_head`
+/// into the entry that *is* `free_head`, so the list becomes a one-element
+/// cycle, and `num_free` is incremented past `size` until it wraps. From there
+/// `submit` hands out the same descriptor to every caller for ever.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DescState {
+    /// On the free list, available to [`Queue::submit`].
+    Free,
+    /// Handed to the device and not yet completed.
+    InFlight,
+}
+
 /// A split virtqueue, sized and allocated but not yet registered with the
 /// device.
 pub struct Queue {
@@ -245,6 +270,8 @@ pub struct Queue {
     /// increases `used.idx`, and it wraps at `u16`, so the difference between
     /// the two is the number of pending completions.
     last_used: u16,
+    /// Per-descriptor state, `size` entries. See [`DescState`].
+    states: Vec<DescState>,
 
     /// The device's own index into the notification region for this queue.
     notify_off: u16,
@@ -285,6 +312,7 @@ impl Queue {
             free_head: 0,
             num_free: size,
             last_used: 0,
+            states: vec![DescState::Free; size as usize],
             notify_off: 0,
         };
 
@@ -425,6 +453,17 @@ impl Queue {
             return None;
         }
         let head = self.free_head;
+        // The free list and `states` are two descriptions of the same thing,
+        // and this is where they are required to agree. They can only diverge
+        // through a bug here or through a completion that got past
+        // `take_used`'s check, and handing out a descriptor the device still
+        // owns is the failure this whole mechanism exists to prevent.
+        assert_eq!(
+            self.states.get(head as usize).copied(),
+            Some(DescState::Free),
+            "queue {}: free list head {head} is not free",
+            self.index
+        );
         // SAFETY: the free list is threaded through `next` and `head` is on
         // it, so this read is of a live entry.
         let next_free = unsafe {
@@ -447,6 +486,7 @@ impl Queue {
         );
         self.free_head = next_free;
         self.num_free -= 1;
+        self.states[head as usize] = DescState::InFlight;
 
         // Publish. The ring is `size` entries and `avail.idx` is a free-running
         // counter, so the slot is the counter masked -- the ring wraps but the
@@ -470,6 +510,12 @@ impl Queue {
     ///
     /// Returns the head descriptor index and the number of bytes the device
     /// wrote, and returns the descriptor to the free list.
+    ///
+    /// A completion naming a descriptor that is not outstanding is **not** a
+    /// completion: it is the untrusted device replaying an `id`, and honouring
+    /// it would self-link the free list and wrap `num_free`. Such an entry is
+    /// consumed -- `last_used` still advances, or the ring would never drain --
+    /// logged at error level, and otherwise ignored. The same goes for a
     pub fn take_used(&mut self) -> Option<(u16, u32)> {
         let idx = self.used_idx();
         if idx == self.last_used {
@@ -485,7 +531,26 @@ impl Queue {
         // `id` is a descriptor index, so anything outside the table means the
         // device wrote nonsense -- or that the ring is being read at the wrong
         // offset. Either way, returning it would corrupt the free list.
-        let head = u16::try_from(elem.id).ok().filter(|id| *id < self.size)?;
+        let Some(head) = u16::try_from(elem.id).ok().filter(|id| *id < self.size) else {
+            log::error!(
+                "virtio     queue {}: completion names descriptor {}, but the table has {} \
+                 entries; ignored",
+                self.index,
+                elem.id,
+                self.size
+            );
+            return None;
+        };
+
+        if self.states[head as usize] != DescState::InFlight {
+            log::error!(
+                "virtio     queue {}: completion for descriptor {head}, which is not in \
+                 flight; the device is replaying a used-ring id. Ignored -- honouring it \
+                 would self-link the free list.",
+                self.index
+            );
+            return None;
+        }
 
         // Return the chain -- one descriptor, since nothing chains here -- to
         // the free list.
@@ -500,6 +565,7 @@ impl Queue {
         );
         self.free_head = head;
         self.num_free += 1;
+        self.states[head as usize] = DescState::Free;
 
         Some((head, elem.len))
     }
