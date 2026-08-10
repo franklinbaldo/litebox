@@ -1183,8 +1183,22 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
         0
     }
 
+    /// There is no vDSO on this platform, for either host.
+    ///
+    /// `None` rather than `unimplemented!()`, and the distinction matters
+    /// because this is on a *reachable* path:
+    /// `litebox_shim_linux::loader::auxv` calls it while building `auxv`, so a
+    /// panic here would take down any guest running the Linux shim, on LVBS as
+    /// much as on KVM.
+    ///
+    /// A vDSO exists to let userspace avoid the syscall instruction. Here
+    /// LiteBox *is* the kernel, so a `syscall` traps directly to
+    /// `syscall_entry` and there is nothing to avoid — the same reasoning as
+    /// [`Self::get_syscall_entry_point`] returning 0 above. A static binary
+    /// simply omits `AT_SYSINFO_EHDR` and calls `syscall`, which is what we
+    /// want.
     fn get_vdso_address(&self) -> Option<usize> {
-        unimplemented!()
+        None
     }
 }
 
