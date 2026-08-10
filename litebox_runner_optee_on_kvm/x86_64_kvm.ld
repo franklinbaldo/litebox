@@ -14,7 +14,8 @@ SECTIONS
 
     /* `_start` is KEEPt first so that it lands at exactly 0x200000. The PVH
        note's XEN_ELFNOTE_PHYS32_ENTRY descriptor hardcodes that address
-       (PVH_ENTRY_ADDR in src/main.rs); the two must stay in sync. */
+       (PVH_ENTRY_ADDR in src/boot/pvh.rs); the two must stay in sync, and the
+       ASSERT at the end of this file is what enforces it. */
     .text : ALIGN(0x200000) {
         _text_start = .;
         KEEP(*(.text._start))
@@ -65,6 +66,20 @@ SECTIONS
 
     . = ALIGN(0x1000);
     _image_end = .;
+
+    /* The PVH entry address. QEMU reads XEN_ELFNOTE_PHYS32_ENTRY out of the
+       note above and jumps to whatever it says; `PVH_ENTRY_ADDR` in
+       src/boot/pvh.rs is that value, and it is a constant, not something
+       derived from the link. If `_start` ever moves -- an input section
+       reordered ahead of it, the KEEP dropped, `. = 0x200000` edited -- QEMU
+       would enter the guest at an address holding something else, in 32-bit
+       mode, with no output. Checked here rather than at runtime because the
+       linker is where the address is decided and because a link that cannot
+       boot should not produce a binary. */
+    ASSERT(_start == 0x200000,
+           "_start is not at PVH_ENTRY_ADDR (0x200000); the PVH note in src/boot/pvh.rs would send QEMU to the wrong address")
+    ASSERT(_text_start == 0x200000,
+           ".text does not start at 0x200000")
 
     /* Early boot scratch: PML4/PDPT/PD, the 64-bit GDT and its pseudo-
        descriptor, the saved hvm_start_info pointer, and the boot stack.

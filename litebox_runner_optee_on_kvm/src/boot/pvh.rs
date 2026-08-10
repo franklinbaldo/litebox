@@ -29,8 +29,20 @@ use super::{BootInfo, KERNEL_OFFSET, MAX_FIRMWARE_RESERVED, MAX_RAM_REGIONS, Ran
 /// Physical address of [`_start`].
 ///
 /// The linker script places `.text` at `0x200000` and `KEEP`s `.text._start`
-/// as its first input section, so `_start` is guaranteed to sit exactly here.
-/// The build is verified against `nm` rather than trusting this by inspection.
+/// as its first input section, so `_start` sits exactly here.
+///
+/// That is enforced, not assumed. `x86_64_kvm.ld` ends with
+/// `ASSERT(_start == 0x200000, ...)`, so a change that moved the entry point --
+/// an input section reordered ahead of it, the `KEEP` dropped, the origin
+/// edited -- fails the *link* rather than producing an image QEMU enters at the
+/// wrong address, in 32-bit mode, with nothing on the serial port to say why.
+/// The linker is the right place for it: it is where the address is decided,
+/// and `nm` could only report the answer after the fact.
+///
+/// `build.rs` is the other half. The linker script is not a Rust source file,
+/// so cargo does not track it; without a `rerun-if-changed` for it, editing the
+/// script and rebuilding relinked nothing and the assertion was never
+/// re-evaluated.
 const PVH_ENTRY_ADDR: u32 = 0x0020_0000;
 
 /// `XEN_ELFNOTE_PHYS32_ENTRY`: the note type QEMU looks for to select PVH.
