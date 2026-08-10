@@ -33,16 +33,40 @@ SECTIONS
         KEEP(*(.note .note.*))
     }
 
-    .data : ALIGN(0x200000) { 
-        _data_start = .;
+    /* Read-only data, in its own output section so that it can be given its
+       own page permissions.
+
+       This used to be folded into .data. That put `.rodata` -- and, far worse,
+       the exception table -- inside the RW PT_LOAD, and `init_platform` maps
+       everything outside `.text` writable, so `__start_ex_table` was writable
+       at runtime. The exception table is what `read_u64_fallible` and friends
+       consult to decide where to resume after a fault, so a writable one is a
+       control-flow-redirect primitive: anything that can write a few bytes at a
+       known address can choose where the next recovered fault lands.
+
+       Aligned to whole pages at both ends. Page permissions have page
+       granularity, so a tail sharing its page with `.data` would either leave
+       part of the table writable or make part of `.data` read-only, and both
+       are silent. `protect_rodata` in src/main.rs asserts the alignment rather
+       than rounding, so if this is ever removed the guest says so. */
+    . = ALIGN(0x1000);
+    .rodata : ALIGN(0x1000) {
+        _rodata_start = .;
         *(.rodata .rodata.*)
-        *(.data .data.*)
 
         /* Exception table for fallible memory operations (memcpy_fallible, etc.) */
         . = ALIGN(4);
         __start_ex_table = .;
         KEEP(*(ex_table))
         __stop_ex_table = .;
+
+        . = ALIGN(0x1000);
+        _rodata_end = .;
+    }
+
+    .data : ALIGN(0x200000) { 
+        _data_start = .;
+        *(.data .data.*)
 
         _data_end = .;
 

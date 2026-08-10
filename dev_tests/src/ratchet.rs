@@ -46,12 +46,13 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_lvbs/", 28),
             ("litebox_platform_multiplex/", 1),
             ("litebox_platform_windows_userland/", 8),
-            // Linker symbols (_text_start/_end, _rela_start/_end, _memory_base,
+            // Linker symbols (_text_start/_end, _rodata_start/_end,
+            // __start/__stop_ex_table, _rela_start/_end, _memory_base,
             // _heap_start) that must be statics to be addressable at all, the
             // embedded ldelf/TA used by the no-device path, the boot-time
             // probes, the PVH note, the logger, and the virtio MMIO window
             // bump-pointer.
-            ("litebox_runner_optee_on_kvm/", 16),
+            ("litebox_runner_optee_on_kvm/", 20),
             ("litebox_runner_lvbs/", 6),
             ("litebox_runner_snp/", 2),
             ("litebox_shim_linux/", 1),

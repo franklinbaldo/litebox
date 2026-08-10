@@ -315,6 +315,7 @@ extern "C" fn kernel_main(usable: u64, ram_end_pa: u64, mapped_limit: u64) -> ! 
     check_address_space();
     check_data_access();
     check_text_is_read_only();
+    check_rodata_is_read_only();
 
     // Enumerate the PCI bus, parse the virtio capability structures of
     // anything found, and -- if there is a modern virtio device -- map its
@@ -668,6 +669,58 @@ impl core::fmt::Display for Translation {
             if self.pte & PTE_USER != 0 { "U" } else { "s" },
         )
     }
+}
+
+/// The `.rodata` section's bounds, as virtual addresses.
+///
+/// The section holds constants and, more importantly, the exception table.
+/// Page-aligned at both ends by `x86_64_kvm.ld`, which is what lets
+/// [`protect_rodata`] give it page permissions of its own without touching
+/// `.data`.
+fn rodata_va_range() -> (u64, u64) {
+    unsafe extern "C" {
+        static _rodata_start: u8;
+        static _rodata_end: u8;
+    }
+
+    let start: u64;
+    let end: u64;
+    // SAFETY: as `text_va_range`.
+    unsafe {
+        core::arch::asm!(
+            "lea {s}, [rip + _rodata_start]",
+            "lea {e}, [rip + _rodata_end]",
+            s = out(reg) start,
+            e = out(reg) end,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    (start, end)
+}
+
+/// The exception table's bounds, as virtual addresses.
+///
+/// Read only to prove it lies inside the range [`protect_rodata`] made
+/// read-only. Nothing here consults the table; the fault handler does.
+fn ex_table_va_range() -> (u64, u64) {
+    unsafe extern "C" {
+        static __start_ex_table: u8;
+        static __stop_ex_table: u8;
+    }
+
+    let start: u64;
+    let end: u64;
+    // SAFETY: as `text_va_range`.
+    unsafe {
+        core::arch::asm!(
+            "lea {s}, [rip + __start_ex_table]",
+            "lea {e}, [rip + __stop_ex_table]",
+            s = out(reg) start,
+            e = out(reg) end,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    (start, end)
 }
 
 /// Reads CR3.
@@ -1034,7 +1087,116 @@ fn init_platform(ram_end_pa: u64) -> &'static Platform {
     litebox_platform_lvbs::set_platform_low(platform);
     log::info!("platform   registered with the multiplexer");
 
+    // Last, because it takes away a permission everything above still had.
+    protect_rodata();
+
     platform
+}
+
+/// Makes `.rodata` -- and with it the exception table -- read-only and NX.
+///
+/// # Why this is not `Platform::new`'s job
+///
+/// `map_phys_frame_range` takes one list of executable physical ranges and
+/// derives two permissions from it: inside the list, executable and not
+/// writable; outside it, writable and NX. There is no third category, and
+/// adding one would change a signature shared with the LVBS runner, which is
+/// gated byte-for-byte. `.rodata` is the third category, and it belongs to this
+/// runner, so the permission is applied here, straight into the tables the
+/// platform has just loaded.
+///
+/// # Why it is worth doing
+///
+/// Everything outside `.text` was writable, and `.rodata` was folded into
+/// `.data`, so `__start_ex_table` sat inside the RW `PT_LOAD` and our own page
+/// tables mapped it `[WNs]`. The exception table is what the page-fault handler
+/// consults to decide where execution resumes after a recovered fault: each
+/// entry pairs a faulting address with a fixup address. A writable one is
+/// therefore a control-flow-redirect primitive -- anything able to write a few
+/// bytes at a known address gets to choose where the next recovered fault
+/// lands, and recovered faults are exactly what `read_u64_fallible` and the
+/// user-memory copy helpers produce on every bad pointer a TA hands in.
+///
+/// Constants are the smaller half of the same argument: a `static` the compiler
+/// is entitled to assume never changes should not be writable.
+///
+/// # Panics
+///
+/// Panics if the range is not page-aligned, or if any page in it is not mapped
+/// with a 4 KiB leaf. Both are statements about the linker script and about
+/// `Platform::new`, and silently rounding either away would leave part of the
+/// table writable without saying so.
+fn protect_rodata() {
+    let (start, end) = rodata_va_range();
+    assert!(
+        start.is_multiple_of(4096) && end.is_multiple_of(4096),
+        ".rodata va {start:#018X}..{end:#018X} is not page-aligned; \
+         x86_64_kvm.ld must align both ends"
+    );
+    assert!(end > start, ".rodata is empty");
+
+    let cr3 = read_cr3() & PTE_ADDR_MASK;
+    let mut pages = 0_u64;
+    let mut va = start;
+    while va < end {
+        // Walk to the leaf's *containing table* rather than using `walk`,
+        // which reports the translation but not where the entry lives.
+        let mut table = cr3;
+        for level in (2..=4_u32).rev() {
+            let index = (va >> (12 + 9 * (level - 1))) & 0x1FF;
+            // SAFETY: `table` is CR3 or a physical address taken from a present
+            // non-leaf entry, so it is a real frame in RAM mapped through the
+            // `KERNEL_OFFSET` alias; `index` is masked into range.
+            let entry =
+                unsafe { ((table + KERNEL_OFFSET + index * 8) as *const u64).read_volatile() };
+            assert!(
+                entry & PTE_PRESENT != 0,
+                ".rodata va {va:#018X} is unmapped at level {level}"
+            );
+            assert!(
+                entry & PTE_HUGE == 0,
+                ".rodata va {va:#018X} is covered by a huge page at level {level}, so it \
+                 cannot be protected without also protecting its neighbours"
+            );
+            table = entry & PTE_ADDR_MASK;
+        }
+
+        let index = (va >> 12) & 0x1FF;
+        let entry_va = (table + KERNEL_OFFSET + index * 8) as *mut u64;
+        // SAFETY: `table` is the level-1 frame reached above and `index` is
+        // masked into it, so this names a live leaf entry, reachable read/write
+        // through the `KERNEL_OFFSET` alias.
+        unsafe {
+            let entry = entry_va.read_volatile();
+            assert!(
+                entry & PTE_PRESENT != 0,
+                ".rodata va {va:#018X} has no leaf entry"
+            );
+            entry_va.write_volatile((entry & !PTE_WRITABLE) | PTE_NO_EXECUTE);
+        }
+        // The permission has been *reduced*, so a stale TLB entry would keep
+        // the page writable. Unlike the MMIO window's invalidations this one is
+        // load-bearing.
+        //
+        // SAFETY: `invlpg` only discards a translation.
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+        }
+
+        pages += 1;
+        va += 4096;
+    }
+
+    let (ex_start, ex_end) = ex_table_va_range();
+    assert!(
+        ex_start >= start && ex_end <= end,
+        "the exception table {ex_start:#018X}..{ex_end:#018X} is not inside .rodata \
+         {start:#018X}..{end:#018X}, so it has not been protected"
+    );
+    log::info!(
+        "rodata     va {start:#018X}..{end:#018X} ({pages} pages) now read-only and NX; \
+         ex_table {ex_start:#018X}..{ex_end:#018X} is inside it"
+    );
 }
 
 /// Walks the *new* tables for the same addresses [`init_platform`] checked,
@@ -1173,6 +1335,64 @@ fn check_text_is_read_only() {
         target as u64
     );
     log::info!("wx         .text write faulted and recovered as expected");
+}
+
+/// Proves the exception table is read-only: a supervisor write to it faults.
+///
+/// This is [`check_text_is_read_only`] aimed at the other read-only region, and
+/// it uses the same exception-table recovery -- which makes it faintly circular
+/// and entirely appropriate: the thing being protected is the mechanism doing
+/// the recovering, so a successful run is the table proving its own
+/// immutability and then still working.
+///
+/// The probe address is `__start_ex_table` itself rather than an arbitrary
+/// `.rodata` byte, because that is the address the finding named. `.rodata` and
+/// the table share a section and a set of page permissions, so protecting the
+/// table protects the constants too, but the reverse is what needs
+/// demonstrating.
+///
+/// The `host_kvm` fault handler prints CR2, the error code and the faulting RIP
+/// on the recovery path; those three lines are the evidence. The error code is
+/// expected to be `0x3`: present (bit 0) and write (bit 1), with the
+/// user (bit 2) and instruction-fetch (bit 4) bits clear. `0x2` -- write to a
+/// *non-present* page -- would mean the probe missed the mapping rather than
+/// hitting a read-only one.
+fn check_rodata_is_read_only() {
+    let (rodata_start, rodata_end) = rodata_va_range();
+    let (ex_start, _) = ex_table_va_range();
+
+    let t = walk(ex_start).expect("the exception table is unmapped");
+    log::info!(
+        "rodata     ex_table va {ex_start:#018X} -> {t} (.rodata {rodata_start:#018X}..\
+         {rodata_end:#018X})"
+    );
+    assert!(
+        t.pte & PTE_WRITABLE == 0,
+        "the exception table at {ex_start:#018X} is writable: a fixup table anything can \
+         write is a control-flow-redirect primitive"
+    );
+    assert!(
+        t.pte & PTE_NO_EXECUTE != 0,
+        "the exception table at {ex_start:#018X} is executable"
+    );
+
+    let target = ex_start as *mut u8;
+    log::info!(
+        "rodata     writing to the exception table at {:#018X}...",
+        target as u64
+    );
+    // SAFETY: the write is expected to fault, and `write_u8_fallible` registers
+    // it in `.ex_table` so the fault is recovered rather than propagating. The
+    // byte written is the one already there, so even the failure case -- the
+    // write succeeding -- leaves the table unchanged.
+    let existing = unsafe { core::ptr::read_volatile(target) };
+    let result = unsafe { litebox::mm::exception_table::write_u8_fallible(target, existing) };
+    assert!(
+        result.is_err(),
+        "a write to the exception table at {:#018X} succeeded: the fixup table is writable",
+        target as u64
+    );
+    log::info!("rodata     ex_table write faulted and recovered as expected");
 }
 
 /// Address of the [`check_nx_is_enforced`] probe page, or 0 before it is
