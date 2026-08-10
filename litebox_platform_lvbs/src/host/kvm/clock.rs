@@ -409,11 +409,44 @@ const PIT_MODE0_CHANNEL2: u8 = 0b1011_0000;
 /// = 54.9 ms, which keeps the relative cost of the sampling overhead low.
 const PIT_CALIBRATION_COUNT: u16 = 0xFFFF;
 
-/// Upper bound on spins waiting for the PIT to reach terminal count.
+/// Wall-clock budget for the wait, in milliseconds, before the PIT is
+/// declared absent.
 ///
-/// Generous enough never to trip on a working PIT, but bounded so a machine
-/// with no PIT at all falls through to the panic instead of hanging forever.
-const PIT_WAIT_SPINS: u64 = 1_000_000_000;
+/// Generously above the 54.9 ms interval a working PIT actually needs, and far
+/// below the point where a boot looks hung.
+const PIT_WAIT_BUDGET_MILLIS: u64 = 500;
+
+/// Upper bound on the wait for the PIT to reach terminal count, in TSC cycles.
+///
+/// The wait must be bounded: a guest with no PIT never toggles the gate bit,
+/// and each poll of it is a port read, which is *one VM exit*. The previous
+/// bound was an iteration count of 10^9, which at 1-2 us per exit is a 16-33
+/// minute hang against a nominal interval of 54.9 ms.
+///
+/// Bounding it in time instead is awkward here because this *is* the TSC
+/// calibration: `crate::Instant` does not exist yet, so there is no clock to
+/// ask. What is available is a raw `rdtsc` delta plus the one thing already
+/// known about the TSC without calibrating it -- [`MAX_PLAUSIBLE_HZ`], the
+/// ceiling above which any discovered frequency is rejected anyway. If the TSC
+/// cannot tick faster than that, then `N` seconds cannot be more than
+/// `N * MAX_PLAUSIBLE_HZ` cycles, so that product is a sound over-estimate of
+/// the cycles in `N` seconds *whatever the real frequency turns out to be*.
+///
+/// That over-estimate is deliberately in the safe direction. It guarantees the
+/// wait never expires early on a working PIT: on the fastest TSC this code
+/// would accept (100 GHz), the budget is a real half second, still nine times
+/// the 54.9 ms the PIT needs. The cost is that on a slower TSC the same cycle
+/// count is more wall-clock time -- at a typical 2.5 GHz it is about 20
+/// seconds. That is a 50-100x improvement on the old worst case and is plainly
+/// a failure rather than a hang, which is what matters: on expiry
+/// `pit_gated_interval` returns `None` and `discover` moves on. A missing PIT
+/// is not exotic -- QEMU's `microvm` machine has none.
+///
+/// A TSC that does not advance at all would still spin forever, but that is
+/// not a case this module can survive in any form: `rdtsc` is architecturally
+/// guaranteed to advance, and a TSC that did not would leave every source here
+/// with nothing to report.
+const PIT_WAIT_CYCLE_BUDGET: u64 = PIT_WAIT_BUDGET_MILLIS * (MAX_PLAUSIBLE_HZ / 1_000);
 
 #[inline]
 fn inb(port: u16) -> u8 {
@@ -443,7 +476,10 @@ fn outb(port: u16, value: u8) {
 /// so the interval can be started and observed without any interrupt
 /// plumbing -- which matters here, as there is no IDT yet.
 ///
-/// Returns `None` if the PIT never reaches terminal count.
+/// Returns `None` if the PIT does not reach terminal count within
+/// [`PIT_WAIT_CYCLE_BUDGET`], which is how a guest with no PIT at all (QEMU's
+/// `microvm`, for one) presents. Falling through to the next source is the
+/// right response, so this does not panic.
 fn pit_gated_interval() -> Option<(u64, u64)> {
     // Speaker off, gate low: channel 2 is held reset while it is programmed.
     let gate_base = (inb(PIT_GATE_PORT) & !PIT_SPEAKER_ENABLE) & !PIT_GATE_ENABLE;
@@ -460,9 +496,20 @@ fn pit_gated_interval() -> Option<(u64, u64)> {
     let start = read_tsc();
 
     let mut reached_terminal_count = false;
-    for _ in 0..PIT_WAIT_SPINS {
+    loop {
         if inb(PIT_GATE_PORT) & PIT_CHANNEL2_OUTPUT != 0 {
             reached_terminal_count = true;
+            break;
+        }
+        // `wrapping_sub` rather than a precomputed deadline so the check is
+        // correct even if the TSC is close enough to wrapping that `start +
+        // budget` would not be. No `lfence` here: this bounds a timeout rather
+        // than measuring an interval, so speculation of a few tens of cycles
+        // either way is irrelevant, and the port read above is a VM exit that
+        // dwarfs the `rdtsc` regardless.
+        //
+        // SAFETY: `rdtsc` only reads a counter; see `read_tsc`.
+        if unsafe { _rdtsc() }.wrapping_sub(start) > PIT_WAIT_CYCLE_BUDGET {
             break;
         }
     }
