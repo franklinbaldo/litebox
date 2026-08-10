@@ -28,7 +28,7 @@ info()  { echo -e "${GREEN}${BOLD}[+]${RESET} $1" 1>&2; }
 
 # The guest ends by writing to `isa-debug-exit`, which QEMU turns into the
 # process status `(value << 1) | 1`. The runner writes 0x10 on success and
-# 0x20 on failure; see `debug_exit` in litebox_platform_lvbs/src/host/kvm_impl.rs.
+# 0x20 on failure; see `debug_exit` in litebox_platform_lvbs/src/host/kvm/mod.rs.
 EXIT_SUCCESS=33
 EXIT_GUEST_FAILURE=65
 EXIT_TIMEOUT=124

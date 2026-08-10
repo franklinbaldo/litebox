@@ -53,8 +53,9 @@ static LDELF: &[u8] =
 
 /// The TA the no-device path runs. `hello-ta` is the simplest one in the tree.
 ///
-/// The other four TAs are deliberately *not* embedded. Together they are about
-/// 4.8 MB (`kmpp-ta.elf` alone is 2.5 MB), and the kernel image shares an
+/// The other three TAs the channel tests drive -- `aes-ta`, `random-ta` and
+/// `kmpp-ta` -- are deliberately *not* embedded. Together they are about
+/// 3.4 MB (`kmpp-ta.elf` alone is 2.5 MB), and the kernel image shares an
 /// address space with the boot scratch region, so embedding a TA per test
 /// would grow the image by more than the whole rest of the runner. They arrive
 /// over the channel instead.

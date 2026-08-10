@@ -47,7 +47,7 @@ default = ["host_lvbs"]
 #
 # The rest of what looks like an LVBS crypto stack -- `sha2`, `digest`,
 # `rand_chacha`, `rand_core`, `zeroize` -- is *not* optional: Task 5's ChaCha20
-# CRNG in `host/kvm_impl.rs` uses every one of them.
+# CRNG in `host/kvm/mod.rs` uses every one of them.
 host_lvbs = ["dep:litebox_common_lvbs", "dep:modular-bitfield"]
 # Plain KVM/QEMU guest. LiteBox is the whole kernel; there is no hypervisor
 # to call and no VTL0 peer to protect against.

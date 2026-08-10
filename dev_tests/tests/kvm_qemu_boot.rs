@@ -621,9 +621,9 @@ fn many_open_close_cycles_do_not_exhaust_the_guest() {
 }
 
 // ---------------------------------------------------------------------------
-// The five TAs, mirroring `litebox_runner_optee_on_linux_userland/tests/run.rs`.
+// The four TAs, mirroring `litebox_runner_optee_on_linux_userland/tests/run.rs`.
 //
-// Same five binaries, same five command sequences, read from the same
+// Same four binaries, same four command sequences, read from the same
 // directory -- but *unrewritten*, and driven over the channel rather than
 // in-process. The verification standard is the userland runner's: the client
 // raises, and `run.sh` exits non-zero, if any command comes back with a
