@@ -78,17 +78,38 @@ pub fn enable_fsgsbase() {
 /// Panicking instead is safe here and strictly better: the panic handler
 /// writes to COM1 and exits through `isa-debug-exit` without needing an IDT.
 ///
+/// The maximum-leaf check before leaf `0x07` is load-bearing for the same
+/// reason. CPUID does *not* return zero for an unsupported leaf: it returns
+/// the highest supported leaf's data. On a CPU whose maximum standard leaf is
+/// below 7, `cpuid(0x07)` therefore yields some other leaf's contents, and if
+/// bit 0 of that `EBX` happens to be set the assertion passes, `CR4.FSGSBASE`
+/// is written anyway, and the `#GP` triple-faults with no output at all --
+/// precisely the failure this assertion exists to prevent. `host/kvm/clock.rs`
+/// documents the same hazard at length and guards every leaf it reads.
+///
 /// # Panics
 ///
-/// Panics if CPUID does not advertise FSGSBASE.
+/// Panics if CPUID does not advertise FSGSBASE, including when leaf `0x07` is
+/// out of range and so cannot advertise anything.
 #[cfg(feature = "host_kvm")]
 #[inline]
 pub fn enable_fsgsbase() {
-    // CPUID.07h:EBX bit 0 = FSGSBASE
-    let structured_features = cpuid_count(0x07, 0);
+    /// CPUID leaf 0: `EAX` is the highest supported standard leaf.
+    const MAX_STANDARD_LEAF: u32 = 0;
+    /// Structured extended feature leaf, where FSGSBASE is advertised.
+    const STRUCTURED_FEATURES_LEAF: u32 = 0x07;
+
+    // Leaf 0x07 is only meaningful if it is in range; out of range it aliases
+    // to another leaf's data rather than reading zero. See above.
+    let max_standard_leaf = cpuid_count(MAX_STANDARD_LEAF, 0).eax;
+    let fsgsbase = max_standard_leaf >= STRUCTURED_FEATURES_LEAF
+        // CPUID.07h:EBX bit 0 = FSGSBASE
+        && cpuid_count(STRUCTURED_FEATURES_LEAF, 0).ebx & (1 << 0) != 0;
+
     assert!(
-        structured_features.ebx & (1 << 0) != 0,
-        "CPU does not support FSGSBASE (CPUID.07:EBX bit 0 clear); \
+        fsgsbase,
+        "CPU does not support FSGSBASE (max standard CPUID leaf {max_standard_leaf:#x}, \
+         CPUID.07:EBX bit 0 clear or leaf 0x07 out of range); \
          pass `-cpu max` to QEMU (or `-cpu host` under KVM)"
     );
 
@@ -170,6 +191,15 @@ pub fn enable_extended_states() {
 pub fn enable_extended_states() {
     // CPUID.01h:ECX bit 26 = XSAVE. Checked before CR4.OSXSAVE, and before the
     // XCR0 access below, which #UDs without OSXSAVE.
+    //
+    // No maximum-leaf guard, unlike `enable_fsgsbase`'s leaf 0x07. The
+    // out-of-range aliasing hazard needs the leaf to be out of range, and leaf
+    // 1 cannot be: it carries the family/model/stepping and the feature bits
+    // that every x86_64 CPU must report, so `CPUID.0:EAX` is at least 1 on
+    // anything that implements CPUID at all -- and reaching this code means we
+    // are executing in long mode, which is itself only enterable on a CPU that
+    // enumerates leaf 0x8000_0001. Measured under `qemu -cpu max`:
+    // `CPUID.0:EAX` = 0xd.
     let features = cpuid_count(0x01, 0);
     assert!(
         features.ecx & (1 << 26) != 0,
