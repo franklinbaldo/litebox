@@ -2,27 +2,48 @@
 // Licensed under the MIT license.
 
 use std::error::Error;
-use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{Error as IoError, Result as IoResult};
+use std::os::unix::net::UnixListener;
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
     Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_transport::channel::HostReceive;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
+    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 
-use super::AllowedTcpDestination;
+use super::{
+    AllowedTcpDestination, HostAssociationShutdown, HostRequestSource, HostResponseSink,
+    SETUP_TIMEOUT,
+};
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+impl HostRequestSource for UnixControlRingHostRequestSource {
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        Self::recv_request(self)
+    }
+}
+
+impl HostResponseSink for UnixControlRingHostResponseSink {
+    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+        Self::send_response(self, response)
+    }
+}
+
+impl HostAssociationShutdown for UnixControlRingHostShutdown {
+    fn shutdown(&self) -> IoResult<()> {
+        Self::shutdown(self)
+    }
+}
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let socket_dir = tempfile::Builder::new()
@@ -93,13 +114,10 @@ fn serve_runner(
     runner_process_id: u32,
 ) -> Result<(), Box<dyn Error>> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = accept_runner_stream(
-        control_listener,
-        runner,
-        runner_process_id,
-        setup_deadline,
-        "control",
-    )?;
+    let control_stream = crate::accept_runner_channel(runner, setup_deadline, "control", || {
+        control_listener.accept().map(|(stream, _)| stream)
+    })?;
+    validate_peer_process(&control_stream, runner_process_id)?;
     let control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     crate::serve_runner(
@@ -113,40 +131,6 @@ fn serve_runner(
         },
         UnixStreamHostSetupChannel::into_active,
     )
-}
-
-fn accept_runner_stream(
-    listener: &UnixListener,
-    runner: &mut Child,
-    runner_process_id: u32,
-    deadline: Instant,
-    channel_name: &'static str,
-) -> IoResult<UnixStream> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(IoError::new(
-                ErrorKind::TimedOut,
-                format!("timed out waiting for runner {channel_name} channel"),
-            ));
-        }
-        if let Some(status) = runner.try_wait()? {
-            return Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                format!("runner exited with {status} before connecting its {channel_name} channel"),
-            ));
-        }
-
-        match listener.accept() {
-            Ok((stream, _)) => {
-                validate_peer_process(&stream, runner_process_id)?;
-                return Ok(stream);
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
-    }
 }
 
 #[cfg(test)]

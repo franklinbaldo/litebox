@@ -6,12 +6,14 @@ use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::process::Child;
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{BrokerCore, DestinationPortRange, Ipv4Cidr};
@@ -32,22 +34,8 @@ mod windows;
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const WORKER_COUNT: usize = 8;
-
-#[derive(Parser, Debug)]
-struct CliArgs {
-    /// Permit outbound TCP connections to a destination CIDR and port range.
-    ///
-    /// May be repeated. Supplying any rule replaces the default loopback-only policy.
-    /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
-    #[arg(long, value_name = "CIDR:PORT[-PORT]")]
-    allow_tcp_destination: Vec<AllowedTcpDestination>,
-    /// Local runner executable to launch.
-    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
-    runner: PathBuf,
-    /// Arguments to pass to the local runner.
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
-    runner_arguments: Vec<OsString>,
-}
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedTcpDestination {
@@ -90,6 +78,22 @@ impl FromStr for AllowedTcpDestination {
 
         Ok(Self { destination, ports })
     }
+}
+
+#[derive(Parser, Debug)]
+struct CliArgs {
+    /// Permit outbound TCP connections to a destination CIDR and port range.
+    ///
+    /// May be repeated. Supplying any rule replaces the default loopback-only policy.
+    /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
+    #[arg(long, value_name = "CIDR:PORT[-PORT]")]
+    allow_tcp_destination: Vec<AllowedTcpDestination>,
+    /// Local runner executable to launch.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
+    runner: PathBuf,
+    /// Arguments to pass to the local runner.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    runner_arguments: Vec<OsString>,
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
@@ -159,6 +163,35 @@ where
     Ok(())
 }
 
+fn accept_runner_channel<Channel>(
+    runner: &mut Child,
+    deadline: Instant,
+    channel_name: &'static str,
+    mut try_accept: impl FnMut() -> IoResult<Channel>,
+) -> IoResult<Channel> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                format!("timed out waiting for runner {channel_name} channel"),
+            ));
+        }
+        if let Some(status) = runner.try_wait()? {
+            return Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                format!("runner exited with {status} before connecting its {channel_name} channel"),
+            ));
+        }
+        match try_accept() {
+            Ok(channel) => return Ok(channel),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+    }
+}
+
 trait HostRequestSource {
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>>;
 }
@@ -169,68 +202,6 @@ trait HostResponseSink {
 
 trait HostAssociationShutdown {
     fn shutdown(&self) -> IoResult<()>;
-}
-
-#[cfg(target_os = "linux")]
-mod platform {
-    use litebox_broker_transport_linux_userland::unix_socket::{
-        UnixControlRingHostRequestSource, UnixControlRingHostResponseSink,
-        UnixControlRingHostShutdown,
-    };
-
-    use super::{
-        BrokerRequest, BrokerResponse, HostAssociationShutdown, HostReceive, HostRequestSource,
-        HostResponseSink, IoResult,
-    };
-
-    impl HostRequestSource for UnixControlRingHostRequestSource {
-        fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-            Self::recv_request(self)
-        }
-    }
-
-    impl HostResponseSink for UnixControlRingHostResponseSink {
-        fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
-            Self::send_response(self, response)
-        }
-    }
-
-    impl HostAssociationShutdown for UnixControlRingHostShutdown {
-        fn shutdown(&self) -> IoResult<()> {
-            Self::shutdown(self)
-        }
-    }
-}
-
-#[cfg(all(windows, target_arch = "x86_64"))]
-mod platform {
-    use litebox_broker_transport_windows_userland::control_ring::{
-        WindowsControlRingHostRequestSource, WindowsControlRingHostResponseSink,
-        WindowsControlRingHostShutdown,
-    };
-
-    use super::{
-        BrokerRequest, BrokerResponse, HostAssociationShutdown, HostReceive, HostRequestSource,
-        HostResponseSink, IoResult,
-    };
-
-    impl HostRequestSource for WindowsControlRingHostRequestSource {
-        fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-            Self::recv_request(self)
-        }
-    }
-
-    impl HostResponseSink for WindowsControlRingHostResponseSink {
-        fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
-            Self::send_response(self, response)
-        }
-    }
-
-    impl HostAssociationShutdown for WindowsControlRingHostShutdown {
-        fn shutdown(&self) -> IoResult<()> {
-            Self::shutdown(self)
-        }
-    }
 }
 
 /// Records the first failure of an association and ends its transport.

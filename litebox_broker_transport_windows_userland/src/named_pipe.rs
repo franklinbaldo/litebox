@@ -18,11 +18,13 @@ use litebox_broker_transport::channel::{
     HostReceive, HostSetupChannel, LocalSetupChannel, PeerCredential,
 };
 use litebox_broker_transport::control_ring::ControlRing;
-use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE,
-    PIPE_TYPE_BYTE, PIPE_WAIT,
+    PIPE_TYPE_BYTE, PIPE_WAIT, SetNamedPipeHandleState,
 };
 
 use crate::setup::{invalid_data, read_frame, wire_error, write_frame};
@@ -53,13 +55,16 @@ impl WindowsNamedPipeListener {
     /// Creates one duplex byte-mode named-pipe instance.
     pub fn bind(name: &OsStr) -> IoResult<Self> {
         let name = wide_string(name)?;
-        // SAFETY: `name` is NUL-terminated. The pipe is synchronous, byte-mode, and uses the
-        // process token's default security descriptor until the deployment supplies a tighter ACL.
+        // SAFETY: `name` is NUL-terminated. The pipe is synchronous, byte-mode, initially
+        // nonblocking for bounded accept, and uses the process token's default security descriptor
+        // until the deployment supplies a tighter ACL.
         let handle = unsafe {
             CreateNamedPipeW(
                 name.as_ptr(),
                 PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                PIPE_TYPE_BYTE
+                    | PIPE_READMODE_BYTE
+                    | windows_sys::Win32::System::Pipes::PIPE_NOWAIT,
                 1,
                 64 * 1024,
                 64 * 1024,
@@ -77,21 +82,43 @@ impl WindowsNamedPipeListener {
         })
     }
 
-    fn accept(mut self, expected_process_id: u32) -> IoResult<File> {
-        let stream = self
-            .stream
-            .take()
-            .expect("named-pipe listener can only accept once");
-        let handle = file_handle(&stream);
-        // SAFETY: `handle` names a listening named-pipe instance and no OVERLAPPED is used.
+    /// Tries to accept one client without blocking.
+    pub fn try_accept(&mut self) -> IoResult<File> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "named-pipe client already accepted",
+            )
+        })?;
+        let handle = file_handle(stream);
+        // SAFETY: `handle` names a synchronous, nonblocking listening named-pipe instance.
         if unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } == 0 {
             let error = Error::last_os_error();
-            if error.raw_os_error() != Some(ERROR_PIPE_CONNECTED.cast_signed()) {
-                return Err(error);
+            match error.raw_os_error() {
+                Some(code) if code == ERROR_PIPE_CONNECTED.cast_signed() => {}
+                Some(code) if code == ERROR_PIPE_LISTENING.cast_signed() => {
+                    return Err(Error::new(
+                        ErrorKind::WouldBlock,
+                        "named-pipe listener has no pending client",
+                    ));
+                }
+                _ => return Err(error),
             }
         }
-        validate_client_process(handle, expected_process_id)?;
-        Ok(stream)
+        let mode = PIPE_READMODE_BYTE | PIPE_WAIT;
+        // SAFETY: `handle` names the connected server pipe and `mode` remains live for the call.
+        if unsafe {
+            SetNamedPipeHandleState(handle, &raw const mode, std::ptr::null(), std::ptr::null())
+        } == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        self.stream.take().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "named-pipe client already accepted",
+            )
+        })
     }
 }
 
@@ -150,16 +177,13 @@ impl WindowsNamedPipeLocalSetupChannel {
 }
 
 impl WindowsNamedPipeHostSetupChannel {
-    /// Accepts and authenticates the expected runner process.
-    pub fn accept_host_guaranteed(
-        listener: WindowsNamedPipeListener,
-        expected_process_id: u32,
-    ) -> IoResult<Self> {
-        Ok(Self {
-            stream: listener.accept(expected_process_id)?,
+    /// Creates a host setup channel after the deployment has authenticated the client.
+    pub const fn from_host_guaranteed(stream: File) -> Self {
+        Self {
+            stream,
             peer_credential: PeerCredential::HostGuaranteed,
             negotiated: false,
-        })
+        }
     }
 
     /// Duplicates one shared-memory object into the runner and sends its handle values.
@@ -230,10 +254,11 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
     }
 }
 
-fn validate_client_process(pipe: HANDLE, expected_process_id: u32) -> IoResult<()> {
+/// Validates that a connected named-pipe client belongs to `expected_process_id`.
+pub fn validate_client_process(stream: &File, expected_process_id: u32) -> IoResult<()> {
     let mut process_id = 0;
-    // SAFETY: `pipe` is connected and `process_id` is writable.
-    if unsafe { GetNamedPipeClientProcessId(pipe, &raw mut process_id) } == 0 {
+    // SAFETY: `stream` is a connected named pipe and `process_id` is writable.
+    if unsafe { GetNamedPipeClientProcessId(file_handle(stream), &raw mut process_id) } == 0 {
         return Err(Error::last_os_error());
     }
     if process_id != expected_process_id {
@@ -348,16 +373,39 @@ mod tests {
         )
     }
 
+    fn accept_host_guaranteed(
+        mut listener: WindowsNamedPipeListener,
+    ) -> WindowsNamedPipeHostSetupChannel {
+        loop {
+            match listener.try_accept() {
+                Ok(stream) => {
+                    validate_client_process(&stream, unsafe { GetCurrentProcessId() }).unwrap();
+                    return WindowsNamedPipeHostSetupChannel::from_host_guaranteed(stream);
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => panic!("failed to accept named-pipe client: {error}"),
+            }
+            std::thread::sleep(CONNECT_RETRY_DELAY);
+        }
+    }
+
+    #[test]
+    fn accept_without_client_would_block() {
+        let mut listener =
+            WindowsNamedPipeListener::bind(&pipe_name("accept-would-block")).unwrap();
+        let Err(error) = listener.try_accept() else {
+            panic!("accept without a client must not succeed");
+        };
+
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    }
+
     #[test]
     fn setup_negotiates_and_transfers_shared_memory() {
         let name = pipe_name("setup");
         let listener = WindowsNamedPipeListener::bind(&name).unwrap();
         let host = std::thread::spawn(move || {
-            let mut host =
-                WindowsNamedPipeHostSetupChannel::accept_host_guaranteed(listener, unsafe {
-                    GetCurrentProcessId()
-                })
-                .unwrap();
+            let mut host = accept_host_guaranteed(listener);
             assert!(matches!(
                 host.recv_handshake_request().unwrap(),
                 HostReceive::Message(BrokerHandshakeRequest { .. })
@@ -398,11 +446,7 @@ mod tests {
         let (local_ring, host_ring) = control_rings();
         let (messages_received, wait_for_messages) = std::sync::mpsc::sync_channel(0);
         let host = std::thread::spawn(move || {
-            let mut setup = WindowsNamedPipeHostSetupChannel::accept_host_guaranteed(
-                control_listener,
-                unsafe { GetCurrentProcessId() },
-            )
-            .unwrap();
+            let mut setup = accept_host_guaranteed(control_listener);
             assert!(matches!(
                 setup.recv_handshake_request().unwrap(),
                 HostReceive::Message(BrokerHandshakeRequest { .. })
@@ -477,11 +521,7 @@ mod tests {
         let (local_ring, host_ring) = control_rings();
         let (responses_received, wait_for_responses) = std::sync::mpsc::sync_channel(0);
         let host = std::thread::spawn(move || {
-            let mut setup = WindowsNamedPipeHostSetupChannel::accept_host_guaranteed(
-                control_listener,
-                unsafe { GetCurrentProcessId() },
-            )
-            .unwrap();
+            let mut setup = accept_host_guaranteed(control_listener);
             assert!(matches!(
                 setup.recv_handshake_request().unwrap(),
                 HostReceive::Message(BrokerHandshakeRequest { .. })
@@ -552,11 +592,7 @@ mod tests {
         let control_listener = WindowsNamedPipeListener::bind(&control_name).unwrap();
         let (local_ring, host_ring) = control_rings();
         let host = std::thread::spawn(move || {
-            let mut setup = WindowsNamedPipeHostSetupChannel::accept_host_guaranteed(
-                control_listener,
-                unsafe { GetCurrentProcessId() },
-            )
-            .unwrap();
+            let mut setup = accept_host_guaranteed(control_listener);
             assert!(matches!(
                 setup.recv_handshake_request().unwrap(),
                 HostReceive::Message(BrokerHandshakeRequest { .. })
@@ -631,11 +667,7 @@ mod tests {
         let control_listener = WindowsNamedPipeListener::bind(&control_name).unwrap();
         let (local_ring, host_ring) = control_rings();
         let host = std::thread::spawn(move || {
-            let mut setup = WindowsNamedPipeHostSetupChannel::accept_host_guaranteed(
-                control_listener,
-                unsafe { GetCurrentProcessId() },
-            )
-            .unwrap();
+            let mut setup = accept_host_guaranteed(control_listener);
             assert!(matches!(
                 setup.recv_handshake_request().unwrap(),
                 HostReceive::Message(BrokerHandshakeRequest { .. })

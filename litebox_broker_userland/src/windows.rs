@@ -5,17 +5,44 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::time::Instant;
 
 use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
+use litebox_broker_transport::channel::HostReceive;
+use litebox_broker_transport_windows_userland::control_ring::{
+    WindowsControlRingHostRequestSource, WindowsControlRingHostResponseSink,
+    WindowsControlRingHostShutdown,
+};
 use litebox_broker_transport_windows_userland::named_pipe::{
-    WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener,
+    WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
+
+use super::{HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT};
+
+impl HostRequestSource for WindowsControlRingHostRequestSource {
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        Self::recv_request(self)
+    }
+}
+
+impl HostResponseSink for WindowsControlRingHostResponseSink {
+    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+        Self::send_response(self, response)
+    }
+}
+
+impl HostAssociationShutdown for WindowsControlRingHostShutdown {
+    fn shutdown(&self) -> IoResult<()> {
+        Self::shutdown(self)
+    }
+}
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     if !args.allow_tcp_destination.is_empty() {
@@ -39,7 +66,8 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         .args(&args.runner_arguments)
         .spawn()?;
     let runner_process_id = runner.id();
-    let association_result = serve_runner(&broker, control_listener, &runner, runner_process_id);
+    let association_result =
+        serve_runner(&broker, control_listener, &mut runner, runner_process_id);
     if association_result.is_err() {
         let _ = runner.kill();
     }
@@ -53,14 +81,16 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
 
 fn serve_runner(
     broker: &BrokerCore,
-    control_listener: WindowsNamedPipeListener,
-    runner: &Child,
+    mut control_listener: WindowsNamedPipeListener,
+    runner: &mut Child,
     runner_process_id: u32,
 ) -> Result<(), Box<dyn Error>> {
-    let control_channel = WindowsNamedPipeHostSetupChannel::accept_host_guaranteed(
-        control_listener,
-        runner_process_id,
-    )?;
+    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    let control_stream = crate::accept_runner_channel(runner, setup_deadline, "control", || {
+        control_listener.try_accept()
+    })?;
+    validate_client_process(&control_stream, runner_process_id)?;
+    let control_channel = WindowsNamedPipeHostSetupChannel::from_host_guaranteed(control_stream);
     let runner_process = runner.as_raw_handle();
     crate::serve_runner(
         broker,
