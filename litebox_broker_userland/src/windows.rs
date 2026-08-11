@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::ffi::OsString;
-use std::io::Error as IoError;
+use std::io::{Error as IoError, ErrorKind};
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -18,6 +18,13 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
+    if !args.allow_tcp_destination.is_empty() {
+        return Err(IoError::new(
+            ErrorKind::Unsupported,
+            "--allow-tcp-destination is not supported on Windows",
+        )
+        .into());
+    }
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let broker = BrokerCore::new(

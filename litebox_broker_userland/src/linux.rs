@@ -3,10 +3,8 @@
 
 use std::error::Error;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,51 +18,11 @@ use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
+
+use super::AllowedTcpDestination;
+
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct AllowedTcpDestination {
-    destination: Ipv4Cidr,
-    ports: DestinationPortRange,
-}
-
-impl FromStr for AllowedTcpDestination {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (cidr, ports) = value
-            .rsplit_once(':')
-            .ok_or_else(|| "expected CIDR:PORT or CIDR:START-END".to_owned())?;
-        let (network, prefix_length) = cidr
-            .split_once('/')
-            .ok_or_else(|| "destination must include an IPv4 CIDR prefix".to_owned())?;
-        let network = network
-            .parse::<Ipv4Addr>()
-            .map_err(|error| format!("invalid IPv4 network: {error}"))?;
-        let prefix_length = prefix_length
-            .parse::<u8>()
-            .map_err(|error| format!("invalid IPv4 prefix length: {error}"))?;
-        let destination =
-            Ipv4Cidr::new(Ipv4Address(network.octets()), prefix_length).ok_or_else(|| {
-                "IPv4 CIDR must have a valid prefix and canonical network address".to_owned()
-            })?;
-
-        let (start, end) = ports
-            .split_once('-')
-            .map_or((ports, ports), |(start, end)| (start, end));
-        let start = start
-            .parse::<u16>()
-            .map_err(|error| format!("invalid TCP port: {error}"))?;
-        let end = end
-            .parse::<u16>()
-            .map_err(|error| format!("invalid TCP port: {error}"))?;
-        let ports = DestinationPortRange::new(Port(start), Port(end))
-            .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
-
-        Ok(Self { destination, ports })
-    }
-}
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let socket_dir = tempfile::Builder::new()
@@ -194,27 +152,6 @@ fn accept_runner_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tcp_destination_argument_parses_canonical_cidr_and_ports() {
-        let allowed = "203.0.113.0/24:443-444"
-            .parse::<AllowedTcpDestination>()
-            .unwrap();
-
-        assert_eq!(
-            allowed,
-            AllowedTcpDestination {
-                destination: Ipv4Cidr::new(Ipv4Address([203, 0, 113, 0]), 24).unwrap(),
-                ports: DestinationPortRange::new(Port(443), Port(444)).unwrap(),
-            }
-        );
-        assert!(
-            "203.0.113.1/24:443"
-                .parse::<AllowedTcpDestination>()
-                .is_err()
-        );
-        assert!("203.0.113.0/24:0".parse::<AllowedTcpDestination>().is_err());
-    }
 
     #[test]
     fn tcp_destination_arguments_replace_the_loopback_default() {

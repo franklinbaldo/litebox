@@ -4,7 +4,9 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
     Arc, Mutex,
@@ -12,10 +14,11 @@ use std::sync::{
 };
 
 use clap::Parser;
-use litebox_broker_core::BrokerCore;
+use litebox_broker_core::{BrokerCore, DestinationPortRange, Ipv4Cidr};
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_protocol::socket::{Ipv4Address, Port};
 use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive, HostSetupChannel};
 use litebox_broker_transport::control_ring::{CONTROL_RING_MEMORY_SIZE, ControlRing};
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
@@ -36,15 +39,57 @@ struct CliArgs {
     ///
     /// May be repeated. Supplying any rule replaces the default loopback-only policy.
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
-    #[cfg(target_os = "linux")]
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
-    allow_tcp_destination: Vec<linux::AllowedTcpDestination>,
+    allow_tcp_destination: Vec<AllowedTcpDestination>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllowedTcpDestination {
+    destination: Ipv4Cidr,
+    ports: DestinationPortRange,
+}
+
+impl FromStr for AllowedTcpDestination {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (cidr, ports) = value
+            .rsplit_once(':')
+            .ok_or_else(|| "expected CIDR:PORT or CIDR:START-END".to_owned())?;
+        let (network, prefix_length) = cidr
+            .split_once('/')
+            .ok_or_else(|| "destination must include an IPv4 CIDR prefix".to_owned())?;
+        let network = network
+            .parse::<Ipv4Addr>()
+            .map_err(|error| format!("invalid IPv4 network: {error}"))?;
+        let prefix_length = prefix_length
+            .parse::<u8>()
+            .map_err(|error| format!("invalid IPv4 prefix length: {error}"))?;
+        let destination =
+            Ipv4Cidr::new(Ipv4Address(network.octets()), prefix_length).ok_or_else(|| {
+                "IPv4 CIDR must have a valid prefix and canonical network address".to_owned()
+            })?;
+
+        let (start, end) = ports
+            .split_once('-')
+            .map_or((ports, ports), |(start, end)| (start, end));
+        let start = start
+            .parse::<u16>()
+            .map_err(|error| format!("invalid TCP port: {error}"))?;
+        let end = end
+            .parse::<u16>()
+            .map_err(|error| format!("invalid TCP port: {error}"))?;
+        let ports = DestinationPortRange::new(Port(start), Port(end))
+            .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
+
+        Ok(Self { destination, ports })
+    }
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
@@ -476,6 +521,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
 fn main() {}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_tcp_destination_argument() {
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--allow-tcp-destination",
+            "127.0.0.0/8:80",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+
+        assert_eq!(args.allow_tcp_destination.len(), 1);
+    }
+
+    #[test]
+    fn tcp_destination_argument_parses_canonical_cidr_and_ports() {
+        let allowed = "203.0.113.0/24:443-444"
+            .parse::<AllowedTcpDestination>()
+            .unwrap();
+
+        assert_eq!(
+            allowed,
+            AllowedTcpDestination {
+                destination: Ipv4Cidr::new(Ipv4Address([203, 0, 113, 0]), 24).unwrap(),
+                ports: DestinationPortRange::new(Port(443), Port(444)).unwrap(),
+            }
+        );
+        assert!(
+            "203.0.113.1/24:443"
+                .parse::<AllowedTcpDestination>()
+                .is_err()
+        );
+        assert!("203.0.113.0/24:0".parse::<AllowedTcpDestination>().is_err());
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
