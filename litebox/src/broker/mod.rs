@@ -5,6 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::net::SocketAddrV4;
 
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
@@ -14,9 +15,10 @@ use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
-    MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags as BrokerReceiveFlags, ReceiveSocketResponse,
-    SendFlags as BrokerSendFlags, ShutdownMode, SocketAddressV4, SocketConnectionStatus,
-    SocketOutcome, SocketStatusResponse,
+    AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
+    ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
+    ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
+    SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -42,11 +44,30 @@ use shared_buffer::{SlotAllocator, SlotLease};
 pub(crate) trait BrokerControl: Send + Sync {
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
+    fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
     fn connect_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+
+    fn bind_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError>;
+
+    fn listen_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError>;
+
+    fn accept_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError>;
 
     fn socket_status(
         &self,
@@ -70,11 +91,38 @@ pub(crate) trait BrokerControl: Send + Sync {
         discard: bool,
     ) -> core::result::Result<SocketOutcome<ReceiveSocketResponse>, BrokerControlError>;
 
+    fn send_to_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: BrokerSendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError>;
+
+    fn receive_from_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: BrokerReceiveFromFlags,
+    ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError>;
+
     fn shutdown_socket(
         &self,
         handle: ObjectHandle,
         mode: ShutdownMode,
     ) -> core::result::Result<SocketOutcome<()>, BrokerControlError>;
+
+    fn set_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        value: TcpOptionValue,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn get_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        name: TcpOptionName,
+    ) -> core::result::Result<TcpOptionValue, BrokerControlError>;
 
     fn create_event_with_count(
         &self,
@@ -277,14 +325,53 @@ where
         self.request(BrokerLocal::create_tcp_socket)
     }
 
+    fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::create_udp_socket)
+    }
+
     fn connect_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
         self.request(|local| local.connect_socket(handle, address))
             .map(|result| match result {
                 Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn bind_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddrV4,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError> {
+        self.request(|local| local.bind_socket(handle, address))
+            .map(|result| match result {
+                Ok(address) => SocketOutcome::Completed(address),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn listen_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, BrokerControlError> {
+        self.request(|local| local.listen_socket(handle, backlog))
+            .map(|result| match result {
+                Ok(address) => SocketOutcome::Completed(address),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn accept_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError> {
+        self.request(|local| local.accept_socket(handle))
+            .map(|result| match result {
+                Ok(accepted) => SocketOutcome::Completed(accepted),
                 Err(error) => SocketOutcome::Failed(error),
             })
     }
@@ -349,6 +436,47 @@ where
         })
     }
 
+    fn send_to_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        flags: BrokerSendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> core::result::Result<SocketOutcome<usize>, BrokerControlError> {
+        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(data.len()).expect("validated UDP datagram length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| {
+            local.send_to_socket(handle, lease.descriptor(), data, flags, destination)
+        })
+        .map(|result| match result {
+            Ok(sent) => SocketOutcome::Completed(sent),
+            Err(error) => SocketOutcome::Failed(error),
+        })
+    }
+
+    fn receive_from_socket(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        flags: BrokerReceiveFromFlags,
+    ) -> core::result::Result<SocketOutcome<ReceiveFromSocketResponse>, BrokerControlError> {
+        if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(data.len()).expect("validated UDP receive length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.receive_from_socket(handle, lease.descriptor(), data, flags))
+            .map(|result| match result {
+                Ok(received) => SocketOutcome::Completed(received),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
     fn shutdown_socket(
         &self,
         handle: ObjectHandle,
@@ -359,6 +487,22 @@ where
                 Ok(()) => SocketOutcome::Completed(()),
                 Err(error) => SocketOutcome::Failed(error),
             })
+    }
+
+    fn set_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        value: TcpOptionValue,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_tcp_option(handle, value))
+    }
+
+    fn get_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        name: TcpOptionName,
+    ) -> core::result::Result<TcpOptionValue, BrokerControlError> {
+        self.request(|local| local.get_tcp_option(handle, name))
     }
 
     fn create_event_with_count(

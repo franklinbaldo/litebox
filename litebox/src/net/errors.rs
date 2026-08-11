@@ -5,8 +5,6 @@
 
 use core::net::SocketAddr;
 
-use super::local_ports::LocalPortAllocationError;
-
 #[expect(
     unused_imports,
     reason = "used for doc string links to work out, but not for code"
@@ -21,6 +19,8 @@ use thiserror::Error;
 pub enum SocketError {
     #[error("Unsupported protocol {0}")]
     UnsupportedProtocol(u8),
+    #[error("Brokered networking is unavailable")]
+    BrokerUnavailable,
     #[error("Socket resources are exhausted")]
     ResourceExhausted,
     #[error("Socket creation was denied")]
@@ -45,6 +45,8 @@ pub enum CloseError {
 pub enum ShutdownError {
     #[error("Not a valid open file descriptor")]
     InvalidFd,
+    #[error("Socket is listening for connections")]
+    Listening,
     #[error("Shutdown is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
@@ -59,8 +61,6 @@ pub enum ConnectError {
     InvalidFd,
     #[error("Unsupported address {0}")]
     UnsupportedAddress(SocketAddr),
-    #[error("Port allocation failed: {0}")]
-    PortAllocationFailure(#[from] LocalPortAllocationError),
     #[error("Invalid address")]
     Unaddressable,
     #[error("Connection is still in progress")]
@@ -105,6 +105,8 @@ pub enum BindError {
     AlreadyBound,
     #[error("Binding is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::listen`]
@@ -117,10 +119,10 @@ pub enum ListenError {
     InvalidAddress,
     #[error("Socket is in invalid state")]
     InvalidState,
-    #[error("No available free ephemeral ports")]
-    NoAvailableFreeEphemeralPorts,
     #[error("Listening is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::accept`]
@@ -135,6 +137,8 @@ pub enum AcceptError {
     NoConnectionsReady,
     #[error("Accepting connections is unsupported for this socket")]
     UnsupportedOperation,
+    #[error("Socket operation failed: {0:?}")]
+    OperationFailed(SocketAsyncError),
 }
 
 /// Possible errors from [`Network::send`]
@@ -149,8 +153,8 @@ pub enum SendError {
     Unaddressable,
     #[error("Buffer is full")]
     BufferFull,
-    #[error("port allocation failed: {0}")]
-    PortAllocationFailure(#[from] LocalPortAllocationError),
+    #[error("Datagram is too large")]
+    MessageTooLong,
     #[error("unnecessary destination address provided")]
     UnnecessaryDestinationAddress,
     #[error("destination address required but not provided")]
@@ -200,6 +204,8 @@ crate::utilities::macros::repr_enum! {
         UnsupportedOperation = 12,
         /// The broker association or host socket failed.
         BackendFailure = 13,
+        /// An argument or socket state is invalid for the operation.
+        InvalidArgument = 14,
     }
 }
 
@@ -213,6 +219,8 @@ pub enum SetTcpOptionError {
     NotTcpSocket,
     #[error("TCP option is unsupported by this socket backend")]
     Unsupported,
+    #[error("TCP socket backend failed")]
+    BackendFailure,
 }
 /// Possible errors from [`Network::get_tcp_option`]
 #[non_exhaustive]
@@ -224,4 +232,6 @@ pub enum GetTcpOptionError {
     NotTcpSocket,
     #[error("TCP option is unsupported by this socket backend")]
     Unsupported,
+    #[error("TCP socket backend failed")]
+    BackendFailure,
 }

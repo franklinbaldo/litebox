@@ -27,7 +27,7 @@ use litebox::platform::{
     SystemInfoProvider, TimeProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
-use litebox::sync::RawSyncPrimitivesProvider;
+use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::PAGE_SIZE;
@@ -596,6 +596,9 @@ pub struct Process<Platform: ShimPlatform> {
     user_lcid: AtomicU32,
     user_ui_language: AtomicU32,
     default_hard_error_mode: AtomicU32,
+    wnf_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
+    wnf_subscriptions: Mutex<Platform, syscalls::wnf::WnfProcessSubscriptions>,
+    trace_notifications: Mutex<Platform, syscalls::trace::TraceNotifications<Platform>>,
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
@@ -689,6 +692,9 @@ impl<Platform: ShimPlatform> Process<Platform> {
             user_lcid: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             user_ui_language: AtomicU32::new(syscalls::nls::DEFAULT_LOCALE_ID),
             default_hard_error_mode: AtomicU32::new(0),
+            wnf_notification_event: Mutex::new(None),
+            wnf_subscriptions: Mutex::new(syscalls::wnf::WnfProcessSubscriptions::default()),
+            trace_notifications: Mutex::new(syscalls::trace::TraceNotifications::default()),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
@@ -1390,6 +1396,43 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 byte_offset,
                 key,
             ),
+            SyscallRequest::NtGetCurrentProcessorNumberEx { processor_number } => {
+                self.sys_nt_get_current_processor_number_ex(processor_number)
+            }
+            SyscallRequest::NtQueryDebugFilterState {
+                component_id,
+                level,
+            } => {
+                litebox_util_log::debug!(
+                    component_id,
+                    level;
+                    "NtQueryDebugFilterState reports no attached debugger"
+                );
+                NtStatus::DEBUGGER_INACTIVE
+            }
+            SyscallRequest::NtQueryDirectoryFileEx {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+                query_flags,
+                file_name,
+            } => self.sys_nt_query_directory_file_ex(
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+                query_flags,
+                file_name,
+            ),
             SyscallRequest::NtQueryVolumeInformationFile {
                 file_handle,
                 io_status_block,
@@ -1476,6 +1519,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 length,
                 result_length,
             ),
+            SyscallRequest::NtEnumerateKey {
+                key_handle,
+                index,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            } => self.sys_nt_enumerate_key(
+                key_handle,
+                index,
+                key_information_class,
+                key_information,
+                length,
+                result_length,
+            ),
             SyscallRequest::NtQueryValueKey {
                 key_handle,
                 value_name,
@@ -1486,6 +1544,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             } => self.sys_nt_query_value_key(
                 key_handle,
                 value_name,
+                key_value_information_class,
+                key_value_information,
+                length,
+                result_length,
+            ),
+            SyscallRequest::NtEnumerateValueKey {
+                key_handle,
+                index,
+                key_value_information_class,
+                key_value_information,
+                length,
+                result_length,
+            } => self.sys_nt_enumerate_value_key(
+                key_handle,
+                index,
                 key_value_information_class,
                 key_value_information,
                 length,
@@ -1685,6 +1758,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 buffer,
                 buffer_size,
             ),
+            SyscallRequest::NtSetWnfProcessNotificationEvent { notification_event } => {
+                self.sys_nt_set_wnf_process_notification_event(notification_event)
+            }
+            SyscallRequest::NtGetCompleteWnfStateSubscription {
+                old_state_name,
+                old_subscription_id,
+                old_event_mask,
+                old_status,
+                delivery_descriptor,
+                descriptor_size,
+            } => self.sys_nt_get_complete_wnf_state_subscription(
+                old_state_name,
+                old_subscription_id,
+                old_event_mask,
+                old_status,
+                delivery_descriptor,
+                descriptor_size,
+            ),
+            SyscallRequest::NtSubscribeWnfStateChange {
+                state_name,
+                change_stamp,
+                event_mask,
+                subscription_id,
+            } => self.sys_nt_subscribe_wnf_state_change(
+                state_name,
+                change_stamp,
+                event_mask,
+                subscription_id,
+            ),
+            SyscallRequest::NtUnsubscribeWnfStateChange { state_name } => {
+                self.sys_nt_unsubscribe_wnf_state_change(state_name)
+            }
             SyscallRequest::NtQuerySection {
                 section_handle,
                 section_information_class,
@@ -2003,6 +2108,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 field_size,
                 fields,
             } => self.sys_nt_trace_event(trace_handle, flags, field_size, fields),
+            SyscallRequest::NtTraceControl {
+                function_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            } => self.sys_nt_trace_control(
+                function_code,
+                input_buffer,
+                input_buffer_length,
+                output_buffer,
+                output_buffer_length,
+                return_length,
+            ),
             SyscallRequest::NtTerminateProcess {
                 process_handle,
                 exit_status,

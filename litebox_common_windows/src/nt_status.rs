@@ -101,6 +101,7 @@ impl NtStatus {
             0x80000003 => "STATUS_BREAKPOINT: Breakpoint encountered",
             0x80000004 => "STATUS_SINGLE_STEP: Single instruction executed",
             0x80000005 => "STATUS_BUFFER_OVERFLOW: Buffer overflow",
+            0x80000006 => "STATUS_NO_MORE_FILES: No more files are available",
             0x8000001A => "STATUS_NO_MORE_ENTRIES: No more entries are available",
             0xC0000001 => "STATUS_UNSUCCESSFUL: The operation completed with an error",
             0xC0000002 => "STATUS_NOT_IMPLEMENTED: The function is not implemented",
@@ -221,6 +222,12 @@ impl NtStatus {
             0xC0000286 => "STATUS_MAGAZINE_NOT_PRESENT: Magazine not present",
             0xC0000287 => "STATUS_REINITIALIZATION_NEEDED: Reinitialization needed",
             0xC0000302 => "STATUS_WMI_ALREADY_DISABLED: WMI collection or events already disabled",
+            0xC0000354 => {
+                "STATUS_DEBUGGER_INACTIVE: An attempt to do an operation on a debug object failed because the object is in the process of being deleted"
+            }
+            0xC0000718 => {
+                "STATUS_WNF_EVENT_ALREADY_SUBSCRIBED: The WNF event is already subscribed"
+            }
             _ => "STATUS_UNKNOWN: Unknown status code",
         }
     }
@@ -275,6 +282,8 @@ impl NtStatus {
 
     /// STATUS_BUFFER_OVERFLOW
     pub const BUFFER_OVERFLOW: Self = Self::from_raw(0x80000005);
+    /// STATUS_NO_MORE_FILES
+    pub const NO_MORE_FILES: Self = Self::from_raw(0x80000006);
     /// STATUS_NO_MORE_ENTRIES
     pub const NO_MORE_ENTRIES: Self = Self::from_raw(0x8000001A);
 
@@ -633,6 +642,12 @@ impl NtStatus {
 
     /// STATUS_WMI_ALREADY_DISABLED
     pub const WMI_ALREADY_DISABLED: Self = Self::from_raw(0xC0000302);
+
+    /// STATUS_DEBUGGER_INACTIVE
+    pub const DEBUGGER_INACTIVE: Self = Self::from_raw(0xC0000354);
+
+    /// STATUS_WNF_EVENT_ALREADY_SUBSCRIBED
+    pub const WNF_EVENT_ALREADY_SUBSCRIBED: Self = Self::from_raw(0xC0000718);
 }
 
 impl From<i32> for NtStatus {

@@ -6,6 +6,7 @@ use clap::Parser;
 use std::sync::atomic::Ordering::Relaxed;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
     sync::atomic::AtomicBool,
     time::Duration,
@@ -695,6 +696,7 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
             "cargo build -p litebox_runner_linux_userland {release...} {features...}"
         )
         .run()?;
+        cmd!(sh, "cargo build -p litebox_broker_userland {release...}").run()?;
     } else {
         let mode = if release_mode { "release" } else { "debug" };
         let iperf3_host = locate_command(sh, "iperf3")?;
@@ -702,48 +704,121 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
             "{}/target/{mode}/litebox_runner_linux_userland",
             project_root.display()
         );
+        let broker = format!(
+            "{}/target/{mode}/litebox-broker-userland",
+            project_root.display()
+        );
         let iperf3_rewritten = sh.current_dir().join("iperf3_rewritten");
-
-        // Spawn the sandboxed iperf3 server in a background thread so we can run the client
-        // from the host side. The server uses `-1` to exit after handling one client.
-        let server_handle = std::thread::spawn(move || -> Result<()> {
-            let sh = xshell::Shell::new()?;
-            cmd!(
-                sh,
-                "{runner} --unstable --env LD_LIBRARY_PATH=/lib64:/lib32:/lib --env HOME=/ --tun-device-name tun99 --initial-files {tar_file} {iperf3_rewritten} -s -1 -B 10.0.0.2"
-            ).run()?;
-            Ok(())
-        });
-
-        // Retry the client connection until the server is ready, using a short
-        // connect-timeout so we don't waste time sleeping for a fixed duration.
-        debug!("Connecting iperf3 client to sandboxed server");
         let client_sh = xshell::Shell::new()?;
-        let max_attempts = 50;
-        for attempt in 1..=max_attempts {
-            let result = cmd!(
-                client_sh,
-                "{iperf3_host} -c 10.0.0.2 --bytes 1G --connect-timeout 50"
-            )
-            .quiet()
-            .ignore_stdout()
-            .ignore_stderr()
-            .run();
-            if result.is_ok() {
-                break;
+        let max_server_attempts = 5;
+        let max_client_attempts = 50;
+        let mut last_failure = "sandboxed server did not become ready".to_owned();
+
+        for server_attempt in 1..=max_server_attempts {
+            let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
+                .local_addr()?
+                .port()
+                .to_string();
+            let mut server_command = std::process::Command::new(&broker);
+            server_command
+                .arg("--runner")
+                .arg(&runner)
+                .arg("--")
+                .args([
+                    "--env",
+                    "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
+                    "--env",
+                    "HOME=/",
+                    "--initial-files",
+                ])
+                .arg(&tar_file)
+                .arg(&iperf3_rewritten)
+                .args(["-s", "-1", "-B", "127.0.0.1", "-p", &port]);
+            if COMMAND_EXECUTION_IS_QUIET.load(Relaxed) {
+                server_command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
             }
-            if attempt == max_attempts {
-                return Err(anyhow!(
-                    "iperf3 client failed to connect after {max_attempts} attempts"
-                ));
+            let mut server = server_command.spawn()?;
+
+            debug!(
+                server_attempt,
+                "Connecting iperf3 client to sandboxed server"
+            );
+            let mut client_succeeded = false;
+            for client_attempt in 1..=max_client_attempts {
+                let result = cmd!(
+                    client_sh,
+                    "{iperf3_host} -c 127.0.0.1 -p {port} --bytes 1G --connect-timeout 50"
+                )
+                .quiet()
+                .ignore_stdout()
+                .ignore_stderr()
+                .run();
+                if result.is_ok() {
+                    client_succeeded = true;
+                    break;
+                }
+                match server.try_wait() {
+                    Ok(Some(status)) => {
+                        last_failure = format!("sandboxed server exited with {status}");
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = server.kill();
+                        let _ = server.wait();
+                        return Err(error.into());
+                    }
+                }
+                if client_attempt == max_client_attempts {
+                    last_failure = format!(
+                        "iperf3 client failed to connect after {max_client_attempts} attempts"
+                    );
+                    break;
+                }
+                debug!(client_attempt, "iperf3 client connection failed, retrying");
+                std::thread::sleep(Duration::from_millis(100));
             }
-            debug!(attempt, "iperf3 client connection failed, retrying");
-            std::thread::sleep(Duration::from_millis(100));
+
+            if !client_succeeded {
+                match server.try_wait() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let _ = server.kill();
+                        let _ = server.wait();
+                    }
+                    Err(error) => {
+                        let _ = server.kill();
+                        let _ = server.wait();
+                        return Err(error.into());
+                    }
+                }
+                debug!(
+                    server_attempt,
+                    %last_failure,
+                    "Relaunching sandboxed iperf3 server"
+                );
+                continue;
+            }
+
+            let status = match server.wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    let _ = server.kill();
+                    let _ = server.wait();
+                    return Err(error.into());
+                }
+            };
+            if !status.success() {
+                return Err(anyhow!("sandboxed iperf3 server exited with {status}"));
+            }
+            return Ok(());
         }
 
-        server_handle
-            .join()
-            .map_err(|e| anyhow!("iperf3 server thread panicked: {e:?}"))??;
+        return Err(anyhow!(
+            "sandboxed iperf3 server failed after {max_server_attempts} attempts: {last_failure}"
+        ));
     }
     Ok(())
 }

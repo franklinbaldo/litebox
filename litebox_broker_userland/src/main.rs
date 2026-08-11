@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, CallerCredential, Ipv4Cidr, ObjectRights, PolicyEngine,
-    SocketPolicy, SocketPolicyError, TcpDestinationRule, TcpPortRange,
+    BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
+    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::{LinuxSocketProvider, LinuxTimerProvider};
@@ -45,7 +45,7 @@ const WORKER_COUNT: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedTcpDestination {
     destination: Ipv4Cidr,
-    ports: TcpPortRange,
+    ports: DestinationPortRange,
 }
 
 impl FromStr for AllowedTcpDestination {
@@ -78,7 +78,7 @@ impl FromStr for AllowedTcpDestination {
         let end = end
             .parse::<u16>()
             .map_err(|error| format!("invalid TCP port: {error}"))?;
-        let ports = TcpPortRange::new(Port(start), Port(end))
+        let ports = DestinationPortRange::new(Port(start), Port(end))
             .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
 
         Ok(Self { destination, ports })
@@ -144,19 +144,25 @@ fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::Ipv4LoopbackTcp);
+        return Ok(SocketPolicy::Ipv4Loopback);
     }
     let rules = allowed_destinations
         .iter()
         .map(|allowed| {
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 allowed.destination,
                 allowed.ports,
             )
         })
         .collect::<Vec<_>>();
-    SocketPolicy::from_tcp_destination_rules(&rules)
+    let udp_loopback = DestinationRule::new(
+        CallerCredential::HostGuaranteed,
+        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
+        DestinationPortRange::new(Port(1), Port(u16::MAX))
+            .expect("the full nonzero UDP port range is valid"),
+    );
+    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
 }
 
 fn serve_runner(
@@ -547,7 +553,7 @@ mod tests {
             allowed,
             AllowedTcpDestination {
                 destination: Ipv4Cidr::new(Ipv4Address([203, 0, 113, 0]), 24).unwrap(),
-                ports: TcpPortRange::new(Port(443), Port(444)).unwrap(),
+                ports: DestinationPortRange::new(Port(443), Port(444)).unwrap(),
             }
         );
         assert!(
@@ -562,7 +568,7 @@ mod tests {
     fn tcp_destination_arguments_replace_the_loopback_default() {
         assert_eq!(
             configured_socket_policy(&[]).unwrap(),
-            SocketPolicy::Ipv4LoopbackTcp
+            SocketPolicy::Ipv4Loopback
         );
 
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
@@ -571,11 +577,19 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(
             rules[0],
-            TcpDestinationRule::new(
+            DestinationRule::new(
                 CallerCredential::HostGuaranteed,
                 allowed.destination,
                 allowed.ports,
             )
+        );
+        assert_eq!(
+            policy.udp_destination_rules().unwrap(),
+            &[DestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            )]
         );
     }
 

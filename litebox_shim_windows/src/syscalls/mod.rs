@@ -374,6 +374,25 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         byte_offset: Option<Platform::RawConstPointer<i64>>,
         key: Option<Platform::RawConstPointer<u32>>,
     },
+    NtGetCurrentProcessorNumberEx {
+        processor_number: Platform::RawMutPointer<sysinfo::ProcessorNumber>,
+    },
+    NtQueryDebugFilterState {
+        component_id: u32,
+        level: u32,
+    },
+    NtQueryDirectoryFileEx {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<Platform::RawConstPointer<u8>>,
+        apc_context: Option<Platform::RawConstPointer<u8>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        file_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        file_information_class: u32,
+        query_flags: u32,
+        file_name: Option<Platform::RawConstPointer<nt_types::UnicodeString>>,
+    },
     NtQueryVolumeInformationFile {
         file_handle: Handle,
         io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
@@ -424,9 +443,25 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         length: u32,
         result_length: Platform::RawMutPointer<u32>,
     },
+    NtEnumerateKey {
+        key_handle: Handle,
+        index: u32,
+        key_information_class: u32,
+        key_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        result_length: Platform::RawMutPointer<u32>,
+    },
     NtQueryValueKey {
         key_handle: Handle,
         value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        key_value_information_class: u32,
+        key_value_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        result_length: Platform::RawMutPointer<u32>,
+    },
+    NtEnumerateValueKey {
+        key_handle: Handle,
+        index: u32,
         key_value_information_class: u32,
         key_value_information: Platform::RawMutPointer<u8>,
         length: u32,
@@ -551,6 +586,26 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         buffer: Platform::RawMutPointer<u32>,
         buffer_size: u32,
     },
+    NtSetWnfProcessNotificationEvent {
+        notification_event: Handle,
+    },
+    NtGetCompleteWnfStateSubscription {
+        old_state_name: Option<Platform::RawConstPointer<u64>>,
+        old_subscription_id: Option<Platform::RawConstPointer<u64>>,
+        old_event_mask: u32,
+        old_status: i32,
+        delivery_descriptor: Platform::RawMutPointer<u8>,
+        descriptor_size: u32,
+    },
+    NtSubscribeWnfStateChange {
+        state_name: Platform::RawConstPointer<u64>,
+        change_stamp: u32,
+        event_mask: u32,
+        subscription_id: Option<Platform::RawMutPointer<u64>>,
+    },
+    NtUnsubscribeWnfStateChange {
+        state_name: Platform::RawConstPointer<u64>,
+    },
     NtQuerySection {
         section_handle: Handle,
         section_information_class: u32,
@@ -652,6 +707,14 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         flags: u32,
         field_size: u32,
         fields: Platform::RawConstPointer<trace::EventHeader>,
+    },
+    NtTraceControl {
+        function_code: u32,
+        input_buffer: Platform::RawConstPointer<u32>,
+        input_buffer_length: u32,
+        output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_length: u32,
+        return_length: Platform::RawMutPointer<u32>,
     },
     NtAllocateVirtualMemory {
         process_handle: ProcessHandle,
@@ -1011,6 +1074,27 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 byte_offset:*,
                 key:*,
             })),
+            NtSysno::NtGetCurrentProcessorNumberEx => {
+                Some(sys_req!(NtGetCurrentProcessorNumberEx {
+                    processor_number:*,
+                }))
+            }
+            NtSysno::NtQueryDebugFilterState => Some(sys_req!(NtQueryDebugFilterState {
+                component_id,
+                level,
+            })),
+            NtSysno::NtQueryDirectoryFileEx => Some(sys_req!(NtQueryDirectoryFileEx {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context:*,
+                io_status_block:*,
+                file_information:*,
+                length,
+                file_information_class,
+                query_flags,
+                file_name:*,
+            })),
             NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(NtQueryVolumeInformationFile {
                 file_handle:{Handle::from_raw},
                 io_status_block:*,
@@ -1061,9 +1145,25 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 length,
                 result_length:*,
             })),
+            NtSysno::NtEnumerateKey => Some(sys_req!(NtEnumerateKey {
+                key_handle:{Handle::from_raw},
+                index,
+                key_information_class,
+                key_information:*,
+                length,
+                result_length:*,
+            })),
             NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
                 key_handle:{Handle::from_raw},
                 value_name:*,
+                key_value_information_class,
+                key_value_information:*,
+                length,
+                result_length:*,
+            })),
+            NtSysno::NtEnumerateValueKey => Some(sys_req!(NtEnumerateValueKey {
+                key_handle:{Handle::from_raw},
+                index,
                 key_value_information_class,
                 key_value_information:*,
                 length,
@@ -1190,6 +1290,30 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                     buffer_size,
                 }))
             }
+            NtSysno::NtSetWnfProcessNotificationEvent => {
+                Some(sys_req!(NtSetWnfProcessNotificationEvent {
+                    notification_event: { Handle::from_raw },
+                }))
+            }
+            NtSysno::NtGetCompleteWnfStateSubscription => {
+                Some(sys_req!(NtGetCompleteWnfStateSubscription {
+                    old_state_name:*,
+                    old_subscription_id:*,
+                    old_event_mask,
+                    old_status,
+                    delivery_descriptor:*,
+                    descriptor_size,
+                }))
+            }
+            NtSysno::NtSubscribeWnfStateChange => Some(sys_req!(NtSubscribeWnfStateChange {
+                state_name:*,
+                change_stamp,
+                event_mask,
+                subscription_id:*,
+            })),
+            NtSysno::NtUnsubscribeWnfStateChange => Some(sys_req!(NtUnsubscribeWnfStateChange {
+                state_name:*,
+            })),
             NtSysno::NtQuerySection => Some(sys_req!(NtQuerySection {
                 section_handle: { Handle::from_raw },
                 section_information_class,
@@ -1295,6 +1419,14 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 flags,
                 field_size,
                 fields:*,
+            })),
+            NtSysno::NtTraceControl => Some(sys_req!(NtTraceControl {
+                function_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
+                return_length:*,
             })),
             NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
                 process_handle: { ProcessHandle::from_raw },

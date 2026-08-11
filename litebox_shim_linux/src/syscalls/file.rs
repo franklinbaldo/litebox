@@ -509,12 +509,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EBADF);
         };
         let files = self.files.borrow();
+        let is_inet_datagram = core::cell::Cell::new(false);
         let res = files
             .run_on_raw_fd(
                 raw_fd,
                 |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
                 |fd| {
                     espipe_for_non_seekable_offset(offset)?;
+                    is_inet_datagram.set(matches!(
+                        self.global.get_socket_type(fd)?,
+                        litebox_common_linux::SockType::Datagram
+                    ));
                     self.global.sendto(
                         &self.wait_cx(),
                         fd,
@@ -563,7 +568,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
             )
             .flatten();
-        if let Err(Errno::EPIPE) = res {
+        if let Err(Errno::EPIPE) = res
+            && !is_inet_datagram.get()
+        {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
         res
@@ -974,6 +981,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let iovs: &[IoReadVec] = &iovec
             .to_owned_slice::<Platform>(iovcnt)
             .ok_or(Errno::EFAULT)?;
+        if let Some(received) = self.try_read_datagram_from_iovec(fd, iovs)? {
+            return Ok(received);
+        }
         let mut kernel_buffer = vec![0u8; PAGE_SIZE];
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
@@ -981,6 +991,126 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         read_from_iovec::<_, Platform>(iovs, &mut kernel_buffer, |buf, _total| {
             self.sys_read(fd, buf, None)
         })
+    }
+
+    fn try_read_datagram_from_iovec(
+        &self,
+        fd: i32,
+        iovs: &[IoReadVec],
+    ) -> Result<Option<usize>, Errno> {
+        let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let Some(socket) = self
+            .files
+            .borrow()
+            .try_pin_inet_socket(&self.global, raw_fd)?
+        else {
+            return Ok(None);
+        };
+        if socket.is_broker_datagram() {
+            self.read_datagram_from_iovec(&socket, iovs).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_datagram_from_iovec(
+        &self,
+        socket: &super::net::InetSocketPin<'_, Platform, FS>,
+        iovs: &[IoReadVec],
+    ) -> Result<usize, Errno> {
+        check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+        let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+        if capacity == 0 {
+            return Ok(0);
+        }
+        let mut buffer = alloc::vec::Vec::new();
+        let capacity = capacity.min(litebox::net::SOCKET_RECEIVE_OPERATION_SIZE);
+        buffer
+            .try_reserve_exact(capacity)
+            .map_err(|_| Errno::ENOMEM)?;
+        buffer.resize(capacity, 0);
+        let received = self
+            .global
+            .receive_from_socket(
+                &self.wait_cx(),
+                socket,
+                &mut buffer,
+                litebox_common_linux::ReceiveFlags::empty(),
+                super::net::ReceiveContext::new(None, false),
+                None,
+            )?
+            .min(buffer.len());
+        let mut copied = 0;
+        for iov in iovs {
+            if copied == received {
+                break;
+            }
+            let length = (received - copied).min(iov.iov_len);
+            if iov
+                .iov_base
+                .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
+                .is_none()
+            {
+                return Err(Errno::EFAULT);
+            }
+            copied += length;
+        }
+        Ok(received)
+    }
+
+    fn try_write_datagram_to_iovec(
+        &self,
+        fd: i32,
+        iovs: &[IoWriteVec],
+    ) -> Result<Option<usize>, Errno> {
+        let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let Some(socket) = self
+            .files
+            .borrow()
+            .try_pin_inet_socket(&self.global, raw_fd)?
+        else {
+            return Ok(None);
+        };
+        if socket.is_broker_datagram() {
+            self.write_datagram_to_iovec(&socket, iovs).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn write_datagram_to_iovec(
+        &self,
+        socket: &super::net::InetSocketPin<'_, Platform, FS>,
+        iovs: &[IoWriteVec],
+    ) -> Result<usize, Errno> {
+        check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+        let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+        if length == 0 {
+            return Ok(0);
+        }
+        if length > litebox::net::MAX_UDP_DATAGRAM_SIZE {
+            return Err(Errno::EMSGSIZE);
+        }
+        let mut buffer = alloc::vec::Vec::new();
+        buffer
+            .try_reserve_exact(length)
+            .map_err(|_| Errno::ENOMEM)?;
+        for iov in iovs {
+            for offset in 0..iov.iov_len {
+                let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
+                buffer.push(
+                    iov.iov_base
+                        .read_at_offset::<Platform>(offset)
+                        .ok_or(Errno::EFAULT)?,
+                );
+            }
+        }
+        self.global.send_to_pinned_socket(
+            &self.wait_cx(),
+            socket,
+            &buffer,
+            litebox_common_linux::SendFlags::empty(),
+        )
     }
 }
 
@@ -1135,6 +1265,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let iovs: &[IoWriteVec] = &iovec
             .to_owned_slice::<Platform>(iovcnt)
             .ok_or(Errno::EFAULT)?;
+        match self.try_write_datagram_to_iovec(fd, iovs) {
+            Ok(Some(written)) => return Ok(written),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
         // TODO: The data transfers performed by readv() and writev() are atomic: the data
         // written by writev() is written as a single block that is not intermingled with
         // output from writes in other processes
@@ -3053,7 +3188,7 @@ mod tests {
 
     #[test]
     fn getcwd_and_chdir() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Default CWD is root.
         let mut buf = [0u8; 256];
@@ -3096,7 +3231,7 @@ mod tests {
 
     #[test]
     fn chdir_relative_path() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Create nested dirs: /rel_parent/rel_child
         task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/rel_parent", 0o777)
@@ -3128,7 +3263,7 @@ mod tests {
     fn mknodat_regular_file_does_not_consume_fd_limit() {
         use litebox_common_linux::{Rlimit, RlimitResource};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
         let old_limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
         task.do_prlimit(
             RlimitResource::NOFILE,
@@ -3156,7 +3291,7 @@ mod tests {
 
     #[test]
     fn empty_pathnames_return_enoent() {
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         assert_eq!(
             task.sys_open("", OFlags::RDONLY, Mode::empty())
@@ -3202,7 +3337,7 @@ mod tests {
     fn all_path_syscalls_respect_chdir() {
         use litebox_common_linux::{AccessFlags, AtFlags};
 
-        let task = crate::syscalls::tests::init_platform(None);
+        let task = crate::syscalls::tests::init_platform();
 
         // Set up: mkdir + chdir into /cwd_test/.
         task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/cwd_test", 0o777)

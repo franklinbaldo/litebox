@@ -374,17 +374,22 @@ mod tests {
     };
     use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::socket::{
-        AddressFamily, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-        CreateSocketResponse, IpProtocol, Ipv4Address, Port, ReceiveFlags, ReceiveSocketRequest,
-        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, ShutdownMode,
-        ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-        SocketStatusRequest, SocketStatusResponse, SocketType,
+        AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
+        BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
+        CreateSocketResponse, GetTcpOptionRequest, GetTcpOptionResponse, IpProtocol,
+        ListenSocketRequest, ListenSocketResponse, ReceiveFlags, ReceiveFromFlags,
+        ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse,
+        SendToSocketRequest, SendToSocketResponse, SetTcpOptionRequest, ShutdownMode,
+        ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
+        SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
     use crate::timer::{
         CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
         ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
+    use core::net::{Ipv4Addr, SocketAddrV4};
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
@@ -454,12 +459,23 @@ mod tests {
                 socket_type: SocketType::Stream,
                 protocol: IpProtocol::Tcp,
             })),
+            BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
+            })),
+            BrokerOperation::Socket(SocketRequest::Bind(BindSocketRequest {
+                handle,
+                address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            })),
+            BrokerOperation::Socket(SocketRequest::Listen(ListenSocketRequest {
+                handle,
+                backlog: 4096,
+            })),
+            BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest { handle })),
             BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                 handle,
-                address: SocketAddressV4 {
-                    address: Ipv4Address([203, 0, 113, 7]),
-                    port: Port(443),
-                },
+                address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
             })),
             BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
                 handle,
@@ -468,6 +484,24 @@ mod tests {
                     length: 3,
                 },
                 flags: SendFlags::NONE,
+            })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 3,
+                },
+                flags: SendFlags::NONE,
+                destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+            })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 0,
+                },
+                flags: SendFlags::NONE,
+                destination: None,
             })),
             BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                 handle,
@@ -478,6 +512,14 @@ mod tests {
                 flags: ReceiveFlags::PEEK,
                 peek_offset: 2,
                 peek_length: 5,
+            })),
+            BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+                handle,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(15),
+                    length: 3,
+                },
+                flags: ReceiveFromFlags::PEEK,
             })),
             BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
                 handle,
@@ -494,6 +536,26 @@ mod tests {
             BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
                 handle,
                 mode: ShutdownMode::Abort,
+            })),
+            BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
+                handle,
+                mode: ShutdownMode::StopListening,
+            })),
+            BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                handle,
+                value: TcpOptionValue::NoDelay(true),
+            })),
+            BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                handle,
+                value: TcpOptionValue::KeepAlive(false),
+            })),
+            BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                handle,
+                name: TcpOptionName::NoDelay,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                handle,
+                name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
             BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest { clock_id: 1 })),
@@ -556,6 +618,11 @@ mod tests {
                 peek_offset: 0,
                 peek_length: 0,
             })),
+            BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+                handle,
+                buffer,
+                flags: ReceiveFromFlags(unsupported),
+            })),
         ] {
             let request = BrokerRequest {
                 request_id: TEST_REQUEST_ID,
@@ -575,6 +642,9 @@ mod tests {
         assert!(!ReceiveFlags::PEEK.has_unsupported_bits());
         assert!(ReceiveFlags::PEEK.contains(ReceiveFlags::PEEK));
         assert!(!ReceiveFlags::NONE.contains(ReceiveFlags::PEEK));
+        assert!(ReceiveFromFlags(unsupported).has_unsupported_bits());
+        assert!(!ReceiveFromFlags::PEEK.has_unsupported_bits());
+        assert!(ReceiveFromFlags::PEEK.contains(ReceiveFromFlags::PEEK));
     }
 
     #[test]
@@ -591,6 +661,7 @@ mod tests {
             SocketError::PolicyDenied,
             SocketError::Other,
             SocketError::NotConnected,
+            SocketError::InvalidArgument,
         ] {
             for socket_response in [
                 SocketResponse::Failed(error),
@@ -668,6 +739,17 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 3 })),
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 3 })),
             BrokerResult::Socket(SocketResponse::Create(CreateSocketResponse { handle })),
+            BrokerResult::Socket(SocketResponse::Bind(BindSocketResponse {
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+            })),
+            BrokerResult::Socket(SocketResponse::Listen(ListenSocketResponse {
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+            })),
+            BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
+                handle,
+                local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+                remote_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+            })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
                 SocketConnectionStatus::Unconnected,
             ))),
@@ -681,10 +763,28 @@ mod tests {
                 status: SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
             })),
             BrokerResult::Socket(SocketResponse::Send(SendSocketResponse { sent: 3 })),
+            BrokerResult::Socket(SocketResponse::SendTo(SendToSocketResponse { sent: 3 })),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(3))),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::Received(0))),
             BrokerResult::Socket(SocketResponse::Receive(ReceiveSocketResponse::EndOfStream)),
+            BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+                received: 3,
+                datagram_length: 7,
+                source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+            })),
+            BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+                received: 0,
+                datagram_length: 0,
+                source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+            })),
             BrokerResult::Socket(SocketResponse::Shutdown),
+            BrokerResult::Socket(SocketResponse::SetTcpOption),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+                value: TcpOptionValue::NoDelay(true),
+            })),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+                value: TcpOptionValue::KeepAlive(false),
+            })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
                 SocketConnectionStatus::Connecting,
             ))),
@@ -693,10 +793,7 @@ mod tests {
             ))),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddressV4 {
-                    address: Ipv4Address([127, 0, 0, 1]),
-                    port: Port(49152),
-                }),
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
                 pending_error: Some(SocketError::ConnectionReset),
             })),
             BrokerResult::Socket(SocketResponse::Status(socket_status(
@@ -893,6 +990,20 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
 
+        let set_tcp_option = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                handle: ObjectHandle(13),
+                value: TcpOptionValue::NoDelay(true),
+            })),
+        });
+        for offset in 1..=2 {
+            let mut frame = set_tcp_option.clone();
+            let index = frame.len() - offset;
+            frame[index] = 0xff;
+            assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
+        }
+
         let mut unknown_shutdown_mode = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
@@ -910,15 +1021,30 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                 handle: ObjectHandle(9),
-                address: SocketAddressV4 {
-                    address: Ipv4Address([203, 0, 113, 7]),
-                    port: Port(443),
-                },
+                address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
             })),
         });
         assert_eq!(
             decode_request(&connect[..connect.len() - 1]),
             Err(WireError::TruncatedFrame)
+        );
+
+        let mut unknown_send_to_destination = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle: ObjectHandle(9),
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(1),
+                    length: 0,
+                },
+                flags: SendFlags::NONE,
+                destination: None,
+            })),
+        });
+        *unknown_send_to_destination.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_request(&unknown_send_to_destination),
+            Err(WireError::InvalidTag)
         );
 
         let mut trailing = connect;
@@ -963,11 +1089,24 @@ mod tests {
         *unknown_status.last_mut().unwrap() = 0xff;
         assert_eq!(decode_response(&unknown_status), Err(WireError::InvalidTag));
 
+        let get_tcp_option = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Socket(SocketResponse::GetTcpOption(GetTcpOptionResponse {
+                value: TcpOptionValue::KeepAlive(true),
+            })),
+        });
+        for offset in 1..=2 {
+            let mut frame = get_tcp_option.clone();
+            let index = frame.len() - offset;
+            frame[index] = 0xff;
+            assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
+        }
+
         let socket_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
         });
-        for raw in [0, 12, u8::MAX] {
+        for raw in [0, 13, u8::MAX] {
             let mut unknown_socket_error = socket_error.clone();
             *unknown_socket_error.last_mut().unwrap() = raw;
             assert_eq!(
@@ -1159,14 +1298,46 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: ObjectHandle(9),
-                    address: SocketAddressV4 {
-                        address: Ipv4Address([203, 0, 113, 7]),
-                        port: Port(443),
-                    },
+                    address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
                 })),
             }),
             [
                 5, 13, 0, 0, 0, 0, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 203, 0, 113, 7, 187, 1
+            ]
+        );
+    }
+
+    #[test]
+    fn socket_accept_request_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_request(BrokerRequest {
+                request_id: RequestId(13),
+                operation: BrokerOperation::Socket(SocketRequest::Accept(AcceptSocketRequest {
+                    handle: ObjectHandle(9),
+                })),
+            }),
+            [5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn socket_send_to_request_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_request(BrokerRequest {
+                request_id: RequestId(13),
+                operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                    handle: ObjectHandle(9),
+                    buffer: SharedBufferDescriptor {
+                        slot_index: SharedBufferSlotIndex(2),
+                        length: 3,
+                    },
+                    flags: SendFlags::NONE,
+                    destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53,)),
+                })),
+            }),
+            [
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 10, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0,
+                0, 0, 0, 1, 203, 0, 113, 7, 53, 0
             ]
         );
     }
@@ -1179,6 +1350,24 @@ mod tests {
                 result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
             }),
             [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
+        );
+    }
+
+    #[test]
+    fn socket_accept_response_wire_shape_is_pinned() {
+        assert_eq!(
+            encode_response(BrokerResponse {
+                request_id: RequestId(13),
+                result: BrokerResult::Socket(SocketResponse::Accept(AcceptSocketResponse {
+                    handle: ObjectHandle(9),
+                    local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
+                    remote_address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443),
+                })),
+            }),
+            [
+                8, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
+                0, 113, 7, 187, 1,
+            ]
         );
     }
 

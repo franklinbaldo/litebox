@@ -66,21 +66,52 @@ int main(int argc, char **argv) {
     assert(local_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(local_address.sin_port != 0);
     assert(accept(fd, NULL, NULL) == -1);
-    assert(errno == EOPNOTSUPP);
+    assert(errno == EINVAL);
     struct sockaddr_in peer_address;
     address_length = sizeof(peer_address);
     assert(getpeername(fd, (struct sockaddr *)&peer_address, &address_length) == 0);
     assert(peer_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
     assert(peer_address.sin_port == address.sin_port);
     int option = 1;
-    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == -1);
-    assert(errno == EOPNOTSUPP);
-    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, sizeof(option)) == -1);
-    assert(errno == EOPNOTSUPP);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option,
+                      sizeof(option) - 1) == -1);
+    assert(errno == EINVAL);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const void *)1,
+                      sizeof(option)) == -1);
+    assert(errno == EFAULT);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == 0);
     socklen_t option_length = sizeof(option);
+    option = -1;
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, &option_length) == 0);
+    assert(option == 1);
+    option = 1;
+    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, sizeof(option)) == 0);
+    option_length = sizeof(option);
+    option = -1;
+    assert(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, &option_length) == 0);
+    assert(option == 1);
+    option = 0;
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, sizeof(option)) == 0);
+    assert(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, sizeof(option)) == 0);
+    option_length = sizeof(option);
+    option = -1;
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option, &option_length) == 0);
+    assert(option == 0);
+    option_length = sizeof(option);
     option = -1;
     assert(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &option, &option_length) == 0);
     assert(option == 0);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, &option,
+                      sizeof(option) - 1) == -1);
+    assert(errno == EINVAL);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, (const void *)1,
+                      sizeof(option)) == -1);
+    assert(errno == EFAULT);
+    assert(setsockopt(fd, IPPROTO_TCP, TCP_CORK, &option, sizeof(option)) == -1);
+    assert(errno == EOPNOTSUPP);
+    option_length = sizeof(option);
+    assert(getsockopt(fd, IPPROTO_TCP, TCP_CORK, &option, &option_length) == -1);
+    assert(errno == EOPNOTSUPP);
     option = 30;
     assert(setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &option, sizeof(option)) == -1);
     assert(errno == EOPNOTSUPP);

@@ -12,9 +12,13 @@ use crate::pipe::{
 };
 use crate::readiness::ReadinessFlags;
 use crate::socket::{
+    AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest, SendSocketResponse,
-    ShutdownSocketRequest, SocketError, SocketStatusRequest, SocketStatusResponse,
+    GetTcpOptionRequest, GetTcpOptionResponse, ListenSocketRequest, ListenSocketResponse,
+    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+    ReceiveSocketResponse, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
+    SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
+    SocketStatusRequest, SocketStatusResponse,
 };
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
@@ -108,12 +112,26 @@ pub enum SocketRequest {
     Create(CreateSocketRequest),
     /// Connect a socket to a remote address.
     Connect(ConnectSocketRequest),
+    /// Bind a socket to a local address.
+    Bind(BindSocketRequest),
+    /// Make a bound socket listen for connections.
+    Listen(ListenSocketRequest),
+    /// Accept one pending connection.
+    Accept(AcceptSocketRequest),
     /// Send bytes staged in shared memory.
     Send(SendSocketRequest),
+    /// Send one complete datagram staged in shared memory.
+    SendTo(SendToSocketRequest),
     /// Receive bytes into shared memory.
     Receive(ReceiveSocketRequest),
+    /// Receive one datagram into shared memory.
+    ReceiveFrom(ReceiveFromSocketRequest),
     /// Shut down one or both directions.
     Shutdown(ShutdownSocketRequest),
+    /// Set a typed TCP socket option.
+    SetTcpOption(SetTcpOptionRequest),
+    /// Read a typed TCP socket option.
+    GetTcpOption(GetTcpOptionRequest),
     /// Read a socket's connection state.
     Status(SocketStatusRequest),
 }
@@ -188,20 +206,34 @@ pub enum SocketResponse {
     Create(CreateSocketResponse),
     /// Connect operation response.
     Connect(ConnectSocketResponse),
+    /// Bind operation response.
+    Bind(BindSocketResponse),
+    /// Listen operation response.
+    Listen(ListenSocketResponse),
+    /// Accept operation response.
+    Accept(AcceptSocketResponse),
     /// Send operation response.
     Send(SendSocketResponse),
+    /// Datagram send operation response.
+    SendTo(SendToSocketResponse),
     /// Receive operation response.
     Receive(ReceiveSocketResponse),
+    /// Datagram receive operation response.
+    ReceiveFrom(ReceiveFromSocketResponse),
     /// Shutdown operation completed.
     Shutdown,
+    /// TCP socket option was updated.
+    SetTcpOption,
+    /// TCP socket option response.
+    GetTcpOption(GetTcpOptionResponse),
     /// Status operation response.
     Status(SocketStatusResponse),
-    /// A non-connect host network operation failed.
+    /// A host network operation failed.
     ///
-    /// Connect and status responses carry terminal failures in
-    /// [`SocketConnectionStatus`] so repeated status requests remain
-    /// idempotent. Broker and request-validation failures use
-    /// [`BrokerResult::Error`] instead.
+    /// Stream connect and status responses carry terminal connection failures
+    /// in [`SocketConnectionStatus`]. Datagram connect failures and other
+    /// ordinary socket failures use this variant. Broker and request-validation
+    /// failures use [`BrokerResult::Error`] instead.
     ///
     /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
     Failed(SocketError),

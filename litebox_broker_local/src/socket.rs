@@ -1,16 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::net::SocketAddrV4;
+
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SocketRequest, SocketResponse,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
 use litebox_broker_protocol::socket::{
-    AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE,
-    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, ShutdownMode,
-    ShutdownSocketRequest, SocketAddressV4, SocketConnectionStatus, SocketError,
-    SocketStatusRequest, SocketStatusResponse, SocketType,
+    AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
+    ConnectSocketRequest, CreateSocketRequest, GetTcpOptionRequest, IpProtocol,
+    ListenSocketRequest, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags,
+    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
+    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest, SetTcpOptionRequest,
+    ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
+    SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -34,6 +39,23 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(response.handle)
     }
 
+    /// Creates a broker-owned IPv4 UDP datagram socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn create_udp_socket(&self) -> Result<ObjectHandle, Channel::Error> {
+        let response = self.request_socket(SocketRequest::Create(CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Datagram,
+            protocol: IpProtocol::Udp,
+        }))?;
+        let SocketResponse::Create(response) = response else {
+            panic!("broker returned unexpected socket create response: {response:?}");
+        };
+        Ok(response.handle)
+    }
+
     /// Starts or observes a nonblocking connect attempt.
     ///
     /// # Panics
@@ -42,7 +64,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn connect_socket(
         &self,
         handle: ObjectHandle,
-        address: SocketAddressV4,
+        address: SocketAddrV4,
     ) -> Result<core::result::Result<SocketConnectionStatus, SocketError>, Channel::Error> {
         let response = self.request_socket(SocketRequest::Connect(ConnectSocketRequest {
             handle,
@@ -52,6 +74,319 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             SocketResponse::Connect(response) => Ok(Ok(response.status)),
             SocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected socket connect response: {response:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::items_after_test_module,
+    reason = "the test module must access private adapter state while the production methods stay grouped"
+)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::cell::RefCell;
+    use core::convert::Infallible;
+    use litebox_broker_protocol::message::{
+        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+    };
+    use litebox_broker_protocol::shared_buffer::{
+        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
+    };
+    use litebox_broker_transport::channel::LocalSetupChannel;
+    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    #[test]
+    fn udp_operations_stage_complete_datagrams() {
+        let handle = ObjectHandle(7);
+        let channel = ScriptedChannel::new([
+            BrokerResult::Socket(SocketResponse::Create(
+                litebox_broker_protocol::socket::CreateSocketResponse { handle },
+            )),
+            BrokerResult::Socket(SocketResponse::SendTo(
+                litebox_broker_protocol::socket::SendToSocketResponse { sent: 3 },
+            )),
+            BrokerResult::Socket(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
+                received: 2,
+                datagram_length: 4,
+                source_address: SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, 49153),
+            })),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone(), ()))).unwrap();
+
+        assert_eq!(local.create_udp_socket().unwrap(), handle);
+        assert_eq!(
+            local
+                .send_to_socket(
+                    handle,
+                    descriptor(0, 3),
+                    &[1, 2, 3],
+                    SendFlags::NONE,
+                    Some(SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, 53)),
+                )
+                .unwrap(),
+            Ok(3)
+        );
+        let mut staged = [0; 3];
+        memory.read(0, &mut staged).unwrap();
+        assert_eq!(staged, [1, 2, 3]);
+
+        memory
+            .write(SHARED_BUFFER_SLOT_SIZE as usize, &[4, 5])
+            .unwrap();
+        let mut received = [0; 2];
+        assert_eq!(
+            local
+                .receive_from_socket(
+                    handle,
+                    descriptor(1, 2),
+                    &mut received,
+                    ReceiveFromFlags::PEEK,
+                )
+                .unwrap(),
+            Ok(ReceiveFromSocketResponse {
+                received: 2,
+                datagram_length: 4,
+                source_address: SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, 49153),
+            })
+        );
+        assert_eq!(received, [4, 5]);
+        assert!(matches!(
+            local.channel.sent_operations.borrow().as_slice(),
+            [
+                BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
+                    socket_type: SocketType::Datagram,
+                    protocol: IpProtocol::Udp,
+                    ..
+                })),
+                BrokerOperation::Socket(SocketRequest::SendTo(_)),
+                BrokerOperation::Socket(SocketRequest::ReceiveFrom(_)),
+            ]
+        ));
+    }
+
+    #[test]
+    fn tcp_options_use_typed_requests() {
+        let handle = ObjectHandle(7);
+        let channel = ScriptedChannel::new([
+            BrokerResult::Socket(SocketResponse::SetTcpOption),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(
+                litebox_broker_protocol::socket::GetTcpOptionResponse {
+                    value: TcpOptionValue::NoDelay(true),
+                },
+            )),
+            BrokerResult::Socket(SocketResponse::GetTcpOption(
+                litebox_broker_protocol::socket::GetTcpOptionResponse {
+                    value: TcpOptionValue::KeepAlive(false),
+                },
+            )),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
+
+        local
+            .set_tcp_option(handle, TcpOptionValue::NoDelay(true))
+            .unwrap();
+        assert_eq!(
+            local
+                .get_tcp_option(handle, TcpOptionName::NoDelay)
+                .unwrap(),
+            TcpOptionValue::NoDelay(true)
+        );
+        assert_eq!(
+            local
+                .get_tcp_option(handle, TcpOptionName::KeepAlive)
+                .unwrap(),
+            TcpOptionValue::KeepAlive(false)
+        );
+        assert_eq!(
+            local.channel.sent_operations.borrow().as_slice(),
+            [
+                BrokerOperation::Socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+                    handle,
+                    value: TcpOptionValue::NoDelay(true),
+                })),
+                BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                    handle,
+                    name: TcpOptionName::NoDelay,
+                })),
+                BrokerOperation::Socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+                    handle,
+                    name: TcpOptionName::KeepAlive,
+                })),
+            ]
+        );
+    }
+
+    const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
+        SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(slot),
+            length,
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestSharedMemory(Arc<Mutex<std::vec::Vec<u8>>>);
+
+    impl TestSharedMemory {
+        fn new(length: usize) -> Self {
+            Self(Arc::new(Mutex::new(std::vec![0; length])))
+        }
+    }
+
+    impl SharedMemory for TestSharedMemory {
+        fn len(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+
+        fn read(
+            &self,
+            offset: usize,
+            destination: &mut [u8],
+        ) -> core::result::Result<(), SharedMemoryError> {
+            let memory = self.0.lock().unwrap();
+            let end = offset
+                .checked_add(destination.len())
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            destination.copy_from_slice(
+                memory
+                    .get(offset..end)
+                    .ok_or(SharedMemoryError::InvalidRange)?,
+            );
+            Ok(())
+        }
+
+        fn write(
+            &self,
+            offset: usize,
+            source: &[u8],
+        ) -> core::result::Result<(), SharedMemoryError> {
+            let mut memory = self.0.lock().unwrap();
+            let end = offset
+                .checked_add(source.len())
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            memory
+                .get_mut(offset..end)
+                .ok_or(SharedMemoryError::InvalidRange)?
+                .copy_from_slice(source);
+            Ok(())
+        }
+    }
+
+    struct ScriptedChannel {
+        results: RefCell<VecDeque<BrokerResult>>,
+        sent_operations: RefCell<std::vec::Vec<BrokerOperation>>,
+    }
+
+    impl ScriptedChannel {
+        fn new(results: impl IntoIterator<Item = BrokerResult>) -> Self {
+            Self {
+                results: RefCell::new(results.into_iter().collect()),
+                sent_operations: RefCell::new(std::vec::Vec::new()),
+            }
+        }
+    }
+
+    impl LocalSetupChannel for ScriptedChannel {
+        type Error = Infallible;
+
+        fn send_handshake_request(
+            &mut self,
+            request: &BrokerHandshakeRequest,
+        ) -> core::result::Result<(), Self::Error> {
+            assert_eq!(
+                request.protocol_version,
+                litebox_broker_protocol::BROKER_PROTOCOL_VERSION
+            );
+            Ok(())
+        }
+
+        fn recv_handshake_response(
+            &mut self,
+        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+            Ok(Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+            }))
+        }
+    }
+
+    impl LocalCallChannel for ScriptedChannel {
+        type Error = Infallible;
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            self.sent_operations.borrow_mut().push(request.operation);
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result: self
+                    .results
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("response requires a scripted result"),
+            })
+        }
+    }
+}
+
+impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    /// Binds a broker-owned socket to a local IPv4 address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn bind_socket(
+        &self,
+        handle: ObjectHandle,
+        address: SocketAddrV4,
+    ) -> Result<core::result::Result<SocketAddrV4, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::Bind(BindSocketRequest { handle, address }))? {
+            SocketResponse::Bind(response) => Ok(Ok(response.local_address)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected socket bind response: {response:?}"),
+        }
+    }
+
+    /// Makes a broker-owned TCP socket listen for incoming connections.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn listen_socket(
+        &self,
+        handle: ObjectHandle,
+        backlog: u32,
+    ) -> Result<core::result::Result<SocketAddrV4, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::Listen(ListenSocketRequest {
+            handle,
+            backlog,
+        }))? {
+            SocketResponse::Listen(response) => Ok(Ok(response.local_address)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected socket listen response: {response:?}"),
+        }
+    }
+
+    /// Accepts one pending connection from a broker-owned TCP listener.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn accept_socket(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<core::result::Result<AcceptSocketResponse, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::Accept(AcceptSocketRequest { handle }))? {
+            SocketResponse::Accept(response) => Ok(Ok(response)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected socket accept response: {response:?}"),
         }
     }
 
@@ -70,6 +405,57 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             panic!("broker returned unexpected socket status response: {response:?}");
         };
         Ok(response)
+    }
+
+    /// Sets a typed option on a broker-owned TCP socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn set_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        value: TcpOptionValue,
+    ) -> Result<(), Channel::Error> {
+        let response = self.request_socket(SocketRequest::SetTcpOption(SetTcpOptionRequest {
+            handle,
+            value,
+        }))?;
+        assert_eq!(
+            response,
+            SocketResponse::SetTcpOption,
+            "broker returned unexpected TCP option set response"
+        );
+        Ok(())
+    }
+
+    /// Reads a typed option from a broker-owned TCP socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation or
+    /// returns a value for a different option.
+    pub fn get_tcp_option(
+        &self,
+        handle: ObjectHandle,
+        name: TcpOptionName,
+    ) -> Result<TcpOptionValue, Channel::Error> {
+        let response = self.request_socket(SocketRequest::GetTcpOption(GetTcpOptionRequest {
+            handle,
+            name,
+        }))?;
+        let SocketResponse::GetTcpOption(response) = response else {
+            panic!("broker returned unexpected TCP option get response: {response:?}");
+        };
+        assert!(
+            matches!(
+                (name, response.value),
+                (TcpOptionName::NoDelay, TcpOptionValue::NoDelay(_))
+                    | (TcpOptionName::KeepAlive, TcpOptionValue::KeepAlive(_))
+            ),
+            "broker returned a mismatched TCP option value"
+        );
+        Ok(response.value)
     }
 
     /// Sends bytes from an operation-scoped shared-buffer lease.
@@ -104,6 +490,42 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             }
             SocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected socket send response: {response:?}"),
+        }
+    }
+
+    /// Sends one datagram from an operation-scoped shared-buffer lease.
+    ///
+    /// The destination is omitted only for a connected UDP socket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the descriptor does not match `data`, or if the broker
+    /// returns a mismatched or non-atomic response.
+    pub fn send_to_socket(
+        &self,
+        handle: ObjectHandle,
+        buffer: SharedBufferDescriptor,
+        data: &[u8],
+        flags: SendFlags,
+        destination: Option<SocketAddrV4>,
+    ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
+        self.validate_udp_buffer(buffer, data.len());
+        self.shared_buffers
+            .write(buffer.slot_index, data)
+            .expect("validated shared UDP send range must be accessible");
+        match self.request_socket(SocketRequest::SendTo(SendToSocketRequest {
+            handle,
+            buffer,
+            flags,
+            destination,
+        }))? {
+            SocketResponse::SendTo(response) => {
+                let sent = response.sent as usize;
+                assert_eq!(sent, data.len(), "broker returned partial UDP send");
+                Ok(Ok(sent))
+            }
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected UDP send response: {response:?}"),
         }
     }
 
@@ -144,6 +566,49 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Receives one datagram into an operation-scoped shared-buffer lease.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the descriptor does not match `destination`, or if the broker
+    /// returns inconsistent datagram lengths.
+    pub fn receive_from_socket(
+        &self,
+        handle: ObjectHandle,
+        buffer: SharedBufferDescriptor,
+        destination: &mut [u8],
+        flags: ReceiveFromFlags,
+    ) -> Result<core::result::Result<ReceiveFromSocketResponse, SocketError>, Channel::Error> {
+        self.validate_udp_buffer(buffer, destination.len());
+        match self.request_socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
+            handle,
+            buffer,
+            flags,
+        }))? {
+            SocketResponse::ReceiveFrom(response) => {
+                assert!(
+                    response.received <= buffer.length,
+                    "broker returned oversized UDP receive"
+                );
+                assert!(
+                    response.received <= response.datagram_length,
+                    "broker returned inconsistent UDP receive lengths"
+                );
+                assert!(
+                    response.datagram_length <= MAX_UDP_DATAGRAM_SIZE,
+                    "broker returned oversized UDP datagram length"
+                );
+                let received = response.received as usize;
+                self.shared_buffers
+                    .read(buffer.slot_index, &mut destination[..received])
+                    .expect("validated shared UDP receive range must be accessible");
+                Ok(Ok(response))
+            }
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected UDP receive response: {response:?}"),
+        }
+    }
+
     /// Shuts down one or both directions of a broker socket.
     ///
     /// # Panics
@@ -177,6 +642,21 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .layout()
             .range(buffer.slot_index, data_len)
             .expect("shared socket descriptor must identify a valid slot range");
+    }
+
+    fn validate_udp_buffer(&self, buffer: SharedBufferDescriptor, data_len: usize) {
+        assert!(
+            buffer.length <= MAX_UDP_DATAGRAM_SIZE,
+            "shared UDP descriptor exceeds the datagram limit"
+        );
+        assert_eq!(
+            data_len, buffer.length as usize,
+            "shared UDP data must match its descriptor"
+        );
+        self.shared_buffers
+            .layout()
+            .range(buffer.slot_index, data_len)
+            .expect("shared UDP descriptor must identify a valid slot range");
     }
 
     fn request_socket(&self, request: SocketRequest) -> Result<SocketResponse, Channel::Error> {

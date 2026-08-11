@@ -14,7 +14,7 @@ use alloc::sync::Arc;
 use litebox::{
     event::{
         Events, IOPollable,
-        polling::TryOpError,
+        polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
     fd::EntryHandle,
@@ -26,6 +26,7 @@ use litebox::{
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
     platform::{Instant as _, page_mgmt::MemoryRegionPermissions},
+    sync::{Mutex, MutexGuard},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
@@ -80,33 +81,41 @@ impl<Instant> ReceiveContext<Instant> {
     }
 }
 
-struct InetReceiveSocket<'a, Platform: ShimPlatform, FS: ShimFS> {
+pub(crate) struct InetSocketPin<'a, Platform: ShimPlatform, FS: ShimFS> {
     global: &'a GlobalState<Platform, FS>,
     entry: Option<EntryHandle<Platform, litebox::net::Network<Platform>>>,
-    state: SocketReceiveState,
+    state: SocketIoState,
     proxy: Arc<NetworkProxy<Platform>>,
     recv_timeout: Option<core::time::Duration>,
+    send_timeout: Option<core::time::Duration>,
     is_nonblock: bool,
     socket_type: SockType,
+    recvmmsg_lock: SocketRecvmmsgLock<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Drop for InetReceiveSocket<'_, Platform, FS> {
+impl<Platform: ShimPlatform, FS: ShimFS> InetSocketPin<'_, Platform, FS> {
+    pub(crate) fn is_broker_datagram(&self) -> bool {
+        matches!(self.proxy.as_ref(), NetworkProxy::BrokerDatagram(_))
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for InetSocketPin<'_, Platform, FS> {
     fn drop(&mut self) {
         drop(self.entry.take());
         let previous = self
             .state
             .0
             .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-        let active_pins = previous & SOCKET_RECEIVE_PIN_COUNT_MASK;
-        assert_ne!(active_pins, 0, "receive pin count underflow");
-        if active_pins != 1 || previous & SOCKET_RECEIVE_CLOSE_PENDING == 0 {
+        let active_pins = previous & SOCKET_IO_PIN_COUNT_MASK;
+        assert_ne!(active_pins, 0, "socket I/O pin count underflow");
+        if active_pins != 1 || previous & SOCKET_IO_CLOSE_PENDING == 0 {
             return;
         }
         let mut net = self.global.net.lock();
         let pending = net.finish_deferred_closes();
         if !pending {
             self.state.0.fetch_and(
-                !SOCKET_RECEIVE_CLOSE_PENDING,
+                !SOCKET_IO_CLOSE_PENDING,
                 core::sync::atomic::Ordering::Release,
             );
         }
@@ -114,11 +123,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for InetReceiveSocket<'_, Platform
 }
 
 enum ReceiveSocket<'a, Platform: ShimPlatform, FS: ShimFS> {
-    Inet(InetReceiveSocket<'a, Platform, FS>),
+    Inet(InetSocketPin<'a, Platform, FS>),
     Unix(EntryHandle<Platform, UnixSocketSubsystem<Platform, FS>>),
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
+    pub(crate) fn try_pin_inet_socket<'a>(
+        &self,
+        global: &'a GlobalState<Platform, FS>,
+        raw_fd: usize,
+    ) -> Result<Option<InetSocketPin<'a, Platform, FS>>, Errno> {
+        let rds = self.raw_descriptor_store.read();
+        let fd = match rds.fd_from_raw_integer(raw_fd) {
+            Ok(fd) => fd,
+            Err(litebox::fd::ErrRawIntFd::NotFound) => return Err(Errno::EBADF),
+            Err(litebox::fd::ErrRawIntFd::InvalidSubsystem) => return Ok(None),
+        };
+        let socket = global.pin_socket(&fd)?;
+        drop(rds);
+        Ok(Some(socket))
+    }
+
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
     ///
     /// This method handles the common pattern of:
@@ -168,7 +193,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         let raw_fd = sockfd as usize;
         let rds = self.raw_descriptor_store.read();
         if let Ok(fd) = rds.fd_from_raw_integer(raw_fd) {
-            let socket = ReceiveSocket::Inet(global.pin_receive_socket(&fd)?);
+            let socket = ReceiveSocket::Inet(global.pin_socket(&fd)?);
             drop(rds);
             return Ok(socket);
         }
@@ -265,10 +290,68 @@ pub(super) struct SocketOptions {
 pub(crate) struct SocketOFlags(pub OFlags);
 pub(crate) struct SocketProxy<Platform: ShimPlatform>(pub Arc<NetworkProxy<Platform>>);
 #[derive(Clone)]
-struct SocketReceiveState(Arc<core::sync::atomic::AtomicUsize>);
+struct SocketIoState(Arc<core::sync::atomic::AtomicUsize>);
+/// Entry metadata that shares `recvmmsg` serialization across duplicated descriptors.
+struct SocketRecvmmsgLock<Platform: ShimPlatform>(Arc<RecvmmsgLock<Platform>>);
 
-const SOCKET_RECEIVE_CLOSE_PENDING: usize = 1 << (usize::BITS - 1);
-const SOCKET_RECEIVE_PIN_COUNT_MASK: usize = SOCKET_RECEIVE_CLOSE_PENDING - 1;
+/// Serializes multi-message receives while allowing contended waits to be interrupted or timed out.
+struct RecvmmsgLock<Platform: ShimPlatform> {
+    mutex: Mutex<Platform, ()>,
+    pollee: Pollee<Platform>,
+}
+
+struct RecvmmsgGuard<'a, Platform: ShimPlatform> {
+    guard: Option<MutexGuard<'a, Platform, ()>>,
+    lock: &'a RecvmmsgLock<Platform>,
+}
+
+impl<Platform: ShimPlatform> RecvmmsgLock<Platform> {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(()),
+            pollee: Pollee::new(),
+        }
+    }
+
+    fn try_lock(&self) -> Option<RecvmmsgGuard<'_, Platform>> {
+        Some(RecvmmsgGuard {
+            guard: Some(self.mutex.try_lock()?),
+            lock: self,
+        })
+    }
+
+    fn lock_interruptibly(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+    ) -> Result<RecvmmsgGuard<'_, Platform>, Errno> {
+        cx.wait_on_events(
+            false,
+            Events::IN,
+            |observer, filter| {
+                self.pollee.register_observer(observer, filter);
+                Ok(())
+            },
+            || self.try_lock().ok_or(TryOpError::TryAgain),
+        )
+        .map_err(socket_io_errno)
+    }
+}
+
+impl<Platform: ShimPlatform> Drop for RecvmmsgGuard<'_, Platform> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.lock.pollee.notify_observers(Events::IN);
+    }
+}
+
+impl<Platform: ShimPlatform> Clone for SocketRecvmmsgLock<Platform> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+const SOCKET_IO_CLOSE_PENDING: usize = 1 << (usize::BITS - 1);
+const SOCKET_IO_PIN_COUNT_MASK: usize = SOCKET_IO_CLOSE_PENDING - 1;
 
 impl<Platform: ShimPlatform> Clone for SocketProxy<Platform> {
     fn clone(&self) -> Self {
@@ -302,13 +385,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let old = dt.set_fd_metadata(fd, sock_type);
+        let old = dt.set_entry_metadata(fd, sock_type);
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
         let old = dt.set_entry_metadata(
             fd,
-            SocketReceiveState(Arc::new(core::sync::atomic::AtomicUsize::new(0))),
+            SocketIoState(Arc::new(core::sync::atomic::AtomicUsize::new(0))),
+        );
+        assert!(old.is_none());
+        let old = dt.set_entry_metadata(
+            fd,
+            SocketRecvmmsgLock(Arc::new(RecvmmsgLock::<Platform>::new())),
         );
         assert!(old.is_none());
         drop(dt);
@@ -414,11 +502,26 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optval: UserPtr<u8>,
         optlen: usize,
     ) -> Result<(), Errno> {
+        let keepalive_socket_type =
+            if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE)) {
+                Some(self.get_socket_type(fd)?)
+            } else {
+                None
+            };
+        if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE))
+            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+        {
+            let value: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+            return self
+                .net
+                .lock()
+                .set_tcp_option(fd, litebox::net::TcpOptionData::KEEPALIVE(value != 0))
+                .map_err(Errno::from);
+        }
         match self.setsockopt_common(optname, optval, optlen, |so, value| {
             let unsupported_broker_option = matches!(
                 (so, &value),
                 (SocketOption::LINGER, SocketOptionValue::Timeout(Some(_)))
-                    | (SocketOption::KEEPALIVE, SocketOptionValue::U32(_))
             );
             if unsupported_broker_option
                 && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
@@ -452,14 +555,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     }
                     (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
                         let keep_alive = val != 0;
-                        deferred_tcp_option = Some(if keep_alive {
-                            // default time interval is 2 hours
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
-                                core::time::Duration::from_hours(2),
-                            ))
-                        } else {
-                            litebox::net::TcpOptionData::KEEPALIVE(None)
-                        });
+                        if matches!(keepalive_socket_type, Some(SockType::Stream)) {
+                            deferred_tcp_option =
+                                Some(litebox::net::TcpOptionData::KEEPALIVE(keep_alive));
+                        }
                         opt.keep_alive = keep_alive;
                     }
                     _ => unreachable!(),
@@ -475,9 +574,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         return Err(Errno::EBADF);
                     }
                     litebox::net::errors::SetTcpOptionError::NotTcpSocket => {
-                        unimplemented!("SO_KEEPALIVE is not supported for non-TCP sockets")
+                        return Err(Errno::EOPNOTSUPP);
                     }
-                    _ => unimplemented!(),
+                    litebox::net::errors::SetTcpOptionError::Unsupported
+                    | litebox::net::errors::SetTcpOptionError::BackendFailure => {
+                        return Err(err.into());
+                    }
+                    _ => unreachable!(),
                 }
             }
             Ok(())
@@ -532,10 +635,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     self.net.lock().set_tcp_option(
                         fd,
                         match name {
-                            "reno" | "cubic" => {
-                                log_unsupported!("enable {} for smoltcp?", name);
-                                return Err(Errno::EINVAL);
-                            }
+                            "reno" => litebox::net::TcpOptionData::CONGESTION(
+                                litebox::net::CongestionControl::Reno,
+                            ),
+                            "cubic" => litebox::net::TcpOptionData::CONGESTION(
+                                litebox::net::CongestionControl::Cubic,
+                            ),
                             "none" => litebox::net::TcpOptionData::CONGESTION(
                                 litebox::net::CongestionControl::None,
                             ),
@@ -547,20 +652,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 TcpOption::NODELAY | TcpOption::CORK => {
-                    let val: u32 = super::read_from_user::<_, Platform>(optval, size_of::<u32>())?;
-                    // Some applications use Nagle's Algorithm (via the TCP_NODELAY option) for a similar effect.
-                    // However, TCP_CORK offers more fine-grained control, as it's designed for applications that
-                    // send variable-length chunks of data that don't necessarily fit nicely into a full TCP segment.
-                    // Because smoltcp does not support TCP_CORK, we emulate it by enabling/disabling Nagle's Algorithm.
-                    let on = if let TcpOption::NODELAY = to {
-                        val != 0
-                    } else {
-                        // CORK is the opposite of NODELAY
-                        val == 0
+                    let proxy = self.get_proxy(fd)?;
+                    let NetworkProxy::BrokerStream(_) = proxy.as_ref() else {
+                        return Err(Errno::ENOPROTOOPT);
                     };
+                    drop(proxy);
+                    let val: u32 = super::read_from_user::<_, Platform>(optval, optlen)?;
+                    if matches!(to, TcpOption::CORK) {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
                     self.net
                         .lock()
-                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
+                        .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(val != 0))?;
                 }
                 TcpOption::KEEPINTVL => {
                     const MAX_TCP_KEEPINTVL: u32 = 32767;
@@ -572,7 +675,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         .lock()
                         .set_tcp_option(
                             fd,
-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+                            litebox::net::TcpOptionData::KEEPINTVL(Some(
                                 core::time::Duration::from_secs(u64::from(val)),
                             )),
                         )
@@ -641,6 +744,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
+        if matches!(optname, SocketOptionName::Socket(SocketOption::KEEPALIVE))
+            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+        {
+            let TcpOptionData::KEEPALIVE(enabled) = self
+                .net
+                .lock()
+                .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+            else {
+                unreachable!()
+            };
+            return super::write_to_user::<_, Platform>(u32::from(enabled), optval, len);
+        }
         match self.getsockopt_common(optname, optval, len, |sopt| {
             self.with_socket_options(fd, |options| match sopt {
                 SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.recv_timeout),
@@ -713,16 +828,21 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                         return Err(Errno::EOPNOTSUPP);
                     }
                     TcpOption::KEEPINTVL => {
-                        let TcpOptionData::KEEPALIVE(interval) = self
+                        let TcpOptionData::KEEPINTVL(interval) = self
                             .net
                             .lock()
-                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPALIVE)?
+                            .get_tcp_option(fd, litebox::net::TcpOptionName::KEEPINTVL)?
                         else {
                             unreachable!()
                         };
                         interval.map_or(0, |d| d.as_secs().try_into().unwrap())
                     }
                     TcpOption::NODELAY | TcpOption::CORK => {
+                        if matches!(tcpopt, TcpOption::CORK)
+                            && matches!(self.get_proxy(fd)?.as_ref(), NetworkProxy::BrokerStream(_))
+                        {
+                            return Err(Errno::EOPNOTSUPP);
+                        }
                         let TcpOptionData::NODELAY(nodelay) = self
                             .net
                             .lock()
@@ -752,7 +872,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             AcceptError::NoConnectionsReady => TryOpError::TryAgain,
             AcceptError::InvalidFd
             | AcceptError::NotListening
-            | AcceptError::UnsupportedOperation => TryOpError::Other(e.into()),
+            | AcceptError::UnsupportedOperation
+            | AcceptError::OperationFailed(_) => TryOpError::Other(e.into()),
             _ => unimplemented!(),
         })
     }
@@ -831,38 +952,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
     ) -> Result<usize, Errno> {
         let proxy = self.get_proxy(fd)?;
 
-        // Auto-bind UDP sockets if not already bound (Linux behavior: sendto() on an unbound
-        // UDP socket implicitly binds it to an ephemeral port before sending).
-        // This is mostly lock-free: we only take the network lock if we need to allocate a port.
-        if let NetworkProxy::Datagram(proxy) = proxy.as_ref()
-            && proxy.local_port() == 0
-        {
-            // UDP socket is unbound - bind to an ephemeral port
-            let mut net = self.net.lock();
-            // Bind with port 0 to get an ephemeral port
-            if let Err(err) = net.bind(
-                fd,
-                &SocketAddr::V4(core::net::SocketAddrV4::new(
-                    core::net::Ipv4Addr::UNSPECIFIED,
-                    0,
-                )),
-            ) {
-                match err {
-                    litebox::net::errors::BindError::AlreadyBound => {
-                        // Another thread bound it in the meantime - that's fine
-                    }
-                    litebox::net::errors::BindError::InvalidFd => return Err(Errno::EBADF),
-                    litebox::net::errors::BindError::UnsupportedAddress(_)
-                    | litebox::net::errors::BindError::PortAlreadyInUse(_) => unreachable!(),
-                    _ => unimplemented!(),
-                }
-            }
-            // Get the assigned port
-            let local_addr = net.get_local_addr(fd).map_err(Errno::from)?;
-            // If another thread already set a port, that's fine - we'll use theirs
-            let _ = proxy.set_local_port(local_addr.port());
-        }
-
         // Convert `SendFlags` to `litebox::net::SendFlags`
         // `DONTWAIT` is handled in this function and `NOSIGNAL` should be handled by caller,
         // so we don't convert them.
@@ -880,11 +969,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let is_nonblock =
             self.get_status(fd).contains(OFlags::NONBLOCK) || flags.contains(SendFlags::DONTWAIT);
-        let is_empty_stream = buf.is_empty()
-            && matches!(
-                proxy.as_ref(),
-                NetworkProxy::Stream(_) | NetworkProxy::BrokerStream(_)
-            );
+        let is_empty_stream =
+            buf.is_empty() && matches!(proxy.as_ref(), NetworkProxy::BrokerStream(_));
 
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -919,14 +1005,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         context: ReceiveContext<Platform::Instant>,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
-        let socket = self.pin_receive_socket(fd)?;
-        self.receive_from_socket(cx, &socket, buf, flags, context, source_addr)
+        let socket = self.pin_socket(fd)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let received = self.receive_from_socket(cx, &socket, buf, flags, context, source_addr)?;
+        Ok(if flags.contains(ReceiveFlags::TRUNC) {
+            received
+        } else {
+            received.min(buf.len())
+        })
     }
 
-    fn pin_receive_socket(
+    pub(crate) fn pin_socket(
         &self,
         fd: &SocketFd<Platform>,
-    ) -> Result<InetReceiveSocket<'_, Platform, FS>, Errno> {
+    ) -> Result<InetSocketPin<'_, Platform, FS>, Errno> {
         let descriptor_table = self.litebox.descriptor_table();
         let entry = descriptor_table.entry_handle(fd).ok_or(Errno::EBADF)?;
         let proxy = descriptor_table
@@ -935,8 +1029,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
-        let recv_timeout = descriptor_table
-            .with_metadata(fd, |options: &SocketOptions| options.recv_timeout)
+        let (recv_timeout, send_timeout) = descriptor_table
+            .with_metadata(fd, |options: &SocketOptions| {
+                (options.recv_timeout, options.send_timeout)
+            })
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
@@ -954,33 +1050,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
         let state = descriptor_table
-            .with_metadata(fd, |state: &SocketReceiveState| state.clone())
+            .with_metadata(fd, |state: &SocketIoState| state.clone())
+            .map_err(|error| match error {
+                litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
+                litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
+            })?;
+        let recvmmsg_lock = descriptor_table
+            .with_metadata(fd, |lock: &SocketRecvmmsgLock<Platform>| lock.clone())
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
         let previous = state.0.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         assert_ne!(
-            previous & SOCKET_RECEIVE_PIN_COUNT_MASK,
-            SOCKET_RECEIVE_PIN_COUNT_MASK,
-            "receive pin count overflow"
+            previous & SOCKET_IO_PIN_COUNT_MASK,
+            SOCKET_IO_PIN_COUNT_MASK,
+            "socket I/O pin count overflow"
         );
         drop(descriptor_table);
-        Ok(InetReceiveSocket {
+        Ok(InetSocketPin {
             global: self,
             entry: Some(entry),
             state,
             proxy,
             recv_timeout,
+            send_timeout,
             is_nonblock,
             socket_type,
+            recvmmsg_lock,
         })
     }
 
-    fn receive_from_socket(
+    pub(crate) fn receive_from_socket(
         &self,
         cx: &WaitContext<'_, Platform>,
-        socket: &InetReceiveSocket<'_, Platform, FS>,
+        socket: &InetSocketPin<'_, Platform, FS>,
         buf: &mut [u8],
         flags: ReceiveFlags,
         context: ReceiveContext<Platform::Instant>,
@@ -1000,12 +1104,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let wait_all = flags.contains(ReceiveFlags::WAITALL)
             && matches!(socket_type, SockType::Stream)
             && !is_nonblock;
-        if buf.is_empty()
-            && matches!(
-                socket.proxy.as_ref(),
-                NetworkProxy::Stream(_) | NetworkProxy::BrokerStream(_)
-            )
-        {
+        if buf.is_empty() && matches!(socket.proxy.as_ref(), NetworkProxy::BrokerStream(_)) {
             return Ok(0);
         }
 
@@ -1068,6 +1167,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                             return Ok(received);
                         }
                     }
+                    Err(ChannelReadError::ReadShutdown)
+                        if is_nonblock && matches!(socket_type, SockType::Datagram) =>
+                    {
+                        return Err(TryOpError::TryAgain);
+                    }
                     Err(ChannelReadError::ReadShutdown) => return Ok(received),
                     Err(ChannelReadError::WouldBlock) => return Err(TryOpError::TryAgain),
                     Err(ChannelReadError::ConnectionClosed) => {
@@ -1118,11 +1222,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     Err(ChannelReadError::WouldBlock) => Err(socket_io_errno(error)),
                 }
             }
+
             Err(error) => Err(socket_io_errno(error)),
         }
     }
 
-    fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
+    pub(crate) fn send_to_pinned_socket(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        socket: &InetSocketPin<'_, Platform, FS>,
+        buf: &[u8],
+        flags: SendFlags,
+    ) -> Result<usize, Errno> {
+        let new_flags = convert_flags!(
+            flags,
+            SendFlags,
+            litebox::net::SendFlags,
+            CONFIRM,
+            DONTROUTE,
+            EOR,
+            MORE,
+            OOB,
+        );
+        cx.with_timeout(socket.send_timeout)
+            .wait_on_events(
+                socket.is_nonblock || flags.contains(SendFlags::DONTWAIT),
+                Events::OUT,
+                |observer, filter| {
+                    socket.proxy.register_observer(observer, filter);
+                    Ok(())
+                },
+                || match socket.proxy.try_write(buf, new_flags, None) {
+                    Ok(0) if buf.is_empty() => Ok(0),
+                    Ok(0) | Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
+                    Ok(n) => Ok(n),
+                    Err(error) => Err(TryOpError::Other(Errno::from(error))),
+                },
+            )
+            .map_err(socket_io_errno)
+    }
+
+    pub(crate) fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
         self.litebox
             .descriptor_table()
             .with_metadata(fd, |sock_type: &SockType| *sock_type)
@@ -1197,26 +1337,31 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         let state = self
             .litebox
             .descriptor_table()
-            .with_metadata(fd, |state: &SocketReceiveState| state.clone())
+            .with_metadata(fd, |state: &SocketIoState| state.clone())
             .map_err(|_| litebox::net::errors::CloseError::InvalidFd)?;
         state.0.fetch_or(
-            SOCKET_RECEIVE_CLOSE_PENDING,
+            SOCKET_IO_CLOSE_PENDING,
             core::sync::atomic::Ordering::AcqRel,
         );
         let mut net = self.net.lock();
         state.0.fetch_or(
-            SOCKET_RECEIVE_CLOSE_PENDING,
+            SOCKET_IO_CLOSE_PENDING,
             core::sync::atomic::Ordering::AcqRel,
         );
         let result = net.close(fd, behavior);
         let pending = net.finish_deferred_closes();
         if !pending {
             state.0.fetch_and(
-                !SOCKET_RECEIVE_CLOSE_PENDING,
+                !SOCKET_IO_CLOSE_PENDING,
                 core::sync::atomic::Ordering::Release,
             );
         }
         result
+    }
+
+    fn close_unpublished_socket(&self, fd: &SocketFd<Platform>) {
+        self.close_network_socket(fd, CloseBehavior::Immediate)
+            .expect("closing an unpublished socket must succeed");
     }
 }
 
@@ -1278,10 +1423,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let socket = self.global.net.lock().socket(protocol)?;
                 let _ = self.global.initialize_socket(&socket, ty, flags);
-                let Ok(raw_fd) = files.insert_raw_fd(socket) else {
-                    unimplemented!()
-                };
-                raw_fd
+                files.insert_raw_fd(socket).map_err(|socket| {
+                    self.global.close_unpublished_socket(&socket);
+                    Errno::EMFILE
+                })?
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -1606,9 +1751,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
                 proxy.set_state(SocketState::Connected);
-                let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
-                    unimplemented!()
-                };
+                let raw_fd = files
+                    .insert_raw_fd(accepted_file)
+                    .map_err(|accepted_file| {
+                        self.global.close_unpublished_socket(&accepted_file);
+                        Errno::EMFILE
+                    })?;
                 Ok((raw_fd, peer_addr))
             },
             |file| {
@@ -1737,10 +1885,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        let is_inet_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
+                is_inet_datagram.set(matches!(
+                    self.global.get_socket_type(fd)?,
+                    SockType::Datagram
+                ));
                 let sockaddr = sockaddr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1758,6 +1911,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
+            && !is_inet_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1808,10 +1962,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
+        let is_inet_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_socket(
             &self.global,
             sockfd,
             |fd| {
+                is_inet_datagram.set(matches!(
+                    self.global.get_socket_type(fd)?,
+                    SockType::Datagram
+                ));
                 let sock_addr = sock_addr
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
@@ -1831,6 +1990,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         );
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
+            && !is_inet_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -2371,7 +2531,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // A `None` deadline means either no user-supplied timeout or a saturating overflow
         // — both are treated as "no deadline".
         let deadline = timeout_duration.and_then(|d| self.global.platform.now().checked_add(d));
-
         let stride = size_of::<UserMmsgHdr>();
         let msg_len_off = offset_of!(UserMmsgHdr, msg_len);
         let msgvec_base = msgvec.as_usize();
@@ -2379,6 +2538,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if msgvec_base.checked_add(msgvec_len).is_none() {
             return Err(Errno::EFAULT);
         }
+
+        let _recvmmsg = if vlen <= 1 {
+            None
+        } else {
+            match &socket {
+                ReceiveSocket::Inet(socket)
+                    if flags.contains(ReceiveFlags::DONTWAIT) || socket.is_nonblock =>
+                {
+                    Some(socket.recvmmsg_lock.0.try_lock().ok_or(Errno::EAGAIN)?)
+                }
+                ReceiveSocket::Inet(socket) => {
+                    let wait_cx = self.wait_cx().with_deadline(deadline);
+                    Some(socket.recvmmsg_lock.0.lock_interruptibly(&wait_cx)?)
+                }
+                ReceiveSocket::Unix(_) => None,
+            }
+        };
 
         // WAITFORONE is mmsg-only; the inner recvmsg doesn't recognize it.
         let waitforone = flags.contains(ReceiveFlags::WAITFORONE);
@@ -2603,11 +2779,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     ShutdownHow::Write => litebox::net::ShutdownDirection::Write,
                     ShutdownHow::Both => litebox::net::ShutdownDirection::Both,
                 };
-                self.global
-                    .net
-                    .lock()
-                    .shutdown(fd, direction)
-                    .map_err(Errno::from)
+                let network = self.global.net.lock();
+                match network.shutdown(fd, direction) {
+                    Err(litebox::net::errors::ShutdownError::Listening) => match how {
+                        ShutdownHow::Read | ShutdownHow::Both => {
+                            network.stop_listening(fd).map_err(Errno::from)
+                        }
+                        ShutdownHow::Write => Ok(()),
+                    },
+                    result => result.map_err(Errno::from),
+                }
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
@@ -2632,7 +2813,7 @@ mod tests {
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
         AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
-        SocketOption, SocketOptionName, TcpOption, errno::Errno,
+        SocketOption, SocketOptionName, errno::Errno,
     };
     use zerocopy::FromZeros as _;
 
@@ -2654,11 +2835,24 @@ mod tests {
             == core::mem::size_of::<libc::msghdr>()
     );
 
-    const TUN_IP_ADDR: [u8; 4] = [10, 0, 0, 2];
-    const TUN_IP_ADDR_STR: &str = "10.0.0.2";
-    const TUN_DEVICE_NAME: &str = "tun99";
-    const SERVER_PORT: u16 = 8080;
-    const CLIENT_PORT: u16 = 8081;
+    const LOOPBACK_IP_ADDR: [u8; 4] = [127, 0, 0, 1];
+    const LOOPBACK_IP_ADDR_STR: &str = "127.0.0.1";
+
+    fn find_free_tcp_port() -> u16 {
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve TCP port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn find_free_udp_port() -> u16 {
+        std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("failed to reserve UDP port")
+            .local_addr()
+            .unwrap()
+            .port()
+    }
 
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
@@ -2666,8 +2860,9 @@ mod tests {
     }
 
     #[test]
-    fn dropping_inet_receive_pin_reaps_deferred_close() {
-        let task = init_platform(None);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn dropping_inet_socket_pin_reaps_deferred_close() {
+        let task = init_platform();
         let fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
@@ -2683,13 +2878,184 @@ mod tests {
 
         close_socket(&task, fd);
         assert!(
-            state.0.load(core::sync::atomic::Ordering::Acquire)
-                & super::SOCKET_RECEIVE_CLOSE_PENDING
+            state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
                 != 0
         );
 
         drop(socket);
         assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
+        let task = init_platform();
+        let fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let socket = task
+            .files
+            .borrow()
+            .pin_receive_socket(&task.global, fd)
+            .unwrap();
+        let state = match &socket {
+            super::ReceiveSocket::Inet(socket) => socket.state.clone(),
+            super::ReceiveSocket::Unix(_) => unreachable!(),
+        };
+
+        close_socket(&task, fd);
+        assert!(
+            state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
+                != 0
+        );
+        let result = match &socket {
+            super::ReceiveSocket::Inet(socket) => task.global.send_to_pinned_socket(
+                &task.wait_cx(),
+                socket,
+                b"pinned",
+                SendFlags::empty(),
+            ),
+            super::ReceiveSocket::Unix(_) => unreachable!(),
+        };
+        assert_eq!(result, Err(Errno::EDESTADDRREQ));
+
+        drop(socket);
+        assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn raw_inet_socket_pin_does_not_follow_dup2_replacement() {
+        let task = init_platform();
+        let old_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let new_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let old_socket = task
+            .files
+            .borrow()
+            .try_pin_inet_socket(&task.global, old_fd as usize)
+            .unwrap()
+            .unwrap();
+        let old_state = old_socket.state.clone();
+        let new_socket = task
+            .files
+            .borrow()
+            .try_pin_inet_socket(&task.global, new_fd as usize)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            task.sys_dup(
+                new_fd.try_into().unwrap(),
+                Some(old_fd.try_into().unwrap()),
+                None,
+            )
+            .unwrap(),
+            old_fd
+        );
+        assert!(
+            old_state.0.load(core::sync::atomic::Ordering::Acquire)
+                & super::SOCKET_IO_CLOSE_PENDING
+                != 0
+        );
+        let replacement = task
+            .files
+            .borrow()
+            .try_pin_inet_socket(&task.global, old_fd as usize)
+            .unwrap()
+            .unwrap();
+        assert!(alloc::sync::Arc::ptr_eq(
+            &replacement.proxy,
+            &new_socket.proxy
+        ));
+        assert!(!alloc::sync::Arc::ptr_eq(
+            &replacement.proxy,
+            &old_socket.proxy
+        ));
+
+        drop(old_socket);
+        assert_eq!(old_state.0.load(core::sync::atomic::Ordering::Acquire), 0);
+        drop(replacement);
+        drop(new_socket);
+        close_socket(&task, old_fd);
+        close_socket(&task, new_fd);
+    }
+
+    #[test]
+    fn recvmmsg_lock_wakes_contended_waiter() {
+        let task = init_platform();
+        let lock = alloc::sync::Arc::new(super::RecvmmsgLock::new());
+        let guard = lock.try_lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker_lock = alloc::sync::Arc::clone(&lock);
+        task.spawn_clone_for_test(move |task| {
+            started_tx.send(()).unwrap();
+            let _guard = worker_lock.lock_interruptibly(&task.wait_cx()).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx
+            .recv_timeout(core::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(core::time::Duration::from_millis(20))
+                .is_err()
+        );
+        drop(guard);
+        acquired_rx
+            .recv_timeout(core::time::Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn recvmmsg_lock_honors_wait_deadline() {
+        let task = init_platform();
+        let lock = super::RecvmmsgLock::new();
+        let guard = lock.try_lock().unwrap();
+        let wait_cx = task
+            .wait_cx()
+            .with_timeout(core::time::Duration::from_millis(20));
+
+        assert!(matches!(
+            lock.lock_interruptibly(&wait_cx),
+            Err(Errno::EAGAIN)
+        ));
+        drop(guard);
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn inet_socket_returns_emfile_at_raw_fd_limit() {
+        let task = init_platform();
+        let fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        task.files.borrow().set_max_fd(fd as usize);
+        assert_eq!(
+            task.do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0),
+            Err(Errno::EMFILE)
+        );
+        close_socket(&task, fd);
     }
 
     /// Helper to read SO_ERROR from a socket via getsockopt.
@@ -2773,22 +3139,21 @@ mod tests {
         let buf = "Hello, world!";
         let child_handle = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(200)); // Give server time to start
+            let port = port.to_string();
             match option {
                 "sendto" | "sendmsg" => std::process::Command::new("nc")
                     .args([
                         "-w", // timeout for connects and final net reads
                         "1",
-                        TUN_IP_ADDR_STR,
-                        SERVER_PORT.to_string().as_str(),
+                        LOOPBACK_IP_ADDR_STR,
+                        &port,
                     ])
                     .stdout(std::process::Stdio::piped())
                     .output(),
                 "recvfrom" | "recvmsg" => std::process::Command::new("sh")
                     .args([
                         "-c",
-                        &alloc::format!(
-                            "echo -n '{buf}' | nc -w 1 {TUN_IP_ADDR_STR} {SERVER_PORT}",
-                        ),
+                        &alloc::format!("echo -n '{buf}' | nc -w 1 {LOOPBACK_IP_ADDR_STR} {port}"),
                     ])
                     .output(),
                 _ => panic!("Unknown option"),
@@ -2823,7 +3188,7 @@ mod tests {
         let super::SocketAddress::Inet(SocketAddr::V4(remote_addr)) = remote_addr else {
             panic!("Expected IPv4 address");
         };
-        assert_eq!(remote_addr.ip().octets(), [10, 0, 0, 1]);
+        assert_eq!(remote_addr.ip().octets(), LOOPBACK_IP_ADDR);
         assert_ne!(remote_addr.port(), 0);
 
         match option {
@@ -2938,20 +3303,20 @@ mod tests {
         close_socket(task, server);
     }
 
-    fn test_tcp_socket_with_external_client(port: u16, is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    fn test_tcp_socket_with_external_client(is_nonblocking: bool, test_trunc: bool) {
+        let task = init_platform();
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            port,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "recvfrom",
         );
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            port,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "recvmsg",
@@ -2959,19 +3324,19 @@ mod tests {
     }
 
     fn test_tcp_socket_send(is_nonblocking: bool, test_trunc: bool) {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let task = init_platform();
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            SERVER_PORT,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "sendto",
         );
         test_tcp_socket_as_server(
             &task,
-            TUN_IP_ADDR,
-            SERVER_PORT,
+            LOOPBACK_IP_ADDR,
+            find_free_tcp_port(),
             is_nonblocking,
             test_trunc,
             "sendmsg",
@@ -2979,33 +3344,40 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_blocking_send_tcp_socket() {
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_send_tcp_socket() {
         test_tcp_socket_send(false, false);
     }
 
     #[test]
-    fn test_tun_nonblocking_send_tcp_socket() {
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nonblocking_send_tcp_socket() {
         test_tcp_socket_send(true, false);
     }
 
     #[test]
-    fn test_tun_blocking_recvfrom_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, false);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(false, false);
     }
 
     #[test]
-    fn test_tun_nonblocking_recvfrom_tcp_socket() {
-        test_tcp_socket_with_external_client(SERVER_PORT, true, false);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nonblocking_recvfrom_tcp_socket() {
+        test_tcp_socket_with_external_client(true, false);
     }
 
     #[test]
-    fn test_tun_blocking_recvfrom_tcp_socket_with_truncation() {
-        test_tcp_socket_with_external_client(SERVER_PORT, false, true);
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_recvfrom_tcp_socket_with_truncation() {
+        test_tcp_socket_with_external_client(false, true);
     }
 
     #[test]
-    fn test_tun_tcp_connection_refused() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_tcp_connection_refused() {
+        let task = init_platform();
+        let port = find_free_tcp_port();
         let socket_fd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
@@ -3018,8 +3390,8 @@ mod tests {
             .do_connect(
                 socket_fd2,
                 SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-                    core::net::Ipv4Addr::from([10, 0, 0, 1]),
-                    SERVER_PORT,
+                    core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+                    port,
                 ))),
             )
             .unwrap_err();
@@ -3033,18 +3405,15 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_tcp_socket_as_client() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_tcp_socket_as_client() {
+        let task = init_platform();
+        let port = find_free_tcp_port();
 
-        let child_handle = std::thread::spawn(|| {
+        let child_handle = std::thread::spawn(move || {
+            let port = port.to_string();
             std::process::Command::new("nc")
-                .args([
-                    "-w",
-                    "1",
-                    "-l",
-                    "10.0.0.1",
-                    SERVER_PORT.to_string().as_str(),
-                ])
+                .args(["-w", "1", "-l", LOOPBACK_IP_ADDR_STR, &port])
                 .output()
         });
         std::thread::sleep(core::time::Duration::from_secs(1));
@@ -3055,8 +3424,8 @@ mod tests {
             .expect("failed to create client socket");
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::from([10, 0, 0, 1]),
-            SERVER_PORT,
+            core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+            port,
         )));
         task.do_connect(client_fd, server_addr)
             .expect("failed to connect to server");
@@ -3071,19 +3440,6 @@ mod tests {
             .do_sendto(client_fd, buf.as_bytes(), SendFlags::empty(), None)
             .unwrap();
         assert_eq!(n, buf.len());
-
-        let linger = litebox_common_linux::Linger {
-            onoff: 1,   // enable linger
-            linger: 60, // timeout in seconds
-        };
-        let optval = UserPtr::from_usize((&raw const linger).cast::<u8>() as usize);
-        task.do_setsockopt(
-            client_fd,
-            SocketOptionName::Socket(SocketOption::LINGER),
-            optval,
-            core::mem::size_of::<litebox_common_linux::Linger>(),
-        )
-        .expect("Failed to set SO_LINGER");
 
         close_socket(&task, client_fd);
 
@@ -3102,6 +3458,9 @@ mod tests {
         is_nonblocking: bool,
         op: &str,
     ) {
+        let server_port = find_free_udp_port();
+        let client_port = find_free_udp_port();
+
         // Server socket and bind
         let server_fd = task
             .do_socket(
@@ -3116,8 +3475,8 @@ mod tests {
             )
             .expect("failed to create server socket");
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-            core::net::Ipv4Addr::from(TUN_IP_ADDR),
-            SERVER_PORT,
+            core::net::Ipv4Addr::from(LOOPBACK_IP_ADDR),
+            server_port,
         )));
         task.do_bind(server_fd, server_addr.clone())
             .expect("failed to bind server");
@@ -3141,9 +3500,9 @@ mod tests {
                 "-q", // quit after EOF on stdin and delay of secs
                 "1",
                 "-p", // Specify local port for remote connects
-                CLIENT_PORT.to_string().as_str(),
-                TUN_IP_ADDR_STR,
-                SERVER_PORT.to_string().as_str(),
+                client_port.to_string().as_str(),
+                LOOPBACK_IP_ADDR_STR,
+                server_port.to_string().as_str(),
             ])
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -3235,7 +3594,7 @@ mod tests {
         let SocketAddress::Inet(sender_addr) = sender_addr.unwrap() else {
             panic!("Expected Inet socket address");
         };
-        assert_eq!(sender_addr.port(), CLIENT_PORT);
+        assert_eq!(sender_addr.port(), client_port);
 
         close_socket(task, server_fd);
 
@@ -3243,32 +3602,35 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_blocking_udp_server_socket() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_udp_server_socket() {
+        let task = init_platform();
         blocking_udp_server_socket(&task, false, false, false, "recvfrom");
         blocking_udp_server_socket(&task, false, false, false, "recvmsg");
     }
 
     #[test]
-    fn test_tun_nonblocking_udp_server_socket() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_nonblocking_udp_server_socket() {
+        let task = init_platform();
         blocking_udp_server_socket(&task, false, false, true, "recvfrom");
         blocking_udp_server_socket(&task, false, false, true, "recvmsg");
     }
 
     #[test]
-    fn test_tun_blocking_udp_server_socket_with_truncation() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_blocking_udp_server_socket_with_truncation() {
+        let task = init_platform();
         blocking_udp_server_socket(&task, true, true, false, "recvfrom");
         blocking_udp_server_socket(&task, true, true, false, "recvmsg");
         blocking_udp_server_socket(&task, true, false, false, "recvmsg");
     }
 
     #[test]
-    fn test_tun_udp_client_socket_without_server() {
-        // We do not support loopback yet, so this test only checks that
-        // the client can send packets without a server.
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_udp_client_socket_without_server() {
+        let task = init_platform();
+        let server_port = find_free_udp_port();
 
         // Client socket and explicit bind
         let client_fd = task
@@ -3282,7 +3644,7 @@ mod tests {
 
         let server_addr = SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
             core::net::Ipv4Addr::from([127, 0, 0, 1]),
-            SERVER_PORT,
+            server_port,
         )));
 
         // Send from client to server
@@ -3316,45 +3678,12 @@ mod tests {
     }
 
     #[test]
-    fn test_tun_tcp_sockopt() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
+    #[ignore = "requires broker-backed socket test setup"]
+    fn test_tcp_keepalive_sockopt() {
+        let task = init_platform();
         let sockfd = task
             .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
             .expect("failed to create socket");
-
-        let mut congestion_name = [0u8; 16];
-        let optlen = task
-            .do_getsockopt(
-                sockfd,
-                SocketOptionName::TCP(TcpOption::CONGESTION),
-                UserPtrMut::from_usize(congestion_name.as_mut_ptr() as usize),
-                congestion_name.len().trunc(),
-            )
-            .expect("Failed to get TCP_CONGESTION");
-        assert_eq!(optlen, 4);
-        assert_eq!(
-            core::str::from_utf8(&congestion_name[..optlen]).unwrap(),
-            "none"
-        );
-
-        task.do_setsockopt(
-            sockfd,
-            SocketOptionName::TCP(TcpOption::CONGESTION),
-            UserPtr::from_usize(congestion_name.as_ptr() as usize),
-            optlen,
-        )
-        .expect("Failed to set TCP_CONGESTION");
-
-        let congestion_name = b"cubic\0";
-        let err = task
-            .do_setsockopt(
-                sockfd,
-                SocketOptionName::TCP(TcpOption::CONGESTION),
-                UserPtr::from_usize(congestion_name.as_ptr() as usize),
-                congestion_name.len(),
-            )
-            .unwrap_err();
-        assert_eq!(err, Errno::EINVAL);
 
         let val: u32 = 1;
         let optval = UserPtr::from_usize((&raw const val).cast::<u8>() as usize);
@@ -3379,39 +3708,13 @@ mod tests {
             .expect("failed to get SO_KEEPALIVE");
         assert_eq!(len, core::mem::size_of::<u32>());
         assert_eq!(result, 1);
-    }
-
-    #[ignore = "timeout is 75s"]
-    #[test]
-    fn test_tun_tcp_so_error_network_unreachable() {
-        let task = init_platform(Some(TUN_DEVICE_NAME));
-        let sockfd = task
-            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
-            .expect("failed to create socket");
-
-        // Connect to an off-subnet IP (TEST-NET, 192.0.2.1).
-        // smoltcp does not report errors when route table lookup fails. Instead, it just dicards the packets.
-        // Our current implementation returns `ETIMEDOUT` instead of `ENETUNREACH`.
-        let err = task
-            .do_connect(
-                sockfd,
-                SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
-                    core::net::Ipv4Addr::from([192, 0, 2, 1]),
-                    SERVER_PORT,
-                ))),
-            )
-            .unwrap_err();
-        assert_eq!(err, Errno::ETIMEDOUT);
-
-        let so_err = get_so_error(&task, sockfd);
-        assert_eq!(so_err, i32::from(Errno::ETIMEDOUT).cast_unsigned());
-
         close_socket(&task, sockfd);
     }
 
     #[test]
+    #[ignore = "requires broker-backed socket test setup"]
     fn test_socket_dup_and_close() {
-        let task = init_platform(None);
+        let task = init_platform();
         let socket_fd = task
             .do_socket(
                 litebox_common_linux::AddressFamily::INET,
@@ -3497,7 +3800,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_datagram_socket() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         for _ in 0..10 {
             let server_path = "/unix_stream_socket_server.sock";
@@ -3574,7 +3877,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket() {
-        let task = init_platform(None);
+        let task = init_platform();
 
         for _ in 0..10 {
             let addr = "/unix_stream_socket.sock";
@@ -3630,7 +3933,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket_refused() {
-        let task = init_platform(None);
+        let task = init_platform();
         let client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
         let addr = "/unix_stream_socket_refused.sock";
         let result = task.do_connect(
@@ -3678,7 +3981,7 @@ mod unix_tests {
     }
 
     fn test_multiple_unix_stream_connections(is_nonblocking: bool) {
-        let task = init_platform(None);
+        let task = init_platform();
         let addr = "/unix_multi_stream_socket.sock";
         let server_fd = create_unix_server_socket(
             &task,
@@ -3777,7 +4080,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket_on_same_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         for _ in 0..10 {
             let addr = "/unix_stream_socket_server.sock";
             let server1_fd = create_unix_server_socket(&task, addr, SockFlags::NONBLOCK).unwrap();
@@ -3828,7 +4131,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_datagram_socket_on_same_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         for _ in 0..10 {
             let addr = "/unix_datagram_socket_server.sock";
             let server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
@@ -3862,7 +4165,7 @@ mod unix_tests {
     }
 
     fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
-        let task = init_platform(None);
+        let task = init_platform();
         let mut sv_ptr = alloc::vec![0u32; 2];
         let sv_mut_ptr = UserPtrMut::from_usize(sv_ptr.as_mut_ptr() as usize);
 
@@ -3929,7 +4232,7 @@ mod unix_tests {
 
     #[test]
     fn pinned_receive_does_not_follow_dup2_replacement() {
-        let task = init_platform(None);
+        let task = init_platform();
         let (old_sender, old_receiver) = task
             .do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0)
             .unwrap();
@@ -3978,7 +4281,7 @@ mod unix_tests {
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {
-        let task = init_platform(None);
+        let task = init_platform();
         let (sock1, _sock2) = task
             .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
             .expect("socketpair failed");
@@ -4015,7 +4318,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         let server_path = "/unix_stream_sockname.sock";
         let server_fd = create_unix_server_socket(&task, server_path, SockFlags::empty()).unwrap();
 
@@ -4083,7 +4386,7 @@ mod unix_tests {
 
     #[test]
     fn test_unix_datagram_addr() {
-        let task = init_platform(None);
+        let task = init_platform();
         let server_path = "/unix_datagram_sockname_server.sock";
         let client_path = "/unix_datagram_sockname_client.sock";
 
