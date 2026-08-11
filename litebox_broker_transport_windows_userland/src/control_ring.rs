@@ -1,0 +1,947 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Active Windows-userland broker endpoints over a shared control ring.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Error, ErrorKind, Read, Result as IoResult};
+use std::os::windows::io::AsRawHandle;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+
+use litebox_broker_protocol::RequestId;
+use litebox_broker_protocol::message::{BrokerNotification, BrokerRequest, BrokerResponse};
+use litebox_broker_protocol::wire::{
+    WireError, decode_notification, decode_request, decode_response, encode_notification,
+    encode_request, encode_response,
+};
+use litebox_broker_transport::channel::{
+    HostNotificationChannel, HostReceive, LocalCallChannel, LocalNotificationChannel,
+};
+use litebox_broker_transport::control_ring::{
+    CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
+    ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
+};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED,
+    HANDLE,
+};
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
+use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess as windows_get_current_process, GetCurrentThread,
+};
+
+use crate::setup::{copy_io_error, invalid_data, read_frame, ring_error, wire_error, write_frame};
+use crate::shared_memory::WindowsSharedMemory;
+
+/// Maximum number of active calls waiting for broker responses.
+pub const MAX_PENDING_CALLS: usize = 64;
+
+/// Request-reading endpoint of an active host control-ring association.
+pub struct WindowsControlRingHostRequestSource {
+    consumer: ControlRingConsumer<WindowsSharedMemory>,
+    association: Arc<HostRingAssociation>,
+}
+
+/// Shared response-writing endpoint of an active host control-ring association.
+#[derive(Clone)]
+pub struct WindowsControlRingHostResponseSink {
+    producer: Arc<Mutex<ControlRingProducer<WindowsSharedMemory>>>,
+    association: Arc<HostRingAssociation>,
+}
+
+/// Host notification sender for a shared-ring Windows broker association.
+pub struct WindowsControlRingHostNotificationChannel {
+    producer: ControlRingProducer<WindowsSharedMemory>,
+    association: Arc<HostRingAssociation>,
+}
+
+/// RAII guard that interrupts all active host ring I/O when dropped.
+pub struct WindowsControlRingHostShutdown {
+    association: Arc<HostRingAssociation>,
+}
+
+struct HostRingAssociation {
+    status: Mutex<HostAssociationStatus>,
+    liveness: PipeLiveness,
+    request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+    response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+    notification_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+}
+
+enum HostAssociationStatus {
+    Live,
+    PeerClosed,
+    Failed(Arc<Error>),
+}
+
+/// Call-issuing endpoint of an active local control-ring association.
+pub struct WindowsControlRingLocalCallChannel {
+    association: Arc<LocalRingAssociation>,
+}
+
+/// Local notification receiver for a shared-ring Windows broker association.
+pub struct WindowsControlRingLocalNotificationChannel {
+    consumer: ControlRingConsumer<WindowsSharedMemory>,
+    association: Arc<LocalRingAssociation>,
+}
+
+struct LocalRingAssociation {
+    request_producer: Mutex<ControlRingProducer<WindowsSharedMemory>>,
+    pending_calls: Arc<PendingCalls>,
+    liveness: PipeLiveness,
+    request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+    response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+    notification_wake: ControlRingWakeHandle<WindowsSharedMemory>,
+}
+
+struct PendingCalls {
+    state: Mutex<PendingCallsState>,
+    capacity_available: Condvar,
+}
+
+struct PendingCallsState {
+    calls: HashMap<RequestId, Arc<PendingCall>>,
+    failure: Option<Arc<Error>>,
+}
+
+struct PendingCall {
+    result: Mutex<Option<PendingCallResult>>,
+    result_ready: Condvar,
+}
+
+enum PendingCallResult {
+    Response(BrokerResponse),
+    Failure(Arc<Error>),
+}
+
+struct PipeLiveness {
+    server: bool,
+    state: Mutex<PipeLivenessState>,
+}
+
+struct PipeLivenessState {
+    stream: Option<File>,
+    shutdown: bool,
+    next_id: u64,
+    threads: HashMap<u64, OwnedThreadHandle>,
+}
+
+struct OwnedThreadHandle(HANDLE);
+
+struct PipeIoGuard<'association> {
+    liveness: &'association PipeLiveness,
+    id: u64,
+}
+
+pub(crate) fn activate_host(
+    mut stream: File,
+    negotiated: bool,
+    ring: ControlRing<WindowsSharedMemory>,
+) -> IoResult<(
+    WindowsControlRingHostRequestSource,
+    WindowsControlRingHostResponseSink,
+    WindowsControlRingHostNotificationChannel,
+    WindowsControlRingHostShutdown,
+)> {
+    if !negotiated {
+        return Err(invalid_data(
+            "broker host setup channel activated before negotiation completed",
+        ));
+    }
+    let ready = read_frame(&mut stream)?.ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnexpectedEof,
+            "runner closed before control-ring setup acknowledgement",
+        )
+    })?;
+    if ready != CONTROL_RING_READY {
+        return Err(invalid_data(
+            "runner sent an invalid control-ring setup acknowledgement",
+        ));
+    }
+    write_frame(&mut stream, CONTROL_RING_READY)?;
+
+    let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
+        request_consumer,
+        response_producer,
+        notification_producer,
+    } = ring.into_broker();
+    let association = Arc::new(HostRingAssociation {
+        liveness: PipeLiveness::new(stream.try_clone()?, true),
+        status: Mutex::new(HostAssociationStatus::Live),
+        request_wake: request_consumer.wake_handle(),
+        response_wake: response_producer.wake_handle(),
+        notification_wake: notification_producer.wake_handle(),
+    });
+    let monitor_association = Arc::clone(&association);
+    thread::Builder::new()
+        .name("litebox-runner-liveness".to_owned())
+        .spawn(move || monitor_host_pipe(&mut stream, &monitor_association))?;
+    Ok((
+        WindowsControlRingHostRequestSource {
+            consumer: request_consumer,
+            association: Arc::clone(&association),
+        },
+        WindowsControlRingHostResponseSink {
+            producer: Arc::new(Mutex::new(response_producer)),
+            association: Arc::clone(&association),
+        },
+        WindowsControlRingHostNotificationChannel {
+            producer: notification_producer,
+            association: Arc::clone(&association),
+        },
+        WindowsControlRingHostShutdown { association },
+    ))
+}
+
+pub(crate) fn activate_local(
+    mut stream: File,
+    negotiated: bool,
+    ring: ControlRing<WindowsSharedMemory>,
+) -> IoResult<(
+    WindowsControlRingLocalCallChannel,
+    WindowsControlRingLocalNotificationChannel,
+)> {
+    if !negotiated {
+        return Err(invalid_data(
+            "broker local setup channel activated before negotiation completed",
+        ));
+    }
+    write_frame(&mut stream, CONTROL_RING_READY)?;
+    let ready = read_frame(&mut stream)?.ok_or_else(|| {
+        Error::new(
+            ErrorKind::UnexpectedEof,
+            "broker closed before control-ring setup acknowledgement",
+        )
+    })?;
+    if ready != CONTROL_RING_READY {
+        return Err(invalid_data(
+            "broker sent an invalid control-ring setup acknowledgement",
+        ));
+    }
+
+    let litebox_broker_transport::control_ring::LocalControlRingEndpoints {
+        request_producer,
+        response_consumer,
+        notification_consumer,
+    } = ring.into_local();
+    let pending_calls = Arc::new(PendingCalls::new());
+    let association = Arc::new(LocalRingAssociation {
+        liveness: PipeLiveness::new(stream.try_clone()?, false),
+        request_wake: request_producer.wake_handle(),
+        request_producer: Mutex::new(request_producer),
+        response_wake: response_consumer.wake_handle(),
+        notification_wake: notification_consumer.wake_handle(),
+        pending_calls,
+    });
+    let response_association = Arc::clone(&association);
+    thread::Builder::new()
+        .name("litebox-broker-responses".to_owned())
+        .spawn(move || dispatch_responses(response_consumer, response_association))?;
+    let monitor_association = Arc::clone(&association);
+    thread::Builder::new()
+        .name("litebox-broker-liveness".to_owned())
+        .spawn(move || monitor_local_pipe(&mut stream, &monitor_association))?;
+    Ok((
+        WindowsControlRingLocalCallChannel {
+            association: Arc::clone(&association),
+        },
+        WindowsControlRingLocalNotificationChannel {
+            consumer: notification_consumer,
+            association,
+        },
+    ))
+}
+
+impl WindowsControlRingHostShutdown {
+    /// Shuts down the active association without waiting for a ring lock.
+    pub fn shutdown(&self) -> IoResult<()> {
+        self.association.fail(Error::new(
+            ErrorKind::ConnectionAborted,
+            "broker host association shut down",
+        ))
+    }
+}
+
+impl Drop for WindowsControlRingHostShutdown {
+    fn drop(&mut self) {
+        let _ = self.association.fail(Error::new(
+            ErrorKind::ConnectionAborted,
+            "broker host association shutdown guard dropped",
+        ));
+    }
+}
+
+impl WindowsControlRingHostRequestSource {
+    /// Receives one active broker request.
+    pub fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        loop {
+            if let Some(error) = self.association.current_failure() {
+                return Err(error);
+            }
+            match self.consumer.try_read(decode_request) {
+                Ok(ControlRingReadStatus::Message(request)) => {
+                    self.association.acknowledge_request(&mut self.consumer)?;
+                    return Ok(HostReceive::Message(request));
+                }
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if let Some(terminal) = self.association.request_terminal_result() {
+                        return terminal;
+                    }
+                    if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
+                        let result = Err(copy_io_error(&error));
+                        let _ = self.association.fail(error);
+                        return result;
+                    }
+                }
+                Err(ControlRingReadError::Decode(WireError::WrongMessagePhase)) => {
+                    return Ok(HostReceive::ProtocolViolation);
+                }
+                Err(ControlRingReadError::Decode(error)) => {
+                    let error = wire_error(error);
+                    let result = Err(copy_io_error(&error));
+                    let _ = self.association.fail(error);
+                    return result;
+                }
+                Err(ControlRingReadError::Ring(error)) => {
+                    let error = ring_error(error);
+                    let result = Err(copy_io_error(&error));
+                    let _ = self.association.fail(error);
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl WindowsControlRingHostResponseSink {
+    /// Serializes and sends one complete active broker response.
+    pub fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+        let frame = encode_response(response.clone());
+        let mut producer = self
+            .producer
+            .lock()
+            .map_err(|_| Error::other("broker response writer mutex poisoned"))?;
+        loop {
+            match self.association.try_publish(&mut producer, &frame)? {
+                ControlRingWriteStatus::Written => return Ok(()),
+                ControlRingWriteStatus::Full { wait_epoch } => {
+                    if let Err(error) = producer.wait_for_capacity(wait_epoch) {
+                        let result = Err(copy_io_error(&error));
+                        let _ = self.association.fail(error);
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl HostNotificationChannel for WindowsControlRingHostNotificationChannel {
+    type Error = Error;
+
+    fn send_notification(&mut self, notification: &BrokerNotification) -> IoResult<()> {
+        let frame = encode_notification(notification.clone());
+        loop {
+            match self.association.try_publish(&mut self.producer, &frame)? {
+                ControlRingWriteStatus::Written => return Ok(()),
+                ControlRingWriteStatus::Full { wait_epoch } => {
+                    if let Err(error) = self.producer.wait_for_capacity(wait_epoch) {
+                        let result = Err(copy_io_error(&error));
+                        let _ = self.association.fail(error);
+                        return result;
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl HostRingAssociation {
+    fn acknowledge_request(
+        &self,
+        consumer: &mut ControlRingConsumer<WindowsSharedMemory>,
+    ) -> IoResult<()> {
+        let result = {
+            let status = self
+                .status
+                .lock()
+                .expect("broker host association mutex poisoned");
+            if let HostAssociationStatus::Failed(error) = &*status {
+                return Err(copy_io_error(error));
+            }
+            consumer
+                .publish_head()
+                .map_err(ring_error)
+                .and_then(|()| consumer.wake_producer())
+        };
+        if let Err(error) = result {
+            let result = Err(copy_io_error(&error));
+            let _ = self.fail(error);
+            return result;
+        }
+        Ok(())
+    }
+
+    fn fail(&self, error: Error) -> IoResult<()> {
+        {
+            let mut status = self
+                .status
+                .lock()
+                .expect("broker host association mutex poisoned");
+            if matches!(*status, HostAssociationStatus::Live) {
+                *status = HostAssociationStatus::Failed(Arc::new(error));
+            }
+        }
+        self.interrupt_waits().and(self.liveness.shutdown())
+    }
+
+    fn peer_closed(&self) {
+        {
+            let mut status = self
+                .status
+                .lock()
+                .expect("broker host association mutex poisoned");
+            if matches!(*status, HostAssociationStatus::Live) {
+                *status = HostAssociationStatus::PeerClosed;
+            }
+        }
+        let _ = self.interrupt_waits();
+        self.liveness.peer_closed();
+    }
+
+    fn interrupt_waits(&self) -> IoResult<()> {
+        self.request_wake
+            .interrupt_wait()
+            .and(self.response_wake.interrupt_wait())
+            .and(self.notification_wake.interrupt_wait())
+    }
+
+    fn request_terminal_result(&self) -> Option<IoResult<HostReceive<BrokerRequest>>> {
+        match &*self
+            .status
+            .lock()
+            .expect("broker host association mutex poisoned")
+        {
+            HostAssociationStatus::Live => None,
+            HostAssociationStatus::PeerClosed => Some(Ok(HostReceive::PeerClosed)),
+            HostAssociationStatus::Failed(error) => Some(Err(copy_io_error(error))),
+        }
+    }
+
+    fn current_failure(&self) -> Option<Error> {
+        match &*self
+            .status
+            .lock()
+            .expect("broker host association mutex poisoned")
+        {
+            HostAssociationStatus::Failed(error) => Some(copy_io_error(error)),
+            HostAssociationStatus::Live | HostAssociationStatus::PeerClosed => None,
+        }
+    }
+
+    fn try_publish(
+        &self,
+        producer: &mut ControlRingProducer<WindowsSharedMemory>,
+        frame: &[u8],
+    ) -> IoResult<ControlRingWriteStatus> {
+        let result = {
+            let status = self
+                .status
+                .lock()
+                .expect("broker host association mutex poisoned");
+            match &*status {
+                HostAssociationStatus::Live => {}
+                HostAssociationStatus::PeerClosed => {
+                    return Err(Error::new(
+                        ErrorKind::BrokenPipe,
+                        "runner closed the active broker association",
+                    ));
+                }
+                HostAssociationStatus::Failed(error) => return Err(copy_io_error(error)),
+            }
+            producer
+                .try_write(frame)
+                .map_err(ring_error)
+                .and_then(|write_status| {
+                    if matches!(write_status, ControlRingWriteStatus::Written) {
+                        producer.wake_consumer()?;
+                    }
+                    Ok(write_status)
+                })
+        };
+        if let Err(error) = result {
+            let result = Err(copy_io_error(&error));
+            let _ = self.fail(error);
+            return result;
+        }
+        result
+    }
+}
+
+impl LocalCallChannel for WindowsControlRingLocalCallChannel {
+    type Error = Error;
+
+    fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
+        let association = &self.association;
+        let request_id = request.request_id;
+        let pending_call = association.pending_calls.register(request_id)?;
+        let frame = encode_request(request);
+        let write_result = {
+            let mut producer = association
+                .request_producer
+                .lock()
+                .map_err(|_| Error::other("broker request writer mutex poisoned"))?;
+            loop {
+                let status = association
+                    .pending_calls
+                    .run_if_live(|| producer.try_write(&frame).map_err(ring_error));
+                match status {
+                    Ok(ControlRingWriteStatus::Written) => {
+                        break producer.wake_consumer();
+                    }
+                    Ok(ControlRingWriteStatus::Full { wait_epoch }) => {
+                        if let Err(error) = producer.wait_for_capacity(wait_epoch) {
+                            break Err(error);
+                        }
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        };
+        if let Err(error) = write_result {
+            let _ = association.fail(error);
+        }
+        pending_call.wait()
+    }
+}
+
+impl Drop for WindowsControlRingLocalCallChannel {
+    fn drop(&mut self) {
+        let _ = self.association.fail(Error::new(
+            ErrorKind::ConnectionAborted,
+            "broker local call channel dropped",
+        ));
+    }
+}
+
+impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
+    type Error = Error;
+
+    fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
+        loop {
+            if let Some(error) = self.association.pending_calls.current_failure() {
+                return Err(copy_io_error(&error));
+            }
+            match self.consumer.try_read(decode_notification) {
+                Ok(ControlRingReadStatus::Message(notification)) => {
+                    self.association
+                        .acknowledge_notification(&mut self.consumer)?;
+                    return Ok(Some(notification));
+                }
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if let Some(error) = self.association.pending_calls.current_failure() {
+                        return Err(copy_io_error(&error));
+                    }
+                    if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
+                        let result = Err(copy_io_error(&error));
+                        let _ = self.association.fail(error);
+                        return result;
+                    }
+                }
+                Err(ControlRingReadError::Ring(error)) => {
+                    let error = ring_error(error);
+                    let result = Err(copy_io_error(&error));
+                    let _ = self.association.fail(error);
+                    return result;
+                }
+                Err(ControlRingReadError::Decode(error)) => {
+                    let error = wire_error(error);
+                    let result = Err(copy_io_error(&error));
+                    let _ = self.association.fail(error);
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl PendingCall {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            result_ready: Condvar::new(),
+        }
+    }
+
+    fn resolve(&self, result: PendingCallResult) {
+        let mut stored = self
+            .result
+            .lock()
+            .expect("broker pending-call result mutex poisoned");
+        assert!(stored.is_none(), "broker pending call already resolved");
+        *stored = Some(result);
+        self.result_ready.notify_one();
+    }
+
+    fn wait(&self) -> IoResult<BrokerResponse> {
+        let mut result = self
+            .result
+            .lock()
+            .expect("broker pending-call result mutex poisoned");
+        loop {
+            if let Some(result) = result.take() {
+                return match result {
+                    PendingCallResult::Response(response) => Ok(response),
+                    PendingCallResult::Failure(error) => Err(copy_io_error(&error)),
+                };
+            }
+            result = self
+                .result_ready
+                .wait(result)
+                .expect("broker pending-call result mutex poisoned");
+        }
+    }
+}
+
+impl PendingCalls {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(PendingCallsState {
+                calls: HashMap::new(),
+                failure: None,
+            }),
+            capacity_available: Condvar::new(),
+        }
+    }
+
+    fn register(&self, request_id: RequestId) -> IoResult<Arc<PendingCall>> {
+        let pending_call = Arc::new(PendingCall::new());
+        let mut state = self.state.lock().expect("broker pending mutex poisoned");
+        while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
+            state = self
+                .capacity_available
+                .wait(state)
+                .expect("broker pending mutex poisoned");
+        }
+        if let Some(error) = state.failure.as_ref() {
+            return Err(copy_io_error(error));
+        }
+        match state.calls.entry(request_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&pending_call));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(invalid_data("duplicate broker request ID"));
+            }
+        }
+        Ok(pending_call)
+    }
+
+    fn complete(&self, response: BrokerResponse) -> IoResult<()> {
+        let pending_call = {
+            let mut state = self.state.lock().expect("broker pending mutex poisoned");
+            if let Some(error) = state.failure.as_ref() {
+                return Err(copy_io_error(error));
+            }
+            let Some(pending_call) = state.calls.remove(&response.request_id) else {
+                return Err(invalid_data("broker returned an unknown response ID"));
+            };
+            self.capacity_available.notify_one();
+            pending_call
+        };
+        pending_call.resolve(PendingCallResult::Response(response));
+        Ok(())
+    }
+
+    fn record_failure(&self, error: Arc<Error>) {
+        let pending_calls = {
+            let mut state = self.state.lock().expect("broker pending mutex poisoned");
+            if state.failure.is_some() {
+                return;
+            }
+            state.failure = Some(Arc::clone(&error));
+            let pending_calls = core::mem::take(&mut state.calls);
+            self.capacity_available.notify_all();
+            pending_calls
+        };
+        for pending_call in pending_calls.into_values() {
+            pending_call.resolve(PendingCallResult::Failure(Arc::clone(&error)));
+        }
+    }
+
+    fn current_failure(&self) -> Option<Arc<Error>> {
+        self.state
+            .lock()
+            .expect("broker pending mutex poisoned")
+            .failure
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    fn run_if_live<T>(&self, operation: impl FnOnce() -> IoResult<T>) -> IoResult<T> {
+        let state = self.state.lock().expect("broker pending mutex poisoned");
+        if let Some(error) = state.failure.as_ref() {
+            return Err(copy_io_error(error));
+        }
+        operation()
+    }
+}
+
+impl LocalRingAssociation {
+    fn acknowledge_notification(
+        &self,
+        consumer: &mut ControlRingConsumer<WindowsSharedMemory>,
+    ) -> IoResult<()> {
+        self.acknowledge_consumer(consumer)
+    }
+
+    fn acknowledge_consumer(
+        &self,
+        consumer: &mut ControlRingConsumer<WindowsSharedMemory>,
+    ) -> IoResult<()> {
+        let result = self.pending_calls.run_if_live(|| {
+            consumer
+                .publish_head()
+                .map_err(ring_error)
+                .and_then(|()| consumer.wake_producer())
+        });
+        if let Err(error) = result {
+            let result = Err(copy_io_error(&error));
+            let _ = self.fail(error);
+            return result;
+        }
+        Ok(())
+    }
+
+    fn fail(&self, error: Error) -> IoResult<()> {
+        self.pending_calls.record_failure(Arc::new(error));
+        self.request_wake
+            .interrupt_wait()
+            .and(self.response_wake.interrupt_wait())
+            .and(self.notification_wake.interrupt_wait())
+            .and(self.liveness.shutdown())
+    }
+}
+
+fn dispatch_responses(
+    mut consumer: ControlRingConsumer<WindowsSharedMemory>,
+    association: Arc<LocalRingAssociation>,
+) {
+    loop {
+        match consumer.try_read(decode_response) {
+            Ok(ControlRingReadStatus::Message(response)) => {
+                if let Err(error) = consumer
+                    .publish_head()
+                    .map_err(ring_error)
+                    .and_then(|()| consumer.wake_producer())
+                    .and_then(|()| association.pending_calls.complete(response))
+                {
+                    let _ = association.fail(error);
+                    return;
+                }
+            }
+            Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                if association.pending_calls.current_failure().is_some() {
+                    return;
+                }
+                if let Err(error) = consumer.wait_for_message(wait_epoch) {
+                    let _ = association.fail(error);
+                    return;
+                }
+            }
+            Err(ControlRingReadError::Ring(error)) => {
+                let _ = association.fail(ring_error(error));
+                return;
+            }
+            Err(ControlRingReadError::Decode(error)) => {
+                let _ = association.fail(wire_error(error));
+                return;
+            }
+        }
+    }
+}
+
+impl PipeLiveness {
+    fn new(stream: File, server: bool) -> Self {
+        Self {
+            server,
+            state: Mutex::new(PipeLivenessState {
+                stream: Some(stream),
+                shutdown: false,
+                next_id: 0,
+                threads: HashMap::new(),
+            }),
+        }
+    }
+
+    fn register_io(&self) -> IoResult<PipeIoGuard<'_>> {
+        let thread = duplicate_current_thread()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::other("broker pipe liveness mutex poisoned"))?;
+        if state.shutdown {
+            return Err(Error::new(
+                ErrorKind::ConnectionAborted,
+                "broker association shut down",
+            ));
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.threads.insert(id, thread);
+        Ok(PipeIoGuard { liveness: self, id })
+    }
+
+    fn shutdown(&self) -> IoResult<()> {
+        let (stream, threads) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::other("broker pipe liveness mutex poisoned"))?;
+            if state.shutdown {
+                return Ok(());
+            }
+            state.shutdown = true;
+            (
+                state.stream.take(),
+                state
+                    .threads
+                    .values()
+                    .map(|thread| thread.0)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut first_error = None;
+        for thread in threads {
+            // SAFETY: The handle is a live duplicate of a thread blocked on the liveness pipe.
+            if unsafe { CancelSynchronousIo(thread) } == 0 {
+                let error = Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_NOT_FOUND.cast_signed())
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if self.server
+            && let Some(stream) = &stream
+        {
+            // SAFETY: This is a duplicated server handle for the active named-pipe instance.
+            if unsafe { DisconnectNamedPipe(file_handle(stream)) } == 0 {
+                let error = Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_PIPE_NOT_CONNECTED.cast_signed())
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        drop(stream);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn peer_closed(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutdown = true;
+            state.stream.take();
+        }
+    }
+}
+
+impl Drop for PipeIoGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.liveness.state.lock() {
+            state.threads.remove(&self.id);
+        }
+    }
+}
+
+impl Drop for OwnedThreadHandle {
+    fn drop(&mut self) {
+        // SAFETY: This is a live thread handle returned by DuplicateHandle.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+// SAFETY: Windows thread handles can be canceled and closed from any process thread.
+unsafe impl Send for OwnedThreadHandle {}
+
+fn duplicate_current_thread() -> IoResult<OwnedThreadHandle> {
+    let mut duplicate = std::ptr::null_mut();
+    // SAFETY: Both process pseudo-handles and the current-thread pseudo-handle are valid, and the
+    // output points to writable storage for a new real thread handle.
+    if unsafe {
+        DuplicateHandle(
+            windows_get_current_process(),
+            GetCurrentThread(),
+            windows_get_current_process(),
+            &raw mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        return Err(Error::last_os_error());
+    }
+    Ok(OwnedThreadHandle(duplicate))
+}
+
+fn monitor_host_pipe(stream: &mut File, association: &HostRingAssociation) {
+    let Ok(_io) = association.liveness.register_io() else {
+        return;
+    };
+    let mut byte = [0];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                association.peer_closed();
+                return;
+            }
+            Ok(_) => {
+                let _ = association.fail(invalid_data(
+                    "runner sent unexpected active control-pipe data",
+                ));
+                return;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => {
+                let _ = association.fail(error);
+                return;
+            }
+        }
+    }
+}
+
+fn monitor_local_pipe(stream: &mut File, association: &LocalRingAssociation) {
+    let Ok(_io) = association.liveness.register_io() else {
+        return;
+    };
+    let mut byte = [0];
+    let error = loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                break Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "broker closed the active association",
+                );
+            }
+            Ok(_) => break invalid_data("broker sent unexpected active control-pipe data"),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => break error,
+        }
+    };
+    let _ = association.fail(error);
+}
+
+fn file_handle(file: &File) -> HANDLE {
+    file.as_raw_handle()
+}
