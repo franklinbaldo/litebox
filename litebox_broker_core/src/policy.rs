@@ -466,16 +466,17 @@ impl PolicyEngine {
         address: SocketAddrV4,
     ) -> Result<(), BrokerError> {
         self.principal_object_rights(caller_credential)?;
-        // Egress rules do not describe local listener authority. Socket
-        // creation admission plus this fixed loopback boundary governs binds.
-        let supported_socket = matches!(
-            (request.socket_type, request.protocol),
-            (SocketType::Stream, IpProtocol::Tcp) | (SocketType::Datagram, IpProtocol::Udp)
-        );
-        if request.address_family == AddressFamily::Ipv4
-            && supported_socket
-            && address.ip().is_loopback()
-        {
+        // Egress rules do not describe local listener authority. TCP may bind
+        // loopback for a private endpoint or unspecified for the broker's
+        // configured external interface. UDP remains loopback-only.
+        let permitted_address = match (request.socket_type, request.protocol) {
+            (SocketType::Stream, IpProtocol::Tcp) => {
+                address.ip().is_loopback() || address.ip().is_unspecified()
+            }
+            (SocketType::Datagram, IpProtocol::Udp) => address.ip().is_loopback(),
+            _ => false,
+        };
+        if request.address_family == AddressFamily::Ipv4 && permitted_address {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)
@@ -786,6 +787,14 @@ mod tests {
                 address([0, 0, 0, 0], 0),
             ),
             Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            policy.authorize_socket_bind(
+                CallerCredential::Unauthenticated,
+                IPV4_TCP,
+                address([0, 0, 0, 0], 0),
+            ),
+            Ok(())
         );
     }
 }

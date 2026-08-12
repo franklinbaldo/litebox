@@ -796,7 +796,7 @@ mod tests {
         fn listen(
             &self,
             _backlog: u32,
-            _publication: Option<litebox_broker_core::socket::TcpPortPublicationClaim>,
+            _mapping: Option<litebox_broker_core::socket::TcpPortMapping>,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
             let local_address = self
                 .local_address
@@ -896,6 +896,8 @@ mod tests {
                 pending_error: None,
             })
         }
+
+        fn retire(&self) {}
 
         fn readiness(&self) -> litebox_broker_protocol::readiness::ReadinessFlags {
             litebox_broker_protocol::readiness::ReadinessFlags::READ
@@ -1369,7 +1371,7 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152)),
                 pending_error: None,
             }))
         );

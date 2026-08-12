@@ -342,20 +342,22 @@ fn spawn_test_broker(
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
-    spawn_test_broker_with_tcp_port_publications(
+    spawn_test_broker_with_tcp_port_mappings(
         control_socket_path,
         policy,
         connection_count,
+        std::net::Ipv4Addr::LOCALHOST,
         Vec::new(),
     )
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn spawn_test_broker_with_tcp_port_publications(
+fn spawn_test_broker_with_tcp_port_mappings(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
-    tcp_port_publications: Vec<litebox_broker_core::socket::TcpPortPublication>,
+    broker_ipv4_address: std::net::Ipv4Addr,
+    tcp_port_mappings: Vec<litebox_broker_core::socket::TcpPortMapping>,
 ) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
 
@@ -374,10 +376,11 @@ fn spawn_test_broker_with_tcp_port_publications(
                 policy,
                 limits,
                 std::sync::Arc::new(
-                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new_with_tcp_port_publications(
+                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new_with_tcp_port_mappings(
                         limits.max_sockets,
                         limits.max_sockets_per_session,
-                        &tcp_port_publications,
+                        broker_ipv4_address,
+                        &tcp_port_mappings,
                     )
                     .expect("failed to create broker test socket provider"),
                 ),
@@ -771,16 +774,17 @@ fn test_runner_broker_tcp_server_with_rewriter() {
     };
     drop(host_listener);
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-server-control");
-    let broker = spawn_test_broker_with_tcp_port_publications(
+    let broker = spawn_test_broker_with_tcp_port_mappings(
         &control_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
         .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
         1,
-        vec![litebox_broker_core::socket::TcpPortPublication {
+        *host_address.ip(),
+        vec![litebox_broker_core::socket::TcpPortMapping {
+            broker_port: host_address.port(),
             guest_port: GUEST_PORT,
-            external_address: host_address,
         }],
     );
     let mut child = Runner::new(&target, "broker_tcp_server_rewriter")

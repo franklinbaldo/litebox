@@ -4,7 +4,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -19,8 +19,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, CallerCredential, DestinationPortRange, DestinationRule,
-    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError,
-    socket::TcpPortPublication,
+    Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy, SocketPolicyError, socket::TcpPortMapping,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
@@ -86,31 +85,31 @@ impl FromStr for AllowedTcpDestination {
     }
 }
 
-/// Command-line description of one external-to-guest TCP publication.
+/// Command-line description of one broker-to-guest TCP port mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TcpPortPublicationArgument {
-    external_address: SocketAddrV4,
+struct TcpPortMappingArgument {
+    broker_port: u16,
     guest_port: u16,
 }
 
-impl FromStr for TcpPortPublicationArgument {
+impl FromStr for TcpPortMappingArgument {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (external_address, guest_port) = value
-            .rsplit_once(':')
-            .ok_or_else(|| "expected HOST_IP:HOST_PORT:GUEST_PORT".to_owned())?;
-        let external_address = external_address
-            .parse::<SocketAddrV4>()
-            .map_err(|error| format!("invalid external IPv4 endpoint: {error}"))?;
+        let (broker_port, guest_port) = value
+            .split_once(':')
+            .ok_or_else(|| "expected BROKER_PORT:GUEST_PORT".to_owned())?;
+        let broker_port = broker_port
+            .parse::<u16>()
+            .map_err(|error| format!("invalid broker port: {error}"))?;
         let guest_port = guest_port
             .parse::<u16>()
             .map_err(|error| format!("invalid guest port: {error}"))?;
-        if external_address.port() == 0 || guest_port == 0 {
-            return Err("published external and guest ports must be nonzero".to_owned());
+        if broker_port == 0 || guest_port == 0 {
+            return Err("mapped broker and guest ports must be nonzero".to_owned());
         }
         Ok(Self {
-            external_address,
+            broker_port,
             guest_port,
         })
     }
@@ -124,9 +123,12 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_tcp_destination: Vec<AllowedTcpDestination>,
-    /// Publish a host IPv4 TCP endpoint to a guest-local TCP port.
-    #[arg(long, value_name = "HOST_IP:HOST_PORT:GUEST_PORT")]
-    publish_tcp: Vec<TcpPortPublicationArgument>,
+    /// Host-facing IPv4 address used for TCP listeners and outbound TCP.
+    #[arg(long, default_value_t = Ipv4Addr::UNSPECIFIED, value_name = "IP")]
+    broker_ipv4_address: Ipv4Addr,
+    /// Map one TCP port on the broker IPv4 address to a guest-local TCP port.
+    #[arg(long, value_name = "BROKER_PORT:GUEST_PORT")]
+    tcp_port_mapping: Vec<TcpPortMappingArgument>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -144,15 +146,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
-    let tcp_port_publications = configured_tcp_port_publications(&args.publish_tcp);
+    let tcp_port_mappings = configured_tcp_port_mappings(&args.tcp_port_mapping);
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
             .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
         limits,
-        Arc::new(LinuxSocketProvider::new_with_tcp_port_publications(
+        Arc::new(LinuxSocketProvider::new_with_tcp_port_mappings(
             limits.max_sockets,
             limits.max_sockets_per_session,
-            &tcp_port_publications,
+            args.broker_ipv4_address,
+            &tcp_port_mappings,
         )?),
     )?;
 
@@ -178,11 +181,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn configured_tcp_port_publications(tcp: &[TcpPortPublicationArgument]) -> Vec<TcpPortPublication> {
+fn configured_tcp_port_mappings(tcp: &[TcpPortMappingArgument]) -> Vec<TcpPortMapping> {
     tcp.iter()
-        .map(|publication| TcpPortPublication {
-            guest_port: publication.guest_port,
-            external_address: publication.external_address,
+        .map(|mapping| TcpPortMapping {
+            broker_port: mapping.broker_port,
+            guest_port: mapping.guest_port,
         })
         .collect()
 }
@@ -612,34 +615,28 @@ mod tests {
     }
 
     #[test]
-    fn tcp_publication_arguments_name_distinct_external_and_guest_ports() {
-        let publication = "127.0.0.1:8080:80"
-            .parse::<TcpPortPublicationArgument>()
-            .unwrap();
+    fn tcp_port_mapping_arguments_name_distinct_broker_and_guest_ports() {
+        let mapping = "8080:80".parse::<TcpPortMappingArgument>().unwrap();
 
         assert_eq!(
-            publication,
-            TcpPortPublicationArgument {
-                external_address: "127.0.0.1:8080".parse().unwrap(),
+            mapping,
+            TcpPortMappingArgument {
+                broker_port: 8080,
                 guest_port: 80,
             }
         );
+        assert!("0:80".parse::<TcpPortMappingArgument>().is_err());
+        assert!("8080:0".parse::<TcpPortMappingArgument>().is_err());
         assert!(
-            "127.0.0.1:0:80"
-                .parse::<TcpPortPublicationArgument>()
+            "127.0.0.1:8080:80"
+                .parse::<TcpPortMappingArgument>()
                 .is_err()
         );
-        assert!(
-            "127.0.0.1:8080:0"
-                .parse::<TcpPortPublicationArgument>()
-                .is_err()
-        );
-        assert!("8080:80".parse::<TcpPortPublicationArgument>().is_err());
         assert_eq!(
-            configured_tcp_port_publications(&[publication]),
-            vec![TcpPortPublication {
+            configured_tcp_port_mappings(&[mapping]),
+            vec![TcpPortMapping {
+                broker_port: 8080,
                 guest_port: 80,
-                external_address: "127.0.0.1:8080".parse().unwrap(),
             }]
         );
     }

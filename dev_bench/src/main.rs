@@ -722,8 +722,10 @@ fn run_rewritten_iperf3(ctx: BenchCtx<'_>) -> Result<()> {
                 .to_string();
             let mut server_command = std::process::Command::new(&broker);
             server_command
-                .arg("--publish-tcp")
-                .arg(format!("127.0.0.1:{host_port}:{guest_port}"))
+                .arg("--broker-ipv4-address")
+                .arg("127.0.0.1")
+                .arg("--tcp-port-mapping")
+                .arg(format!("{host_port}:{guest_port}"))
                 .arg("--runner")
                 .arg(&runner)
                 .arg("--")

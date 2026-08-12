@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-    PlatformStreamReceive, SocketProvider, TcpPortPublication, TcpPortPublicationClaim,
+    PlatformStreamReceive, SocketProvider, TcpPortMapping,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -44,7 +44,7 @@ const WAKE_TOKEN: u64 = 0;
 const MAX_QUEUED_SOCKET_COMMANDS: usize = 64;
 const MAX_EPOLL_EVENTS: usize = 64;
 const MAX_STALE_PORT_MAPPING_CONNECTIONS: usize = MAX_TCP_LISTEN_BACKLOG as usize + 3;
-const MAX_RETAINED_TRANSLATIONS: usize = 1 << 14;
+const MAX_TRACKED_GUEST_CONNECTIONS: usize = 1 << 14;
 const PENDING_CONNECT_DISCARD_LIFETIME: Duration = Duration::from_mins(5);
 
 /// Linux-userland socket provider.
@@ -54,15 +54,14 @@ const PENDING_CONNECT_DISCARD_LIFETIME: Duration = Duration::from_mins(5);
 /// immediate nonblocking operation, never for network readiness.
 pub struct LinuxSocketProvider {
     reactor: Arc<ReactorClient>,
-    tcp_port_publications: Vec<TcpPortPublication>,
+    tcp_port_mappings: Vec<TcpPortMapping>,
 }
 
 struct PortMappingState {
-    mapping: TcpPortPublication,
+    mapping: TcpPortMapping,
     reservation: Option<OwnedFd>,
     reservation_registered: bool,
-    claimed_by: Option<(u64, TcpPortPublicationClaim)>,
-    stale_connections: HashMap<(SocketAddrV4, SocketAddrV4), StaleTcpConnection>,
+    owned_by: Option<u64>,
 }
 
 struct StaleTcpConnection {
@@ -74,46 +73,54 @@ struct StaleTcpConnection {
 impl LinuxSocketProvider {
     /// Starts a provider with matching global and per-session socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
-        Self::new_with_tcp_port_publications(max_sockets, max_sockets_per_session, &[])
+        Self::new_with_tcp_port_mappings(
+            max_sockets,
+            max_sockets_per_session,
+            Ipv4Addr::UNSPECIFIED,
+            &[],
+        )
     }
 
-    /// Starts a limited provider and realizes every TCP publication immediately.
-    pub fn new_with_tcp_port_publications(
+    /// Starts a limited provider with broker-wide TCP port mapping overrides.
+    pub fn new_with_tcp_port_mappings(
         max_sockets: usize,
         max_sockets_per_session: usize,
-        tcp_port_publications: &[TcpPortPublication],
+        broker_ipv4_address: Ipv4Addr,
+        tcp_port_mappings: &[TcpPortMapping],
     ) -> IoResult<Self> {
-        for (index, publication) in tcp_port_publications.iter().enumerate() {
-            if publication.guest_port == 0 || publication.external_address.port() == 0 {
+        for (index, mapping) in tcp_port_mappings.iter().enumerate() {
+            if mapping.guest_port == 0 || mapping.broker_port == 0 {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    "published guest and external ports must be nonzero",
+                    "mapped broker and guest ports must be nonzero",
                 ));
             }
-            if tcp_port_publications[..index].iter().any(|existing| {
-                existing.guest_port == publication.guest_port
-                    || existing.external_address == publication.external_address
+            if tcp_port_mappings[..index].iter().any(|existing| {
+                existing.guest_port == mapping.guest_port
+                    || existing.broker_port == mapping.broker_port
             }) {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
-                    "published guest ports and external endpoints must be unique",
+                    "mapped broker and guest ports must be unique",
                 ));
             }
         }
-        let tcp_port_publications = tcp_port_publications.to_vec();
+        let tcp_port_mappings = tcp_port_mappings.to_vec();
         Ok(Self {
             reactor: Arc::new(ReactorClient::start(
                 max_sockets,
                 max_sockets_per_session,
-                tcp_port_publications.clone(),
+                broker_ipv4_address,
+                tcp_port_mappings.clone(),
             )?),
-            tcp_port_publications,
+            tcp_port_mappings,
         })
     }
 }
 
 fn create_port_mapping_reservation(
-    mapping: TcpPortPublication,
+    broker_ipv4_address: Ipv4Addr,
+    mapping: TcpPortMapping,
     reuse_address: bool,
     reuse_port: bool,
 ) -> core::result::Result<OwnedFd, Errno> {
@@ -129,24 +136,28 @@ fn create_port_mapping_reservation(
     if reuse_port {
         sockopt::set_socket_reuseport(&socket, true)?;
     }
-    bind(&socket, &mapping.external_address)?;
+    bind(
+        &socket,
+        &SocketAddrV4::new(broker_ipv4_address, mapping.broker_port),
+    )?;
     Ok(socket)
 }
 
 fn create_replacement_port_mapping_reservation(
-    mapping: TcpPortPublication,
+    broker_ipv4_address: Ipv4Addr,
+    mapping: TcpPortMapping,
 ) -> core::result::Result<OwnedFd, Errno> {
-    let socket = create_port_mapping_reservation(mapping, true, false)?;
+    let socket = create_port_mapping_reservation(broker_ipv4_address, mapping, true, false)?;
     // Reuse is needed only while replacing a listener that may still have
     // accepted children. Clear it afterward so the bound reservation is
-    // exclusive between publications.
+    // exclusive between mapped listeners.
     sockopt::set_socket_reuseaddr(&socket, false)?;
     Ok(socket)
 }
 
 impl SocketProvider for LinuxSocketProvider {
-    fn tcp_port_publications(&self) -> &[TcpPortPublication] {
-        &self.tcp_port_publications
+    fn tcp_port_mappings(&self) -> &[TcpPortMapping] {
+        &self.tcp_port_mappings
     }
 
     fn create(
@@ -210,12 +221,12 @@ impl PlatformSocket for LinuxSocket {
     fn listen(
         &self,
         backlog: u32,
-        publication: Option<TcpPortPublicationClaim>,
+        mapping: Option<TcpPortMapping>,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         self.reactor.request(|response| ReactorCommand::Listen {
             id: self.id,
             backlog,
-            publication,
+            mapping,
             response,
         })
     }
@@ -368,6 +379,12 @@ impl PlatformSocket for LinuxSocket {
         })
     }
 
+    fn retire(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            self.reactor.close_socket(self.id);
+        }
+    }
+
     fn readiness(&self) -> ReadinessFlags {
         self.snapshot
             .lock()
@@ -378,9 +395,7 @@ impl PlatformSocket for LinuxSocket {
 
 impl Drop for LinuxSocket {
     fn drop(&mut self) {
-        if self.active.swap(false, Ordering::AcqRel) {
-            self.reactor.close_socket(self.id);
-        }
+        self.retire();
     }
 }
 
@@ -396,24 +411,29 @@ impl ReactorClient {
     fn start(
         max_sockets: usize,
         max_sockets_per_session: usize,
-        tcp_port_publications: Vec<TcpPortPublication>,
+        broker_ipv4_address: Ipv4Addr,
+        tcp_port_mappings: Vec<TcpPortMapping>,
     ) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
-        let port_mappings = tcp_port_publications
+        let port_mappings = tcp_port_mappings
             .into_iter()
-            .map(|mapping| {
-                let mut stale_connections = HashMap::new();
-                stale_connections.try_reserve(MAX_RETAINED_TRANSLATIONS)?;
-                Ok(PortMappingState {
-                    mapping,
-                    reservation: Some(create_port_mapping_reservation(mapping, false, false)?),
-                    reservation_registered: false,
-                    claimed_by: None,
-                    stale_connections,
-                })
+            .map(|mapping| PortMappingState {
+                mapping,
+                reservation: None,
+                reservation_registered: false,
+                owned_by: None,
             })
-            .collect::<IoResult<Vec<_>>>()?;
+            .collect::<Vec<_>>();
+        let mut tcp = BrokerTcpState::default();
+        tcp.stale_mapped_connections
+            .try_reserve(MAX_TRACKED_GUEST_CONNECTIONS)
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::OutOfMemory,
+                    "stale guest connection table allocation failed",
+                )
+            })?;
         epoll::add(
             &epoll_fd,
             wake.as_ref(),
@@ -439,8 +459,10 @@ impl ReactorClient {
                 let mut reactor = Reactor {
                     epoll: epoll_fd,
                     wake: reactor_wake,
+                    broker_ipv4_address,
                     commands: receiver,
                     sockets,
+                    tcp,
                     sessions: HashMap::new(),
                     port_mappings,
                     max_sockets,
@@ -497,7 +519,9 @@ impl ReactorClient {
             Err(TrySendError::Full(_)) => return Err(BrokerError::ResourceExhausted),
             Err(TrySendError::Disconnected(_)) => return Err(BrokerError::Internal),
         }
-        self.signal().map_err(|_| BrokerError::Internal)?;
+        // Once queued, wait for acknowledgement even if the wake write fails:
+        // the reactor may still execute the command after another event.
+        let _ = self.signal();
         receive.recv().map_err(|_| BrokerError::Internal)?
     }
 
@@ -525,8 +549,9 @@ impl ReactorClient {
                 ));
             }
         }
-        self.signal()
-            .map_err(|_| PlatformConnectError::PeerIndeterminate(BrokerError::Internal))?;
+        // A queued connect has indeterminate peer state until the reactor
+        // acknowledges it, regardless of whether this wake write succeeds.
+        let _ = self.signal();
         receive
             .recv()
             .map_err(|_| PlatformConnectError::PeerIndeterminate(BrokerError::Internal))?
@@ -562,20 +587,20 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
-    fn tcp_translation_count(&self) -> usize {
+    fn pending_guest_connection_count(&self) -> usize {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::TcpTranslationCount { response })
+            .send(ReactorCommand::PendingGuestConnectionCount { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
     }
 
     #[cfg(test)]
-    fn stale_tcp_translation_count(&self) -> usize {
+    fn stale_guest_connection_count(&self) -> usize {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::StaleTcpTranslationCount { response })
+            .send(ReactorCommand::StaleGuestConnectionCount { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
@@ -674,7 +699,7 @@ enum ReactorCommand {
     Listen {
         id: u64,
         backlog: u32,
-        publication: Option<TcpPortPublicationClaim>,
+        mapping: Option<TcpPortMapping>,
         response: SyncSender<BrokerResult<SocketOutcome<SocketAddrV4>>>,
     },
     Accept {
@@ -744,11 +769,11 @@ enum ReactorCommand {
         response: SyncSender<Option<SocketAddrV4>>,
     },
     #[cfg(test)]
-    TcpTranslationCount {
+    PendingGuestConnectionCount {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
-    StaleTcpTranslationCount {
+    StaleGuestConnectionCount {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
@@ -787,7 +812,7 @@ enum AcceptedTcpPeer {
 }
 
 #[derive(Clone, Copy)]
-enum ConnectorTranslationDisposition {
+enum PendingGuestConnectionDisposition {
     Retain,
     Discard(Option<Instant>),
 }
@@ -795,7 +820,6 @@ enum ConnectorTranslationDisposition {
 struct RetiredTcpConnector {
     connection: (SocketAddrV4, SocketAddrV4),
     mapping_index: Option<usize>,
-    retained_in_namespace: bool,
     unplaced_connector: Option<OwnedFd>,
 }
 
@@ -803,9 +827,11 @@ struct RetiredTcpConnector {
 struct Reactor {
     epoll: OwnedFd,
     wake: Arc<OwnedFd>,
+    broker_ipv4_address: Ipv4Addr,
     commands: Receiver<ReactorCommand>,
     sockets: HashMap<u64, SocketEntry>,
-    sessions: HashMap<SessionId, SessionSocketNamespace>,
+    tcp: BrokerTcpState,
+    sessions: HashMap<SessionId, SessionSocketState>,
     port_mappings: Vec<PortMappingState>,
     max_sockets: usize,
     max_sockets_per_session: usize,
@@ -835,25 +861,33 @@ struct SocketEntry {
     abortive_close: bool,
     guest_local_address: Option<SocketAddrV4>,
     port_mapping_index: Option<usize>,
-    tcp_port_publication_claim: Option<TcpPortPublicationClaim>,
-    publication_fallback_socket: Option<OwnedFd>,
+    mapping_fallback_socket: Option<OwnedFd>,
     tcp_no_delay: bool,
     tcp_keep_alive: bool,
 }
 
-/// Guest-visible TCP endpoints owned by one broker session.
+/// The broker-wide guest TCP namespace and pending guest-to-guest connections.
 #[derive(Default)]
-struct SessionSocketNamespace {
-    tcp: HashMap<u16, GuestPortBinding>,
-    // Pending accepts can outlive the connecting socket, so a translation is
-    // retained separately from its guest port binding until accept consumes it.
-    tcp_translations: HashMap<(SocketAddrV4, SocketAddrV4), TcpPeerTranslation>,
+struct BrokerTcpState {
+    bindings: HashMap<u16, GuestPortBinding>,
+    pending_guest_connections: HashMap<(SocketAddrV4, SocketAddrV4), PendingGuestTcpConnection>,
+    stale_mapped_connections: HashMap<(usize, SocketAddrV4, SocketAddrV4), StaleTcpConnection>,
+}
+
+/// Per-session socket ownership, quota, and teardown state.
+///
+/// Sessions do not define network namespaces; all guest TCP endpoints and
+/// pending guest-to-guest connections live in the reactor-wide `BrokerTcpState`.
+#[derive(Default)]
+struct SessionSocketState {
     live_sockets: usize,
+    pending_guest_connections: usize,
     retained_connectors: usize,
     closing: bool,
 }
 
-struct TcpPeerTranslation {
+struct PendingGuestTcpConnection {
+    session_id: SessionId,
     guest_address: SocketAddrV4,
     listener_id: u64,
     discard_on_accept: bool,
@@ -870,6 +904,7 @@ struct GuestPortBinding {
     host_peer_address: Option<SocketAddrV4>,
     host_peer_mapping_index: Option<usize>,
     host_mapped: bool,
+    listening: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -878,84 +913,38 @@ enum SocketKind {
     Udp,
 }
 
-impl SessionSocketNamespace {
-    /// Returns the guest port bindings tracked for `kind`.
-    ///
-    /// Only TCP endpoints live in the guest namespace; UDP sockets remain
-    /// backed directly by a host endpoint.
-    fn bindings(&self, kind: SocketKind) -> Option<&HashMap<u16, GuestPortBinding>> {
-        match kind {
-            SocketKind::Tcp => Some(&self.tcp),
-            SocketKind::Udp => None,
-        }
-    }
-
-    fn insert_binding(
-        &mut self,
-        kind: SocketKind,
-        port: u16,
-        binding: GuestPortBinding,
-    ) -> BrokerResult<()> {
-        if kind != SocketKind::Tcp {
+impl BrokerTcpState {
+    fn insert_binding(&mut self, port: u16, binding: GuestPortBinding) -> BrokerResult<()> {
+        if binding.guest_address.port() != port {
             return Err(BrokerError::Internal);
         }
-        if self.tcp.insert(port, binding).is_some() {
+        if self.bindings.insert(port, binding).is_some() {
             return Err(BrokerError::Internal);
         }
         Ok(())
     }
 
-    fn reserve_binding(&mut self, kind: SocketKind) -> BrokerResult<()> {
-        if kind != SocketKind::Tcp {
-            return Err(BrokerError::Internal);
-        }
-        self.tcp
+    fn reserve_binding(&mut self) -> BrokerResult<()> {
+        self.bindings
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)
     }
 
-    fn reserve_tcp_translation(
-        &mut self,
-        session_stale: usize,
-        total_stale: usize,
-        max_session_translations: usize,
-    ) -> BrokerResult<()> {
+    fn remove_binding(&mut self, port: u16, socket_id: u64) {
         if self
-            .tcp_translations
-            .len()
-            .checked_add(session_stale)
-            .is_none_or(|count| count >= max_session_translations)
-            || self
-                .tcp_translations
-                .len()
-                .checked_add(total_stale)
-                .is_none_or(|count| count >= MAX_RETAINED_TRANSLATIONS)
-        {
-            return Err(BrokerError::ResourceExhausted);
-        }
-        self.tcp_translations
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)
-    }
-
-    fn remove_binding(&mut self, kind: SocketKind, port: u16, socket_id: u64) {
-        if kind != SocketKind::Tcp {
-            return;
-        }
-        if self
-            .tcp
+            .bindings
             .get(&port)
             .is_some_and(|binding| binding.socket_id == socket_id)
         {
-            self.tcp.remove(&port);
+            self.bindings.remove(&port);
         }
     }
 
-    fn guest_binding(&self, kind: SocketKind, address: SocketAddrV4) -> Option<GuestPortBinding> {
+    fn guest_binding(&self, address: SocketAddrV4) -> Option<GuestPortBinding> {
         if !address.ip().is_loopback() {
             return None;
         }
-        let binding = self.bindings(kind)?.get(&address.port())?;
+        let binding = self.bindings.get(&address.port())?;
         if binding.guest_address.ip().is_unspecified() || binding.guest_address.ip() == address.ip()
         {
             Some(*binding)
@@ -966,16 +955,12 @@ impl SessionSocketNamespace {
 
     fn set_host_address(
         &mut self,
-        kind: SocketKind,
         port: u16,
         socket_id: u64,
         host_address: SocketAddrV4,
         host_mapped: bool,
     ) -> BrokerResult<()> {
-        if kind != SocketKind::Tcp {
-            return Err(BrokerError::Internal);
-        }
-        let binding = self.tcp.get_mut(&port).ok_or(BrokerError::Internal)?;
+        let binding = self.bindings.get_mut(&port).ok_or(BrokerError::Internal)?;
         if binding.socket_id != socket_id {
             return Err(BrokerError::Internal);
         }
@@ -986,18 +971,13 @@ impl SessionSocketNamespace {
 
     fn set_host_peer_address(
         &mut self,
-        kind: SocketKind,
         port: u16,
         socket_id: u64,
         host_peer_address: SocketAddrV4,
-        listener_id: u64,
         mapping_index: Option<usize>,
-    ) -> BrokerResult<()> {
-        if kind != SocketKind::Tcp {
-            return Err(BrokerError::Internal);
-        }
+    ) -> BrokerResult<(SocketAddrV4, SocketAddrV4)> {
         let (host_address, guest_address) = {
-            let binding = self.tcp.get_mut(&port).ok_or(BrokerError::Internal)?;
+            let binding = self.bindings.get_mut(&port).ok_or(BrokerError::Internal)?;
             if binding.socket_id != socket_id {
                 return Err(BrokerError::Internal);
             }
@@ -1008,29 +988,11 @@ impl SessionSocketNamespace {
                 binding.guest_address,
             )
         };
-        self.tcp_translations.insert(
-            (host_address, host_peer_address),
-            TcpPeerTranslation {
-                guest_address,
-                listener_id,
-                discard_on_accept: false,
-                discard_deadline: None,
-                retained_connector: None,
-            },
-        );
-        Ok(())
+        Ok((host_address, guest_address))
     }
 
-    fn clear_host_address(
-        &mut self,
-        kind: SocketKind,
-        port: u16,
-        socket_id: u64,
-    ) -> BrokerResult<()> {
-        if kind != SocketKind::Tcp {
-            return Err(BrokerError::Internal);
-        }
-        let binding = self.tcp.get_mut(&port).ok_or(BrokerError::Internal)?;
+    fn clear_host_address(&mut self, port: u16, socket_id: u64) -> BrokerResult<()> {
+        let binding = self.bindings.get_mut(&port).ok_or(BrokerError::Internal)?;
         if binding.socket_id != socket_id {
             return Err(BrokerError::Internal);
         }
@@ -1038,19 +1000,25 @@ impl SessionSocketNamespace {
         binding.host_peer_address = None;
         binding.host_peer_mapping_index = None;
         binding.host_mapped = false;
+        binding.listening = false;
         Ok(())
     }
 
-    fn remove_tcp_translation_for_connector(
+    fn mark_listening(&mut self, port: u16, socket_id: u64) -> BrokerResult<()> {
+        let binding = self.bindings.get_mut(&port).ok_or(BrokerError::Internal)?;
+        if binding.socket_id != socket_id || binding.host_address.is_none() {
+            return Err(BrokerError::Internal);
+        }
+        binding.listening = true;
+        Ok(())
+    }
+
+    fn take_connector_connection(
         &mut self,
-        kind: SocketKind,
         port: u16,
         socket_id: u64,
-    ) -> Option<RetiredTcpConnector> {
-        if kind != SocketKind::Tcp {
-            return None;
-        }
-        let retired = self.tcp.get_mut(&port).and_then(|binding| {
+    ) -> Option<((SocketAddrV4, SocketAddrV4), Option<usize>)> {
+        self.bindings.get_mut(&port).and_then(|binding| {
             (binding.socket_id == socket_id)
                 .then(|| {
                     binding
@@ -1059,187 +1027,30 @@ impl SessionSocketNamespace {
                         .map(|connection| (connection, binding.host_peer_mapping_index.take()))
                 })
                 .flatten()
-        });
-        retired.map(|(connection, mapping_index)| {
-            let retained_connector = self
-                .tcp_translations
-                .remove(&connection)
-                .is_some_and(|translation| translation.retained_connector.is_some());
-            if retained_connector {
-                self.retained_connectors = self
-                    .retained_connectors
-                    .checked_sub(1)
-                    .expect("session retained connector count underflow");
-            }
-            RetiredTcpConnector {
-                connection,
-                mapping_index,
-                retained_in_namespace: retained_connector,
-                unplaced_connector: None,
-            }
         })
     }
 
-    fn retire_tcp_translation_for_connector(
-        &mut self,
-        kind: SocketKind,
-        port: u16,
-        socket_id: u64,
-        discard_on_accept: bool,
-        discard_deadline: Option<Instant>,
-        mut retained_connector: Option<OwnedFd>,
-    ) -> Option<RetiredTcpConnector> {
-        if kind != SocketKind::Tcp {
-            return None;
-        }
-        let retired = self.tcp.get_mut(&port).and_then(|binding| {
-            (binding.socket_id == socket_id)
-                .then(|| {
-                    let connection = binding.host_address.zip(binding.host_peer_address.take());
-                    connection
-                        .map(|connection| (connection, binding.host_peer_mapping_index.take()))
-                })
-                .flatten()
-        });
-        retired.map(|(connection, mapping_index)| {
-            let mut retained = false;
-            if let Some(translation) = self.tcp_translations.get_mut(&connection) {
-                translation.discard_on_accept = discard_on_accept;
-                translation.discard_deadline = discard_deadline;
-                retained = retained_connector.is_some();
-                translation.retained_connector = retained_connector.take();
-                self.retained_connectors = self
-                    .retained_connectors
-                    .checked_add(usize::from(retained))
-                    .expect("session retained connector count overflow");
-            }
-            RetiredTcpConnector {
-                connection,
-                mapping_index,
-                retained_in_namespace: retained,
-                unplaced_connector: retained_connector,
-            }
-        })
-    }
-
-    fn expire_tcp_discard_markers(&mut self, now: Instant) -> usize {
-        let mut released_connectors = 0;
-        self.tcp_translations.retain(|_, translation| {
-            let retain = !translation.discard_on_accept
-                || translation
-                    .discard_deadline
-                    .is_none_or(|deadline| deadline > now);
-            if !retain && translation.retained_connector.is_some() {
-                released_connectors += 1;
-            }
-            retain
-        });
-        self.retained_connectors = self
-            .retained_connectors
-            .checked_sub(released_connectors)
-            .expect("session retained connector count underflow");
-        released_connectors
-    }
-
-    fn take_tcp_peer_translation(
+    fn take_pending_guest_connection(
         &mut self,
         remote_address: SocketAddrV4,
         local_address: SocketAddrV4,
-    ) -> Option<TcpPeerTranslation> {
-        let translation = self
-            .tcp_translations
+    ) -> Option<PendingGuestTcpConnection> {
+        self.pending_guest_connections
             .remove(&(remote_address, local_address))
             .or_else(|| {
-                self.tcp_translations.remove(&(
+                self.pending_guest_connections.remove(&(
                     remote_address,
                     SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_address.port()),
                 ))
-            });
-        if translation
-            .as_ref()
-            .is_some_and(|translation| translation.retained_connector.is_some())
-        {
-            self.retained_connectors = self
-                .retained_connectors
-                .checked_sub(1)
-                .expect("session retained connector count underflow");
-        }
-        translation
+            })
     }
+}
 
-    fn remove_tcp_translations_for_listener(&mut self, listener_address: SocketAddrV4) -> usize {
-        let mut released_connectors = 0;
-        self.tcp_translations
-            .retain(|(_, destination), translation| {
-                let retain = destination.port() != listener_address.port()
-                    || (!listener_address.ip().is_unspecified()
-                        && destination.ip() != listener_address.ip());
-                if !retain && translation.retained_connector.is_some() {
-                    released_connectors += 1;
-                }
-                retain
-            });
-        self.retained_connectors = self
-            .retained_connectors
-            .checked_sub(released_connectors)
-            .expect("session retained connector count underflow");
-        released_connectors
-    }
-
-    fn move_tcp_translations_for_listener(
-        &mut self,
-        session_id: SessionId,
-        listener_address: SocketAddrV4,
-        stale_connections: &mut HashMap<(SocketAddrV4, SocketAddrV4), StaleTcpConnection>,
-    ) -> usize {
-        let retirement_deadline = Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME;
-        let mut released_connectors = 0;
-        self.tcp_translations.retain(|connection, translation| {
-            let destination = connection.1;
-            let matches = destination.port() == listener_address.port()
-                && (listener_address.ip().is_unspecified()
-                    || destination.ip() == listener_address.ip());
-            if matches {
-                let mut deadline = translation
-                    .discard_deadline
-                    .map(|deadline| deadline.max(retirement_deadline));
-                let mut retained_connector = translation.retained_connector.take();
-                if retained_connector.is_some() {
-                    deadline = None;
-                }
-                match stale_connections.entry(*connection) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(StaleTcpConnection {
-                            session_id,
-                            deadline,
-                            retained_connector,
-                        });
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        let existing = entry.get_mut();
-                        existing.deadline = match (existing.deadline, deadline) {
-                            (None, _) | (_, None) => None,
-                            (Some(existing), Some(deadline)) => Some(existing.max(deadline)),
-                        };
-                        if existing.session_id == session_id
-                            && existing.retained_connector.is_none()
-                        {
-                            existing.retained_connector = retained_connector.take();
-                        }
-                        if retained_connector.is_some() {
-                            released_connectors += 1;
-                        }
-                    }
-                }
-            }
-            !matches
-        });
-        self.retained_connectors = self
-            .retained_connectors
-            .checked_sub(released_connectors)
-            .expect("session retained connector count underflow");
-        released_connectors
-    }
+fn retain_session_state(state: &SessionSocketState) -> bool {
+    !state.closing
+        || state.live_sockets != 0
+        || state.pending_guest_connections != 0
+        || state.retained_connectors != 0
 }
 
 /// Cached connection and readiness state shared with the broker-facing handle.
@@ -1285,29 +1096,161 @@ impl fmt::Display for ReactorFailure {
 }
 
 impl Reactor {
-    fn claimed_tcp_port_publication(&self, id: u64) -> Option<(usize, TcpPortPublicationClaim)> {
-        let socket = self.sockets.get(&id)?;
-        let claim = socket.tcp_port_publication_claim?;
-        let mapping_index = claim.publication_id().index();
-        (socket.port_mapping_index == Some(mapping_index)
-            && self
-                .port_mappings
-                .get(mapping_index)
-                .is_some_and(|state| state.claimed_by == Some((id, claim))))
-        .then_some((mapping_index, claim))
+    fn reserve_pending_guest_connection(&mut self, session_id: SessionId) -> BrokerResult<()> {
+        let session = self
+            .sessions
+            .get(&session_id)
+            .ok_or(BrokerError::Internal)?;
+        let session_stale =
+            count_session_stale_connections(self.tcp.stale_mapped_connections.values(), session_id);
+        if session
+            .pending_guest_connections
+            .checked_add(session_stale)
+            .is_none_or(|count| count >= self.max_sockets_per_session)
+            || self
+                .tcp
+                .pending_guest_connections
+                .len()
+                .checked_add(self.tcp.stale_mapped_connections.len())
+                .is_none_or(|count| count >= MAX_TRACKED_GUEST_CONNECTIONS)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        self.tcp
+            .pending_guest_connections
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)
     }
 
-    /// Transfers one reserved host endpoint to the socket publishing it.
+    fn decrement_pending_guest_connection_count(&mut self, session_id: SessionId) {
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .expect("pending guest connection session state missing");
+        session.pending_guest_connections = session
+            .pending_guest_connections
+            .checked_sub(1)
+            .expect("session pending guest connection count underflow");
+    }
+
+    fn release_pending_guest_connection_connector(
+        &mut self,
+        connection: &PendingGuestTcpConnection,
+    ) {
+        if connection.retained_connector.is_none() {
+            return;
+        }
+        self.retained_connectors = self
+            .retained_connectors
+            .checked_sub(1)
+            .expect("reactor retained connector count underflow");
+        let session = self
+            .sessions
+            .get_mut(&connection.session_id)
+            .expect("pending guest connection session state missing");
+        session.retained_connectors = session
+            .retained_connectors
+            .checked_sub(1)
+            .expect("session retained connector count underflow");
+    }
+
+    fn finish_removed_pending_guest_connection(&mut self, connection: &PendingGuestTcpConnection) {
+        self.decrement_pending_guest_connection_count(connection.session_id);
+        self.release_pending_guest_connection_connector(connection);
+    }
+
+    fn insert_pending_guest_connection(
+        &mut self,
+        session_id: SessionId,
+        connection: (SocketAddrV4, SocketAddrV4),
+        guest_address: SocketAddrV4,
+        listener_id: u64,
+    ) -> BrokerResult<()> {
+        if let Some(previous) = self.tcp.pending_guest_connections.remove(&connection) {
+            self.finish_removed_pending_guest_connection(&previous);
+        }
+        let session = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(BrokerError::Internal)?;
+        session.pending_guest_connections = session
+            .pending_guest_connections
+            .checked_add(1)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        self.tcp.pending_guest_connections.insert(
+            connection,
+            PendingGuestTcpConnection {
+                session_id,
+                guest_address,
+                listener_id,
+                discard_on_accept: false,
+                discard_deadline: None,
+                retained_connector: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn retire_pending_guest_connection_for_connector(
+        &mut self,
+        session_id: SessionId,
+        guest_port: u16,
+        socket_id: u64,
+        discard_on_accept: bool,
+        discard_deadline: Option<Instant>,
+        mut retained_connector: Option<OwnedFd>,
+    ) -> Option<RetiredTcpConnector> {
+        let (connection, mapping_index) =
+            self.tcp.take_connector_connection(guest_port, socket_id)?;
+        let mut retained_in_pending_connection = false;
+        if let Some(pending) = self.tcp.pending_guest_connections.get_mut(&connection)
+            && pending.session_id == session_id
+        {
+            pending.discard_on_accept = discard_on_accept;
+            pending.discard_deadline = discard_deadline;
+            retained_in_pending_connection = retained_connector.is_some();
+            pending.retained_connector = retained_connector.take();
+        }
+        if retained_in_pending_connection {
+            self.retained_connectors = self
+                .retained_connectors
+                .checked_add(1)
+                .expect("reactor retained connector count overflow");
+            let session = self
+                .sessions
+                .get_mut(&session_id)
+                .expect("pending guest connection session state missing");
+            session.retained_connectors = session
+                .retained_connectors
+                .checked_add(1)
+                .expect("session retained connector count overflow");
+        }
+        Some(RetiredTcpConnector {
+            connection,
+            mapping_index,
+            unplaced_connector: retained_connector,
+        })
+    }
+
+    fn owned_tcp_port_mapping(&self, id: u64) -> Option<usize> {
+        let socket = self.sockets.get(&id)?;
+        let mapping_index = socket.port_mapping_index?;
+        self.port_mappings
+            .get(mapping_index)
+            .is_some_and(|state| state.owned_by == Some(id))
+            .then_some(mapping_index)
+    }
+
+    /// Transfers one reserved broker endpoint to the socket using its mapping.
     ///
     /// The reservation descriptor keeps the mapped endpoint exclusively owned
-    /// between publications, so a claim replaces the socket's descriptor rather
-    /// than binding the endpoint again.
-    fn realize_tcp_port_publication(
+    /// between mapped listeners, so ownership replaces the socket's descriptor
+    /// rather than binding the endpoint again.
+    fn realize_tcp_port_mapping(
         &mut self,
         id: u64,
-        claim: TcpPortPublicationClaim,
+        mapping_index: usize,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
-        let mapping_index = claim.publication_id().index();
         let guest_port = self
             .sockets
             .get(&id)
@@ -1325,9 +1268,9 @@ impl Reactor {
         if self
             .port_mappings
             .get(mapping_index)
-            .is_some_and(|state| state.claimed_by.is_none() && state.reservation.is_none())
+            .is_some_and(|state| state.owned_by.is_none() && state.reservation.is_none())
         {
-            match create_replacement_port_mapping_reservation(mapping) {
+            match create_replacement_port_mapping_reservation(self.broker_ipv4_address, mapping) {
                 Ok(reservation) => {
                     let state = self
                         .port_mappings
@@ -1348,7 +1291,7 @@ impl Reactor {
                 .port_mappings
                 .get_mut(mapping_index)
                 .ok_or(BrokerError::Internal)?;
-            if state.claimed_by.is_some() {
+            if state.owned_by.is_some() {
                 return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
             }
             let Some(reservation) = state.reservation.take() else {
@@ -1396,7 +1339,7 @@ impl Reactor {
             }
         };
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-        if socket.kind != SocketKind::Tcp || socket.publication_fallback_socket.is_some() {
+        if socket.kind != SocketKind::Tcp || socket.mapping_fallback_socket.is_some() {
             let state = self
                 .port_mappings
                 .get_mut(mapping_index)
@@ -1441,14 +1384,96 @@ impl Reactor {
             return Err(broker_error_from_errno(error));
         }
         let fallback = core::mem::replace(&mut socket.socket, reservation);
-        socket.publication_fallback_socket = Some(fallback);
+        socket.mapping_fallback_socket = Some(fallback);
         socket.port_mapping_index = Some(mapping_index);
-        socket.tcp_port_publication_claim = Some(claim);
         self.port_mappings
             .get_mut(mapping_index)
             .ok_or(BrokerError::Internal)?
-            .claimed_by = Some((id, claim));
+            .owned_by = Some(id);
         Ok(SocketOutcome::Completed(host_address))
+    }
+
+    /// Binds an unconfigured identity mapping at listen time.
+    fn realize_identity_tcp_mapping(
+        &mut self,
+        id: u64,
+        mapping: TcpPortMapping,
+    ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+        let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
+        let guest_port = socket
+            .guest_local_address
+            .ok_or(BrokerError::Internal)?
+            .port();
+        if socket.kind != SocketKind::Tcp
+            || mapping.guest_port != guest_port
+            || mapping.broker_port != guest_port
+            || socket.mapping_fallback_socket.is_some()
+            || socket.port_mapping_index.is_some()
+        {
+            return Err(BrokerError::Internal);
+        }
+        let replacement = match create_port_mapping_reservation(
+            self.broker_ipv4_address,
+            mapping,
+            false,
+            false,
+        ) {
+            Ok(socket) => socket,
+            Err(error) => {
+                return Ok(SocketOutcome::Failed(socket_operation_error_from_errno(
+                    error,
+                )?));
+            }
+        };
+        apply_tcp_options(&replacement, socket.tcp_no_delay, socket.tcp_keep_alive)?;
+        epoll::add(
+            &self.epoll,
+            &replacement,
+            epoll::EventData::new_u64(id),
+            idle_epoll_events(),
+        )
+        .map_err(broker_error_from_errno)?;
+        let host_address = local_socket_address(&replacement)?;
+        let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+        let fallback = core::mem::replace(&mut socket.socket, replacement);
+        socket.mapping_fallback_socket = Some(fallback);
+        Ok(SocketOutcome::Completed(host_address))
+    }
+
+    fn release_failed_identity_tcp_mapping(&mut self, id: u64) -> BrokerResult<()> {
+        let guest_port = self
+            .sockets
+            .get(&id)
+            .and_then(|socket| {
+                (!socket.listening
+                    && socket.port_mapping_index.is_none()
+                    && socket.mapping_fallback_socket.is_some())
+                .then_some(())?;
+                socket.guest_local_address.map(|address| address.port())
+            })
+            .ok_or(BrokerError::Internal)?;
+        let host_address_is_set = self
+            .tcp
+            .bindings
+            .get(&guest_port)
+            .filter(|binding| binding.socket_id == id)
+            .map(|binding| binding.host_mapped);
+        let replacement = {
+            let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+            let fallback = socket
+                .mapping_fallback_socket
+                .take()
+                .ok_or(BrokerError::Internal)?;
+            core::mem::replace(&mut socket.socket, fallback)
+        };
+        drop(replacement);
+        let Some(host_address_is_set) = host_address_is_set else {
+            return Err(BrokerError::Internal);
+        };
+        if host_address_is_set {
+            self.tcp.clear_host_address(guest_port, id)?;
+        }
+        Ok(())
     }
 
     fn drain_tcp_listener(&mut self, socket: &OwnedFd, mapping_index: usize) -> BrokerResult<bool> {
@@ -1467,7 +1492,11 @@ impl Reactor {
                             remote_address,
                             local_address,
                         );
-                        self.take_tcp_peer_translations_except(None, remote_address, local_address);
+                        self.remove_pending_guest_connection_except(
+                            None,
+                            remote_address,
+                            local_address,
+                        );
                     }
                     drop(accepted);
                 }
@@ -1485,7 +1514,7 @@ impl Reactor {
     }
 
     fn stop_listening_socket(&mut self, id: u64) -> BrokerResult<SocketOutcome<()>> {
-        let claimed_publication = {
+        let owned_mapping = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.kind != SocketKind::Tcp || !socket.listening {
                 return self
@@ -1494,11 +1523,11 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)
                     .and_then(|socket| shutdown_socket(socket, ShutdownMode::StopListening));
             }
-            self.claimed_tcp_port_publication(id)
+            self.owned_tcp_port_mapping(id)
         };
-        let Some((mapping_index, claim)) = claimed_publication else {
+        let Some(mapping_index) = owned_mapping else {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
-            if socket.port_mapping_index.is_some() || socket.tcp_port_publication_claim.is_some() {
+            if socket.port_mapping_index.is_some() {
                 return Err(BrokerError::Internal);
             }
             return self
@@ -1507,19 +1536,20 @@ impl Reactor {
                 .ok_or(BrokerError::Internal)
                 .and_then(|socket| shutdown_socket(socket, ShutdownMode::StopListening));
         };
-        if !self.port_mappings.get(mapping_index).is_some_and(|state| {
-            state.claimed_by == Some((id, claim)) && state.reservation.is_none()
-        }) {
+        if !self
+            .port_mappings
+            .get(mapping_index)
+            .is_some_and(|state| state.owned_by == Some(id) && state.reservation.is_none())
+        {
             return Err(BrokerError::Internal);
         }
-        let (session_id, guest_port, no_delay, keep_alive) = self
+        let (guest_port, no_delay, keep_alive) = self
             .sockets
             .get(&id)
-            .filter(|socket| socket.publication_fallback_socket.is_none())
+            .filter(|socket| socket.mapping_fallback_socket.is_none())
             .and_then(|socket| {
                 socket.guest_local_address.map(|guest_address| {
                     (
-                        socket.session_id,
                         guest_address.port(),
                         socket.tcp_no_delay,
                         socket.tcp_keep_alive,
@@ -1528,9 +1558,9 @@ impl Reactor {
             })
             .ok_or(BrokerError::Internal)?;
         if !self
-            .sessions
-            .get(&session_id)
-            .and_then(|namespace| namespace.tcp.get(&guest_port))
+            .tcp
+            .bindings
+            .get(&guest_port)
             .is_some_and(|binding| binding.socket_id == id && binding.host_mapped)
         {
             return Err(BrokerError::Internal);
@@ -1566,75 +1596,70 @@ impl Reactor {
             socket.read_shutdown = true;
             socket.peek_waitall_threshold = None;
             socket.port_mapping_index = None;
-            socket.tcp_port_publication_claim = None;
             reservation
         };
         let state = self
             .port_mappings
             .get_mut(mapping_index)
             .ok_or(BrokerError::Internal)?;
-        state.claimed_by = None;
+        state.owned_by = None;
         state.reservation = Some(reservation);
         state.reservation_registered = false;
         Ok(SocketOutcome::Completed(()))
     }
 
-    fn release_failed_tcp_port_publication(
+    fn release_failed_tcp_port_mapping(
         &mut self,
         id: u64,
-        claim: TcpPortPublicationClaim,
+        mapping_index: usize,
     ) -> BrokerResult<()> {
-        let mapping_index = claim.publication_id().index();
-        if !self.port_mappings.get(mapping_index).is_some_and(|state| {
-            state.claimed_by == Some((id, claim)) && state.reservation.is_none()
-        }) {
+        if !self
+            .port_mappings
+            .get(mapping_index)
+            .is_some_and(|state| state.owned_by == Some(id) && state.reservation.is_none())
+        {
             return Err(BrokerError::Internal);
         }
-        let (session_id, guest_port) = self
+        let guest_port = self
             .sockets
             .get(&id)
             .and_then(|socket| {
                 (!socket.listening
                     && socket.port_mapping_index == Some(mapping_index)
-                    && socket.tcp_port_publication_claim == Some(claim)
-                    && socket.publication_fallback_socket.is_some())
+                    && socket.mapping_fallback_socket.is_some())
                 .then_some(())?;
                 socket
                     .guest_local_address
-                    .map(|guest_address| (socket.session_id, guest_address.port()))
+                    .map(|guest_address| guest_address.port())
             })
             .ok_or(BrokerError::Internal)?;
         let host_address_is_set = self
-            .sessions
-            .get(&session_id)
-            .and_then(|namespace| namespace.tcp.get(&guest_port))
+            .tcp
+            .bindings
+            .get(&guest_port)
             .filter(|binding| binding.socket_id == id)
             .map(|binding| binding.host_mapped);
         let reservation = {
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
             let fallback = socket
-                .publication_fallback_socket
+                .mapping_fallback_socket
                 .take()
                 .ok_or(BrokerError::Internal)?;
             socket.port_mapping_index = None;
-            socket.tcp_port_publication_claim = None;
             core::mem::replace(&mut socket.socket, fallback)
         };
         let state = self
             .port_mappings
             .get_mut(mapping_index)
             .ok_or(BrokerError::Internal)?;
-        state.claimed_by = None;
+        state.owned_by = None;
         state.reservation = Some(reservation);
         state.reservation_registered = true;
         let Some(host_address_is_set) = host_address_is_set else {
             return Err(BrokerError::Internal);
         };
         if host_address_is_set {
-            self.sessions
-                .get_mut(&session_id)
-                .ok_or(BrokerError::Internal)?
-                .clear_host_address(SocketKind::Tcp, guest_port, id)?;
+            self.tcp.clear_host_address(guest_port, id)?;
         }
         Ok(())
     }
@@ -1648,12 +1673,10 @@ impl Reactor {
         kind: SocketKind,
         address: SocketAddrV4,
     ) -> BrokerResult<bool> {
-        for binding in self
-            .sessions
-            .values()
-            .filter_map(|namespace| namespace.bindings(kind))
-            .flat_map(HashMap::values)
-        {
+        if kind != SocketKind::Tcp {
+            return Ok(false);
+        }
+        for binding in self.tcp.bindings.values() {
             let Some(host_address) = binding.host_address else {
                 continue;
             };
@@ -1673,18 +1696,18 @@ impl Reactor {
     /// Resolves a guest destination to the host endpoint that should receive it.
     fn resolve_guest_destination(
         &self,
-        session_id: SessionId,
         kind: SocketKind,
         mut address: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<(SocketAddrV4, Option<u64>)>> {
         if address.ip().is_unspecified() {
             address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
         }
-        if let Some(binding) = self
-            .sessions
-            .get(&session_id)
-            .and_then(|namespace| namespace.guest_binding(kind, address))
+        if kind == SocketKind::Tcp
+            && let Some(binding) = self.tcp.guest_binding(address)
         {
+            if !binding.listening {
+                return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+            }
             return match binding.host_address {
                 Some(host_address) if host_address.ip().is_unspecified() => {
                     Ok(SocketOutcome::Completed((
@@ -1716,13 +1739,9 @@ impl Reactor {
         id: u64,
         requested_address: SocketAddrV4,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
-        let (session_id, kind, already_bound) = {
+        let (kind, already_bound) = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
-            (
-                socket.session_id,
-                socket.kind,
-                socket.guest_local_address.is_some(),
-            )
+            (socket.kind, socket.guest_local_address.is_some())
         };
         if kind != SocketKind::Tcp {
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
@@ -1745,35 +1764,23 @@ impl Reactor {
         if guest_port == 0 {
             return Err(BrokerError::Internal);
         }
-        if self
-            .sessions
-            .get(&session_id)
-            .ok_or(BrokerError::Internal)?
-            .tcp
-            .contains_key(&guest_port)
-        {
+        if self.tcp.bindings.contains_key(&guest_port) {
             return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
         }
-        self.sessions
-            .get_mut(&session_id)
-            .ok_or(BrokerError::Internal)?
-            .reserve_binding(kind)?;
+        self.tcp.reserve_binding()?;
         let guest_address = SocketAddrV4::new(*requested_address.ip(), guest_port);
-        self.sessions
-            .get_mut(&session_id)
-            .ok_or(BrokerError::Internal)?
-            .insert_binding(
-                kind,
-                guest_port,
-                GuestPortBinding {
-                    socket_id: id,
-                    guest_address,
-                    host_address: None,
-                    host_peer_address: None,
-                    host_peer_mapping_index: None,
-                    host_mapped: false,
-                },
-            )?;
+        self.tcp.insert_binding(
+            guest_port,
+            GuestPortBinding {
+                socket_id: id,
+                guest_address,
+                host_address: None,
+                host_peer_address: None,
+                host_peer_mapping_index: None,
+                host_mapped: false,
+                listening: false,
+            },
+        )?;
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
         socket
@@ -1788,17 +1795,16 @@ impl Reactor {
         &mut self,
         id: u64,
         backlog: u32,
-        publication_claim: Option<TcpPortPublicationClaim>,
+        mapping: Option<TcpPortMapping>,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
-        let (session_id, kind, guest_address, current_claim) = self
+        let (kind, guest_address, current_mapping_index) = self
             .sockets
             .get(&id)
             .map(|socket| {
                 (
-                    socket.session_id,
                     socket.kind,
                     socket.guest_local_address,
-                    socket.tcp_port_publication_claim,
+                    socket.port_mapping_index,
                 )
             })
             .ok_or(BrokerError::Internal)?;
@@ -1810,30 +1816,63 @@ impl Reactor {
             local_socket_address(&self.sockets.get(&id).ok_or(BrokerError::Internal)?.socket)?
                 .port()
                 == 0;
-        if let Some(current_claim) = current_claim {
-            if publication_claim != Some(current_claim) {
-                return Err(BrokerError::Internal);
-            }
-            let mapping_index = current_claim.publication_id().index();
-            if !self.port_mappings.get(mapping_index).is_some_and(|state| {
-                state.claimed_by == Some((id, current_claim))
-                    && self
-                        .sockets
-                        .get(&id)
-                        .is_some_and(|socket| socket.port_mapping_index == Some(mapping_index))
-            }) {
-                return Err(BrokerError::Internal);
-            }
-        } else if publication_claim.is_some() && !needs_host_bind {
+        if mapping.is_some_and(|mapping| mapping.guest_port != guest_address.port()) {
             return Err(BrokerError::Internal);
         }
-        let newly_claimed_publication = current_claim
+        let requested_mapping_index = mapping.and_then(|mapping| {
+            self.port_mappings
+                .iter()
+                .position(|state| state.mapping == mapping)
+        });
+        let identity_mapping = mapping.filter(|_| requested_mapping_index.is_none());
+        if identity_mapping.is_some_and(|mapping| mapping.broker_port != mapping.guest_port) {
+            return Err(BrokerError::Internal);
+        }
+        let currently_host_mapped = self
+            .tcp
+            .bindings
+            .get(&guest_address.port())
+            .filter(|binding| binding.socket_id == id)
+            .map(|binding| binding.host_mapped)
+            .ok_or(BrokerError::Internal)?;
+        if let Some(current_mapping_index) = current_mapping_index {
+            if requested_mapping_index != Some(current_mapping_index) {
+                return Err(BrokerError::Internal);
+            }
+            if self
+                .port_mappings
+                .get(current_mapping_index)
+                .is_none_or(|state| state.owned_by != Some(id))
+            {
+                return Err(BrokerError::Internal);
+            }
+        } else if !needs_host_bind {
+            if mapping.is_some() != currently_host_mapped {
+                return Err(BrokerError::Internal);
+            }
+            if let Some(mapping) = mapping
+                && local_socket_address(
+                    &self.sockets.get(&id).ok_or(BrokerError::Internal)?.socket,
+                )?
+                .port()
+                    != mapping.broker_port
+            {
+                return Err(BrokerError::Internal);
+            }
+        }
+        let new_mapping = current_mapping_index
             .is_none()
-            .then_some(publication_claim)
+            .then_some(requested_mapping_index)
             .flatten();
+        let new_identity_mapping = needs_host_bind.then_some(identity_mapping).flatten();
         if needs_host_bind {
-            let (host_address, host_mapped) = if let Some(claim) = publication_claim {
-                match self.realize_tcp_port_publication(id, claim)? {
+            let (host_address, host_mapped) = if let Some(mapping_index) = requested_mapping_index {
+                match self.realize_tcp_port_mapping(id, mapping_index)? {
+                    SocketOutcome::Completed(address) => (address, true),
+                    SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+                }
+            } else if let Some(mapping) = identity_mapping {
+                match self.realize_identity_tcp_mapping(id, mapping)? {
                     SocketOutcome::Completed(address) => (address, true),
                     SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
                 }
@@ -1846,39 +1885,43 @@ impl Reactor {
                     };
                 (address, false)
             };
-            if let Err(error) = self
-                .sessions
-                .get_mut(&session_id)
-                .ok_or(BrokerError::Internal)
-                .and_then(|namespace| {
-                    namespace.set_host_address(
-                        kind,
-                        guest_address.port(),
-                        id,
-                        host_address,
-                        host_mapped,
-                    )
-                })
+            if let Err(error) =
+                self.tcp
+                    .set_host_address(guest_address.port(), id, host_address, host_mapped)
             {
-                if let Some(claim) = newly_claimed_publication {
-                    self.release_failed_tcp_port_publication(id, claim)?;
+                if let Some(mapping_index) = new_mapping {
+                    self.release_failed_tcp_port_mapping(id, mapping_index)?;
+                } else if new_identity_mapping.is_some() {
+                    self.release_failed_identity_tcp_mapping(id)?;
                 }
                 return Err(error);
             }
         }
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-        let host_mapped = socket.port_mapping_index.is_some();
+        let host_mapped = mapping.is_some();
         let outcome = listen_tcp_socket(&self.epoll, id, socket, backlog, host_mapped);
         match outcome {
             Ok(SocketOutcome::Completed(())) => {
-                if let Some(claim) = newly_claimed_publication {
+                self.tcp.mark_listening(guest_address.port(), id)?;
+                if let Some(mapping_index) = new_mapping {
                     let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-                    if socket.tcp_port_publication_claim != Some(claim) {
+                    if socket.port_mapping_index != Some(mapping_index) {
                         return Err(BrokerError::Internal);
                     }
                     drop(
                         socket
-                            .publication_fallback_socket
+                            .mapping_fallback_socket
+                            .take()
+                            .ok_or(BrokerError::Internal)?,
+                    );
+                } else if new_identity_mapping.is_some() {
+                    let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
+                    if socket.port_mapping_index.is_some() {
+                        return Err(BrokerError::Internal);
+                    }
+                    drop(
+                        socket
+                            .mapping_fallback_socket
                             .take()
                             .ok_or(BrokerError::Internal)?,
                     );
@@ -1886,14 +1929,18 @@ impl Reactor {
                 Ok(SocketOutcome::Completed(guest_address))
             }
             Ok(SocketOutcome::Failed(error)) => {
-                if let Some(claim) = newly_claimed_publication {
-                    self.release_failed_tcp_port_publication(id, claim)?;
+                if let Some(mapping_index) = new_mapping {
+                    self.release_failed_tcp_port_mapping(id, mapping_index)?;
+                } else if new_identity_mapping.is_some() {
+                    self.release_failed_identity_tcp_mapping(id)?;
                 }
                 Ok(SocketOutcome::Failed(error))
             }
             Err(error) => {
-                if let Some(claim) = newly_claimed_publication {
-                    self.release_failed_tcp_port_publication(id, claim)?;
+                if let Some(mapping_index) = new_mapping {
+                    self.release_failed_tcp_port_mapping(id, mapping_index)?;
+                } else if new_identity_mapping.is_some() {
+                    self.release_failed_identity_tcp_mapping(id)?;
                 }
                 Err(error)
             }
@@ -1917,8 +1964,8 @@ impl Reactor {
                     ))?;
             return connect_datagram_socket(socket, address);
         }
-        let claims_mapping = self.claimed_tcp_port_publication(id).is_some();
-        if claims_mapping {
+        let owns_mapping = self.owned_tcp_port_mapping(id).is_some();
+        if owns_mapping {
             let status = SocketConnectionStatus::Failed(SocketError::InvalidArgument);
             update_snapshot(
                 self.sockets
@@ -1949,7 +1996,7 @@ impl Reactor {
             socket.session_id
         };
         let (network_address, guest_listener_id) = match self
-            .resolve_guest_destination(session_id, SocketKind::Tcp, guest_address)
+            .resolve_guest_destination(SocketKind::Tcp, guest_address)
             .map_err(PlatformConnectError::PeerUnchanged)?
         {
             SocketOutcome::Completed(destination) => destination,
@@ -1966,37 +2013,48 @@ impl Reactor {
                 return Ok(status);
             }
         };
+        if guest_listener_id.is_none() {
+            let source_ip = self
+                .sockets
+                .get(&id)
+                .and_then(|socket| socket.guest_local_address)
+                .map(|address| {
+                    if address.ip().is_unspecified() {
+                        self.broker_ipv4_address
+                    } else {
+                        *address.ip()
+                    }
+                })
+                .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+            let socket = self
+                .sockets
+                .get_mut(&id)
+                .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+            if local_socket_address(&socket.socket)
+                .map_err(PlatformConnectError::PeerUnchanged)?
+                .port()
+                == 0
+            {
+                match bind_host_socket(socket, SocketAddrV4::new(source_ip, 0))
+                    .map_err(PlatformConnectError::PeerUnchanged)?
+                {
+                    SocketOutcome::Completed(_) => {}
+                    SocketOutcome::Failed(error) => {
+                        let status = SocketConnectionStatus::Failed(error);
+                        update_snapshot(socket, Some(status), ReadinessFlags::ERROR)
+                            .map_err(PlatformConnectError::PeerIndeterminate)?;
+                        return Ok(status);
+                    }
+                }
+            }
+        }
         let guest_mapping_index = guest_listener_id
             .and_then(|listener_id| self.sockets.get(&listener_id))
             .and_then(|listener| listener.port_mapping_index);
         if guest_listener_id.is_some() {
             let now = Instant::now();
-            for state in &mut self.port_mappings {
-                state.stale_connections.retain(|_, stale| {
-                    stale.retained_connector.is_some()
-                        || stale.deadline.is_none_or(|deadline| deadline > now)
-                });
-            }
-            let session_stale = count_session_stale_connections(
-                self.port_mappings
-                    .iter()
-                    .flat_map(|state| state.stale_connections.values()),
-                session_id,
-            );
-            let total_stale = guest_mapping_index
-                .and_then(|mapping_index| self.port_mappings.get(mapping_index))
-                .map_or(0, |state| state.stale_connections.len());
-            let namespace = self
-                .sessions
-                .get_mut(&session_id)
-                .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-            let released_connectors = namespace.expire_tcp_discard_markers(now);
-            self.retained_connectors = self
-                .retained_connectors
-                .checked_sub(released_connectors)
-                .expect("reactor retained connector count underflow");
-            namespace
-                .reserve_tcp_translation(session_stale, total_stale, self.max_sockets_per_session)
+            self.expire_deadlined_state(now);
+            self.reserve_pending_guest_connection(session_id)
                 .map_err(PlatformConnectError::PeerUnchanged)?;
         }
         let (outcome, readiness) = {
@@ -2033,41 +2091,32 @@ impl Reactor {
                     )?;
                     self.take_stale_tcp_connection(mapping_index, host_address, network_address);
                 }
-                self.take_tcp_peer_translations_except(
+                self.remove_pending_guest_connection_except(
                     Some(session_id),
                     host_address,
                     network_address,
                 );
-                self.sessions.retain(|_, namespace| {
-                    !namespace.closing
-                        || namespace.live_sockets != 0
-                        || namespace.retained_connectors != 0
-                        || !namespace.tcp_translations.is_empty()
-                });
             }
-            let namespace = self.sessions.get_mut(&session_id).ok_or(
-                PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
-            )?;
-            namespace
-                .set_host_address(
-                    SocketKind::Tcp,
-                    local_guest_address.port(),
-                    id,
-                    host_address,
-                    false,
-                )
+            self.tcp
+                .set_host_address(local_guest_address.port(), id, host_address, false)
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
             if let Some(listener_id) = guest_listener_id {
-                namespace
+                let (host_address, guest_address) = self
+                    .tcp
                     .set_host_peer_address(
-                        SocketKind::Tcp,
                         local_guest_address.port(),
                         id,
                         network_address,
-                        listener_id,
                         guest_mapping_index,
                     )
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
+                self.insert_pending_guest_connection(
+                    session_id,
+                    (host_address, network_address),
+                    guest_address,
+                    listener_id,
+                )
+                .map_err(PlatformConnectError::PeerIndeterminate)?;
             }
         }
         update_snapshot(
@@ -2083,46 +2132,46 @@ impl Reactor {
         Ok(outcome)
     }
 
-    fn remove_tcp_translation_for_connector(
+    fn remove_pending_guest_connection_for_connector(
         &mut self,
         session_id: SessionId,
         kind: SocketKind,
         guest_port: u16,
         socket_id: u64,
     ) {
-        let retired = self.sessions.get_mut(&session_id).and_then(|namespace| {
-            namespace.remove_tcp_translation_for_connector(kind, guest_port, socket_id)
-        });
-        if let Some(retired) = retired {
-            self.retained_connectors = self
-                .retained_connectors
-                .checked_sub(usize::from(retired.retained_in_namespace))
-                .expect("reactor retained connector count underflow");
-            if let Some(mapping_index) = retired.mapping_index {
-                self.port_mappings[mapping_index]
-                    .stale_connections
-                    .remove(&retired.connection);
+        if kind != SocketKind::Tcp {
+            return;
+        }
+        if let Some((connection, mapping_index)) =
+            self.tcp.take_connector_connection(guest_port, socket_id)
+        {
+            if let Some(pending) = self.tcp.pending_guest_connections.remove(&connection) {
+                debug_assert_eq!(pending.session_id, session_id);
+                self.finish_removed_pending_guest_connection(&pending);
+            }
+            if let Some(mapping_index) = mapping_index
+                && let Some(stale) = self.tcp.stale_mapped_connections.remove(&(
+                    mapping_index,
+                    connection.0,
+                    connection.1,
+                ))
+            {
+                self.release_stale_tcp_connection(stale);
             }
         }
     }
 
-    /// Drops a socket, releasing its guest port and any claimed host mapping.
+    /// Drops a socket, releasing its guest port and any owned host mapping.
     fn remove_socket(&mut self, id: u64) {
         let port_mapping = self
-            .claimed_tcp_port_publication(id)
-            .map(|(mapping_index, claim)| {
-                (
-                    mapping_index,
-                    claim,
-                    self.port_mappings[mapping_index].mapping,
-                )
-            });
+            .owned_tcp_port_mapping(id)
+            .map(|mapping_index| (mapping_index, self.port_mappings[mapping_index].mapping));
         let retired_listener_address = self.sockets.get(&id).and_then(|socket| {
             (socket.kind == SocketKind::Tcp && socket.listening)
                 .then(|| local_socket_address(&socket.socket).ok())
                 .flatten()
         });
-        // Keep a published listener active with a zero backlog so the endpoint
+        // Keep a mapped listener active with a zero backlog so the endpoint
         // remains exclusive without accumulating an unbounded stale queue.
         let retain_original = port_mapping.is_some_and(|_| {
             self.sockets.get(&id).is_some_and(|socket| {
@@ -2152,10 +2201,10 @@ impl Reactor {
             .expect("Linux socket snapshot mutex poisoned")
             .status
             == SocketConnectionStatus::Connecting;
-        let translation_disposition =
+        let pending_connection_disposition =
             match getpeername(socket.as_ref().expect("removed socket descriptor missing")) {
-                Ok(Some(_)) if abortive_close => ConnectorTranslationDisposition::Discard(None),
-                Ok(Some(_)) => ConnectorTranslationDisposition::Retain,
+                Ok(Some(_)) if abortive_close => PendingGuestConnectionDisposition::Discard(None),
+                Ok(Some(_)) => PendingGuestConnectionDisposition::Retain,
                 Ok(None) | Err(_) => {
                     if abortive_close || connecting {
                         let _ = sockopt::set_socket_linger(
@@ -2163,144 +2212,136 @@ impl Reactor {
                             Some(Duration::ZERO),
                         );
                     }
-                    ConnectorTranslationDisposition::Discard(Some(
+                    PendingGuestConnectionDisposition::Discard(Some(
                         Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME,
                     ))
                 }
             };
         if retired_listener_address.is_some()
-            && let Some((mapping_index, _, _)) = port_mapping
+            && let Some((mapping_index, _)) = port_mapping
             && !retain_original
         {
             self.clear_stale_tcp_connections(mapping_index);
         }
-        let (discarded_connector, retained_before, retained_after) =
-            if let Some(namespace) = self.sessions.get_mut(&session_id) {
-                let retained_before = namespace.retained_connectors;
-                if let Some(listener_address) = retired_listener_address {
-                    if let Some((mapping_index, _, _)) = port_mapping {
-                        let state = &mut self.port_mappings[mapping_index];
-                        if retain_original {
-                            namespace.move_tcp_translations_for_listener(
-                                session_id,
-                                listener_address,
-                                &mut state.stale_connections,
-                            );
-                        } else {
-                            namespace.remove_tcp_translations_for_listener(listener_address);
-                        }
-                    } else {
-                        namespace.remove_tcp_translations_for_listener(listener_address);
-                    }
-                }
-                let mut discarded_connector = None;
-                if let Some(address) = guest_local_address {
-                    match translation_disposition {
-                        ConnectorTranslationDisposition::Retain => {
-                            let retained_connector =
-                                socket.take().expect("removed socket descriptor missing");
-                            discarded_connector = namespace.retire_tcp_translation_for_connector(
-                                kind,
-                                address.port(),
-                                id,
-                                false,
-                                None,
-                                Some(retained_connector),
-                            );
-                        }
-                        ConnectorTranslationDisposition::Discard(discard_deadline) => {
-                            let retained_connector = discard_deadline
-                                .is_none()
-                                .then(|| socket.take().expect("removed socket descriptor missing"));
-                            discarded_connector = namespace.retire_tcp_translation_for_connector(
-                                kind,
-                                address.port(),
-                                id,
-                                true,
-                                discard_deadline,
-                                retained_connector,
-                            );
-                        }
-                    }
-                    if let Some(retired) = discarded_connector.as_mut()
-                        && let Some(mapping_index) = retired.mapping_index
-                        && let Some(stale) = self.port_mappings[mapping_index]
-                            .stale_connections
-                            .get_mut(&retired.connection)
-                        && stale.session_id == session_id
-                    {
-                        stale.deadline = match (stale.deadline, translation_disposition) {
-                            (existing, ConnectorTranslationDisposition::Discard(None)) => existing,
-                            (_, ConnectorTranslationDisposition::Retain) => None,
-                            (None, ConnectorTranslationDisposition::Discard(Some(deadline))) => {
-                                Some(deadline)
-                            }
-                            (
-                                Some(existing),
-                                ConnectorTranslationDisposition::Discard(Some(deadline)),
-                            ) => Some(existing.max(deadline)),
-                        };
-                        if stale.retained_connector.is_none()
-                            && let Some(retained_connector) = retired.unplaced_connector.take()
-                        {
-                            stale.deadline = None;
-                            stale.retained_connector = Some(retained_connector);
-                            namespace.retained_connectors = namespace
-                                .retained_connectors
-                                .checked_add(1)
-                                .expect("session retained connector count overflow");
-                        }
-                    }
-                    namespace.remove_binding(kind, address.port(), id);
-                }
-                namespace.live_sockets = namespace
-                    .live_sockets
-                    .checked_sub(1)
-                    .expect("session socket count underflow");
-                (
-                    discarded_connector,
-                    retained_before,
-                    namespace.retained_connectors,
-                )
+        if let Some(listener_address) = retired_listener_address {
+            if let Some((mapping_index, _)) = port_mapping
+                && retain_original
+            {
+                self.move_pending_guest_connections_for_listener(listener_address, mapping_index);
             } else {
-                (None, 0, 0)
-            };
-        self.retained_connectors = self
-            .retained_connectors
-            .checked_sub(retained_before)
-            .and_then(|count| count.checked_add(retained_after))
-            .expect("reactor retained connector count invariant violated");
+                self.remove_pending_guest_connections_for_listener(listener_address);
+            }
+        }
+        let mut discarded_connector = None;
+        if kind == SocketKind::Tcp
+            && let Some(address) = guest_local_address
+        {
+            match pending_connection_disposition {
+                PendingGuestConnectionDisposition::Retain => {
+                    let retained_connector =
+                        socket.take().expect("removed socket descriptor missing");
+                    discarded_connector = self.retire_pending_guest_connection_for_connector(
+                        session_id,
+                        address.port(),
+                        id,
+                        false,
+                        None,
+                        Some(retained_connector),
+                    );
+                }
+                PendingGuestConnectionDisposition::Discard(discard_deadline) => {
+                    let retained_connector = discard_deadline
+                        .is_none()
+                        .then(|| socket.take().expect("removed socket descriptor missing"));
+                    discarded_connector = self.retire_pending_guest_connection_for_connector(
+                        session_id,
+                        address.port(),
+                        id,
+                        true,
+                        discard_deadline,
+                        retained_connector,
+                    );
+                }
+            }
+            if let Some(retired) = discarded_connector.as_mut()
+                && let Some(mapping_index) = retired.mapping_index
+                && let Some(stale) = self.tcp.stale_mapped_connections.get_mut(&(
+                    mapping_index,
+                    retired.connection.0,
+                    retired.connection.1,
+                ))
+                && stale.session_id == session_id
+            {
+                stale.deadline = match (stale.deadline, pending_connection_disposition) {
+                    (existing, PendingGuestConnectionDisposition::Discard(None)) => existing,
+                    (_, PendingGuestConnectionDisposition::Retain) => None,
+                    (None, PendingGuestConnectionDisposition::Discard(Some(deadline))) => {
+                        Some(deadline)
+                    }
+                    (
+                        Some(existing),
+                        PendingGuestConnectionDisposition::Discard(Some(deadline)),
+                    ) => Some(existing.max(deadline)),
+                };
+                if stale.retained_connector.is_none()
+                    && let Some(retained_connector) = retired.unplaced_connector.take()
+                {
+                    stale.deadline = None;
+                    stale.retained_connector = Some(retained_connector);
+                    self.retained_connectors = self
+                        .retained_connectors
+                        .checked_add(1)
+                        .expect("reactor retained connector count overflow");
+                    let session = self
+                        .sessions
+                        .get_mut(&session_id)
+                        .expect("socket session state missing");
+                    session.retained_connectors = session
+                        .retained_connectors
+                        .checked_add(1)
+                        .expect("session retained connector count overflow");
+                }
+            }
+            self.tcp.remove_binding(address.port(), id);
+        }
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.live_sockets = session
+                .live_sockets
+                .checked_sub(1)
+                .expect("session socket count underflow");
+        }
         drop(discarded_connector);
         if self
             .sessions
             .get(&session_id)
-            .is_some_and(|namespace| namespace.closing)
+            .is_some_and(|session| session.closing)
         {
-            self.retire_session_stale_connectors(session_id);
+            self.retire_session_connectors(session_id);
         }
-        let remove_namespace = self.sessions.get(&session_id).is_some_and(|namespace| {
-            namespace.closing && namespace.live_sockets == 0 && namespace.retained_connectors == 0
-        });
-        if remove_namespace {
+        let remove_session = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| !retain_session_state(session));
+        if remove_session {
             self.sessions.remove(&session_id);
         }
         let replacement_reservation = if retain_original {
             Some(
                 socket
                     .take()
-                    .expect("mapping claimant descriptor unexpectedly retained"),
+                    .expect("mapping owner descriptor unexpectedly retained"),
             )
         } else {
             drop(socket.take());
-            port_mapping.and_then(|(_, _, mapping)| {
-                create_replacement_port_mapping_reservation(mapping).ok()
+            port_mapping.and_then(|(_, mapping)| {
+                create_replacement_port_mapping_reservation(self.broker_ipv4_address, mapping).ok()
             })
         };
-        if let Some((mapping_index, claim, _)) = port_mapping
+        if let Some((mapping_index, _)) = port_mapping
             && let Some(state) = self.port_mappings.get_mut(mapping_index)
-            && state.claimed_by == Some((id, claim))
+            && state.owned_by == Some(id)
         {
-            state.claimed_by = None;
+            state.owned_by = None;
             state.reservation = replacement_reservation;
             state.reservation_registered = false;
         }
@@ -2310,7 +2351,15 @@ impl Reactor {
         loop {
             let mut events = core::mem::take(&mut self.events);
             events.clear();
-            match epoll::wait(&self.epoll, spare_capacity(&mut events), None) {
+            let now = Instant::now();
+            let timeout = self.next_cleanup_deadline().map(|deadline| {
+                let duration = deadline.saturating_duration_since(now);
+                Timespec {
+                    tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
+                    tv_nsec: i64::from(duration.subsec_nanos()),
+                }
+            });
+            match epoll::wait(&self.epoll, spare_capacity(&mut events), timeout.as_ref()) {
                 Ok(_) => {}
                 Err(Errno::INTR) => {
                     self.events = events;
@@ -2318,6 +2367,7 @@ impl Reactor {
                 }
                 Err(error) => return Err(ReactorFailure::Io(error)),
             }
+            self.expire_deadlined_state(Instant::now());
 
             // Apply readiness observed by this wait before commands. A command
             // that then reaches EAGAIN records the newer authoritative state.
@@ -2337,7 +2387,9 @@ impl Reactor {
                         None
                     };
                     if let Some((session_id, kind, Some(guest_port))) = failed_connector {
-                        self.remove_tcp_translation_for_connector(session_id, kind, guest_port, id);
+                        self.remove_pending_guest_connection_for_connector(
+                            session_id, kind, guest_port, id,
+                        );
                     }
                 }
             }
@@ -2349,6 +2401,59 @@ impl Reactor {
                 }
             }
         }
+    }
+
+    fn next_cleanup_deadline(&self) -> Option<Instant> {
+        self.tcp
+            .pending_guest_connections
+            .values()
+            .filter_map(|connection| connection.discard_deadline)
+            .chain(
+                self.tcp
+                    .stale_mapped_connections
+                    .values()
+                    .filter_map(|stale| stale.deadline),
+            )
+            .min()
+    }
+
+    fn expire_deadlined_state(&mut self, now: Instant) {
+        let Reactor {
+            tcp,
+            sessions,
+            retained_connectors,
+            ..
+        } = self;
+        tcp.pending_guest_connections.retain(|_, connection| {
+            let retain = !connection.discard_on_accept
+                || connection
+                    .discard_deadline
+                    .is_none_or(|deadline| deadline > now);
+            if !retain {
+                let session = sessions
+                    .get_mut(&connection.session_id)
+                    .expect("pending guest connection session state missing");
+                session.pending_guest_connections = session
+                    .pending_guest_connections
+                    .checked_sub(1)
+                    .expect("session pending guest connection count underflow");
+                if connection.retained_connector.is_some() {
+                    session.retained_connectors = session
+                        .retained_connectors
+                        .checked_sub(1)
+                        .expect("session retained connector count underflow");
+                    *retained_connectors = retained_connectors
+                        .checked_sub(1)
+                        .expect("reactor retained connector count underflow");
+                }
+            }
+            retain
+        });
+        sessions.retain(|_, session| retain_session_state(session));
+        tcp.stale_mapped_connections.retain(|_, stale| {
+            stale.retained_connector.is_some()
+                || stale.deadline.is_none_or(|deadline| deadline > now)
+        });
     }
 
     fn drain_wake(&self) -> core::result::Result<(), ReactorFailure> {
@@ -2409,11 +2514,17 @@ impl Reactor {
                 ReactorCommand::Listen {
                     id,
                     backlog,
-                    publication,
+                    mapping,
                     response,
                 } => {
-                    let outcome = self.listen_socket(id, backlog, publication);
-                    let _ = response.send(outcome);
+                    let outcome = self.listen_socket(id, backlog, mapping);
+                    if response.send(outcome).is_err() {
+                        // An unacknowledged listen may have committed a
+                        // mapping. Retire the socket before processing any
+                        // later command that could observe released core
+                        // authority.
+                        self.remove_socket(id);
+                    }
                 }
                 ReactorCommand::Accept {
                     listener_id,
@@ -2509,7 +2620,6 @@ impl Reactor {
                                             .guest_local_address
                                             .map(|guest_address| {
                                                 (
-                                                    socket.session_id,
                                                     address,
                                                     guest_address.port(),
                                                     socket.port_mapping_index,
@@ -2531,32 +2641,20 @@ impl Reactor {
                                 .and_then(|socket| shutdown_socket(socket, mode))?
                         };
                         if matches!(outcome, SocketOutcome::Completed(()))
-                            && let Some((session_id, listener_address, guest_port, mapping_index)) =
+                            && let Some((listener_address, guest_port, mapping_index)) =
                                 retired_listener
                         {
-                            let namespace = self
-                                .sessions
-                                .get_mut(&session_id)
-                                .ok_or(BrokerError::Internal)?;
-                            let released_connectors = if let Some(mapping_index) = mapping_index {
-                                let stale_connections = &mut self
-                                    .port_mappings
-                                    .get_mut(mapping_index)
-                                    .ok_or(BrokerError::Internal)?
-                                    .stale_connections;
-                                namespace.move_tcp_translations_for_listener(
-                                    session_id,
+                            if let Some(mapping_index) = mapping_index {
+                                self.move_pending_guest_connections_for_listener(
                                     listener_address,
-                                    stale_connections,
-                                )
+                                    mapping_index,
+                                );
                             } else {
-                                namespace.remove_tcp_translations_for_listener(listener_address)
-                            };
-                            self.retained_connectors = self
-                                .retained_connectors
-                                .checked_sub(released_connectors)
-                                .expect("reactor retained connector count underflow");
-                            namespace.clear_host_address(SocketKind::Tcp, guest_port, id)?;
+                                self.remove_pending_guest_connections_for_listener(
+                                    listener_address,
+                                );
+                            }
+                            self.tcp.clear_host_address(guest_port, id)?;
                             update_snapshot(
                                 self.sockets.get(&id).ok_or(BrokerError::Internal)?,
                                 Some(SocketConnectionStatus::Failed(SocketError::NotConnected)),
@@ -2610,13 +2708,15 @@ impl Reactor {
                     session_id,
                     response,
                 } => {
-                    if let Some(namespace) = self.sessions.get_mut(&session_id) {
-                        namespace.closing = true;
+                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                        session.closing = true;
                     }
-                    self.retire_session_stale_connectors(session_id);
-                    if self.sessions.get(&session_id).is_some_and(|namespace| {
-                        namespace.live_sockets == 0 && namespace.retained_connectors == 0
-                    }) {
+                    self.retire_session_connectors(session_id);
+                    if self
+                        .sessions
+                        .get(&session_id)
+                        .is_some_and(|session| !retain_session_state(session))
+                    {
                         self.sessions.remove(&session_id);
                     }
                     let _ = response.send(());
@@ -2627,31 +2727,19 @@ impl Reactor {
                     guest_port,
                     response,
                 } => {
-                    let host_address = self.sessions.values().find_map(|namespace| {
-                        namespace
-                            .bindings(kind)?
-                            .get(&guest_port)
-                            .and_then(|binding| binding.host_address)
-                    });
+                    let host_address = (kind == SocketKind::Tcp)
+                        .then(|| self.tcp.bindings.get(&guest_port))
+                        .flatten()
+                        .and_then(|binding| binding.host_address);
                     let _ = response.send(host_address);
                 }
                 #[cfg(test)]
-                ReactorCommand::TcpTranslationCount { response } => {
-                    let count = self
-                        .sessions
-                        .values()
-                        .map(|namespace| namespace.tcp_translations.len())
-                        .sum();
-                    let _ = response.send(count);
+                ReactorCommand::PendingGuestConnectionCount { response } => {
+                    let _ = response.send(self.tcp.pending_guest_connections.len());
                 }
                 #[cfg(test)]
-                ReactorCommand::StaleTcpTranslationCount { response } => {
-                    let count = self
-                        .port_mappings
-                        .iter()
-                        .map(|state| state.stale_connections.len())
-                        .sum();
-                    let _ = response.send(count);
+                ReactorCommand::StaleGuestConnectionCount { response } => {
+                    let _ = response.send(self.tcp.stale_mapped_connections.len());
                 }
                 #[cfg(test)]
                 ReactorCommand::RetainedConnectorCount { response } => {
@@ -2659,6 +2747,8 @@ impl Reactor {
                 }
                 ReactorCommand::Stop { response } => {
                     self.sockets.clear();
+                    self.tcp.bindings.clear();
+                    self.tcp.pending_guest_connections.clear();
                     self.sessions.clear();
                     let _ = response.send(());
                     return true;
@@ -2688,13 +2778,13 @@ impl Reactor {
         if self.sockets.contains_key(&id) {
             return Err(BrokerError::Internal);
         }
-        let namespace = self.sessions.entry(session_id).or_default();
-        if namespace.closing {
+        let session = self.sessions.entry(session_id).or_default();
+        if session.closing {
             return Err(BrokerError::UnknownObject);
         }
-        if namespace
+        if session
             .live_sockets
-            .checked_add(namespace.retained_connectors)
+            .checked_add(session.retained_connectors)
             .is_none_or(|count| count >= self.max_sockets_per_session)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -2749,78 +2839,51 @@ impl Reactor {
                 abortive_close: false,
                 guest_local_address: None,
                 port_mapping_index: None,
-                tcp_port_publication_claim: None,
-                publication_fallback_socket: None,
+                mapping_fallback_socket: None,
                 tcp_no_delay: false,
                 tcp_keep_alive: false,
             },
         );
-        namespace.live_sockets = namespace
+        session.live_sockets = session
             .live_sockets
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         Ok(())
     }
 
-    fn take_tcp_peer_translation(
+    fn take_pending_guest_connection_for_accept(
         &mut self,
-        listener_session_id: SessionId,
         listener_id: u64,
         mapping_index: Option<usize>,
         remote_address: SocketAddrV4,
         local_address: SocketAddrV4,
     ) -> AcceptedTcpPeer {
         let now = Instant::now();
-        if let Some(mapping_index) = mapping_index {
-            let stale_connections = &mut self.port_mappings[mapping_index].stale_connections;
-            stale_connections.retain(|_, stale| {
-                stale.retained_connector.is_some()
-                    || stale.deadline.is_none_or(|deadline| deadline > now)
-            });
-            if self.take_stale_tcp_connection(mapping_index, remote_address, local_address) {
-                return AcceptedTcpPeer::Stale;
-            }
+        self.expire_deadlined_state(now);
+        if let Some(mapping_index) = mapping_index
+            && self.take_stale_tcp_connection(mapping_index, remote_address, local_address)
+        {
+            return AcceptedTcpPeer::Stale;
         }
-        let released_connectors = self
-            .sessions
-            .values_mut()
-            .map(|namespace| namespace.expire_tcp_discard_markers(now))
-            .sum::<usize>();
-        self.retained_connectors = self
-            .retained_connectors
-            .checked_sub(released_connectors)
-            .expect("reactor retained connector count underflow");
-        let current_translation =
-            self.sessions
-                .get_mut(&listener_session_id)
-                .and_then(|namespace| {
-                    namespace.take_tcp_peer_translation(remote_address, local_address)
-                });
-        if let Some(translation) = current_translation {
-            self.retained_connectors = self
-                .retained_connectors
-                .checked_sub(usize::from(translation.retained_connector.is_some()))
-                .expect("reactor retained connector count underflow");
-            drop(translation.retained_connector);
-            if translation.discard_on_accept {
+        let pending_connection = self
+            .tcp
+            .take_pending_guest_connection(remote_address, local_address);
+        let peer = if let Some(connection) = pending_connection {
+            self.finish_removed_pending_guest_connection(&connection);
+            drop(connection.retained_connector);
+            if connection.discard_on_accept {
                 AcceptedTcpPeer::Stale
-            } else if translation.listener_id == listener_id {
-                AcceptedTcpPeer::Guest(translation.guest_address)
+            } else if connection.listener_id == listener_id {
+                AcceptedTcpPeer::Guest(connection.guest_address)
             } else {
                 AcceptedTcpPeer::Stale
             }
         } else {
-            let stale = self.take_tcp_peer_translations_except(
-                Some(listener_session_id),
-                remote_address,
-                local_address,
-            );
-            if stale {
-                AcceptedTcpPeer::Stale
-            } else {
-                AcceptedTcpPeer::Native(remote_address)
-            }
-        }
+            AcceptedTcpPeer::Native(remote_address)
+        };
+        self.sessions
+            .retain(|_, session| retain_session_state(session));
+        peer
     }
 
     fn take_stale_tcp_connection(
@@ -2829,17 +2892,17 @@ impl Reactor {
         remote_address: SocketAddrV4,
         local_address: SocketAddrV4,
     ) -> bool {
-        let stale = {
-            let stale_connections = &mut self.port_mappings[mapping_index].stale_connections;
-            stale_connections
-                .remove(&(remote_address, local_address))
-                .or_else(|| {
-                    stale_connections.remove(&(
-                        remote_address,
-                        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_address.port()),
-                    ))
-                })
-        };
+        let stale = self
+            .tcp
+            .stale_mapped_connections
+            .remove(&(mapping_index, remote_address, local_address))
+            .or_else(|| {
+                self.tcp.stale_mapped_connections.remove(&(
+                    mapping_index,
+                    remote_address,
+                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_address.port()),
+                ))
+            });
         let Some(stale) = stale else {
             return false;
         };
@@ -2853,19 +2916,17 @@ impl Reactor {
                 .retained_connectors
                 .checked_sub(1)
                 .expect("reactor retained connector count underflow");
-            let remove_namespace =
-                self.sessions
-                    .get_mut(&stale.session_id)
-                    .is_some_and(|namespace| {
-                        namespace.retained_connectors = namespace
-                            .retained_connectors
-                            .checked_sub(1)
-                            .expect("session retained connector count underflow");
-                        namespace.closing
-                            && namespace.live_sockets == 0
-                            && namespace.retained_connectors == 0
-                    });
-            if remove_namespace {
+            let remove_session = self
+                .sessions
+                .get_mut(&stale.session_id)
+                .is_some_and(|session| {
+                    session.retained_connectors = session
+                        .retained_connectors
+                        .checked_sub(1)
+                        .expect("session retained connector count underflow");
+                    !retain_session_state(session)
+                });
+            if remove_session {
                 self.sessions.remove(&stale.session_id);
             }
         }
@@ -2874,83 +2935,223 @@ impl Reactor {
 
     fn clear_stale_tcp_connections(&mut self, mapping_index: usize) {
         let Reactor {
-            port_mappings,
+            tcp,
             sessions,
             retained_connectors,
             ..
         } = self;
-        for (_, stale) in port_mappings[mapping_index].stale_connections.drain() {
-            if stale.retained_connector.is_some() {
+        tcp.stale_mapped_connections.retain(|(index, _, _), stale| {
+            let retain = *index != mapping_index;
+            if !retain && stale.retained_connector.is_some() {
                 *retained_connectors = retained_connectors
                     .checked_sub(1)
                     .expect("reactor retained connector count underflow");
-                if let Some(namespace) = sessions.get_mut(&stale.session_id) {
-                    namespace.retained_connectors = namespace
+                if let Some(session) = sessions.get_mut(&stale.session_id) {
+                    session.retained_connectors = session
                         .retained_connectors
                         .checked_sub(1)
                         .expect("session retained connector count underflow");
                 }
             }
-        }
-        sessions.retain(|_, namespace| {
-            !namespace.closing || namespace.live_sockets != 0 || namespace.retained_connectors != 0
+            retain
         });
+        sessions.retain(|_, session| retain_session_state(session));
     }
 
-    fn retire_session_stale_connectors(&mut self, session_id: SessionId) {
-        let deadline = Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME;
-        let mut released_connectors = 0;
+    fn retire_session_connectors(&mut self, session_id: SessionId) {
+        let mut pending_connections_released = 0;
+        for connection in self
+            .tcp
+            .pending_guest_connections
+            .values_mut()
+            .filter(|connection| connection.session_id == session_id)
+        {
+            if let Some(connector) = connection.retained_connector.take() {
+                let _ = sockopt::set_socket_linger(&connector, None);
+                drop(connector);
+                connection.discard_on_accept = true;
+                // An established child can remain queued after its connector
+                // closes. Keep its discard marker until accept or listener
+                // teardown so it can never fall through as a native peer.
+                connection.discard_deadline = None;
+                pending_connections_released += 1;
+            }
+        }
+        let mut stale_released = 0;
         for stale in self
-            .port_mappings
-            .iter_mut()
-            .flat_map(|state| state.stale_connections.values_mut())
+            .tcp
+            .stale_mapped_connections
+            .values_mut()
             .filter(|stale| stale.session_id == session_id)
         {
             if let Some(connector) = stale.retained_connector.take() {
                 let _ = sockopt::set_socket_linger(&connector, None);
                 drop(connector);
-                stale.deadline = Some(
-                    stale
-                        .deadline
-                        .map_or(deadline, |existing| existing.max(deadline)),
-                );
-                released_connectors += 1;
+                stale.deadline = None;
+                stale_released += 1;
             }
         }
         self.retained_connectors = self
             .retained_connectors
-            .checked_sub(released_connectors)
+            .checked_sub(pending_connections_released + stale_released)
             .expect("reactor retained connector count underflow");
-        if let Some(namespace) = self.sessions.get_mut(&session_id) {
-            namespace.retained_connectors = namespace
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.retained_connectors = session
                 .retained_connectors
-                .checked_sub(released_connectors)
+                .checked_sub(pending_connections_released + stale_released)
                 .expect("session retained connector count underflow");
         }
     }
 
-    fn take_tcp_peer_translations_except(
+    fn remove_pending_guest_connection_except(
         &mut self,
         excluded_session_id: Option<SessionId>,
         remote_address: SocketAddrV4,
         local_address: SocketAddrV4,
     ) -> bool {
-        let mut found = false;
-        let mut released_connectors = 0;
-        for (session_id, namespace) in &mut self.sessions {
-            if Some(*session_id) != excluded_session_id
-                && let Some(translation) =
-                    namespace.take_tcp_peer_translation(remote_address, local_address)
-            {
-                released_connectors += usize::from(translation.retained_connector.is_some());
-                found = true;
-            }
+        let exact = (remote_address, local_address);
+        let unspecified = (
+            remote_address,
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, local_address.port()),
+        );
+        let connection = if self.tcp.pending_guest_connections.contains_key(&exact) {
+            Some(exact)
+        } else if self
+            .tcp
+            .pending_guest_connections
+            .contains_key(&unspecified)
+        {
+            Some(unspecified)
+        } else {
+            None
+        };
+        let removed = connection
+            .filter(|connection| {
+                self.tcp
+                    .pending_guest_connections
+                    .get(connection)
+                    .is_some_and(|pending| Some(pending.session_id) != excluded_session_id)
+            })
+            .and_then(|connection| self.tcp.pending_guest_connections.remove(&connection));
+        if let Some(pending) = &removed {
+            self.finish_removed_pending_guest_connection(pending);
         }
-        self.retained_connectors = self
-            .retained_connectors
-            .checked_sub(released_connectors)
-            .expect("reactor retained connector count underflow");
-        found
+        self.sessions
+            .retain(|_, session| retain_session_state(session));
+        removed.is_some()
+    }
+
+    fn remove_pending_guest_connections_for_listener(&mut self, listener_address: SocketAddrV4) {
+        let Reactor {
+            tcp,
+            sessions,
+            retained_connectors,
+            ..
+        } = self;
+        tcp.pending_guest_connections
+            .retain(|(_, destination), connection| {
+                let retain = destination.port() != listener_address.port()
+                    || (!listener_address.ip().is_unspecified()
+                        && destination.ip() != listener_address.ip());
+                if !retain {
+                    let session = sessions
+                        .get_mut(&connection.session_id)
+                        .expect("pending guest connection session state missing");
+                    session.pending_guest_connections = session
+                        .pending_guest_connections
+                        .checked_sub(1)
+                        .expect("session pending guest connection count underflow");
+                    if connection.retained_connector.is_some() {
+                        session.retained_connectors = session
+                            .retained_connectors
+                            .checked_sub(1)
+                            .expect("session retained connector count underflow");
+                        *retained_connectors = retained_connectors
+                            .checked_sub(1)
+                            .expect("reactor retained connector count underflow");
+                    }
+                }
+                retain
+            });
+        sessions.retain(|_, session| retain_session_state(session));
+    }
+
+    fn move_pending_guest_connections_for_listener(
+        &mut self,
+        listener_address: SocketAddrV4,
+        mapping_index: usize,
+    ) {
+        let retirement_deadline = Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME;
+        let Reactor {
+            tcp,
+            sessions,
+            retained_connectors,
+            ..
+        } = self;
+        let BrokerTcpState {
+            pending_guest_connections,
+            stale_mapped_connections,
+            ..
+        } = tcp;
+        pending_guest_connections.retain(|connection_tuple, connection| {
+            let destination = connection_tuple.1;
+            let matches = destination.port() == listener_address.port()
+                && (listener_address.ip().is_unspecified()
+                    || destination.ip() == listener_address.ip());
+            if !matches {
+                return true;
+            }
+            let session = sessions
+                .get_mut(&connection.session_id)
+                .expect("pending guest connection session state missing");
+            session.pending_guest_connections = session
+                .pending_guest_connections
+                .checked_sub(1)
+                .expect("session pending guest connection count underflow");
+            let mut deadline = connection
+                .discard_deadline
+                .map(|deadline| deadline.max(retirement_deadline));
+            let mut retained_connector = connection.retained_connector.take();
+            if retained_connector.is_some() {
+                deadline = None;
+            }
+            match stale_mapped_connections.entry((
+                mapping_index,
+                connection_tuple.0,
+                connection_tuple.1,
+            )) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(StaleTcpConnection {
+                        session_id: connection.session_id,
+                        deadline,
+                        retained_connector,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    existing.deadline = match (existing.deadline, deadline) {
+                        (None, _) | (_, None) => None,
+                        (Some(existing), Some(deadline)) => Some(existing.max(deadline)),
+                    };
+                    if existing.session_id == connection.session_id
+                        && existing.retained_connector.is_none()
+                    {
+                        existing.retained_connector = retained_connector.take();
+                    }
+                    if retained_connector.is_some() {
+                        session.retained_connectors = session
+                            .retained_connectors
+                            .checked_sub(1)
+                            .expect("session retained connector count underflow");
+                        *retained_connectors = retained_connectors
+                            .checked_sub(1)
+                            .expect("reactor retained connector count underflow");
+                    }
+                }
+            }
+            false
+        });
+        sessions.retain(|_, session| retain_session_state(session));
     }
 
     fn accept_socket(
@@ -3012,8 +3213,7 @@ impl Reactor {
                 SocketAddrV4::try_from(remote_address.ok_or(BrokerError::Internal)?)
                     .map_err(|_| BrokerError::Internal)?;
             let host_local_address = local_socket_address(&socket)?;
-            match self.take_tcp_peer_translation(
-                listener_session_id,
+            match self.take_pending_guest_connection_for_accept(
                 listener_id,
                 mapping_index,
                 remote_address,
@@ -3095,17 +3295,16 @@ impl Reactor {
                 abortive_close: false,
                 guest_local_address: Some(local_address),
                 port_mapping_index: None,
-                tcp_port_publication_claim: None,
-                publication_fallback_socket: None,
+                mapping_fallback_socket: None,
                 tcp_no_delay: listener_tcp_no_delay,
                 tcp_keep_alive: listener_tcp_keep_alive,
             },
         );
-        let namespace = self
+        let session = self
             .sessions
             .get_mut(&listener_session_id)
             .ok_or(BrokerError::Internal)?;
-        namespace.live_sockets = namespace
+        session.live_sockets = session
             .live_sockets
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
@@ -3124,7 +3323,7 @@ impl Reactor {
             snapshot.readiness = ReadinessFlags::ERROR;
             drop(snapshot);
             // The readiness path may itself be why the reactor is failing. The
-            // cached terminal snapshot remains authoritative if publication is
+            // cached terminal snapshot remains authoritative if mapping is
             // no longer available.
             let _ = socket.readiness.publish(ReadinessFlags::ERROR);
         }
@@ -3651,7 +3850,7 @@ fn set_tcp_option(socket: &mut SocketEntry, value: TcpOptionValue) -> BrokerResu
     if socket.kind != SocketKind::Tcp {
         return Err(BrokerError::UnsupportedOperation);
     }
-    // Cached values are reapplied when a published endpoint replaces this
+    // Cached values are reapplied when a mapped endpoint replaces this
     // socket's descriptor.
     match value {
         TcpOptionValue::NoDelay(value) => {
@@ -4162,6 +4361,83 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const FIRST_GUEST_EPHEMERAL_PORT: u16 = 49152;
 
+    fn test_reactor(
+        max_sockets_per_session: usize,
+        tcp_port_mappings: &[TcpPortMapping],
+    ) -> Reactor {
+        let epoll = epoll::create(epoll::CreateFlags::CLOEXEC).unwrap();
+        let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap());
+        let (_, commands) = sync_channel(1);
+        Reactor {
+            epoll,
+            wake,
+            broker_ipv4_address: Ipv4Addr::LOCALHOST,
+            commands,
+            sockets: HashMap::new(),
+            tcp: BrokerTcpState::default(),
+            sessions: HashMap::new(),
+            port_mappings: tcp_port_mappings
+                .iter()
+                .copied()
+                .map(|mapping| PortMappingState {
+                    mapping,
+                    reservation: None,
+                    reservation_registered: false,
+                    owned_by: None,
+                })
+                .collect(),
+            max_sockets: MAX_TRACKED_GUEST_CONNECTIONS,
+            max_sockets_per_session,
+            retained_connectors: 0,
+            peek_cache: None,
+            events: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_test_pending_guest_connection(
+        reactor: &mut Reactor,
+        session_id: SessionId,
+        guest_port: u16,
+        socket_id: u64,
+        host_address: SocketAddrV4,
+        listener_address: SocketAddrV4,
+        listener_id: u64,
+        mapping_index: Option<usize>,
+    ) {
+        reactor.sessions.entry(session_id).or_default();
+        reactor
+            .reserve_pending_guest_connection(session_id)
+            .unwrap();
+        reactor
+            .tcp
+            .insert_binding(
+                guest_port,
+                GuestPortBinding {
+                    socket_id,
+                    guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
+                    host_address: Some(host_address),
+                    host_peer_address: None,
+                    host_peer_mapping_index: None,
+                    host_mapped: false,
+                    listening: false,
+                },
+            )
+            .unwrap();
+        let (host_address, guest_address) = reactor
+            .tcp
+            .set_host_peer_address(guest_port, socket_id, listener_address, mapping_index)
+            .unwrap();
+        reactor
+            .insert_pending_guest_connection(
+                session_id,
+                (host_address, listener_address),
+                guest_address,
+                listener_id,
+            )
+            .unwrap();
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct ReceivedPlatformDatagram {
         received: usize,
@@ -4302,9 +4578,10 @@ mod tests {
     fn port_mapping_reservation_is_close_on_exec() {
         let host_address = unused_tcp_address();
         let retained = create_port_mapping_reservation(
-            TcpPortPublication {
+            *host_address.ip(),
+            TcpPortMapping {
+                broker_port: host_address.port(),
                 guest_port: 80,
-                external_address: host_address,
             },
             false,
             false,
@@ -4319,21 +4596,44 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_publish_endpoint_rejects_provider_startup() {
+    fn unavailable_mapped_port_rejects_listen() {
         let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
         let host_address = socket_address_v4(occupied.local_addr().unwrap());
-        let error = LinuxSocketProvider::new_with_tcp_port_publications(
-            1,
-            1,
-            &[TcpPortPublication {
-                guest_port: 80,
-                external_address: host_address,
-            }],
+        let provider = Arc::new(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
+                1,
+                1,
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
+                    guest_port: 80,
+                }],
+            )
+            .unwrap(),
+        );
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+            provider,
         )
-        .err()
         .unwrap();
-
-        assert_eq!(error.kind(), ErrorKind::AddrInUse);
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, _publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let listener = create_socket(&session, readiness);
+        let guest_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&session, listener, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::listen(&session, listener, 1),
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+        );
     }
 
     #[test]
@@ -4393,42 +4693,27 @@ mod tests {
     }
 
     #[test]
-    fn tcp_peer_translation_uses_the_complete_connection_tuple() {
-        let mut namespace = SessionSocketNamespace::default();
+    fn pending_guest_tcp_connection_uses_the_complete_host_tuple() {
+        let mut reactor = test_reactor(MAX_TRACKED_GUEST_CONNECTIONS, &[]);
+        let session_id = SessionId(7);
         let shared_host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
         for (guest_port, host_peer_port) in [(1000, 5000), (1001, 5001)] {
-            namespace
-                .reserve_tcp_translation(0, 0, MAX_RETAINED_TRANSLATIONS)
-                .unwrap();
-            namespace
-                .insert_binding(
-                    SocketKind::Tcp,
-                    guest_port,
-                    GuestPortBinding {
-                        socket_id: u64::from(guest_port),
-                        guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
-                        host_address: Some(shared_host_address),
-                        host_peer_address: None,
-                        host_peer_mapping_index: None,
-                        host_mapped: false,
-                    },
-                )
-                .unwrap();
-            namespace
-                .set_host_peer_address(
-                    SocketKind::Tcp,
-                    guest_port,
-                    u64::from(guest_port),
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, host_peer_port),
-                    u64::from(guest_port),
-                    None,
-                )
-                .unwrap();
+            insert_test_pending_guest_connection(
+                &mut reactor,
+                session_id,
+                guest_port,
+                u64::from(guest_port),
+                shared_host_address,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, host_peer_port),
+                u64::from(guest_port),
+                None,
+            );
         }
 
         assert_eq!(
-            namespace
-                .take_tcp_peer_translation(
+            reactor
+                .tcp
+                .take_pending_guest_connection(
                     shared_host_address,
                     SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5001),
                 )
@@ -4436,18 +4721,20 @@ mod tests {
                 .guest_address,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001)
         );
-        assert_eq!(namespace.tcp_translations.len(), 1);
+        assert_eq!(reactor.tcp.pending_guest_connections.len(), 1);
         assert!(
-            namespace
-                .take_tcp_peer_translation(
+            reactor
+                .tcp
+                .take_pending_guest_connection(
                     shared_host_address,
                     SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5001),
                 )
                 .is_none()
         );
         assert_eq!(
-            namespace
-                .take_tcp_peer_translation(
+            reactor
+                .tcp
+                .take_pending_guest_connection(
                     shared_host_address,
                     SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000),
                 )
@@ -4455,26 +4742,105 @@ mod tests {
                 .guest_address,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000)
         );
-        assert!(namespace.tcp_translations.is_empty());
+        assert!(reactor.tcp.pending_guest_connections.is_empty());
     }
 
     #[test]
-    fn tcp_translation_capacity_charges_only_session_owned_stale_state() {
-        let mut namespace = SessionSocketNamespace::default();
+    fn connector_binding_is_not_routable_as_a_guest_listener() {
+        let mut reactor = test_reactor(1, &[]);
+        let guest_port = 1000;
+        let socket_id = 1;
+        let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        reactor
+            .tcp
+            .insert_binding(
+                guest_port,
+                GuestPortBinding {
+                    socket_id,
+                    guest_address: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, guest_port),
+                    host_address: Some(host_address),
+                    host_peer_address: None,
+                    host_peer_mapping_index: None,
+                    host_mapped: false,
+                    listening: false,
+                },
+            )
+            .unwrap();
 
-        namespace.reserve_tcp_translation(0, 1, 1).unwrap();
         assert_eq!(
-            namespace.reserve_tcp_translation(1, 1, 1),
-            Err(BrokerError::ResourceExhausted)
+            reactor.resolve_guest_destination(
+                SocketKind::Tcp,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
+            ),
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        );
+
+        reactor.tcp.mark_listening(guest_port, socket_id).unwrap();
+        assert_eq!(
+            reactor.resolve_guest_destination(
+                SocketKind::Tcp,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
+            ),
+            Ok(SocketOutcome::Completed((host_address, Some(socket_id))))
+        );
+    }
+
+    #[test]
+    fn pending_guest_connection_capacity_counts_all_stale_mappings() {
+        let mut reactor = test_reactor(1, &[]);
+        let session_id = SessionId(7);
+        let foreign_session_id = SessionId(8);
+        reactor
+            .sessions
+            .insert(session_id, SessionSocketState::default());
+
+        reactor
+            .reserve_pending_guest_connection(session_id)
+            .unwrap();
+        reactor.tcp.stale_mapped_connections.insert(
+            (
+                0,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000),
+            ),
+            StaleTcpConnection {
+                session_id,
+                deadline: None,
+                retained_connector: None,
+            },
         );
         assert_eq!(
-            namespace.reserve_tcp_translation(0, MAX_RETAINED_TRANSLATIONS, 1),
+            reactor.reserve_pending_guest_connection(session_id),
+            Err(BrokerError::ResourceExhausted)
+        );
+        reactor.tcp.stale_mapped_connections.clear();
+        reactor
+            .tcp
+            .stale_mapped_connections
+            .try_reserve(MAX_TRACKED_GUEST_CONNECTIONS)
+            .unwrap();
+        for mapping_index in 0..MAX_TRACKED_GUEST_CONNECTIONS {
+            reactor.tcp.stale_mapped_connections.insert(
+                (
+                    mapping_index,
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000),
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000),
+                ),
+                StaleTcpConnection {
+                    session_id: foreign_session_id,
+                    deadline: None,
+                    retained_connector: None,
+                },
+            );
+        }
+        assert_eq!(
+            reactor.reserve_pending_guest_connection(session_id),
             Err(BrokerError::ResourceExhausted)
         );
     }
 
     #[test]
-    fn stale_translation_ownership_is_aggregated_across_mappings() {
+    fn stale_guest_connection_ownership_is_aggregated_across_mappings() {
         let session_id = SessionId(7);
         let foreign_session_id = SessionId(8);
         let stale = [
@@ -4499,49 +4865,39 @@ mod tests {
     }
 
     #[test]
-    fn retiring_listener_removes_its_pending_tcp_translations() {
-        let mut namespace = SessionSocketNamespace::default();
+    fn retiring_listener_removes_its_pending_guest_connections() {
+        let mut reactor = test_reactor(MAX_TRACKED_GUEST_CONNECTIONS, &[]);
+        let session_id = SessionId(7);
         let first_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
         let second_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5001);
         for (guest_port, listener) in [(1000, first_listener), (1001, second_listener)] {
-            namespace
-                .reserve_tcp_translation(0, 0, MAX_RETAINED_TRANSLATIONS)
-                .unwrap();
-            namespace
-                .insert_binding(
-                    SocketKind::Tcp,
-                    guest_port,
-                    GuestPortBinding {
-                        socket_id: u64::from(guest_port),
-                        guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
-                        host_address: Some(SocketAddrV4::new(
-                            Ipv4Addr::LOCALHOST,
-                            40000 + guest_port,
-                        )),
-                        host_peer_address: None,
-                        host_peer_mapping_index: None,
-                        host_mapped: false,
-                    },
-                )
-                .unwrap();
-            namespace
-                .set_host_peer_address(
-                    SocketKind::Tcp,
-                    guest_port,
-                    u64::from(guest_port),
-                    listener,
-                    u64::from(guest_port),
-                    None,
-                )
-                .unwrap();
+            insert_test_pending_guest_connection(
+                &mut reactor,
+                session_id,
+                guest_port,
+                u64::from(guest_port),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000 + guest_port),
+                listener,
+                u64::from(guest_port),
+                None,
+            );
         }
 
-        namespace.remove_tcp_translations_for_listener(first_listener);
+        reactor.remove_pending_guest_connections_for_listener(first_listener);
 
-        assert_eq!(namespace.tcp_translations.len(), 1);
+        assert_eq!(reactor.tcp.pending_guest_connections.len(), 1);
         assert_eq!(
-            namespace
-                .take_tcp_peer_translation(
+            reactor
+                .sessions
+                .get(&session_id)
+                .unwrap()
+                .pending_guest_connections,
+            1
+        );
+        assert_eq!(
+            reactor
+                .tcp
+                .take_pending_guest_connection(
                     SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41001),
                     second_listener,
                 )
@@ -4549,157 +4905,122 @@ mod tests {
                 .guest_address,
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001)
         );
-        assert!(namespace.tcp_translations.is_empty());
+        assert!(reactor.tcp.pending_guest_connections.is_empty());
     }
 
     #[test]
-    fn moving_live_translation_keeps_nonexpiring_session_identity() {
-        let mut namespace = SessionSocketNamespace::default();
+    fn moving_live_pending_guest_connection_keeps_nonexpiring_session_identity() {
+        let mapping = TcpPortMapping {
+            guest_port: 5000,
+            broker_port: 5000,
+        };
+        let mut reactor = test_reactor(MAX_TRACKED_GUEST_CONNECTIONS, &[mapping]);
         let session_id = SessionId(7);
         let guest_port = 1000;
         let socket_id = 1;
         let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
         let listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        namespace
-            .reserve_tcp_translation(0, 0, MAX_RETAINED_TRANSLATIONS)
-            .unwrap();
-        namespace
-            .insert_binding(
-                SocketKind::Tcp,
-                guest_port,
-                GuestPortBinding {
-                    socket_id,
-                    guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
-                    host_address: Some(host_address),
-                    host_peer_address: None,
-                    host_peer_mapping_index: None,
-                    host_mapped: false,
-                },
-            )
-            .unwrap();
-        namespace
-            .set_host_peer_address(
-                SocketKind::Tcp,
-                guest_port,
-                socket_id,
-                listener_address,
-                2,
-                Some(0),
-            )
-            .unwrap();
-        namespace.retire_tcp_translation_for_connector(
-            SocketKind::Tcp,
+        insert_test_pending_guest_connection(
+            &mut reactor,
+            session_id,
+            guest_port,
+            socket_id,
+            host_address,
+            listener_address,
+            2,
+            Some(0),
+        );
+        reactor.retire_pending_guest_connection_for_connector(
+            session_id,
             guest_port,
             socket_id,
             false,
             None,
             Some(eventfd(0, EventfdFlags::CLOEXEC).unwrap()),
         );
-        let mut stale_connections = HashMap::new();
-        stale_connections
-            .try_reserve(MAX_RETAINED_TRANSLATIONS)
-            .unwrap();
 
-        assert_eq!(
-            namespace.move_tcp_translations_for_listener(
-                session_id,
-                listener_address,
-                &mut stale_connections,
-            ),
-            0
-        );
+        reactor.move_pending_guest_connections_for_listener(listener_address, 0);
 
-        let stale = stale_connections
-            .get(&(host_address, listener_address))
+        let stale = reactor
+            .tcp
+            .stale_mapped_connections
+            .get(&(0, host_address, listener_address))
             .unwrap();
         assert_eq!(stale.session_id, session_id);
         assert_eq!(stale.deadline, None);
         assert!(stale.retained_connector.is_some());
-        assert_eq!(namespace.retained_connectors, 1);
+        let session = reactor.sessions.get(&session_id).unwrap();
+        assert_eq!(session.pending_guest_connections, 0);
+        assert_eq!(session.retained_connectors, 1);
     }
 
     #[test]
-    fn retiring_failed_connector_removes_its_tcp_translation() {
-        let mut namespace = SessionSocketNamespace::default();
+    fn retiring_failed_connector_removes_its_pending_guest_connection() {
+        let mut reactor = test_reactor(MAX_TRACKED_GUEST_CONNECTIONS, &[]);
+        let session_id = SessionId(7);
         let guest_port = 1000;
         let socket_id = 1;
         let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
         let listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        namespace
-            .reserve_tcp_translation(0, 0, MAX_RETAINED_TRANSLATIONS)
-            .unwrap();
-        namespace
-            .insert_binding(
-                SocketKind::Tcp,
-                guest_port,
-                GuestPortBinding {
-                    socket_id,
-                    guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
-                    host_address: Some(host_address),
-                    host_peer_address: None,
-                    host_peer_mapping_index: None,
-                    host_mapped: false,
-                },
-            )
-            .unwrap();
-        namespace
-            .set_host_peer_address(
-                SocketKind::Tcp,
-                guest_port,
-                socket_id,
-                listener_address,
-                2,
-                None,
-            )
-            .unwrap();
+        insert_test_pending_guest_connection(
+            &mut reactor,
+            session_id,
+            guest_port,
+            socket_id,
+            host_address,
+            listener_address,
+            2,
+            None,
+        );
 
-        let _ =
-            namespace.remove_tcp_translation_for_connector(SocketKind::Tcp, guest_port, socket_id);
+        reactor.remove_pending_guest_connection_for_connector(
+            session_id,
+            SocketKind::Tcp,
+            guest_port,
+            socket_id,
+        );
 
-        assert!(namespace.tcp_translations.is_empty());
+        assert!(reactor.tcp.pending_guest_connections.is_empty());
         assert_eq!(
-            namespace.tcp.get(&guest_port).unwrap().host_peer_address,
+            reactor
+                .tcp
+                .bindings
+                .get(&guest_port)
+                .unwrap()
+                .host_peer_address,
             None
+        );
+        assert_eq!(
+            reactor
+                .sessions
+                .get(&session_id)
+                .unwrap()
+                .pending_guest_connections,
+            0
         );
     }
 
     #[test]
-    fn aborting_connector_marks_its_translation_for_discard() {
-        let mut namespace = SessionSocketNamespace::default();
+    fn aborting_connector_marks_its_pending_guest_connection_for_discard() {
+        let mut reactor = test_reactor(MAX_TRACKED_GUEST_CONNECTIONS, &[]);
+        let session_id = SessionId(7);
         let guest_port = 1000;
         let socket_id = 1;
         let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
         let listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-        namespace
-            .reserve_tcp_translation(0, 0, MAX_RETAINED_TRANSLATIONS)
-            .unwrap();
-        namespace
-            .insert_binding(
-                SocketKind::Tcp,
-                guest_port,
-                GuestPortBinding {
-                    socket_id,
-                    guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port),
-                    host_address: Some(host_address),
-                    host_peer_address: None,
-                    host_peer_mapping_index: None,
-                    host_mapped: false,
-                },
-            )
-            .unwrap();
-        namespace
-            .set_host_peer_address(
-                SocketKind::Tcp,
-                guest_port,
-                socket_id,
-                listener_address,
-                2,
-                None,
-            )
-            .unwrap();
+        insert_test_pending_guest_connection(
+            &mut reactor,
+            session_id,
+            guest_port,
+            socket_id,
+            host_address,
+            listener_address,
+            2,
+            None,
+        );
 
-        let _ = namespace.retire_tcp_translation_for_connector(
-            SocketKind::Tcp,
+        let _ = reactor.retire_pending_guest_connection_for_connector(
+            session_id,
             guest_port,
             socket_id,
             true,
@@ -4707,15 +5028,59 @@ mod tests {
             Some(eventfd(0, EventfdFlags::CLOEXEC).unwrap()),
         );
 
-        let translation = namespace
-            .take_tcp_peer_translation(host_address, listener_address)
+        let pending = reactor
+            .tcp
+            .take_pending_guest_connection(host_address, listener_address)
             .unwrap();
-        assert!(translation.discard_on_accept);
-        assert!(translation.retained_connector.is_some());
+        assert!(pending.discard_on_accept);
+        assert!(pending.retained_connector.is_some());
     }
 
     #[test]
-    fn guest_tcp_ports_are_session_scoped_and_do_not_bind_host_ports() {
+    fn closing_session_keeps_established_discard_marker_until_accept() {
+        let mut reactor = test_reactor(MAX_TRACKED_GUEST_CONNECTIONS, &[]);
+        let session_id = SessionId(7);
+        let guest_port = 1000;
+        let socket_id = 1;
+        let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+        insert_test_pending_guest_connection(
+            &mut reactor,
+            session_id,
+            guest_port,
+            socket_id,
+            host_address,
+            listener_address,
+            2,
+            None,
+        );
+        reactor.retire_pending_guest_connection_for_connector(
+            session_id,
+            guest_port,
+            socket_id,
+            false,
+            None,
+            Some(eventfd(0, EventfdFlags::CLOEXEC).unwrap()),
+        );
+
+        reactor.retire_session_connectors(session_id);
+        reactor.expire_deadlined_state(
+            Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME + Duration::from_secs(1),
+        );
+
+        let pending = reactor
+            .tcp
+            .pending_guest_connections
+            .get(&(host_address, listener_address))
+            .unwrap();
+        assert!(pending.discard_on_accept);
+        assert_eq!(pending.discard_deadline, None);
+        assert!(pending.retained_connector.is_none());
+        assert_eq!(reactor.retained_connectors, 0);
+    }
+
+    #[test]
+    fn guest_tcp_ports_are_broker_wide_and_do_not_bind_private_host_ports() {
         let occupied_host_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let occupied_host_address = socket_address_v4(occupied_host_listener.local_addr().unwrap());
         let provider = Arc::new(LinuxSocketProvider::new(4, 4).unwrap());
@@ -4746,7 +5111,7 @@ mod tests {
         );
         assert_eq!(
             litebox_broker_core::socket::bind(&second_session, second, guest_port_80),
-            Ok(SocketOutcome::Completed(guest_port_80))
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         );
         assert_eq!(
             litebox_broker_core::socket::bind(
@@ -4759,7 +5124,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_tcp_loopback_routes_within_the_session_namespace() {
+    fn guest_tcp_loopback_routes_across_sessions() {
         let provider = Arc::new(LinuxSocketProvider::new(3, 3).unwrap());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -4768,50 +5133,29 @@ mod tests {
             provider.clone(),
         )
         .unwrap();
-        let session = broker
+        let listener_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let client_session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let (published, publications) = channel();
         let (retired, retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
-        let listener = create_socket(&session, readiness.clone());
+        let listener = create_socket(&listener_session, readiness.clone());
         let guest_listener_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
         assert_eq!(
-            litebox_broker_core::socket::bind(&session, listener, guest_listener_address),
+            litebox_broker_core::socket::bind(&listener_session, listener, guest_listener_address,),
             Ok(SocketOutcome::Completed(guest_listener_address))
         );
         assert_eq!(
-            litebox_broker_core::socket::listen(&session, listener, 2),
+            litebox_broker_core::socket::listen(&listener_session, listener, 2),
             Ok(SocketOutcome::Completed(guest_listener_address))
         );
 
-        let client = create_socket(&session, readiness.clone());
+        let client = create_socket(&client_session, readiness.clone());
         let connect =
-            litebox_broker_core::socket::connect(&session, client, guest_listener_address).unwrap();
-        assert!(matches!(
-            connect,
-            SocketOutcome::Completed(
-                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-            )
-        ));
-        wait_until_connected(&session, client, &publications);
-        let client_address = litebox_broker_core::socket::status(&session, client)
-            .unwrap()
-            .local_address
-            .expect("connected client must have a guest-local address");
-        session.close_object_reference(client).unwrap();
-        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), client);
-        assert_eq!(provider.reactor.retained_connector_count(), 1);
-
-        let replacement = create_socket(&session, readiness.clone());
-        let replacement_address =
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, FIRST_GUEST_EPHEMERAL_PORT + 1);
-        assert_eq!(
-            litebox_broker_core::socket::bind(&session, replacement, replacement_address),
-            Ok(SocketOutcome::Completed(replacement_address))
-        );
-        let connect =
-            litebox_broker_core::socket::connect(&session, replacement, guest_listener_address)
+            litebox_broker_core::socket::connect(&client_session, client, guest_listener_address)
                 .unwrap();
         assert!(matches!(
             connect,
@@ -4819,52 +5163,87 @@ mod tests {
                 SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
             )
         ));
-        wait_until_connected(&session, replacement, &publications);
-        if !session
+        wait_until_connected(&client_session, client, &publications);
+        let client_address = litebox_broker_core::socket::status(&client_session, client)
+            .unwrap()
+            .local_address
+            .expect("connected client must have a guest-local address");
+        client_session.close_object_reference(client).unwrap();
+        assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), client);
+        assert_eq!(provider.reactor.retained_connector_count(), 1);
+
+        let replacement = create_socket(&client_session, readiness.clone());
+        let replacement_address =
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, FIRST_GUEST_EPHEMERAL_PORT + 1);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&client_session, replacement, replacement_address,),
+            Ok(SocketOutcome::Completed(replacement_address))
+        );
+        let connect = litebox_broker_core::socket::connect(
+            &client_session,
+            replacement,
+            guest_listener_address,
+        )
+        .unwrap();
+        assert!(matches!(
+            connect,
+            SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            )
+        ));
+        wait_until_connected(&client_session, replacement, &publications);
+        if !listener_session
             .check_readiness(listener)
             .unwrap()
             .contains(ReadinessFlags::READ)
         {
             wait_for_readiness(&publications, listener, ReadinessFlags::READ);
         }
-        let accepted =
-            match litebox_broker_core::socket::accept(&session, listener, readiness.clone())
-                .unwrap()
-            {
-                SocketOutcome::Completed(accepted) => accepted,
-                SocketOutcome::Failed(error) => panic!("accept failed: {error:?}"),
-            };
+        let accepted = match litebox_broker_core::socket::accept(
+            &listener_session,
+            listener,
+            readiness.clone(),
+        )
+        .unwrap()
+        {
+            SocketOutcome::Completed(accepted) => accepted,
+            SocketOutcome::Failed(error) => panic!("accept failed: {error:?}"),
+        };
         assert_eq!(accepted.local_address, guest_listener_address);
         assert_eq!(accepted.remote_address, client_address);
         assert_eq!(provider.reactor.retained_connector_count(), 0);
-        session.close_object_reference(accepted.handle).unwrap();
+        listener_session
+            .close_object_reference(accepted.handle)
+            .unwrap();
         assert_eq!(
             retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
             accepted.handle
         );
 
         let accepted =
-            match litebox_broker_core::socket::accept(&session, listener, readiness).unwrap() {
+            match litebox_broker_core::socket::accept(&listener_session, listener, readiness)
+                .unwrap()
+            {
                 SocketOutcome::Completed(accepted) => accepted,
                 SocketOutcome::Failed(error) => panic!("replacement accept failed: {error:?}"),
             };
         assert_eq!(accepted.local_address, guest_listener_address);
         assert_eq!(accepted.remote_address, replacement_address);
         assert_eq!(
-            litebox_broker_core::socket::status(&session, replacement)
+            litebox_broker_core::socket::status(&client_session, replacement)
                 .unwrap()
                 .local_address,
             Some(replacement_address)
         );
         assert_eq!(
-            send_bytes(&session, replacement, b"x", SendFlags::NONE),
+            send_bytes(&client_session, replacement, b"x", SendFlags::NONE),
             Ok(SocketOutcome::Completed(1))
         );
         wait_for_readiness(&publications, accepted.handle, ReadinessFlags::READ);
         let mut byte = [0];
         assert_eq!(
             receive_into(
-                &session,
+                &listener_session,
                 accepted.handle,
                 &mut byte,
                 ReceiveFlags::NONE,
@@ -4877,15 +5256,75 @@ mod tests {
     }
 
     #[test]
+    fn closing_connector_session_preserves_cross_session_discard_marker() {
+        let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+            provider.clone(),
+        )
+        .unwrap();
+        let listener_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let connector_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+        let listener = create_socket(&listener_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::listen(&listener_session, listener, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        let connector = create_socket(&connector_session, readiness.clone());
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&connector_session, connector, guest_address),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&connector_session, connector, &publications);
+        connector_session.close_object_reference(connector).unwrap();
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
+        assert_eq!(provider.reactor.retained_connector_count(), 1);
+
+        drop(connector_session);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
+        assert_eq!(provider.reactor.retained_connector_count(), 0);
+        if !listener_session
+            .check_readiness(listener)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+        {
+            wait_for_readiness(&publications, listener, ReadinessFlags::READ);
+        }
+        assert!(matches!(
+            litebox_broker_core::socket::accept(&listener_session, listener, readiness),
+            Err(BrokerError::WouldBlock)
+        ));
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
+        listener_session.close_object_reference(listener).unwrap();
+    }
+
+    #[test]
     fn mapped_tcp_listener_can_be_replaced_while_an_accepted_socket_remains() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_tcp_port_publications(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
                 2,
                 2,
-                &[TcpPortPublication {
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: 80,
-                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -4903,7 +5342,7 @@ mod tests {
         let (published, publications) = channel();
         let (retired, retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
-        let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let guest_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80);
         let listener = create_socket(&session, readiness.clone());
         assert_eq!(
             litebox_broker_core::socket::bind(&session, listener, guest_address),
@@ -4929,9 +5368,10 @@ mod tests {
         );
         assert_eq!(
             create_port_mapping_reservation(
-                TcpPortPublication {
+                *host_address.ip(),
+                TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: 80,
-                    external_address: host_address,
                 },
                 true,
                 true,
@@ -4958,15 +5398,87 @@ mod tests {
     }
 
     #[test]
-    fn stopped_mapped_listener_cannot_route_into_another_session() {
+    fn unacknowledged_mapped_listen_retires_platform_ownership() {
+        let host_address = unused_tcp_address();
+        let mapping = TcpPortMapping {
+            broker_port: host_address.port(),
+            guest_port: 80,
+        };
+        let provider = Arc::new(
+            LinuxSocketProvider::new_with_tcp_port_mappings(2, 1, *host_address.ip(), &[mapping])
+                .unwrap(),
+        );
+        let broker = BrokerCore::new_with_limits(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
+            provider.clone(),
+        )
+        .unwrap();
+        let first_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, _publications) = channel();
+        let (retired, _retirements) = channel();
+        let readiness = Arc::new(TestReadinessSink { published, retired });
+        let guest_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, mapping.guest_port);
+        let first = create_socket(&first_session, readiness.clone());
+        assert_eq!(
+            litebox_broker_core::socket::bind(&first_session, first, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        let first_id = provider
+            .reactor
+            .next_socket_id
+            .load(Ordering::Relaxed)
+            .checked_sub(1)
+            .unwrap();
+        let (response, receive) = sync_channel(1);
+        drop(receive);
+        provider
+            .reactor
+            .commands
+            .send(ReactorCommand::Listen {
+                id: first_id,
+                backlog: 1,
+                mapping: Some(mapping),
+                response,
+            })
+            .unwrap();
+        provider.reactor.signal().unwrap();
+        assert_eq!(
+            provider
+                .reactor
+                .host_address(SocketKind::Tcp, mapping.guest_port),
+            None
+        );
+        first_session.close_object_reference(first).unwrap();
+
+        let second = create_socket(&second_session, readiness);
+        assert_eq!(
+            litebox_broker_core::socket::bind(&second_session, second, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::listen(&second_session, second, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+    }
+
+    #[test]
+    fn stopped_mapped_listener_keeps_global_guest_port_until_close() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_tcp_port_publications(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
                 3,
                 2,
-                &[TcpPortPublication {
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: 80,
-                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -4987,7 +5499,7 @@ mod tests {
         let (published, _publications) = channel();
         let (retired, _retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
-        let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let guest_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80);
         let first_listener = create_socket(&first_session, readiness.clone());
         assert_eq!(
             litebox_broker_core::socket::bind(&first_session, first_listener, guest_address),
@@ -5009,15 +5521,12 @@ mod tests {
         let second_listener = create_socket(&second_session, readiness.clone());
         assert_eq!(
             litebox_broker_core::socket::bind(&second_session, second_listener, guest_address),
-            Ok(SocketOutcome::Completed(guest_address))
-        );
-        assert_eq!(
-            litebox_broker_core::socket::listen(&second_session, second_listener, 1),
-            Ok(SocketOutcome::Completed(guest_address))
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         );
         let first_client = create_socket(&first_session, readiness);
+        let guest_destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_address.port());
         assert_eq!(
-            litebox_broker_core::socket::connect(&first_session, first_client, guest_address),
+            litebox_broker_core::socket::connect(&first_session, first_client, guest_destination,),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
                 SocketError::ConnectionRefused,
             )))
@@ -5027,6 +5536,14 @@ mod tests {
         first_session
             .close_object_reference(first_listener)
             .unwrap();
+        assert_eq!(
+            litebox_broker_core::socket::bind(&second_session, second_listener, guest_address),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::listen(&second_session, second_listener, 1),
+            Ok(SocketOutcome::Completed(guest_address))
+        );
         second_session
             .close_object_reference(second_listener)
             .unwrap();
@@ -5036,12 +5553,13 @@ mod tests {
     fn mapped_listener_handoff_drains_bounded_stale_connections() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_tcp_port_publications(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
                 3,
                 2,
-                &[TcpPortPublication {
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: 80,
-                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5063,7 +5581,7 @@ mod tests {
         let (published, publications) = channel();
         let (retired, _retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
-        let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let guest_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80);
         let first_listener = create_socket(&first_session, readiness.clone());
         assert_eq!(
             litebox_broker_core::socket::bind(&first_session, first_listener, guest_address),
@@ -5073,15 +5591,16 @@ mod tests {
             litebox_broker_core::socket::listen(&first_session, first_listener, 1),
             Ok(SocketOutcome::Completed(guest_address))
         );
-        let first_client = create_socket(&first_session, readiness.clone());
+        let first_client = create_socket(&second_session, readiness.clone());
+        let guest_destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_address.port());
         assert!(matches!(
-            litebox_broker_core::socket::connect(&first_session, first_client, guest_address,),
+            litebox_broker_core::socket::connect(&second_session, first_client, guest_destination,),
             Ok(SocketOutcome::Completed(
                 SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
             ))
         ));
-        wait_until_connected(&first_session, first_client, &publications);
-        assert_eq!(provider.reactor.tcp_translation_count(), 1);
+        wait_until_connected(&second_session, first_client, &publications);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
         assert_eq!(
             litebox_broker_core::socket::shutdown(
                 &first_session,
@@ -5090,24 +5609,24 @@ mod tests {
             ),
             Ok(SocketOutcome::Completed(()))
         );
-        assert_eq!(provider.reactor.tcp_translation_count(), 0);
-        assert_eq!(provider.reactor.stale_tcp_translation_count(), 1);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
+        assert_eq!(provider.reactor.stale_guest_connection_count(), 1);
         assert_eq!(
             litebox_broker_core::socket::shutdown(
-                &first_session,
+                &second_session,
                 first_client,
                 ShutdownMode::Abort,
             ),
             Ok(SocketOutcome::Completed(()))
         );
-        first_session.close_object_reference(first_client).unwrap();
+        second_session.close_object_reference(first_client).unwrap();
         assert_eq!(provider.reactor.retained_connector_count(), 1);
         first_session
             .close_object_reference(first_listener)
             .unwrap();
         drop(first_session);
-        assert_eq!(provider.reactor.retained_connector_count(), 0);
-        assert_eq!(provider.reactor.stale_tcp_translation_count(), 1);
+        assert_eq!(provider.reactor.retained_connector_count(), 1);
+        assert_eq!(provider.reactor.stale_guest_connection_count(), 1);
 
         let second_listener = create_socket(&second_session, readiness);
         assert_eq!(
@@ -5118,7 +5637,7 @@ mod tests {
             litebox_broker_core::socket::listen(&second_session, second_listener, 1),
             Ok(SocketOutcome::Completed(guest_address))
         );
-        assert_eq!(provider.reactor.stale_tcp_translation_count(), 0);
+        assert_eq!(provider.reactor.stale_guest_connection_count(), 0);
         assert_eq!(provider.reactor.retained_connector_count(), 0);
 
         second_session
@@ -5127,54 +5646,74 @@ mod tests {
     }
 
     #[test]
-    fn stopped_private_listener_refuses_new_guest_connections() {
-        let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    fn stopped_private_listener_cleans_cross_session_pending_guest_connections() {
+        let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
         let socket_provider: Arc<dyn SocketProvider> = provider.clone();
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4Loopback),
-            BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+            BrokerCoreLimits::new_with_all_limits(6, 0, 3, 2),
             socket_provider,
         )
         .unwrap();
-        let session = broker
+        let listener_session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
-        let (published, _publications) = channel();
+        let client_session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (published, publications) = channel();
         let (retired, _retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
         let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8000);
-        let listener = create_socket(&session, readiness.clone());
+        let listener = create_socket(&listener_session, readiness.clone());
         assert_eq!(
-            litebox_broker_core::socket::bind(&session, listener, guest_address),
+            litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
             Ok(SocketOutcome::Completed(guest_address))
         );
         assert_eq!(
-            litebox_broker_core::socket::listen(&session, listener, 1),
+            litebox_broker_core::socket::listen(&listener_session, listener, 1),
             Ok(SocketOutcome::Completed(guest_address))
         );
+        let connected_client = create_socket(&client_session, readiness.clone());
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&client_session, connected_client, guest_address,),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&client_session, connected_client, &publications);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
         assert_eq!(
-            litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::StopListening,),
+            litebox_broker_core::socket::shutdown(
+                &listener_session,
+                listener,
+                ShutdownMode::StopListening,
+            ),
             Ok(SocketOutcome::Completed(()))
         );
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
 
-        let client = create_socket(&session, readiness.clone());
+        let client = create_socket(&client_session, readiness);
         assert_eq!(
-            litebox_broker_core::socket::connect(&session, client, guest_address),
+            litebox_broker_core::socket::connect(&client_session, client, guest_address),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
                 SocketError::ConnectionRefused,
             )))
         );
         assert!(
-            session
+            client_session
                 .check_readiness(client)
                 .unwrap()
                 .contains(ReadinessFlags::ERROR)
         );
-        assert_eq!(provider.reactor.tcp_translation_count(), 0);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
 
-        session.close_object_reference(client).unwrap();
-        session.close_object_reference(listener).unwrap();
+        client_session.close_object_reference(client).unwrap();
+        client_session
+            .close_object_reference(connected_client)
+            .unwrap();
+        listener_session.close_object_reference(listener).unwrap();
     }
 
     #[test]
@@ -5215,7 +5754,7 @@ mod tests {
             ))
         ));
         wait_until_connected(&session, client, &publications);
-        assert_eq!(provider.reactor.tcp_translation_count(), 1);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
 
         assert_eq!(
             litebox_broker_core::socket::shutdown(&session, client, ShutdownMode::Abort),
@@ -5223,7 +5762,7 @@ mod tests {
         );
         session.close_object_reference(client).unwrap();
 
-        assert_eq!(provider.reactor.tcp_translation_count(), 1);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
         assert_eq!(
             litebox_broker_core::socket::create(
                 &session,
@@ -5241,7 +5780,7 @@ mod tests {
             litebox_broker_core::socket::accept(&session, listener, readiness.clone()),
             Err(BrokerError::WouldBlock)
         ));
-        assert_eq!(provider.reactor.tcp_translation_count(), 0);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
         let replacement = create_socket(&session, readiness.clone());
         session.close_object_reference(replacement).unwrap();
         second_session
@@ -5260,9 +5799,9 @@ mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         session.close_object_reference(retiring_client).unwrap();
-        assert_eq!(provider.reactor.tcp_translation_count(), 1);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
         session.close_object_reference(listener).unwrap();
-        assert_eq!(provider.reactor.tcp_translation_count(), 0);
+        assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
         let after_retirement = create_socket(&second_session, readiness);
         second_session
             .close_object_reference(after_retirement)
@@ -5273,12 +5812,13 @@ mod tests {
     fn closing_mapped_listener_discards_more_than_sixty_four_queued_connections() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_tcp_port_publications(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
                 2,
                 2,
-                &[TcpPortPublication {
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: 80,
-                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5296,7 +5836,7 @@ mod tests {
         let (published, _publications) = channel();
         let (retired, retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
-        let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let guest_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80);
         let listener = create_socket(&session, readiness.clone());
         assert_eq!(
             litebox_broker_core::socket::bind(&session, listener, guest_address),
@@ -5314,9 +5854,10 @@ mod tests {
         assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
         assert_eq!(
             create_port_mapping_reservation(
-                TcpPortPublication {
+                *host_address.ip(),
+                TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: 80,
-                    external_address: host_address,
                 },
                 true,
                 true,
@@ -5354,8 +5895,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (allow_response, response_allowed) = channel();
         let (allow_end_of_stream, end_of_stream_allowed) = channel();
+        let (peer_address, peer_addresses) = channel();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, peer) = listener.accept().unwrap();
+            peer_address.send(peer).unwrap();
             stream.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
             stream.set_write_timeout(Some(TEST_TIMEOUT)).unwrap();
             let mut request = [0_u8; 4];
@@ -5393,7 +5936,11 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
         });
 
-        let provider = Arc::new(LinuxSocketProvider::new(8, 8).unwrap());
+        let broker_ipv4_address = Ipv4Addr::new(127, 0, 0, 2);
+        let provider = Arc::new(
+            LinuxSocketProvider::new_with_tcp_port_mappings(8, 8, broker_ipv4_address, &[])
+                .unwrap(),
+        );
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4Loopback),
@@ -5418,12 +5965,16 @@ mod tests {
             )
         ));
         wait_until_connected(&session, handle, &publications);
+        assert_eq!(
+            socket_address_v4(peer_addresses.recv_timeout(TEST_TIMEOUT).unwrap()).ip(),
+            &broker_ipv4_address
+        );
         let status = litebox_broker_core::socket::status(&session, handle).unwrap();
         assert_eq!(status.status, SocketConnectionStatus::Connected);
         let local_address = status
             .local_address
             .expect("connected socket must expose its local address");
-        assert_eq!(*local_address.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(*local_address.ip(), Ipv4Addr::UNSPECIFIED);
         assert_eq!(local_address.port(), FIRST_GUEST_EPHEMERAL_PORT);
         assert_eq!(status.pending_error, None);
         assert_eq!(
@@ -5709,15 +6260,16 @@ mod tests {
     }
 
     #[test]
-    fn reactor_assigns_a_port_to_an_unbound_tcp_listener() {
+    fn unbound_listener_uses_identity_mapping_and_configured_override() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_tcp_port_publications(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
                 2,
                 2,
-                &[TcpPortPublication {
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: FIRST_GUEST_EPHEMERAL_PORT,
-                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5744,13 +6296,12 @@ mod tests {
             SocketOutcome::Failed(error) => panic!("listen failed: {error:?}"),
         };
         assert_eq!(local_address.port(), FIRST_GUEST_EPHEMERAL_PORT + 1);
-        assert_eq!(
-            TcpListener::bind(host_address).unwrap_err().kind(),
-            ErrorKind::AddrInUse
-        );
+        assert!(local_address.ip().is_unspecified());
+        TcpStream::connect(SocketAddrV4::new(*host_address.ip(), local_address.port())).unwrap();
+        drop(TcpListener::bind(host_address).unwrap());
         let mapped_listener = create_socket(&session, readiness);
         let mapped_guest_address =
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, FIRST_GUEST_EPHEMERAL_PORT);
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, FIRST_GUEST_EPHEMERAL_PORT);
         assert_eq!(
             litebox_broker_core::socket::set_tcp_option(
                 &session,
@@ -5797,9 +6348,10 @@ mod tests {
         );
         assert_eq!(
             create_port_mapping_reservation(
-                TcpPortPublication {
+                *host_address.ip(),
+                TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: FIRST_GUEST_EPHEMERAL_PORT,
-                    external_address: host_address,
                 },
                 true,
                 true,
@@ -5811,15 +6363,16 @@ mod tests {
     }
 
     #[test]
-    fn reactor_drives_a_loopback_tcp_listener() {
+    fn reactor_drives_an_external_tcp_listener() {
         let host_address = unused_tcp_address();
         let provider = Arc::new(
-            LinuxSocketProvider::new_with_tcp_port_publications(
+            LinuxSocketProvider::new_with_tcp_port_mappings(
                 4,
                 4,
-                &[TcpPortPublication {
+                *host_address.ip(),
+                &[TcpPortMapping {
+                    broker_port: host_address.port(),
                     guest_port: FIRST_GUEST_EPHEMERAL_PORT,
-                    external_address: host_address,
                 }],
             )
             .unwrap(),
@@ -5838,7 +6391,8 @@ mod tests {
         let (retired, retirements) = channel();
         let readiness = Arc::new(TestReadinessSink { published, retired });
         let listener = create_socket(&session, readiness.clone());
-        let requested_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, FIRST_GUEST_EPHEMERAL_PORT);
+        let requested_address =
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, FIRST_GUEST_EPHEMERAL_PORT);
         let local_address =
             match litebox_broker_core::socket::bind(&session, listener, requested_address).unwrap()
             {
