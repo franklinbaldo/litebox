@@ -110,6 +110,40 @@ Inspect the filesystem from Windows with:
 tar -tvf .\rootfs.tar
 ```
 
+## Encrypt a TAR at rest
+
+The launcher uses the interoperable binary `age` file format with its
+passphrase mode. Encryption is authenticated, and the passphrase is processed
+with the format's scrypt recipient. It is prompted without echo and is never
+accepted as a command-line argument or environment variable.
+
+```powershell
+litebox encrypt --input .\rootfs.tar --output .\rootfs.tar.age
+```
+
+The command refuses to overwrite an existing output. After verifying that the
+encrypted file works and arranging a backup, the plaintext source TAR can be
+removed separately by the user.
+
+Run the encrypted filesystem with:
+
+```powershell
+litebox `
+  --runner .\litebox-runner.exe `
+  --encrypted-initial-files .\rootfs.tar.age `
+  --env HOME=/tmp `
+  --program /bin/sh
+```
+
+Because the current runner requires a filesystem path, the launcher decrypts
+the TAR into an OS temporary file, passes that path to the runner, and removes
+the temporary file when the runner exits or the launcher unwinds normally.
+This protects the stored TAR, but it is not the same as an in-memory-only
+filesystem: forced termination, a crash, backup/indexing software, swap, or
+filesystem recovery may leave plaintext traces. Deletion is not a guaranteed
+secure erase on modern filesystems. A future runner API that accepts a stream
+or encrypted backing store would remove this limitation.
+
 The current Windows-userland runner loads one `--initial-files` TAR into an
 in-memory filesystem. It does not expose a live host-directory mount, does not
 write modified files back to the TAR, and does not accept several overlay TARs.
