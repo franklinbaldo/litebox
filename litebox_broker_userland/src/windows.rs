@@ -7,7 +7,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::windows::io::AsRawHandle;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -59,24 +59,9 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         Arc::new(UnsupportedSocketProvider),
     )?;
 
-    let mut runner = Command::new(&args.runner)
-        .arg("--unstable")
-        .arg("--broker-control-pipe")
-        .arg(&control_pipe)
-        .args(&args.runner_arguments)
-        .spawn()?;
-    let runner_process_id = runner.id();
-    let association_result =
-        serve_runner(&broker, control_listener, &mut runner, runner_process_id);
-    if association_result.is_err() {
-        let _ = runner.kill();
-    }
-    let runner_status = runner.wait()?;
-    association_result?;
-    if !runner_status.success() {
-        return Err(IoError::other(format!("runner exited with {runner_status}")).into());
-    }
-    Ok(())
+    crate::run_runner_process(&args, &control_pipe, |runner, runner_process_id| {
+        serve_runner(&broker, control_listener, runner, runner_process_id)
+    })
 }
 
 fn serve_runner(
@@ -90,7 +75,8 @@ fn serve_runner(
         control_listener.try_accept()
     })?;
     validate_client_process(&control_stream, runner_process_id)?;
-    let control_channel = WindowsNamedPipeHostSetupChannel::from_host_guaranteed(control_stream);
+    let control_channel =
+        WindowsNamedPipeHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     let runner_process = runner.as_raw_handle();
     crate::serve_runner(
         broker,

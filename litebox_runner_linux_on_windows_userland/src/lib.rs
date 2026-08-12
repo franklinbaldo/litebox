@@ -39,13 +39,13 @@ pub struct CliArgs {
     pub unstable: bool,
     /// Broker-supplied Windows named-pipe path for the local control channel.
     #[arg(
-        long = "broker-control-pipe",
+        long = "broker-control-channel",
         value_name = "PIPE_NAME",
         hide = true,
         requires = "unstable",
         help_heading = "Unstable Options"
     )]
-    pub broker_control_pipe: Option<std::ffi::OsString>,
+    pub broker_control_channel: Option<std::ffi::OsString>,
     /// Tar archive containing the program and its shared libraries.
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
@@ -81,7 +81,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let platform = Platform::new();
     let broker_connection = cli_args
-        .broker_control_pipe
+        .broker_control_channel
         .as_deref()
         .map(broker::connect)
         .transpose()?;

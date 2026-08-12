@@ -2,9 +2,9 @@
 // Licensed under the MIT license.
 
 use std::error::Error;
-use std::io::{Error as IoError, Result as IoResult};
+use std::io::Result as IoResult;
 use std::os::unix::net::UnixListener;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -60,26 +60,13 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         Arc::new(LinuxSocketProvider::new(limits.max_sockets)?),
     )?;
 
-    let mut runner_command = Command::new(&args.runner);
-    runner_command
-        .arg("--unstable")
-        .arg("--broker-control-socket")
-        .arg(&control_socket_path)
-        .args(&args.runner_arguments);
-    let mut runner = runner_command.spawn()?;
-    let runner_process_id = runner.id();
-
-    let association_result =
-        serve_runner(&broker, &control_listener, &mut runner, runner_process_id);
-    if association_result.is_err() {
-        let _ = runner.kill();
-    }
-    let runner_status = runner.wait()?;
-    association_result?;
-    if !runner_status.success() {
-        return Err(IoError::other(format!("runner exited with {runner_status}")).into());
-    }
-    Ok(())
+    crate::run_runner_process(
+        &args,
+        control_socket_path.as_os_str(),
+        |runner, runner_process_id| {
+            serve_runner(&broker, &control_listener, runner, runner_process_id)
+        },
+    )
 }
 
 fn configured_socket_policy(

@@ -2,11 +2,11 @@
 // Licensed under the MIT license.
 
 use std::error::Error;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{
@@ -32,10 +32,10 @@ mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
-const REQUEST_QUEUE_CAPACITY: usize = 64;
-const WORKER_COUNT: usize = 8;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+const REQUEST_QUEUE_CAPACITY: usize = 64;
+const WORKER_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedTcpDestination {
@@ -94,6 +94,30 @@ struct CliArgs {
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
+}
+
+fn run_runner_process(
+    args: &CliArgs,
+    control_channel: &OsStr,
+    serve: impl FnOnce(&mut Child, u32) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    let mut runner = Command::new(&args.runner)
+        .arg("--unstable")
+        .arg("--broker-control-channel")
+        .arg(control_channel)
+        .args(&args.runner_arguments)
+        .spawn()?;
+    let runner_process_id = runner.id();
+    let association_result = serve(&mut runner, runner_process_id);
+    if association_result.is_err() {
+        let _ = runner.kill();
+    }
+    let runner_status = runner.wait()?;
+    association_result?;
+    if !runner_status.success() {
+        return Err(IoError::other(format!("runner exited with {runner_status}")).into());
+    }
+    Ok(())
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(

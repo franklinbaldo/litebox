@@ -41,6 +41,7 @@ pub struct WindowsNamedPipeListener {
 /// Local-side broker setup channel over a Windows named pipe.
 pub struct WindowsNamedPipeLocalSetupChannel {
     stream: File,
+    setup_deadline: Option<Instant>,
     negotiated: bool,
 }
 
@@ -48,6 +49,7 @@ pub struct WindowsNamedPipeLocalSetupChannel {
 pub struct WindowsNamedPipeHostSetupChannel {
     stream: File,
     peer_credential: PeerCredential,
+    setup_deadline: Option<Instant>,
     negotiated: bool,
 }
 
@@ -130,6 +132,7 @@ impl WindowsNamedPipeLocalSetupChannel {
                 Ok(stream) => {
                     return Ok(Self {
                         stream,
+                        setup_deadline: Some(deadline),
                         negotiated: false,
                     });
                 }
@@ -149,7 +152,7 @@ impl WindowsNamedPipeLocalSetupChannel {
         &mut self,
         expected_length: usize,
     ) -> IoResult<WindowsSharedMemory> {
-        let frame = read_frame(&mut self.stream)?.ok_or_else(|| {
+        let frame = read_frame(&mut self.stream, self.setup_deadline)?.ok_or_else(|| {
             Error::new(
                 ErrorKind::UnexpectedEof,
                 "broker closed before transferring shared memory",
@@ -172,16 +175,17 @@ impl WindowsNamedPipeLocalSetupChannel {
         crate::control_ring::WindowsControlRingLocalCallChannel,
         crate::control_ring::WindowsControlRingLocalNotificationChannel,
     )> {
-        crate::control_ring::activate_local(self.stream, self.negotiated, ring)
+        crate::control_ring::activate_local(self.stream, self.negotiated, self.setup_deadline, ring)
     }
 }
 
 impl WindowsNamedPipeHostSetupChannel {
     /// Creates a host setup channel after the deployment has authenticated the client.
-    pub const fn from_host_guaranteed(stream: File) -> Self {
+    pub const fn from_host_guaranteed(stream: File, setup_deadline: Instant) -> Self {
         Self {
             stream,
             peer_credential: PeerCredential::HostGuaranteed,
+            setup_deadline: Some(setup_deadline),
             negotiated: false,
         }
     }
@@ -193,7 +197,11 @@ impl WindowsNamedPipeHostSetupChannel {
         runner_process: HANDLE,
     ) -> IoResult<()> {
         let transfer = memory.duplicate_to_process(runner_process)?;
-        write_frame(&mut self.stream, &encode_transfer(&transfer)?)
+        write_frame(
+            &mut self.stream,
+            &encode_transfer(&transfer)?,
+            self.setup_deadline,
+        )
     }
 
     /// Activates host request, response, and notification control-ring endpoints.
@@ -206,7 +214,7 @@ impl WindowsNamedPipeHostSetupChannel {
         crate::control_ring::WindowsControlRingHostNotificationChannel,
         crate::control_ring::WindowsControlRingHostShutdown,
     )> {
-        crate::control_ring::activate_host(self.stream, self.negotiated, ring)
+        crate::control_ring::activate_host(self.stream, self.negotiated, self.setup_deadline, ring)
     }
 }
 
@@ -214,11 +222,15 @@ impl LocalSetupChannel for WindowsNamedPipeLocalSetupChannel {
     type Error = Error;
 
     fn send_handshake_request(&mut self, request: &BrokerHandshakeRequest) -> IoResult<()> {
-        write_frame(&mut self.stream, &encode_handshake_request(request.clone()))
+        write_frame(
+            &mut self.stream,
+            &encode_handshake_request(request.clone()),
+            self.setup_deadline,
+        )
     }
 
     fn recv_handshake_response(&mut self) -> IoResult<Option<BrokerHandshakeResponse>> {
-        let response = read_frame(&mut self.stream)?
+        let response = read_frame(&mut self.stream, self.setup_deadline)?
             .map(|frame| decode_handshake_response(&frame).map_err(wire_error))
             .transpose()?;
         self.negotiated = matches!(response, Some(BrokerHandshakeResponse::Negotiated { .. }));
@@ -234,7 +246,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
     }
 
     fn recv_handshake_request(&mut self) -> IoResult<HostReceive<BrokerHandshakeRequest>> {
-        let Some(frame) = read_frame(&mut self.stream)? else {
+        let Some(frame) = read_frame(&mut self.stream, self.setup_deadline)? else {
             return Ok(HostReceive::PeerClosed);
         };
         match decode_handshake_request(&frame) {
@@ -248,6 +260,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
         write_frame(
             &mut self.stream,
             &encode_handshake_response(response.clone()),
+            self.setup_deadline,
         )?;
         self.negotiated = matches!(response, BrokerHandshakeResponse::Negotiated { .. });
         Ok(())
@@ -374,13 +387,20 @@ mod tests {
     }
 
     fn accept_host_guaranteed(
-        mut listener: WindowsNamedPipeListener,
+        listener: WindowsNamedPipeListener,
     ) -> WindowsNamedPipeHostSetupChannel {
+        WindowsNamedPipeHostSetupChannel::from_host_guaranteed(
+            accept_stream_guaranteed(listener),
+            Instant::now() + Duration::from_secs(5),
+        )
+    }
+
+    fn accept_stream_guaranteed(mut listener: WindowsNamedPipeListener) -> File {
         loop {
             match listener.try_accept() {
                 Ok(stream) => {
                     validate_client_process(&stream, unsafe { GetCurrentProcessId() }).unwrap();
-                    return WindowsNamedPipeHostSetupChannel::from_host_guaranteed(stream);
+                    return stream;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => panic!("failed to accept named-pipe client: {error}"),
@@ -398,6 +418,34 @@ mod tests {
         };
 
         assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn setup_deadline_interrupts_silent_client() {
+        let name = pipe_name("setup-deadline");
+        let listener = WindowsNamedPipeListener::bind(&name).unwrap();
+        let (release_client, wait_for_release) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let _client = WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(
+                &name,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            wait_for_release.recv().unwrap();
+        });
+        let stream = accept_stream_guaranteed(listener);
+        let mut host = WindowsNamedPipeHostSetupChannel::from_host_guaranteed(
+            stream,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        let result = host.recv_handshake_request();
+        release_client.send(()).unwrap();
+        client.join().unwrap();
+        let Err(error) = result else {
+            panic!("silent setup client must not outlive the setup deadline");
+        };
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use litebox_broker_protocol::RequestId;
 use litebox_broker_protocol::message::{BrokerNotification, BrokerRequest, BrokerResponse};
@@ -23,17 +24,14 @@ use litebox_broker_transport::control_ring::{
     CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
     ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
-use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED,
-    HANDLE,
-};
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_PIPE_NOT_CONNECTED, HANDLE};
 use windows_sys::Win32::System::IO::CancelSynchronousIo;
 use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess as windows_get_current_process, GetCurrentThread,
-};
 
-use crate::setup::{copy_io_error, invalid_data, read_frame, ring_error, wire_error, write_frame};
+use crate::setup::{
+    OwnedThreadHandle, copy_io_error, duplicate_current_thread, invalid_data, read_frame,
+    ring_error, wire_error, write_frame,
+};
 use crate::shared_memory::WindowsSharedMemory;
 
 /// Maximum number of active calls waiting for broker responses.
@@ -129,8 +127,6 @@ struct PipeLivenessState {
     threads: HashMap<u64, OwnedThreadHandle>,
 }
 
-struct OwnedThreadHandle(HANDLE);
-
 struct PipeIoGuard<'association> {
     liveness: &'association PipeLiveness,
     id: u64,
@@ -139,6 +135,7 @@ struct PipeIoGuard<'association> {
 pub(crate) fn activate_host(
     mut stream: File,
     negotiated: bool,
+    setup_deadline: Option<Instant>,
     ring: ControlRing<WindowsSharedMemory>,
 ) -> IoResult<(
     WindowsControlRingHostRequestSource,
@@ -151,7 +148,7 @@ pub(crate) fn activate_host(
             "broker host setup channel activated before negotiation completed",
         ));
     }
-    let ready = read_frame(&mut stream)?.ok_or_else(|| {
+    let ready = read_frame(&mut stream, setup_deadline)?.ok_or_else(|| {
         Error::new(
             ErrorKind::UnexpectedEof,
             "runner closed before control-ring setup acknowledgement",
@@ -162,7 +159,7 @@ pub(crate) fn activate_host(
             "runner sent an invalid control-ring setup acknowledgement",
         ));
     }
-    write_frame(&mut stream, CONTROL_RING_READY)?;
+    write_frame(&mut stream, CONTROL_RING_READY, setup_deadline)?;
 
     let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
         request_consumer,
@@ -200,6 +197,7 @@ pub(crate) fn activate_host(
 pub(crate) fn activate_local(
     mut stream: File,
     negotiated: bool,
+    setup_deadline: Option<Instant>,
     ring: ControlRing<WindowsSharedMemory>,
 ) -> IoResult<(
     WindowsControlRingLocalCallChannel,
@@ -210,8 +208,8 @@ pub(crate) fn activate_local(
             "broker local setup channel activated before negotiation completed",
         ));
     }
-    write_frame(&mut stream, CONTROL_RING_READY)?;
-    let ready = read_frame(&mut stream)?.ok_or_else(|| {
+    write_frame(&mut stream, CONTROL_RING_READY, setup_deadline)?;
+    let ready = read_frame(&mut stream, setup_deadline)?.ok_or_else(|| {
         Error::new(
             ErrorKind::UnexpectedEof,
             "broker closed before control-ring setup acknowledgement",
@@ -862,37 +860,6 @@ impl Drop for PipeIoGuard<'_> {
             state.threads.remove(&self.id);
         }
     }
-}
-
-impl Drop for OwnedThreadHandle {
-    fn drop(&mut self) {
-        // SAFETY: This is a live thread handle returned by DuplicateHandle.
-        unsafe { CloseHandle(self.0) };
-    }
-}
-
-// SAFETY: Windows thread handles can be canceled and closed from any process thread.
-unsafe impl Send for OwnedThreadHandle {}
-
-fn duplicate_current_thread() -> IoResult<OwnedThreadHandle> {
-    let mut duplicate = std::ptr::null_mut();
-    // SAFETY: Both process pseudo-handles and the current-thread pseudo-handle are valid, and the
-    // output points to writable storage for a new real thread handle.
-    if unsafe {
-        DuplicateHandle(
-            windows_get_current_process(),
-            GetCurrentThread(),
-            windows_get_current_process(),
-            &raw mut duplicate,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    } == 0
-    {
-        return Err(Error::last_os_error());
-    }
-    Ok(OwnedThreadHandle(duplicate))
 }
 
 fn monitor_host_pipe(stream: &mut File, association: &HostRingAssociation) {
