@@ -44,28 +44,37 @@ uv tool install git+https://github.com/franklinbaldo/litebox
 
 The installation compiles and installs the launcher, Windows-userland runner,
 syscall rewriter, and packager directly from the pinned repository source. Run
-`litebox` with no arguments to see its usage. Run any compatible TAR-backed
-Linux program with:
+`litebox --help` to see its Docker-like command interface. Run any compatible
+TAR-backed Linux program with:
 
 ```powershell
-litebox `
-  --initial-files .\rootfs.tar `
-  --program /bin/sh -- -c "echo hello from LiteBox"
+litebox run --env HOME=/tmp .\rootfs.tar /bin/sh -c "echo hello from LiteBox"
+```
+
+Other common operations follow the same command hierarchy:
+
+```powershell
+litebox image build --oci docker.io/library/alpine:3.22 --output .\alpine.tar
+litebox image inspect .\alpine.tar
+litebox rewrite .\program-linux --output .\program-linux.hooked
+litebox doctor
+litebox version
 ```
 
 To keep a TAR encrypted at rest, create a passphrase-protected `age` file and
 select it when starting LiteBox:
 
 ```powershell
-litebox encrypt --input .\rootfs.tar --output .\rootfs.tar.age
-litebox `
-  --encrypted-initial-files .\rootfs.tar.age `
-  --program /bin/sh
+litebox image encrypt .\rootfs.tar --output .\rootfs.tar.age
+litebox run .\rootfs.tar.age /bin/sh
 ```
 
 Both commands prompt for the passphrase without echoing it. The launcher
 decrypts to a temporary TAR only for the runner session and removes that file
 when the process exits normally.
+
+The pre-0.3 `--initial-files`/`--program` syntax remains accepted with a
+deprecation warning so existing scripts can migrate incrementally.
 
 The client compiles the tools from source during installation and must have a
 working Rust compiler and linker. The rootfs TAR remains an explicit input.

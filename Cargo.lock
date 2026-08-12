@@ -1928,7 +1928,7 @@ dependencies = [
 
 [[package]]
 name = "litebox-launcher"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "anyhow",
@@ -1937,6 +1937,7 @@ dependencies = [
  "litebox_runner_linux_on_windows_userland",
  "litebox_syscall_rewriter",
  "rpassword",
+ "tar",
  "tempfile",
 ]
 

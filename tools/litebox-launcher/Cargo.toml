@@ -1,6 +1,6 @@
 [package]
 name = "litebox-launcher"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -31,6 +31,7 @@ litebox_runner_linux_on_windows_userland = { path = "../../litebox_runner_linux_
 litebox_syscall_rewriter = { path = "../../litebox_syscall_rewriter" }
 rpassword = "7.4.0"
 tempfile = "3.20.0"
+tar = "0.4.46"
 
 [lints]
 workspace = true

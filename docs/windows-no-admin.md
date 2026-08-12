@@ -68,13 +68,11 @@ uvx --from git+https://github.com/franklinbaldo/litebox@COMMIT `
 The client still needs a working Rust compiler and linker because this Git
 installation deliberately builds all tools from source. Maturin applies
 `-C target-feature=+crt-static` and refuses to build with a stale Cargo lockfile.
-The installed runner is discovered beside `litebox`; use `--runner` only to
-override it. The rootfs TAR remains an explicit argument:
+The `litebox run` command invokes the runner directly. The rootfs TAR remains
+an explicit argument:
 
 ```powershell
-litebox `
-  --initial-files .\rootfs.tar `
-  --program /bin/sh -- -c "echo hello from LiteBox"
+litebox run .\rootfs.tar /bin/sh -c "echo hello from LiteBox"
 ```
 
 Clients can verify that two builds produced the same bytes when the compiler,
@@ -95,19 +93,16 @@ The TAR must contain Linux paths and rewritten Linux executables. The launcher
 is intentionally application-agnostic:
 
 ```powershell
-.\tools\litebox-launcher\target\release\litebox-launcher.exe `
-  --runner .\target\release\litebox_runner_linux_on_windows_userland.exe `
-  --initial-files .\rootfs.tar `
+litebox run `
   --env HOME=/tmp `
   --env LANG=C.UTF-8 `
-  --program /bin/sh `
-  -- -c "echo hello from LiteBox"
+  .\rootfs.tar /bin/sh -c "echo hello from LiteBox"
 ```
 
 Inspect the filesystem from Windows with:
 
 ```powershell
-tar -tvf .\rootfs.tar
+litebox image inspect .\rootfs.tar
 ```
 
 ## Encrypt a TAR at rest
@@ -118,7 +113,7 @@ with the format's scrypt recipient. It is prompted without echo and is never
 accepted as a command-line argument or environment variable.
 
 ```powershell
-litebox encrypt --input .\rootfs.tar --output .\rootfs.tar.age
+litebox image encrypt .\rootfs.tar --output .\rootfs.tar.age
 ```
 
 The command refuses to overwrite an existing output. After verifying that the
@@ -128,11 +123,7 @@ removed separately by the user.
 Run the encrypted filesystem with:
 
 ```powershell
-litebox `
-  --runner .\litebox-runner.exe `
-  --encrypted-initial-files .\rootfs.tar.age `
-  --env HOME=/tmp `
-  --program /bin/sh
+litebox run --env HOME=/tmp .\rootfs.tar.age /bin/sh
 ```
 
 Because the current runner requires a filesystem path, the launcher decrypts
@@ -153,6 +144,6 @@ those capabilities are added to the runner itself.
 ## Application example: Codex
 
 Codex is not built into the launcher. Put a rewritten Linux Codex executable
-at `/usr/local/bin/codex` in a compatible TAR and select it with
-`--program /usr/local/bin/codex`. Pass only explicitly required credentials or
+at `/usr/local/bin/codex` in a compatible TAR and run it with
+`litebox run ROOTFS.tar /usr/local/bin/codex`. Pass only explicitly required credentials or
 environment variables; do not forward the complete Windows environment.
