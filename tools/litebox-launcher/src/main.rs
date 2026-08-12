@@ -11,7 +11,7 @@ struct Options {
 }
 
 fn usage() -> &'static str {
-    "Usage: litebox-launcher [--runner PATH] --initial-files ROOTFS.tar \
+    "Usage: litebox [--runner PATH] --initial-files ROOTFS.tar \
      [--env NAME=VALUE]... --program /linux/path [--] [ARG]..."
 }
 

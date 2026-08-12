@@ -35,20 +35,33 @@ cargo build --locked --release `
   --manifest-path .\tools\litebox-launcher\Cargo.toml
 ```
 
-Alternatively, `uvx` can clone the Git repository, invoke Maturin, compile the
-Rust launcher locally, install the resulting binary into an isolated temporary
-environment, and run it:
+For regular use, install the `litebox` command from Git. `uv` invokes Maturin
+and compiles the Rust launcher locally into an isolated tool environment:
 
 ```powershell
-uvx --from git+https://github.com/franklinbaldo/litebox litebox-launcher --help
+uv tool install git+https://github.com/franklinbaldo/litebox
+litebox --help
 ```
 
-Pin a tag or commit for reproducibility instead of relying on the moving
-default branch:
+If `litebox` is not found after installation, add uv's tool executable
+directory to `PATH` once, then reopen the terminal:
+
+```powershell
+uv tool update-shell
+```
+
+Pin a tag or commit when installing for reproducibility instead of relying on
+the moving default branch:
+
+```powershell
+uv tool install git+https://github.com/franklinbaldo/litebox@COMMIT
+```
+
+Use `uvx` when a temporary, non-persistent invocation is preferable:
 
 ```powershell
 uvx --from git+https://github.com/franklinbaldo/litebox@COMMIT `
-  litebox-launcher --help
+  litebox --help
 ```
 
 The client still needs a working Rust compiler and linker because this Git
@@ -58,8 +71,7 @@ installation deliberately builds from source. Maturin applies
 explicit arguments:
 
 ```powershell
-uvx --from git+https://github.com/franklinbaldo/litebox@COMMIT `
-  litebox-launcher `
+litebox `
   --runner .\litebox-runner.exe `
   --initial-files .\rootfs.tar `
   --program /bin/sh -- -c "echo hello from LiteBox"

@@ -6,6 +6,10 @@ publish = false
 license = "MIT"
 description = "Generic source-distributed launcher for LiteBox on Windows"
 
+[[bin]]
+name = "litebox"
+path = "src/main.rs"
+
 [dependencies]
 
 # Keep this utility independently buildable from the LiteBox workspace.
