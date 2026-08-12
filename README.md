@@ -35,7 +35,8 @@ See the following files for details:
 
 The fork includes a small source-distributed Rust launcher and a reproducible
 workflow for running TAR-based Linux filesystems with the Windows-userland
-runner. See [docs/windows-no-admin.md](./docs/windows-no-admin.md).
+runner. It can also be compiled and invoked from Git with `uvx`. See
+[docs/windows-no-admin.md](./docs/windows-no-admin.md).
 
 ## License
 

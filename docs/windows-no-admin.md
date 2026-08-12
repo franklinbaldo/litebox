@@ -35,6 +35,36 @@ cargo build --locked --release `
   --manifest-path .\tools\litebox-launcher\Cargo.toml
 ```
 
+Alternatively, `uvx` can clone the Git repository, invoke Maturin, compile the
+Rust launcher locally, install the resulting binary into an isolated temporary
+environment, and run it:
+
+```powershell
+uvx --from git+https://github.com/franklinbaldo/litebox litebox-launcher --help
+```
+
+Pin a tag or commit for reproducibility instead of relying on the moving
+default branch:
+
+```powershell
+uvx --from git+https://github.com/franklinbaldo/litebox@COMMIT `
+  litebox-launcher --help
+```
+
+The client still needs a working Rust compiler and linker because this Git
+installation deliberately builds from source. Maturin applies
+`-C target-feature=+crt-static` and refuses to build with a stale Cargo lockfile.
+`uvx` packages the launcher only; the LiteBox runner and rootfs TAR remain
+explicit arguments:
+
+```powershell
+uvx --from git+https://github.com/franklinbaldo/litebox@COMMIT `
+  litebox-launcher `
+  --runner .\litebox-runner.exe `
+  --initial-files .\rootfs.tar `
+  --program /bin/sh -- -c "echo hello from LiteBox"
+```
+
 Clients can verify that two builds produced the same bytes when the compiler,
 target, sources, lockfile, flags, and other build inputs are identical:
 

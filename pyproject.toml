@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "litebox-launcher"
+dynamic = ["version"]
+description = "Generic source-distributed launcher for LiteBox on Windows"
+readme = "docs/windows-no-admin.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.txt"]
+authors = [{ name = "LiteBox contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/franklinbaldo/litebox"
+Upstream = "https://github.com/microsoft/litebox"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "tools/litebox-launcher/Cargo.toml"
+locked = true
+strip = true
+rustc-args = ["-C", "target-feature=+crt-static"]
