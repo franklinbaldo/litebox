@@ -1905,7 +1905,11 @@ impl litebox::platform::StdioProvider for WindowsUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
+// Large rewritten Linux executables (for example, developer tools with
+// sizeable static mappings) can require allocations above the former 256 MiB
+// ceiling. Keep enough headroom for mappings up to 2 GiB on the x86-64
+// Windows-userland runner.
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 31, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {

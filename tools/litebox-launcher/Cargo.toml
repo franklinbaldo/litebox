@@ -1,0 +1,33 @@
+[package]
+name = "litebox-launcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Generic source-distributed launcher for LiteBox on Windows"
+
+[[bin]]
+name = "litebox"
+path = "src/main.rs"
+
+[[bin]]
+name = "litebox-runner"
+path = "../../litebox_runner_linux_on_windows_userland/src/main.rs"
+
+[[bin]]
+name = "litebox-rewriter"
+path = "../../litebox_syscall_rewriter/src/main.rs"
+
+[[bin]]
+name = "litebox-packager"
+path = "../../litebox_packager/src/main.rs"
+
+[dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.33", features = ["derive"] }
+litebox_packager = { path = "../../litebox_packager" }
+litebox_runner_linux_on_windows_userland = { path = "../../litebox_runner_linux_on_windows_userland" }
+litebox_syscall_rewriter = { path = "../../litebox_syscall_rewriter" }
+
+[lints]
+workspace = true

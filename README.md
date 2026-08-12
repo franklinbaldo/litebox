@@ -31,6 +31,33 @@ See the following files for details:
 - [SECURITY.md](./SECURITY.md)
 - [SUPPORT.md](./SUPPORT.md)
 
+## Windows without administrator access
+
+The fork includes a small source-distributed Rust launcher and a reproducible
+workflow for running TAR-based Linux filesystems with the Windows-userland
+runner. Install its `litebox` command directly from Git with
+[uv](https://docs.astral.sh/uv/):
+
+```powershell
+uv tool install git+https://github.com/franklinbaldo/litebox
+```
+
+The installation compiles and installs the launcher, Windows-userland runner,
+syscall rewriter, and packager directly from the pinned repository source. Run
+`litebox` with no arguments to see its usage. Run any compatible TAR-backed
+Linux program with:
+
+```powershell
+litebox `
+  --initial-files .\rootfs.tar `
+  --program /bin/sh -- -c "echo hello from LiteBox"
+```
+
+The client compiles the tools from source during installation and must have a
+working Rust compiler and linker. The rootfs TAR remains an explicit input.
+See [docs/windows-no-admin.md](./docs/windows-no-admin.md) for
+the full no-admin build, SHA-256, and filesystem workflow.
+
 ## License
 
 MIT License.  See [./LICENSE](./LICENSE) for details.
