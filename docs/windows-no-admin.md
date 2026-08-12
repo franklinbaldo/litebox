@@ -35,8 +35,9 @@ cargo build --locked --release `
   --manifest-path .\tools\litebox-launcher\Cargo.toml
 ```
 
-For regular use, install the `litebox` command from Git. `uv` invokes Maturin
-and compiles the Rust launcher locally into an isolated tool environment:
+For regular use, install the LiteBox tools from Git. `uv` invokes Maturin and
+compiles the launcher, Windows-userland runner, syscall rewriter, and packager
+locally into an isolated tool environment:
 
 ```powershell
 uv tool install git+https://github.com/franklinbaldo/litebox
@@ -65,14 +66,13 @@ uvx --from git+https://github.com/franklinbaldo/litebox@COMMIT `
 ```
 
 The client still needs a working Rust compiler and linker because this Git
-installation deliberately builds from source. Maturin applies
+installation deliberately builds all tools from source. Maturin applies
 `-C target-feature=+crt-static` and refuses to build with a stale Cargo lockfile.
-`uvx` packages the launcher only; the LiteBox runner and rootfs TAR remain
-explicit arguments:
+The installed runner is discovered beside `litebox`; use `--runner` only to
+override it. The rootfs TAR remains an explicit argument:
 
 ```powershell
 litebox `
-  --runner .\litebox-runner.exe `
   --initial-files .\rootfs.tar `
   --program /bin/sh -- -c "echo hello from LiteBox"
 ```

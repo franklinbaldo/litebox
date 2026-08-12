@@ -15,12 +15,21 @@ fn usage() -> &'static str {
      [--env NAME=VALUE]... --program /linux/path [--] [ARG]..."
 }
 
+fn default_runner(own_exe: &std::path::Path) -> PathBuf {
+    let directory = own_exe
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let friendly = directory.join("litebox-runner.exe");
+    if friendly.is_file() {
+        friendly
+    } else {
+        directory.join("litebox_runner_linux_on_windows_userland.exe")
+    }
+}
+
 fn parse() -> Result<Options, String> {
     let own_exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let mut runner = own_exe
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("litebox-runner.exe");
+    let mut runner = default_runner(&own_exe);
     let mut initial_files = None;
     let mut program = None;
     let mut environment = Vec::new();
@@ -97,7 +106,14 @@ fn run(options: Options) -> Result<ExitCode, String> {
 }
 
 fn main() -> ExitCode {
-    if std::env::args_os().skip(1).any(|arg| arg == "-h" || arg == "--help") {
+    if std::env::args_os().len() == 1 {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
         println!("{}", usage());
         return ExitCode::SUCCESS;
     }

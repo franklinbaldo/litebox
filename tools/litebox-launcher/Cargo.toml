@@ -10,7 +10,24 @@ description = "Generic source-distributed launcher for LiteBox on Windows"
 name = "litebox"
 path = "src/main.rs"
 
-[dependencies]
+[[bin]]
+name = "litebox-runner"
+path = "../../litebox_runner_linux_on_windows_userland/src/main.rs"
 
-# Keep this utility independently buildable from the LiteBox workspace.
-[workspace]
+[[bin]]
+name = "litebox-rewriter"
+path = "../../litebox_syscall_rewriter/src/main.rs"
+
+[[bin]]
+name = "litebox-packager"
+path = "../../litebox_packager/src/main.rs"
+
+[dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.33", features = ["derive"] }
+litebox_packager = { path = "../../litebox_packager" }
+litebox_runner_linux_on_windows_userland = { path = "../../litebox_runner_linux_on_windows_userland" }
+litebox_syscall_rewriter = { path = "../../litebox_syscall_rewriter" }
+
+[lints]
+workspace = true
