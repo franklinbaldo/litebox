@@ -31,6 +31,12 @@ See the following files for details:
 - [SECURITY.md](./SECURITY.md)
 - [SUPPORT.md](./SUPPORT.md)
 
+## Windows without administrator access
+
+The fork includes a small source-distributed Rust launcher and a reproducible
+workflow for running TAR-based Linux filesystems with the Windows-userland
+runner. See [docs/windows-no-admin.md](./docs/windows-no-admin.md).
+
 ## License
 
 MIT License.  See [./LICENSE](./LICENSE) for details.

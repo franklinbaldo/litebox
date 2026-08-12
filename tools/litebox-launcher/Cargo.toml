@@ -1,0 +1,12 @@
+[package]
+name = "litebox-launcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Generic source-distributed launcher for LiteBox on Windows"
+
+[dependencies]
+
+# Keep this utility independently buildable from the LiteBox workspace.
+[workspace]
