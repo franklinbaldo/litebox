@@ -73,9 +73,6 @@ Both commands prompt for the passphrase without echoing it. The launcher
 decrypts to a temporary TAR only for the runner session and removes that file
 when the process exits normally.
 
-The pre-0.3 `--initial-files`/`--program` syntax remains accepted with a
-deprecation warning so existing scripts can migrate incrementally.
-
 The client compiles the tools from source during installation and must have a
 working Rust compiler and linker. The rootfs TAR remains an explicit input.
 See [docs/windows-no-admin.md](./docs/windows-no-admin.md) for

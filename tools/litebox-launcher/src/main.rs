@@ -318,81 +318,14 @@ fn execute(command: Command) -> Result<(), String> {
     }
 }
 
-fn legacy_command(arguments: &[String]) -> Result<Option<Command>, String> {
-    if !arguments.first().is_some_and(|value| {
-        value.starts_with('-') && !matches!(value.as_str(), "-h" | "--help" | "-V" | "--version")
-    }) {
-        return Ok(None);
-    }
-    let mut image = None;
-    let mut encrypted = false;
-    let mut program = None;
-    let mut environment = Vec::new();
-    let mut trailing = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        match arguments[index].as_str() {
-            "--initial-files" | "--encrypted-initial-files" => {
-                encrypted = arguments[index] == "--encrypted-initial-files";
-                index += 1;
-                image = Some(PathBuf::from(
-                    arguments.get(index).ok_or("missing image path")?,
-                ));
-            }
-            "--program" => {
-                index += 1;
-                program = Some(arguments.get(index).ok_or("missing program path")?.clone());
-            }
-            "--env" => {
-                index += 1;
-                environment.push(validate_environment(
-                    arguments.get(index).ok_or("missing environment value")?,
-                )?);
-            }
-            "--runner" => {
-                index += 1;
-                let _ = arguments.get(index).ok_or("missing runner path")?;
-            }
-            "--" => {
-                trailing.extend_from_slice(&arguments[index + 1..]);
-                break;
-            }
-            value => trailing.push(value.to_owned()),
-        }
-        index += 1;
-    }
-    eprintln!("warning: legacy syntax is deprecated; use `litebox run IMAGE PROGRAM [ARG...]`");
-    Ok(Some(Command::Run(RunArgs {
-        environment,
-        forward_env: false,
-        unstable: false,
-        encrypted,
-        plain: false,
-        image: image.ok_or("--initial-files is required")?,
-        program: program.ok_or("--program is required")?,
-        arguments: trailing,
-    })))
-}
-
 fn main() -> ExitCode {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let command = match legacy_command(&arguments) {
-        Ok(Some(command)) => command,
-        Ok(None) => {
-            let cli = Cli::parse();
-            let Some(command) = cli.command else {
-                Cli::command()
-                    .print_help()
-                    .expect("stdout should be writable");
-                println!();
-                return ExitCode::SUCCESS;
-            };
-            command
-        }
-        Err(message) => {
-            eprintln!("error: {message}");
-            return ExitCode::FAILURE;
-        }
+    let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        Cli::command()
+            .print_help()
+            .expect("stdout should be writable");
+        println!();
+        return ExitCode::SUCCESS;
     };
     match execute(command) {
         Ok(()) => ExitCode::SUCCESS,
@@ -405,7 +338,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, decrypt_stream, encrypt_stream, legacy_command};
+    use super::{Cli, Command, decrypt_stream, encrypt_stream};
     use age::secrecy::SecretString;
     use clap::Parser;
 
@@ -435,27 +368,6 @@ mod tests {
         assert!(
             Cli::try_parse_from(["litebox", "run", "-e", "1BAD=x", "x.tar", "/bin/sh"]).is_err()
         );
-    }
-
-    #[test]
-    fn translates_legacy_run_syntax() {
-        let values = [
-            "--initial-files",
-            "rootfs.tar",
-            "--env",
-            "HOME=/tmp",
-            "--program",
-            "/bin/sh",
-            "--",
-            "-c",
-            "echo ok",
-        ]
-        .map(str::to_owned);
-        let Some(Command::Run(args)) = legacy_command(&values).unwrap() else {
-            panic!("expected run")
-        };
-        assert_eq!(args.program, "/bin/sh");
-        assert_eq!(args.arguments, ["-c", "echo ok"]);
     }
 
     #[test]
