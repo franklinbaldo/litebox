@@ -23,6 +23,8 @@ enum Command {
     Run(RunArgs),
     /// Build, inspect, or encrypt filesystem images.
     Image(ImageArgs),
+    /// Inspect hardware capabilities supported by this backend.
+    Hardware(HardwareArgs),
     /// Rewrite syscall instructions in a Linux ELF.
     Rewrite(RewriteArgs),
     /// Check whether the local installation is usable.
@@ -34,6 +36,9 @@ enum Command {
 #[derive(Args, Debug)]
 #[allow(clippy::struct_excessive_bools)] // Independent CLI switches, not application state.
 struct RunArgs {
+    /// Toy hardware capability. May be repeated or comma-separated.
+    #[arg(long, value_delimiter = ',', default_value = "none")]
+    hardware: Vec<String>,
     /// Pass NAME=VALUE to the Linux program. May be repeated.
     #[arg(short = 'e', long = "env", value_parser = validate_environment)]
     environment: Vec<String>,
@@ -62,6 +67,22 @@ struct RunArgs {
 struct ImageArgs {
     #[command(subcommand)]
     command: ImageCommand,
+}
+
+#[derive(Args, Debug)]
+struct HardwareArgs {
+    #[command(subcommand)]
+    command: HardwareCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum HardwareCommand {
+    /// Show inherent, available, and unavailable hardware capabilities.
+    Inspect {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -217,6 +238,7 @@ fn run(args: RunArgs) -> Result<(), String> {
     if !args.image.is_file() {
         return Err(format!("image not found: {}", args.image.display()));
     }
+    let hardware_capabilities = resolve_hardware(&args.hardware)?;
     let encrypted =
         args.encrypted || (!args.plain && args.image.extension().is_some_and(|x| x == "age"));
     let temporary;
@@ -235,9 +257,92 @@ fn run(args: RunArgs) -> Result<(), String> {
             forward_environment_variables: args.forward_env,
             unstable: args.unstable,
             initial_files: image,
+            hardware_capabilities,
         },
     )
     .map_err(|error| format!("runner failed: {error:#}"))
+}
+
+fn resolve_hardware(
+    requested: &[String],
+) -> Result<Vec<litebox_runner_linux_on_windows_userland::hardware::HardwareCapability>, String> {
+    use litebox_runner_linux_on_windows_userland::hardware;
+
+    if requested.len() != 1 && requested.iter().any(|value| value == "none") {
+        return Err("hardware 'none' cannot be combined with other capabilities".into());
+    }
+    if requested.len() != 1
+        && requested
+            .iter()
+            .any(|value| matches!(value.as_str(), "safe" | "host"))
+    {
+        return Err("hardware profiles cannot be combined with explicit capabilities".into());
+    }
+    if requested == ["none"] {
+        return Ok(Vec::new());
+    }
+    if requested == ["safe"] {
+        return Ok(hardware::safe_capabilities());
+    }
+    if requested == ["host"] {
+        return Ok(hardware::host_capabilities());
+    }
+    let mut result = Vec::new();
+    for name in requested {
+        let info = hardware::capability_by_name(name)
+            .ok_or_else(|| format!("unknown hardware capability: {name}"))?;
+        if info.kind == hardware::CapabilityKind::Inherent {
+            return Err(format!(
+                "hardware capability '{name}' is inherent and cannot be granted"
+            ));
+        }
+        if !info.available {
+            return Err(format!(
+                "hardware capability '{name}' is not implemented by windows-userland"
+            ));
+        }
+        let capability = hardware::brokered_by_name(name)
+            .ok_or_else(|| format!("hardware capability '{name}' has no backend"))?;
+        if !result.contains(&capability) {
+            result.push(capability);
+        }
+    }
+    Ok(result)
+}
+
+fn inspect_hardware(json: bool) {
+    use litebox_runner_linux_on_windows_userland::hardware::{CAPABILITIES, CapabilityKind};
+
+    if json {
+        println!("[{}\n]", CAPABILITIES.iter().map(|capability| format!(
+            "  {{\"name\":\"{}\",\"kind\":\"{}\",\"backend\":\"{}\",\"available\":{},\"safe\":{},\"description\":\"{}\"}}",
+            capability.name,
+            match capability.kind { CapabilityKind::Inherent => "inherent", CapabilityKind::Brokered => "brokered" },
+            capability.backend, capability.available, capability.safe, capability.description
+        )).collect::<Vec<_>>().join(",\n"));
+        return;
+    }
+    println!(
+        "{:<12} {:<10} {:<20} {:<11} DESCRIPTION",
+        "CAPABILITY", "KIND", "BACKEND", "STATUS"
+    );
+    for capability in CAPABILITIES {
+        println!(
+            "{:<12} {:<10} {:<20} {:<11} {}",
+            capability.name,
+            match capability.kind {
+                CapabilityKind::Inherent => "inherent",
+                CapabilityKind::Brokered => "brokered",
+            },
+            capability.backend,
+            if capability.available {
+                "available"
+            } else {
+                "unavailable"
+            },
+            capability.description
+        );
+    }
 }
 
 fn inspect_image(args: ImageInspectArgs) -> Result<(), String> {
@@ -309,6 +414,11 @@ fn execute(command: Command) -> Result<(), String> {
             ImageCommand::Inspect(args) => inspect_image(args),
             ImageCommand::Encrypt(args) => encrypt_image(args),
         },
+        Command::Hardware(args) => {
+            let HardwareCommand::Inspect { json } = args.command;
+            inspect_hardware(json);
+            Ok(())
+        }
         Command::Rewrite(args) => rewrite(args),
         Command::Doctor => doctor(),
         Command::Version => {
@@ -338,7 +448,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, decrypt_stream, encrypt_stream};
+    use super::{Cli, Command, decrypt_stream, encrypt_stream, resolve_hardware};
     use age::secrecy::SecretString;
     use clap::Parser;
 
@@ -368,6 +478,28 @@ mod tests {
         assert!(
             Cli::try_parse_from(["litebox", "run", "-e", "1BAD=x", "x.tar", "/bin/sh"]).is_err()
         );
+    }
+
+    #[test]
+    fn resolves_hardware_profiles_and_explicit_capabilities() {
+        assert!(resolve_hardware(&["none".into()]).unwrap().is_empty());
+        assert_eq!(resolve_hardware(&["safe".into()]).unwrap().len(), 2);
+        assert_eq!(resolve_hardware(&["host".into()]).unwrap().len(), 2);
+        assert_eq!(
+            resolve_hardware(&["hostinfo".into(), "power".into()])
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_hardware_requests() {
+        assert!(resolve_hardware(&["cpu".into()]).is_err());
+        assert!(resolve_hardware(&["gpu".into()]).is_err());
+        assert!(resolve_hardware(&["unknown".into()]).is_err());
+        assert!(resolve_hardware(&["none".into(), "power".into()]).is_err());
+        assert!(resolve_hardware(&["safe".into(), "power".into()]).is_err());
     }
 
     #[test]

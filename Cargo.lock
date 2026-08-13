@@ -2099,6 +2099,7 @@ dependencies = [
  "litebox_shim_linux",
  "litebox_util_log",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+pub mod hardware;
+
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
@@ -41,6 +43,9 @@ pub struct CliArgs {
     /// (e.g., via `litebox-packager`).
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
     pub initial_files: PathBuf,
+    /// Brokered hardware capabilities granted to the Linux process.
+    #[arg(skip)]
+    pub hardware_capabilities: Vec<hardware::HardwareCapability>,
 }
 
 /// Run Linux programs with LiteBox on unmodified Windows
@@ -76,20 +81,59 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let prog_path = &cli_args.program_and_arguments[0];
 
     let initial_file_system = {
+        let owner = litebox::fs::UserInfo {
+            user: 1000,
+            group: 1000,
+        };
+        let mut initial_nodes = vec![(
+            "/tmp",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+                owner,
+            },
+        )];
+        if !cli_args.hardware_capabilities.is_empty() {
+            initial_nodes.extend([
+                (
+                    "/run",
+                    litebox::fs::in_mem::InitialNode::Directory {
+                        mode: litebox::fs::Mode::RWXU
+                            | litebox::fs::Mode::RGRP
+                            | litebox::fs::Mode::XGRP
+                            | litebox::fs::Mode::ROTH
+                            | litebox::fs::Mode::XOTH,
+                        owner,
+                    },
+                ),
+                (
+                    "/run/litebox",
+                    litebox::fs::in_mem::InitialNode::Directory {
+                        mode: litebox::fs::Mode::RWXU
+                            | litebox::fs::Mode::RGRP
+                            | litebox::fs::Mode::XGRP
+                            | litebox::fs::Mode::ROTH
+                            | litebox::fs::Mode::XOTH,
+                        owner,
+                    },
+                ),
+            ]);
+        }
+        for capability in cli_args.hardware_capabilities.iter().copied() {
+            let (path, snapshot) = hardware::snapshot(capability)?;
+            initial_nodes.push((
+                path,
+                litebox::fs::in_mem::InitialNode::File {
+                    mode: litebox::fs::Mode::RUSR
+                        | litebox::fs::Mode::RGRP
+                        | litebox::fs::Mode::ROTH,
+                    owner,
+                    data: std::borrow::Cow::Owned(snapshot),
+                },
+            ));
+        }
         let in_mem = litebox::fs::resolver::Resolver::new(
             litebox,
-            litebox::fs::in_mem::InMem::new_initialized([(
-                "/tmp",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: litebox::fs::Mode::RWXU
-                        | litebox::fs::Mode::RWXG
-                        | litebox::fs::Mode::RWXO,
-                    owner: litebox::fs::UserInfo {
-                        user: 1000,
-                        group: 1000,
-                    },
-                },
-            )]),
+            litebox::fs::in_mem::InMem::new_initialized(initial_nodes),
         );
 
         shim_builder.default_fs(in_mem, tar_data.into())
