@@ -85,6 +85,55 @@ recorded or simulated, never executed implicitly.
 - An unsupported import and attempted host operation both fail closed.
 - A crash or infinite loop cannot terminate or indefinitely block the launcher.
 
+## Finding validation and coordinated disclosure
+
+Emulator output is evidence for investigation, not by itself proof of a product
+vulnerability. Before describing a third-party result as a vulnerability, the
+researcher must either reproduce it independently outside the rehosting
+environment or obtain confirmation from the affected vendor. Until then, label
+it as an emulator finding, harness defect, unsupported behavior, or
+inconclusive result as appropriate. The calibration gate is tracked in #15.
+
+Potential vulnerabilities must not be reported through public GitHub issues,
+pull requests, discussions, logs, or artifact uploads. Preserve the evidence
+privately and follow coordinated vulnerability disclosure:
+
+- For a Microsoft product or Microsoft-supplied driver, report through the
+  [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new).
+- For a third-party driver, use the vendor's published security contact or
+  `security.txt` process first.
+- If a finding affects both Microsoft and another vendor, ownership is unclear,
+  or vendor coordination fails, request coordination from MSRC/MSVR or an
+  appropriate national CERT without publishing technical details.
+- For a vulnerability in LiteBox or this fork, follow [the repository security
+  policy](../../SECURITY.md) and use a private security advisory or the private
+  contact it designates. Never open a public issue containing the finding.
+
+The initial private report should include, when applicable:
+
+1. Vendor, product, driver filename and version, signer, source, and SHA-256.
+2. Exact Windows version, architecture, privilege level, and prerequisites.
+3. Minimal deterministic reproduction steps and reproduction rate.
+4. Expected and observed behavior, with the concrete security impact stated
+   without speculation or severity inflation.
+5. Relevant IOCTL, input/output sizes, structured harness events, stack trace,
+   crash dump, and logs.
+6. Controls demonstrating that the result is not a harness or emulation
+   artifact, including the conforming toy corpus and independent reproduction
+   or vendor confirmation.
+7. A minimal private proof of concept that avoids persistence, destructive
+   effects, credential access, or unnecessary exploit weaponization.
+8. Researcher contact details, discovery timeline, and any known active
+   exploitation or customer risk that requires urgent handling.
+
+Do not publish the affected binary when redistribution is not permitted. Do not
+publish exploit code, precise triggering inputs, crash dumps containing private
+data, or enough technical detail to enable exploitation before the affected
+vendor has had a reasonable opportunity to investigate and remediate. Agree on
+a disclosure timeline with the vendor or coordinator and retain submission and
+case identifiers. Issue #11 tracks the repository-level disclosure process and
+templates.
+
 ## Open questions
 
 - Which PE loader or existing permissively licensed implementation should be
@@ -94,5 +143,5 @@ recorded or simulated, never executed implicitly.
 - Which NT ABI version and calling conventions should the toy freeze?
 - How should trapped operations be represented so future typed brokers can
   consume them without exposing arbitrary host calls?
-- What disclosure workflow should be followed if analysis of a third-party
-  driver reveals a likely vulnerability?
+- Which national CERT or independent coordinator should be the fallback for a
+  non-responsive vendor in each relevant jurisdiction?
