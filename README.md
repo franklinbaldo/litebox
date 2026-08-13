@@ -81,6 +81,11 @@ read-only snapshots at `/run/litebox/hostinfo.json` and
 `/run/litebox/power.json`. Requests for unavailable capabilities fail instead
 of being silently ignored.
 
+An experimental proposal for loading selected Windows driver binaries in a
+constrained, emulated user-mode environment is documented in
+[the driver rehosting RFC](./docs/rfcs/windows-driver-rehosting.md). It does not
+install drivers, grant kernel access, or forward arbitrary IOCTLs.
+
 To keep a TAR encrypted at rest, create a passphrase-protected `age` file and
 select it when starting LiteBox:
 
