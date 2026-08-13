@@ -24,7 +24,7 @@ members = [
     # The CI tests are not meant to be released (thus are not prefixed with
     # `litebox_`), but exist purely to better manage development on LiteBox.
     "dev_tests",
-    "dev_bench",
+    "dev_bench", "litebox_driver_rehosting",
 ]
 default-members = [
     "litebox",

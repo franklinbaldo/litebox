@@ -1564,6 +1564,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_driver_rehosting"
+version = "0.1.0"
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
