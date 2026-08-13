@@ -61,6 +61,26 @@ litebox doctor
 litebox version
 ```
 
+Inspect the Windows-userland hardware capability registry and grant either a
+profile or an explicit comma-separated list:
+
+```powershell
+litebox hardware inspect
+litebox hardware inspect --json
+litebox run --hardware none .\rootfs.tar /program
+litebox run --hardware safe .\rootfs.tar /program
+litebox run --hardware host .\rootfs.tar /program
+litebox run --hardware hostinfo,power .\rootfs.tar /program
+```
+
+CPU, SIMD, memory, clock, and threads are inherent to the userland execution
+model and cannot be granted or revoked. Brokered capabilities are opt-in:
+`safe` selects all implemented low-risk backends and `host` selects every
+implemented backend. The initial `hostinfo` and `power` backends publish
+read-only snapshots at `/run/litebox/hostinfo.json` and
+`/run/litebox/power.json`. Requests for unavailable capabilities fail instead
+of being silently ignored.
+
 To keep a TAR encrypted at rest, create a passphrase-protected `age` file and
 select it when starting LiteBox:
 
@@ -77,6 +97,20 @@ The client compiles the tools from source during installation and must have a
 working Rust compiler and linker. The rootfs TAR remains an explicit input.
 See [docs/windows-no-admin.md](./docs/windows-no-admin.md) for
 the full no-admin build, SHA-256, and filesystem workflow.
+
+### Performance comparison
+
+The no-WSL benchmark harness builds identical Rust workloads for native Windows
+and static Linux, creates its own TAR, and reports paired median, p95, slowdown,
+and approximate startup overhead results:
+
+```powershell
+rustup target add x86_64-unknown-linux-musl --toolchain stable-x86_64-pc-windows-gnullvm
+powershell -ExecutionPolicy Bypass -File .\dev_bench\windows_litebox\run.ps1
+```
+
+See [the benchmark protocol](./dev_bench/windows_litebox/README.md) for the
+workloads, limitations, smoke-test options, and reproducibility guidance.
 
 ## License
 
