@@ -1,0 +1,13 @@
+[package]
+name = "litebox-perf-workload"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+

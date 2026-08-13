@@ -44,23 +44,54 @@ uv tool install git+https://github.com/franklinbaldo/litebox
 
 The installation compiles and installs the launcher, Windows-userland runner,
 syscall rewriter, and packager directly from the pinned repository source. Run
-`litebox` with no arguments to see its usage. Run any compatible TAR-backed
-Linux program with:
+`litebox --help` to see its Docker-like command interface. Run any compatible
+TAR-backed Linux program with:
 
 ```powershell
-litebox `
-  --initial-files .\rootfs.tar `
-  --program /bin/sh -- -c "echo hello from LiteBox"
+litebox run --env HOME=/tmp .\rootfs.tar /bin/sh -c "echo hello from LiteBox"
 ```
+
+Other common operations follow the same command hierarchy:
+
+```powershell
+litebox image build --oci docker.io/library/alpine:3.22 --output .\alpine.tar
+litebox image inspect .\alpine.tar
+litebox rewrite .\program-linux --output .\program-linux.hooked
+litebox doctor
+litebox version
+```
+
+Inspect the Windows-userland hardware capability registry and grant either a
+profile or an explicit comma-separated list:
+
+```powershell
+litebox hardware inspect
+litebox hardware inspect --json
+litebox run --hardware none .\rootfs.tar /program
+litebox run --hardware safe .\rootfs.tar /program
+litebox run --hardware host .\rootfs.tar /program
+litebox run --hardware hostinfo,power .\rootfs.tar /program
+```
+
+CPU, SIMD, memory, clock, and threads are inherent to the userland execution
+model and cannot be granted or revoked. Brokered capabilities are opt-in:
+`safe` selects all implemented low-risk backends and `host` selects every
+implemented backend. The initial `hostinfo` and `power` backends publish
+read-only snapshots at `/run/litebox/hostinfo.json` and
+`/run/litebox/power.json`. Requests for unavailable capabilities fail instead
+of being silently ignored.
+
+An experimental proposal for loading selected Windows driver binaries in a
+constrained, emulated user-mode environment is documented in
+[the driver rehosting RFC](./docs/rfcs/windows-driver-rehosting.md). It does not
+install drivers, grant kernel access, or forward arbitrary IOCTLs.
 
 To keep a TAR encrypted at rest, create a passphrase-protected `age` file and
 select it when starting LiteBox:
 
 ```powershell
-litebox encrypt --input .\rootfs.tar --output .\rootfs.tar.age
-litebox `
-  --encrypted-initial-files .\rootfs.tar.age `
-  --program /bin/sh
+litebox image encrypt .\rootfs.tar --output .\rootfs.tar.age
+litebox run .\rootfs.tar.age /bin/sh
 ```
 
 Both commands prompt for the passphrase without echoing it. The launcher
@@ -71,6 +102,20 @@ The client compiles the tools from source during installation and must have a
 working Rust compiler and linker. The rootfs TAR remains an explicit input.
 See [docs/windows-no-admin.md](./docs/windows-no-admin.md) for
 the full no-admin build, SHA-256, and filesystem workflow.
+
+### Performance comparison
+
+The no-WSL benchmark harness builds identical Rust workloads for native Windows
+and static Linux, creates its own TAR, and reports paired median, p95, slowdown,
+and approximate startup overhead results:
+
+```powershell
+rustup target add x86_64-unknown-linux-musl --toolchain stable-x86_64-pc-windows-gnullvm
+powershell -ExecutionPolicy Bypass -File .\dev_bench\windows_litebox\run.ps1
+```
+
+See [the benchmark protocol](./dev_bench/windows_litebox/README.md) for the
+workloads, limitations, smoke-test options, and reproducibility guidance.
 
 ## License
 
