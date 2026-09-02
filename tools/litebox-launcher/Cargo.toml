@@ -1,6 +1,6 @@
 [package]
 name = "litebox-launcher"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -23,11 +23,14 @@ name = "litebox-packager"
 path = "../../litebox_packager/src/main.rs"
 
 [dependencies]
+age = { version = "0.11.1", default-features = false }
 anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 litebox_packager = { path = "../../litebox_packager" }
 litebox_runner_linux_on_windows_userland = { path = "../../litebox_runner_linux_on_windows_userland" }
 litebox_syscall_rewriter = { path = "../../litebox_syscall_rewriter" }
+rpassword = "7.4.0"
+tempfile = "3.20.0"
 
 [lints]
 workspace = true

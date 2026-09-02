@@ -53,6 +53,20 @@ litebox `
   --program /bin/sh -- -c "echo hello from LiteBox"
 ```
 
+To keep a TAR encrypted at rest, create a passphrase-protected `age` file and
+select it when starting LiteBox:
+
+```powershell
+litebox encrypt --input .\rootfs.tar --output .\rootfs.tar.age
+litebox `
+  --encrypted-initial-files .\rootfs.tar.age `
+  --program /bin/sh
+```
+
+Both commands prompt for the passphrase without echoing it. The launcher
+decrypts to a temporary TAR only for the runner session and removes that file
+when the process exits normally.
+
 The client compiles the tools from source during installation and must have a
 working Rust compiler and linker. The rootfs TAR remains an explicit input.
 See [docs/windows-no-admin.md](./docs/windows-no-admin.md) for
