@@ -1,0 +1,100 @@
+name: Android APK Smoke
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-smoke-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_API: "28"
+  ANDROID_BUILD_TOOLS: "35.0.0"
+  ANDROID_SYSTEM_IMAGE: "system-images;android-28;default;x86_64"
+
+jobs:
+  cache_probe:
+    name: Probe prepared Android cache
+    runs-on: windows-latest
+    outputs:
+      cache_hit: ${{ steps.cache.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .android-smoke-cache
+          key: android-smoke-v5-api28-x86_64-${{ hashFiles('scripts/android/**', 'fixtures/android/**', 'litebox_syscall_rewriter/**', 'Cargo.lock', '.github/workflows/android-apk-smoke.yml') }}
+          lookup-only: true
+          enableCrossOsArchive: true
+
+  prepare_android:
+    name: Prepare Android runtime on cache miss
+    needs: cache_probe
+    if: needs.cache_probe.outputs.cache_hit != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - id: cache
+        uses: actions/cache@v5
+        with:
+          path: .android-smoke-cache
+          key: android-smoke-v5-api28-x86_64-${{ hashFiles('scripts/android/**', 'fixtures/android/**', 'litebox_syscall_rewriter/**', 'Cargo.lock', '.github/workflows/android-apk-smoke.yml') }}
+          enableCrossOsArchive: true
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Build cached Android runtime + APK
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: bash scripts/android/ci_prepare_apk_smoke.sh
+
+  android_apk_smoke:
+    name: APK -> ART -> bionic -> LiteBox -> Windows
+    needs: [cache_probe, prepare_android]
+    if: >-
+      always() &&
+      needs.cache_probe.result == 'success' &&
+      (needs.prepare_android.result == 'success' || needs.prepare_android.result == 'skipped')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache/restore@v5
+        with:
+          path: .android-smoke-cache
+          key: android-smoke-v5-api28-x86_64-${{ hashFiles('scripts/android/**', 'fixtures/android/**', 'litebox_syscall_rewriter/**', 'Cargo.lock', '.github/workflows/android-apk-smoke.yml') }}
+          fail-on-cache-miss: true
+          enableCrossOsArchive: true
+      - name: Verify cached bytes
+        shell: bash
+        run: sha256sum --check .android-smoke-cache/SHA256SUMS
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          $channel = (Select-String rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          rustup toolchain install $channel --profile minimal --no-self-update --target x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Windows-userland runner
+        run: cargo build --locked --release -p litebox_runner_linux_on_windows_userland
+      - name: Execute real APK through ART
+        shell: pwsh
+        run: |
+          $boot = (Get-Content .android-smoke-cache/bootclasspath.txt -Raw).Trim()
+          $output = & target/release/litebox_runner_linux_on_windows_userland.exe `
+            --initial-files .android-smoke-cache/android-apk-smoke.tar `
+            --env ANDROID_DATA=/data `
+            --env ANDROID_ROOT=/system `
+            --env "BOOTCLASSPATH=$boot" `
+            /system/bin/dalvikvm64 `
+            -cp /data/local/tmp/litebox-apk-smoke.apk `
+            dev.litebox.androidsmoke.ApkSmokeMain 2>&1
+          $code = $LASTEXITCODE
+          $output | Write-Host
+          if ($code -ne 0) { throw "APK smoke failed with exit code $code" }
+          if (($output -join "`n") -notmatch 'hello from APK on LiteBox') { throw "expected APK stdout was not observed" }
