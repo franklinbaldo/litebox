@@ -285,6 +285,11 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
         aux.insert(AuxKey::AT_PHNUM, info.num_phdrs);
         aux.insert(AuxKey::AT_ENTRY, info.entry_point);
+        // Android's bionic loader scans the auxiliary vector for AT_SECURE and
+        // calls __early_abort() when it reaches AT_NULL without finding it, so
+        // the entry must be present even though the value is the default.
+        // glibc tolerates its absence; bionic does not.
+        aux.insert(AuxKey::AT_SECURE, 0);
         let entry = if let Some(interp) = &interp {
             aux.insert(AuxKey::AT_BASE, interp.base_addr);
             interp.entry_point

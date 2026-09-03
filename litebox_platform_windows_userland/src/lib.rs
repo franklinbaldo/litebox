@@ -95,6 +95,11 @@ impl WindowsUserland {
     }
 }
 
+/// Upper bound for treating a tiny faulting address as a bionic
+/// `__early_abort(__LINE__)` line number rather than an ordinary null-pointer
+/// dereference. Source files are not this long, and no real mapping lives here.
+const BIONIC_EARLY_ABORT_MAX_LINE: usize = 0x2000;
+
 unsafe extern "system" fn vectored_exception_handler(
     exception_info: *mut EXCEPTION_POINTERS,
 ) -> i32 {
@@ -110,6 +115,21 @@ unsafe extern "system" fn vectored_exception_handler(
         context = &mut *info.ContextRecord;
     }
 
+    // Android's bionic cannot log before TLS is set up, so its loader reports
+    // early failures by deliberately faulting on an address equal to the source
+    // line that failed (`__early_abort(__LINE__)`). Without decoding it here the
+    // guest just dies with an access violation and no explanation at all.
+    if tls.is_in_guest.get()
+        && exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+    {
+        let fault_addr = exception_record.ExceptionInformation[1];
+        if fault_addr < BIONIC_EARLY_ABORT_MAX_LINE {
+            std::eprintln!(
+                "litebox: guest faulted writing to 0x{fault_addr:x} (rip=0x{:x}); this is most likely bionic's __early_abort(__LINE__) reporting a loader failure at source line {fault_addr}",
+                context.Rip
+            );
+        }
+    }
     if !tls.is_in_guest.get() {
         // This might be a faulting guest memory access in LiteBox code. Try to
         // recover.
