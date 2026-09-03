@@ -9,9 +9,8 @@ use litebox::{
         PageManager,
         linux::{CreatePagesFlags, NonZeroPageSize, PAGE_SIZE},
     },
-    platform::{RawConstPointer as _, RawMutPointer as _},
 };
-use litebox_common_linux::{ProtFlags, UserPtrMut};
+use litebox_common_linux::{ProtFlags, user_pointers::UserPtrMut};
 use litebox_platform_windows_userland::WindowsUserland;
 
 #[test]
