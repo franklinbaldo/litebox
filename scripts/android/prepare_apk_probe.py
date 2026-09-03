@@ -6,7 +6,6 @@ import argparse
 import pathlib
 import shutil
 import tarfile
-import tempfile
 import zipfile
 
 GUEST_APK = "data/local/tmp/litebox-apk-smoke.apk"
@@ -36,17 +35,14 @@ def main() -> int:
     if not args.runtime_tar.is_file():
         raise SystemExit("runtime TAR not found")
 
-    with tempfile.TemporaryDirectory(prefix="litebox-apk-smoke-") as td:
-        root = pathlib.Path(td)
-        with tarfile.open(args.runtime_tar, "r") as src:
-            src.extractall(root, filter="data")
-        target = root / GUEST_APK
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(args.apk, target)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(args.output, "w", format=tarfile.GNU_FORMAT) as out:
-            for path in sorted(root.rglob("*")):
-                out.add(path, arcname=path.relative_to(root), recursive=False)
+    # The runtime TAR deliberately contains Android absolute symlinks and
+    # address-sensitive ART artifacts. Extracting and rebuilding it on the host
+    # both trips Python's host-safety filters and risks changing guest metadata.
+    # Preserve the runtime archive byte-for-byte and append only the APK entry.
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(args.runtime_tar, args.output)
+    with tarfile.open(args.output, "a", format=tarfile.GNU_FORMAT) as out:
+        out.add(args.apk, arcname=GUEST_APK, recursive=False)
 
     print(f"guest_apk=/{GUEST_APK}")
     for name in dex:
