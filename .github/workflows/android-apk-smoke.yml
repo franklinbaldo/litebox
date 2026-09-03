@@ -22,13 +22,31 @@ jobs:
     runs-on: windows-latest
     outputs:
       cache_hit: ${{ steps.cache.outputs.cache-hit }}
+      cache_key: ${{ steps.cache-key.outputs.value }}
     steps:
       - uses: actions/checkout@v6
+      - id: cache-key
+        name: Compute cross-platform Android cache key
+        shell: bash
+        run: |
+          key="$(
+            git ls-files -s -- \
+              scripts/android \
+              fixtures/android \
+              litebox_syscall_rewriter \
+              Cargo.lock \
+              .github/workflows/android-apk-smoke.yml \
+              | LC_ALL=C sort -k4 \
+              | sha256sum \
+              | cut -d' ' -f1
+          )"
+          echo "value=$key" >> "$GITHUB_OUTPUT"
+          echo "Android cache content key: $key"
       - id: cache
         uses: actions/cache/restore@v5
         with:
           path: .android-smoke-cache
-          key: android-smoke-v5-api28-x86_64-${{ hashFiles('scripts/android/**', 'fixtures/android/**', 'litebox_syscall_rewriter/**', 'Cargo.lock', '.github/workflows/android-apk-smoke.yml') }}
+          key: android-smoke-v6-api28-x86_64-${{ steps.cache-key.outputs.value }}
           lookup-only: true
           enableCrossOsArchive: true
 
@@ -43,7 +61,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .android-smoke-cache
-          key: android-smoke-v5-api28-x86_64-${{ hashFiles('scripts/android/**', 'fixtures/android/**', 'litebox_syscall_rewriter/**', 'Cargo.lock', '.github/workflows/android-apk-smoke.yml') }}
+          key: android-smoke-v6-api28-x86_64-${{ needs.cache_probe.outputs.cache_key }}
           enableCrossOsArchive: true
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/setup-java@v5
@@ -80,7 +98,7 @@ jobs:
       - uses: actions/cache/restore@v5
         with:
           path: .android-smoke-cache
-          key: android-smoke-v5-api28-x86_64-${{ hashFiles('scripts/android/**', 'fixtures/android/**', 'litebox_syscall_rewriter/**', 'Cargo.lock', '.github/workflows/android-apk-smoke.yml') }}
+          key: android-smoke-v6-api28-x86_64-${{ needs.cache_probe.outputs.cache_key }}
           fail-on-cache-miss: true
           enableCrossOsArchive: true
       - name: Verify cached bytes
