@@ -97,6 +97,7 @@ jobs:
       - name: Execute real APK through ART
         shell: pwsh
         run: |
+          $env:LITEBOX_LOG = "trace"
           $boot = (Get-Content .android-smoke-cache/bootclasspath.txt -Raw).Trim()
           $output = & target/release/litebox_runner_linux_on_windows_userland.exe `
             --initial-files .android-smoke-cache/android-apk-smoke.tar `
@@ -107,6 +108,15 @@ jobs:
             -cp /data/local/tmp/litebox-apk-smoke.apk `
             dev.litebox.androidsmoke.ApkSmokeMain 2>&1
           $code = $LASTEXITCODE
+          $output | Set-Content -Encoding utf8 art-smoke.log
           $output | Write-Host
           if ($code -ne 0) { throw "APK smoke failed with exit code $code" }
           if (($output -join "`n") -notmatch 'hello from APK on LiteBox') { throw "expected APK stdout was not observed" }
+      - name: Upload ART diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-art-diagnostics
+          path: art-smoke.log
+          if-no-files-found: warn
+          retention-days: 3
