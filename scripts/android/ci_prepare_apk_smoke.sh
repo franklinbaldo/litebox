@@ -67,10 +67,22 @@ done
 python scripts/android/build_runtime_bundle.py "${args[@]}"
 python scripts/android/finalize_litebox_bundle.py --input "$WORK/runtime-raw.tar" --output "$WORK/runtime-litebox.tar" --rewriter "$PWD/target/release/litebox_syscall_rewriter"
 
-# Boot images are compiled ART artifacts; preserve their bytes instead of
-# treating them as syscall-bearing native ELF libraries.
+# ART boot OAT files are ELF containers with address-sensitive compiled code.
+# Do not runtime-rewrite them merely because they have executable PT_LOAD
+# segments.  We only add LiteBox's existing size=0 sentinel when the normal
+# rewriter proves that the file contains no syscall instructions; if it would
+# change any code, the original file is preserved.
 if test -d "$ROOT/system/framework/x86_64"; then
-  tar --format=gnu --append --file "$WORK/runtime-litebox.tar" -C "$ROOT" system/framework/x86_64
+  ART_ROOT="$WORK/art-runtime-root"
+  rm -rf "$ART_ROOT"
+  mkdir -p "$ART_ROOT/system/framework"
+  cp -a "$ROOT/system/framework/x86_64" "$ART_ROOT/system/framework/"
+  while IFS= read -r -d '' oat; do
+    python scripts/android/mark_no_syscall_elf.py \
+      --input "$oat" \
+      --rewriter "$PWD/target/release/litebox_syscall_rewriter"
+  done < <(find "$ART_ROOT/system/framework/x86_64" -type f -name '*.oat' -print0)
+  tar --format=gnu --append --file "$WORK/runtime-litebox.tar" -C "$ART_ROOT" system/framework/x86_64
 fi
 if test -d "$ROOT/system/usr/icu"; then
   tar --format=gnu --append --file "$WORK/runtime-litebox.tar" -C "$ROOT" system/usr/icu
