@@ -12,7 +12,23 @@ mkdir -p "$WORK" "$CACHE" "$EXTRACTED" "$ROOT"
 
 sudo apt-get update
 sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs zip
-SDKMANAGER="$(command -v sdkmanager)"
+SDKMANAGER="$(command -v sdkmanager || true)"
+if test -z "$SDKMANAGER"; then
+  for candidate in \
+    "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+    "$ANDROID_HOME/cmdline-tools/bin/sdkmanager" \
+    "$ANDROID_HOME/tools/bin/sdkmanager"; do
+    if test -x "$candidate"; then
+      SDKMANAGER="$candidate"
+      break
+    fi
+  done
+fi
+if test -z "$SDKMANAGER"; then
+  echo "sdkmanager not found under ANDROID_HOME=$ANDROID_HOME" >&2
+  find "$ANDROID_HOME" -maxdepth 5 -type f -name sdkmanager -print >&2 || true
+  exit 1
+fi
 yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 "$SDKMANAGER" "platforms;android-$API" "build-tools;$BUILD_TOOLS" "$SYSTEM_IMAGE"
 
@@ -69,7 +85,7 @@ python scripts/android/finalize_litebox_bundle.py --input "$WORK/runtime-raw.tar
 
 # ART boot OAT files are ELF containers with address-sensitive compiled code.
 # Do not runtime-rewrite them merely because they have executable PT_LOAD
-# segments.  We only add LiteBox's existing size=0 sentinel when the normal
+# segments. We only add LiteBox's existing size=0 sentinel when the normal
 # rewriter proves that the file contains no syscall instructions; if it would
 # change any code, the original file is preserved.
 if test -d "$ROOT/system/framework/x86_64"; then
