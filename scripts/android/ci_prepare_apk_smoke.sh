@@ -100,7 +100,11 @@ if grep -Eq 'Bad magic number|Filesystem not open|Found a .* partition table' "$
   exit 1
 fi
 
-debugfs -R "rdump / $EXTRACTED" "$fs_image"
+# debugfs preserves filesystem ownership while rdump-ing. Run the extraction
+# with privilege so root-owned Android entries can be materialized faithfully,
+# then hand ownership of the working copy back to the unprivileged CI runner.
+sudo debugfs -R "rdump / $EXTRACTED" "$fs_image"
+sudo chown -R "$(id -u):$(id -g)" "$EXTRACTED"
 
 if test -f "$EXTRACTED/bin/dalvikvm64"; then
   mkdir -p "$ROOT/system"
