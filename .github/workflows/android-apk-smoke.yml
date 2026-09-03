@@ -35,7 +35,6 @@ jobs:
               fixtures/android \
               litebox_syscall_rewriter \
               Cargo.lock \
-              .github/workflows/android-apk-smoke.yml \
               | LC_ALL=C sort -k4 \
               | sha256sum \
               | cut -d' ' -f1
@@ -46,7 +45,7 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: .android-smoke-cache
-          key: android-smoke-v6-api28-x86_64-${{ steps.cache-key.outputs.value }}
+          key: android-smoke-v7-api28-x86_64-${{ steps.cache-key.outputs.value }}
           lookup-only: true
           enableCrossOsArchive: true
 
@@ -61,7 +60,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: .android-smoke-cache
-          key: android-smoke-v6-api28-x86_64-${{ needs.cache_probe.outputs.cache_key }}
+          key: android-smoke-v7-api28-x86_64-${{ needs.cache_probe.outputs.cache_key }}
           enableCrossOsArchive: true
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: actions/setup-java@v5
@@ -98,12 +97,15 @@ jobs:
       - uses: actions/cache/restore@v5
         with:
           path: .android-smoke-cache
-          key: android-smoke-v6-api28-x86_64-${{ needs.cache_probe.outputs.cache_key }}
+          key: android-smoke-v7-api28-x86_64-${{ needs.cache_probe.outputs.cache_key }}
           fail-on-cache-miss: true
           enableCrossOsArchive: true
       - name: Verify cached bytes
         shell: bash
-        run: sha256sum --check .android-smoke-cache/SHA256SUMS
+        run: |
+          cd .android-smoke-cache
+          awk '{ name=$2; sub(/^.*\//, "", name); print $1 "  " name }' SHA256SUMS \
+            | sha256sum --check -
       - name: Set up Rust
         shell: pwsh
         run: |
