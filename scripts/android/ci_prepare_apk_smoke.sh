@@ -100,27 +100,27 @@ if grep -Eq 'Bad magic number|Filesystem not open|Found a .* partition table' "$
   exit 1
 fi
 
-# debugfs preserves filesystem ownership while rdump-ing. Run the extraction
-# with privilege so root-owned Android entries can be materialized faithfully,
-# then hand ownership of the working copy back to the unprivileged CI runner.
+# Preserve Android ownership and mode bits exactly. Some metadata files are
+# intentionally unreadable to an ordinary user, so both extraction and the
+# full-tree copy must run privileged; changing ownership/modes would mutate
+# the guest filesystem semantics we are trying to exercise.
 sudo debugfs -R "rdump / $EXTRACTED" "$fs_image"
-sudo chown -R "$(id -u):$(id -g)" "$EXTRACTED"
 
 if test -f "$EXTRACTED/bin/dalvikvm64"; then
   mkdir -p "$ROOT/system"
-  cp -a "$EXTRACTED/." "$ROOT/system/"
+  sudo cp -a "$EXTRACTED/." "$ROOT/system/"
 elif test -f "$EXTRACTED/system/bin/dalvikvm64"; then
-  cp -a "$EXTRACTED/." "$ROOT/"
+  sudo cp -a "$EXTRACTED/." "$ROOT/"
 else
   echo "dalvikvm64 not found in Android image" >&2
-  find "$EXTRACTED" -maxdepth 4 -name 'dalvikvm*' -print >&2 || true
+  sudo find "$EXTRACTED" -maxdepth 4 -name 'dalvikvm*' -print >&2 || true
   exit 1
 fi
 test -f "$ROOT/system/bin/linker64"
 
 bootclasspath=""
 for candidate in "$EXTRACTED/init.environ.rc" "$ROOT/init.environ.rc" "$ROOT/system/etc/init/hw/init.environ.rc"; do
-  if test -f "$candidate"; then
+  if test -r "$candidate"; then
     bootclasspath="$(sed -n 's/^[[:space:]]*export BOOTCLASSPATH[[:space:]]*//p' "$candidate" | head -n1)"
     test -z "$bootclasspath" || break
   fi
