@@ -17,6 +17,11 @@ pub(crate) mod signal;
 #[cfg(test)]
 pub(crate) mod tests;
 
+// The crate root also has a `syscalls` module, so references such as
+// `syscalls::Sysno` resolve here rather than to the external dependency.
+// Re-export the external enum explicitly for raw syscall compatibility shims.
+pub(crate) use ::syscalls::Sysno;
+
 macro_rules! common_functions_for_file_status {
     () => {
         pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
