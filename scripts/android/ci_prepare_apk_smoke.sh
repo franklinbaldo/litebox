@@ -43,24 +43,26 @@ if ! simg2img "$system_img" "$raw"; then
 fi
 
 # Android SDK system images have existed both as a direct ext filesystem and
-# as a raw GPT disk image. debugfs needs the filesystem itself, not the outer
-# partition table. Prefer the direct form, otherwise extract an ext partition
-# using byte offsets reported by parted.
+# as a raw GPT disk image. debugfs unfortunately reports success even when it
+# sees a GPT header, so detect the disk label first instead of trusting its
+# process status.
 fs_image="$raw"
-if ! debugfs -R stats "$fs_image" >/dev/null 2>&1; then
+partition_table="$(parted -ms "$raw" unit B print 2>/dev/null || true)"
+disk_label="$(printf '%s\n' "$partition_table" | awk -F: 'NR == 2 { print $6 }')"
+if test "$disk_label" = "gpt" || test "$disk_label" = "msdos"; then
   partition="$(
-    parted -ms "$raw" unit B print 2>/dev/null \
+    printf '%s\n' "$partition_table" \
       | awk -F: '$1 ~ /^[0-9]+$/ && $5 ~ /^ext[234]$/ { print $2, $3; exit }'
   )"
   if test -z "$partition"; then
     partition="$(
-      parted -ms "$raw" unit B print 2>/dev/null \
+      printf '%s\n' "$partition_table" \
         | awk -F: '$1 ~ /^[0-9]+$/ { print $2, $3; exit }'
     )"
   fi
   if test -z "$partition"; then
-    echo "system.img is neither a direct ext filesystem nor a readable GPT disk" >&2
-    parted -ms "$raw" unit B print >&2 || true
+    echo "partitioned system.img contains no extractable partition" >&2
+    printf '%s\n' "$partition_table" >&2
     exit 1
   fi
 
@@ -78,18 +80,24 @@ start = int(sys.argv[3])
 end = int(sys.argv[4])
 remaining = end - start + 1
 if start < 0 or remaining <= 0:
-    raise SystemExit(f"invalid GPT partition byte range: {start}..{end}")
+    raise SystemExit(f"invalid partition byte range: {start}..{end}")
 
 with source.open("rb") as src, target.open("wb") as dst:
     src.seek(start)
     while remaining:
         chunk = src.read(min(8 * 1024 * 1024, remaining))
         if not chunk:
-            raise SystemExit("unexpected EOF while extracting GPT partition")
+            raise SystemExit("unexpected EOF while extracting system partition")
         dst.write(chunk)
         remaining -= len(chunk)
 PY
-  debugfs -R stats "$fs_image" >/dev/null
+fi
+
+# Validate that the selected/extracted object really is an ext filesystem.
+debugfs -R stats "$fs_image" 2>&1 | tee "$WORK/debugfs-stats.log"
+if grep -Eq 'Bad magic number|Filesystem not open|Found a .* partition table' "$WORK/debugfs-stats.log"; then
+  echo "selected system filesystem is not readable by debugfs" >&2
+  exit 1
 fi
 
 debugfs -R "rdump / $EXTRACTED" "$fs_image"
