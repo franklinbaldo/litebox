@@ -11,7 +11,7 @@ ROOT="$WORK/android-root"
 mkdir -p "$WORK" "$CACHE" "$EXTRACTED" "$ROOT"
 
 sudo apt-get update
-sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs zip
+sudo apt-get install -y android-sdk-libsparse-utils e2fsprogs parted zip
 SDKMANAGER="$(command -v sdkmanager || true)"
 if test -z "$SDKMANAGER"; then
   for candidate in \
@@ -37,8 +37,62 @@ cargo build --locked --release -p litebox_syscall_rewriter
 system_img="$(find "$ANDROID_HOME/system-images/android-$API" -name system.img -print -quit)"
 test -n "$system_img"
 raw="$WORK/system.raw.img"
-if ! simg2img "$system_img" "$raw"; then cp "$system_img" "$raw"; fi
-debugfs -R "rdump / $EXTRACTED" "$raw"
+rm -f "$raw"
+if ! simg2img "$system_img" "$raw"; then
+  cp "$system_img" "$raw"
+fi
+
+# Android SDK system images have existed both as a direct ext filesystem and
+# as a raw GPT disk image. debugfs needs the filesystem itself, not the outer
+# partition table. Prefer the direct form, otherwise extract an ext partition
+# using byte offsets reported by parted.
+fs_image="$raw"
+if ! debugfs -R stats "$fs_image" >/dev/null 2>&1; then
+  partition="$(
+    parted -ms "$raw" unit B print 2>/dev/null \
+      | awk -F: '$1 ~ /^[0-9]+$/ && $5 ~ /^ext[234]$/ { print $2, $3; exit }'
+  )"
+  if test -z "$partition"; then
+    partition="$(
+      parted -ms "$raw" unit B print 2>/dev/null \
+        | awk -F: '$1 ~ /^[0-9]+$/ { print $2, $3; exit }'
+    )"
+  fi
+  if test -z "$partition"; then
+    echo "system.img is neither a direct ext filesystem nor a readable GPT disk" >&2
+    parted -ms "$raw" unit B print >&2 || true
+    exit 1
+  fi
+
+  read -r start end <<< "$partition"
+  start="${start%B}"
+  end="${end%B}"
+  fs_image="$WORK/system.fs.img"
+  python - "$raw" "$fs_image" "$start" "$end" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+target = Path(sys.argv[2])
+start = int(sys.argv[3])
+end = int(sys.argv[4])
+remaining = end - start + 1
+if start < 0 or remaining <= 0:
+    raise SystemExit(f"invalid GPT partition byte range: {start}..{end}")
+
+with source.open("rb") as src, target.open("wb") as dst:
+    src.seek(start)
+    while remaining:
+        chunk = src.read(min(8 * 1024 * 1024, remaining))
+        if not chunk:
+            raise SystemExit("unexpected EOF while extracting GPT partition")
+        dst.write(chunk)
+        remaining -= len(chunk)
+PY
+  debugfs -R stats "$fs_image" >/dev/null
+fi
+
+debugfs -R "rdump / $EXTRACTED" "$fs_image"
 
 if test -f "$EXTRACTED/bin/dalvikvm64"; then
   mkdir -p "$ROOT/system"
