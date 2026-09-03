@@ -2,10 +2,11 @@
 """Mark an ELF as already inspected when the LiteBox rewriter finds no syscalls.
 
 The runtime rewriter uses a 32-byte LITEBOX0 trailer with trampoline_size=0 as
-an explicit "checked, nothing to patch" sentinel.  This helper invokes the
+an explicit "checked, nothing to patch" sentinel. This helper invokes the
 normal rewriter in a temporary file and accepts the result only when it is
-byte-for-byte the original input plus that sentinel.  If the rewriter would
-actually patch code, the original bytes are preserved instead.
+byte-for-byte the original input plus that sentinel. If the rewriter would
+actually patch code or cannot inspect the file, the original bytes are
+preserved instead.
 """
 
 from __future__ import annotations
@@ -29,12 +30,14 @@ def mark_if_syscall_free(path: Path, rewriter: Path) -> bool:
         candidate_path = Path(tmp.name)
 
     try:
-        subprocess.run(
+        result = subprocess.run(
             [str(rewriter), str(path), "--output", str(candidate_path)],
-            check=True,
+            check=False,
         )
-        candidate = candidate_path.read_bytes()
+        if result.returncode != 0:
+            return False
 
+        candidate = candidate_path.read_bytes()
         if len(candidate) != len(original) + HEADER_SIZE:
             return False
         if candidate[:-HEADER_SIZE] != original:
@@ -61,7 +64,7 @@ def main() -> int:
     args = parser.parse_args()
 
     marked = mark_if_syscall_free(args.input, args.rewriter)
-    state = "marked syscall-free" if marked else "preserved (rewrite required or not ELF code)"
+    state = "marked syscall-free" if marked else "preserved (rewrite required or unsupported)"
     print(f"{args.input}: {state}")
     return 0
 
