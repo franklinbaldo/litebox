@@ -101,16 +101,18 @@ if grep -Eq 'Bad magic number|Filesystem not open|Found a .* partition table' "$
 fi
 
 # Preserve Android ownership and mode bits exactly. Some metadata files are
-# intentionally unreadable to an ordinary user, so both extraction and the
-# full-tree copy must run privileged; changing ownership/modes would mutate
-# the guest filesystem semantics we are trying to exercise.
+# intentionally unreadable to an ordinary user, so extraction runs privileged;
+# changing ownership/modes would mutate the guest filesystem semantics.
 sudo debugfs -R "rdump / $EXTRACTED" "$fs_image"
 
 if test -f "$EXTRACTED/bin/dalvikvm64"; then
+  # Older images expose the system partition itself as the filesystem root.
   mkdir -p "$ROOT/system"
   sudo cp -a "$EXTRACTED/." "$ROOT/system/"
 elif test -f "$EXTRACTED/system/bin/dalvikvm64"; then
-  sudo cp -a "$EXTRACTED/." "$ROOT/"
+  # API 28's current SDK image already contains the /system directory. Use it
+  # directly instead of copying the complete multi-gigabyte extracted tree.
+  ROOT="$EXTRACTED"
 else
   echo "dalvikvm64 not found in Android image" >&2
   sudo find "$EXTRACTED" -maxdepth 4 -name 'dalvikvm*' -print >&2 || true
@@ -125,10 +127,59 @@ for candidate in "$EXTRACTED/init.environ.rc" "$ROOT/init.environ.rc" "$ROOT/sys
     test -z "$bootclasspath" || break
   fi
 done
+
+# init.environ.rc lives in the boot ramdisk on this SDK image, not system.img.
+# Reconstruct Pie's PRODUCT_BOOT_JARS order from the actual installed jars.
+# TARGET_CORE_JARS for this generation is the six-module prefix below; Pie then
+# appends framework/HIDL jars and one member of each compatibility pair.
 if test -z "$bootclasspath"; then
-  bootclasspath='/system/framework/core-oj.jar:/system/framework/core-libart.jar:/system/framework/conscrypt.jar:/system/framework/okhttp.jar:/system/framework/core-junit.jar:/system/framework/bouncycastle.jar:/system/framework/ext.jar:/system/framework/framework.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/apache-xml.jar:/system/framework/org.apache.http.legacy.boot.jar'
+  boot_paths=()
+  required_modules=(
+    core-oj
+    core-libart
+    conscrypt
+    okhttp
+    bouncycastle
+    apache-xml
+    ext
+    framework
+    telephony-common
+    voip-common
+    ims-common
+    android.hidl.base-V1.0-java
+    android.hidl.manager-V1.0-java
+  )
+  for module in "${required_modules[@]}"; do
+    guest="/system/framework/$module.jar"
+    if ! test -f "$ROOT/${guest#/}"; then
+      echo "Pie BOOTCLASSPATH module missing from image: $guest" >&2
+      exit 1
+    fi
+    boot_paths+=("$guest")
+  done
+
+  if test -f "$ROOT/system/framework/org.apache.http.legacy.boot.jar"; then
+    boot_paths+=(/system/framework/org.apache.http.legacy.boot.jar)
+  elif test -f "$ROOT/system/framework/framework-oahl-backward-compatibility.jar"; then
+    boot_paths+=(/system/framework/framework-oahl-backward-compatibility.jar)
+  else
+    echo "Pie BOOTCLASSPATH is missing both OAHL alternatives" >&2
+    exit 1
+  fi
+
+  if test -f "$ROOT/system/framework/android.test.base.jar"; then
+    boot_paths+=(/system/framework/android.test.base.jar)
+  elif test -f "$ROOT/system/framework/framework-atb-backward-compatibility.jar"; then
+    boot_paths+=(/system/framework/framework-atb-backward-compatibility.jar)
+  else
+    echo "Pie BOOTCLASSPATH is missing both android.test.base alternatives" >&2
+    exit 1
+  fi
+
+  bootclasspath="$(IFS=:; printf '%s' "${boot_paths[*]}")"
 fi
 printf '%s\n' "$bootclasspath" > "$CACHE/bootclasspath.txt"
+echo "BOOTCLASSPATH=$bootclasspath"
 
 apkout="$WORK/apk"
 mkdir -p "$apkout/classes" "$apkout/dex"
