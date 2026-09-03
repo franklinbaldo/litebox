@@ -587,6 +587,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         #[cfg(target_arch = "x86_64")]
         let syscall_number = ctx.orig_rax;
+
+        // LiteBox currently has no scheduler policy model. Android bionic queries
+        // these while creating threads; report SCHED_OTHER with static priority 0.
+        if syscall_number == syscalls::Sysno::sched_getscheduler as usize {
+            return Ok(0);
+        }
+        if syscall_number == syscalls::Sysno::sched_getparam as usize {
+            let param = UserPtrMut::<i32>::from_usize(ctx.syscall_arg(1));
+            return param
+                .write_at_offset::<Platform>(0, 0)
+                .ok_or(Errno::EFAULT)
+                .map(|()| 0);
+        }
+
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
 
         match request {
