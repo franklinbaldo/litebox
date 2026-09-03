@@ -264,6 +264,15 @@ pub fn sys_madvise<
             // No-op for now, as we don't support fork yet.
             Ok(())
         }
+        // Purely advisory hints about page size and read-ahead. The kernel is
+        // free to ignore them, and so are we: accepting them keeps runtimes
+        // that set them at startup (the Go runtime sets NoHugePage on its heap
+        // arenas) from being killed over advice we simply do not act on.
+        crate::MadviseBehavior::HugePage
+        | crate::MadviseBehavior::NoHugePage
+        | crate::MadviseBehavior::Random
+        | crate::MadviseBehavior::Sequential
+        | crate::MadviseBehavior::WillNeed => Ok(()),
         crate::MadviseBehavior::DontNeed => {
             // After a successful MADV_DONTNEED operation, the semantics of memory access in the specified region are changed:
             // subsequent accesses of pages in the range will succeed, but will result in either repopulating the memory contents
