@@ -112,14 +112,14 @@ jobs:
           $channel = (Select-String rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches.Groups[1].Value
           rustup toolchain install $channel --profile minimal --no-self-update --target x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      - name: Build Windows-userland runner
-        run: cargo build --locked --release -p litebox_runner_linux_on_windows_userland
+      - name: Build Windows-userland runner (dev)
+        run: cargo build --locked -p litebox_runner_linux_on_windows_userland
       - name: Execute real APK through ART
         shell: pwsh
         run: |
           $env:LITEBOX_LOG = "trace"
           $boot = (Get-Content .android-smoke-cache/bootclasspath.txt -Raw).Trim()
-          $output = & target/release/litebox_runner_linux_on_windows_userland.exe `
+          $output = & target/debug/litebox_runner_linux_on_windows_userland.exe `
             --initial-files .android-smoke-cache/android-apk-smoke.tar `
             --env ANDROID_DATA=/data `
             --env ANDROID_ROOT=/system `
