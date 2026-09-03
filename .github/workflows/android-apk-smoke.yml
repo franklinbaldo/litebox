@@ -112,6 +112,8 @@ jobs:
           $channel = (Select-String rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches.Groups[1].Value
           rustup toolchain install $channel --profile minimal --no-self-update --target x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
+      - name: Verify idempotent anonymous RW mprotect
+        run: cargo test --locked -p litebox_platform_windows_userland --test mprotect_rw_idempotent -- --nocapture
       - name: Build Windows-userland runner (dev)
         run: cargo build --locked -p litebox_runner_linux_on_windows_userland
       - name: Execute real APK through ART
