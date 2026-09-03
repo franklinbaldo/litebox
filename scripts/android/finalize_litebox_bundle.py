@@ -92,7 +92,7 @@ def main() -> int:
             rewritten.append("/" + guest_path)
 
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(args.output, "w") as dest:
+        with tarfile.open(args.output, "w", format=tarfile.GNU_FORMAT) as dest:
             for path in sorted(root.rglob("*")):
                 dest.add(path, arcname=path.relative_to(root), recursive=False)
 

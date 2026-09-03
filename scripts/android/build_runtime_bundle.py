@@ -112,7 +112,7 @@ def main() -> int:
                         pending.append(dep)
 
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(args.output, "w") as tf:
+        with tarfile.open(args.output, "w", format=tarfile.GNU_FORMAT) as tf:
             for path in sorted(staging.rglob("*")):
                 tf.add(path, arcname=path.relative_to(staging), recursive=False)
 

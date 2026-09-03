@@ -70,10 +70,10 @@ python scripts/android/finalize_litebox_bundle.py --input "$WORK/runtime-raw.tar
 # Boot images are compiled ART artifacts; preserve their bytes instead of
 # treating them as syscall-bearing native ELF libraries.
 if test -d "$ROOT/system/framework/x86_64"; then
-  tar --append --file "$WORK/runtime-litebox.tar" -C "$ROOT" system/framework/x86_64
+  tar --format=gnu --append --file "$WORK/runtime-litebox.tar" -C "$ROOT" system/framework/x86_64
 fi
 if test -d "$ROOT/system/usr/icu"; then
-  tar --append --file "$WORK/runtime-litebox.tar" -C "$ROOT" system/usr/icu
+  tar --format=gnu --append --file "$WORK/runtime-litebox.tar" -C "$ROOT" system/usr/icu
 fi
 
 python scripts/android/prepare_apk_probe.py --runtime-tar "$WORK/runtime-litebox.tar" --apk "$CACHE/litebox-smoke.apk" --output "$CACHE/android-apk-smoke.tar"

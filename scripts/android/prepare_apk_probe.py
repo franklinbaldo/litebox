@@ -44,7 +44,7 @@ def main() -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(args.apk, target)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(args.output, "w") as out:
+        with tarfile.open(args.output, "w", format=tarfile.GNU_FORMAT) as out:
             for path in sorted(root.rglob("*")):
                 out.add(path, arcname=path.relative_to(root), recursive=False)
 
