@@ -1,0 +1,366 @@
+diff --git a/src/video/dummy/SDL_nullframebuffer.c b/src/video/dummy/SDL_nullframebuffer.c
+index 879b774..11e3e2a 100644
+--- a/src/video/dummy/SDL_nullframebuffer.c
++++ b/src/video/dummy/SDL_nullframebuffer.c
+@@ -17,6 +17,11 @@
+   2. Altered source versions must be plainly marked as such, and must not be
+      misrepresented as being the original software.
+   3. This notice may not be removed or altered from any source distribution.
++
++  LiteBox experimental video backend derivation:
++  Derived from SDL dummy video driver by LiteBox contributors for
++  the desktop_fd_v1 video protocol (dedicated FDs 3/4).
++  Original author: Ryan C. Gordon / Sam Lantinga.
+ */
+ #include "../../SDL_internal.h"
+ 
+@@ -25,8 +30,128 @@
+ #include "../SDL_sysvideo.h"
+ #include "SDL_nullframebuffer_c.h"
+ 
++#include <unistd.h>
++#include <errno.h>
++#include <stdint.h>
++
++static int handshaken = 0;
++void SDL_LITEBOX_CloseChannel(void) { if (handshaken) { close(4); close(3); handshaken = 0; } }
+ #define DUMMY_SURFACE "_SDL_DummySurface"
+ 
++#define LB_EXPECTED_WIDTH   160
++#define LB_EXPECTED_HEIGHT  120
++#define LB_BYTES_PER_PIXEL  3
++#define LB_PIXELS_SIZE      (LB_EXPECTED_WIDTH * LB_EXPECTED_HEIGHT * LB_BYTES_PER_PIXEL)
++#define LB_BODY_LEN         (8 + LB_PIXELS_SIZE)
++#define LB_TOTAL_FRAME_LEN  (4 + LB_BODY_LEN)
++
++#define LB_HS_VERSION       1
++#define LB_HS_MAX_MESSAGE   1048576U
++#define LB_HS_FLAGS         0
++
++static int lb_write_exact(int fd, const void *buf, size_t count)
++{
++    const uint8_t *p = (const uint8_t *)buf;
++    size_t left = count;
++    while (left > 0) {
++        ssize_t n = write(fd, p, left);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (n == 0) {
++            return -1;
++        }
++        p += n;
++        left -= (size_t)n;
++    }
++    return 0;
++}
++
++static int lb_read_exact(int fd, void *buf, size_t count)
++{
++    uint8_t *p = (uint8_t *)buf;
++    size_t left = count;
++    while (left > 0) {
++        ssize_t n = read(fd, p, left);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (n == 0) {
++            return -1;
++        }
++        p += n;
++        left -= (size_t)n;
++    }
++    return 0;
++}
++
++static int lb_perform_handshake(void)
++{
++    uint8_t guest_hs[12];
++    uint8_t host_hs[12];
++    uint16_t host_version;
++    uint32_t host_max_message;
++    uint32_t negotiated_max;
++
++    /* Guest handshake (12 bytes):
++     * [0..3]:   "LBDF" (ASCII)
++     * [4..5]:   u16LE version (1)
++     * [6..9]:   u32LE max_message (1048576)
++     * [10..11]: u16LE flags (0)
++     */
++    guest_hs[0] = 'L';
++    guest_hs[1] = 'B';
++    guest_hs[2] = 'D';
++    guest_hs[3] = 'F';
++    guest_hs[4] = (uint8_t)(LB_HS_VERSION & 0xFF);
++    guest_hs[5] = (uint8_t)((LB_HS_VERSION >> 8) & 0xFF);
++    guest_hs[6] = (uint8_t)(LB_HS_MAX_MESSAGE & 0xFF);
++    guest_hs[7] = (uint8_t)((LB_HS_MAX_MESSAGE >> 8) & 0xFF);
++    guest_hs[8] = (uint8_t)((LB_HS_MAX_MESSAGE >> 16) & 0xFF);
++    guest_hs[9] = (uint8_t)((LB_HS_MAX_MESSAGE >> 24) & 0xFF);
++    guest_hs[10] = (uint8_t)(LB_HS_FLAGS & 0xFF);
++    guest_hs[11] = (uint8_t)((LB_HS_FLAGS >> 8) & 0xFF);
++
++    if (lb_write_exact(4, guest_hs, sizeof(guest_hs)) < 0) {
++        return SDL_SetError("LiteBox video: failed to write 12-byte handshake to FD 4");
++    }
++
++    if (lb_read_exact(3, host_hs, sizeof(host_hs)) < 0) {
++        return SDL_SetError("LiteBox video: failed to read 12-byte handshake from FD 3");
++    }
++
++    if (host_hs[0] != 'L' || host_hs[1] != 'B' || host_hs[2] != 'D' || host_hs[3] != 'F') {
++        return SDL_SetError("LiteBox video: invalid host handshake magic");
++    }
++
++    host_version = (uint16_t)host_hs[4] | ((uint16_t)host_hs[5] << 8);
++    if (host_version != LB_HS_VERSION) {
++        return SDL_SetError("LiteBox video: unsupported host version %u", (unsigned int)host_version);
++    }
++
++    host_max_message = (uint32_t)host_hs[6]
++                     | ((uint32_t)host_hs[7] << 8)
++                     | ((uint32_t)host_hs[8] << 16)
++                     | ((uint32_t)host_hs[9] << 24);
++    if (host_max_message == 0) {
++        return SDL_SetError("LiteBox video: host max_message is 0");
++    }
++
++    negotiated_max = (LB_HS_MAX_MESSAGE < host_max_message) ? LB_HS_MAX_MESSAGE : host_max_message;
++    if (negotiated_max < LB_BODY_LEN) {
++        return SDL_SetError("LiteBox video: negotiated max_message %u too small for frame body %u",
++                            (unsigned int)negotiated_max, (unsigned int)LB_BODY_LEN);
++    }
++
++    return 0;
++}
++
+ int SDL_DUMMY_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format, void **pixels, int *pitch)
+ {
+     SDL_Surface *surface;
+@@ -36,8 +161,14 @@ int SDL_DUMMY_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
+     /* Free the old framebuffer surface */
+     SDL_DUMMY_DestroyWindowFramebuffer(_this, window);
+ 
+-    /* Create a new one */
++    /* Validate dimensions strictly for this probe */
+     SDL_GetWindowSizeInPixels(window, &w, &h);
++    if (w != LB_EXPECTED_WIDTH || h != LB_EXPECTED_HEIGHT) {
++        return SDL_SetError("LiteBox video: unsupported window dimensions %dx%d (expected %dx%d)",
++                            w, h, LB_EXPECTED_WIDTH, LB_EXPECTED_HEIGHT);
++    }
++
++    /* Create a new surface */
+     surface = SDL_CreateRGBSurfaceWithFormat(0, w, h, 0, surface_format);
+     if (!surface) {
+         return -1;
+@@ -53,21 +184,83 @@ int SDL_DUMMY_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
+ 
+ int SDL_DUMMY_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL_Rect *rects, int numrects)
+ {
+-    static int frame_number;
++    /* handshake state belongs to this single-session probe backend */
++    static uint8_t frame_pkt[LB_TOTAL_FRAME_LEN];
+     SDL_Surface *surface;
++    SDL_Surface *rgb24_surface;
++    const uint8_t *src_row;
++    uint8_t *dst_row;
++    int y;
++
++    (void)_this;
++    (void)rects;
++    (void)numrects;
+ 
+     surface = (SDL_Surface *)SDL_GetWindowData(window, DUMMY_SURFACE);
+     if (!surface) {
+-        return SDL_SetError("Couldn't find dummy surface for window");
++        return SDL_SetError("LiteBox video: couldn't find dummy surface for window");
+     }
+ 
+-    /* Send the data to the display */
+-    if (SDL_getenv("SDL_VIDEO_DUMMY_SAVE_FRAMES")) {
+-        char file[128];
+-        (void)SDL_snprintf(file, sizeof(file), "SDL_window%" SDL_PRIu32 "-%8.8d.bmp",
+-                           SDL_GetWindowID(window), ++frame_number);
+-        SDL_SaveBMP(surface, file);
++    if (surface->w != LB_EXPECTED_WIDTH || surface->h != LB_EXPECTED_HEIGHT) {
++        return SDL_SetError("LiteBox video: unsupported surface dimensions %dx%d (expected %dx%d)",
++                            surface->w, surface->h, LB_EXPECTED_WIDTH, LB_EXPECTED_HEIGHT);
+     }
++
++    if (!handshaken) {
++        if (lb_perform_handshake() < 0) {
++            return -1;
++        }
++        handshaken = 1;
++    }
++
++    rgb24_surface = SDL_ConvertSurfaceFormat(surface, SDL_PIXELFORMAT_RGB24, 0);
++    if (!rgb24_surface) {
++        return SDL_SetError("LiteBox video: SDL_ConvertSurfaceFormat failed: %s", SDL_GetError());
++    }
++
++    if (rgb24_surface->w != LB_EXPECTED_WIDTH || rgb24_surface->h != LB_EXPECTED_HEIGHT) {
++        SDL_FreeSurface(rgb24_surface);
++        return SDL_SetError("LiteBox video: converted surface dimension mismatch");
++    }
++
++    /* Message format:
++     * Header (4 bytes): u32LE body_length = 8 + 160*120*3 = 57608
++     * Body:
++     *   [4..7]:   ASCII "FRAM"
++     *   [8..9]:   u16LE width (160)
++     *   [10..11]: u16LE height (120)
++     *   [12..]:   packed RGB24 pixels
++     */
++    frame_pkt[0] = (uint8_t)(LB_BODY_LEN & 0xFF);
++    frame_pkt[1] = (uint8_t)((LB_BODY_LEN >> 8) & 0xFF);
++    frame_pkt[2] = (uint8_t)((LB_BODY_LEN >> 16) & 0xFF);
++    frame_pkt[3] = (uint8_t)((LB_BODY_LEN >> 24) & 0xFF);
++
++    frame_pkt[4] = 'F';
++    frame_pkt[5] = 'R';
++    frame_pkt[6] = 'A';
++    frame_pkt[7] = 'M';
++
++    frame_pkt[8] = (uint8_t)(LB_EXPECTED_WIDTH & 0xFF);
++    frame_pkt[9] = (uint8_t)((LB_EXPECTED_WIDTH >> 8) & 0xFF);
++
++    frame_pkt[10] = (uint8_t)(LB_EXPECTED_HEIGHT & 0xFF);
++    frame_pkt[11] = (uint8_t)((LB_EXPECTED_HEIGHT >> 8) & 0xFF);
++
++    src_row = (const uint8_t *)rgb24_surface->pixels;
++    dst_row = &frame_pkt[12];
++    for (y = 0; y < LB_EXPECTED_HEIGHT; ++y) {
++        SDL_memcpy(dst_row, src_row, LB_EXPECTED_WIDTH * LB_BYTES_PER_PIXEL);
++        src_row += rgb24_surface->pitch;
++        dst_row += LB_EXPECTED_WIDTH * LB_BYTES_PER_PIXEL;
++    }
++
++    SDL_FreeSurface(rgb24_surface);
++
++    if (lb_write_exact(4, frame_pkt, sizeof(frame_pkt)) < 0) {
++        return SDL_SetError("LiteBox video: failed to write frame to FD 4");
++    }
++
+     return 0;
+ }
+ 
+@@ -76,7 +269,9 @@ void SDL_DUMMY_DestroyWindowFramebuffer(_THIS, SDL_Window *window)
+     SDL_Surface *surface;
+ 
+     surface = (SDL_Surface *)SDL_SetWindowData(window, DUMMY_SURFACE, NULL);
+-    SDL_FreeSurface(surface);
++    if (surface) {
++        SDL_FreeSurface(surface);
++    }
+ }
+ 
+ #endif /* SDL_VIDEO_DRIVER_DUMMY */
+diff --git a/src/video/dummy/SDL_nullvideo.c b/src/video/dummy/SDL_nullvideo.c
+index b5c60bb..39d7fc9 100644
+--- a/src/video/dummy/SDL_nullvideo.c
++++ b/src/video/dummy/SDL_nullvideo.c
+@@ -17,24 +17,21 @@
+   2. Altered source versions must be plainly marked as such, and must not be
+      misrepresented as being the original software.
+   3. This notice may not be removed or altered from any source distribution.
++
++  LiteBox experimental video backend derivation:
++  Derived from SDL dummy video driver by LiteBox contributors for
++  the desktop_fd_v1 video protocol (dedicated FDs 3/4).
++  Original author: Ryan C. Gordon / Sam Lantinga.
+ */
+ #include "../../SDL_internal.h"
+ 
+ #ifdef SDL_VIDEO_DRIVER_DUMMY
+ 
+-/* Dummy SDL video driver implementation; this is just enough to make an
+- *  SDL-based application THINK it's got a working video driver, for
+- *  applications that call SDL_Init(SDL_INIT_VIDEO) when they don't need it,
+- *  and also for use as a collection of stubs when porting SDL to a new
+- *  platform for which you haven't yet written a valid video driver.
++/* LiteBox experimental SDL video driver implementation; derived from
++ * the dummy SDL video driver to deliver framebuffers over dedicated FDs.
+  *
+- * This is also a great way to determine bottlenecks: if you think that SDL
+- *  is a performance problem for a given platform, enable this driver, and
+- *  then see if your application runs faster without video overhead.
+- *
+- * Initial work by Ryan C. Gordon (icculus@icculus.org). A good portion
+- *  of this was cut-and-pasted from Stephane Peter's work in the AAlib
+- *  SDL video driver.  Renamed to "DUMMY" by Sam Lantinga.
++ * Initial work by Ryan C. Gordon (icculus@icculus.org).
++ * Adapted for LiteBox desktop_fd_v1 by LiteBox contributors.
+  */
+ 
+ #include "SDL_video.h"
+@@ -48,7 +45,7 @@
+ #include "SDL_nullframebuffer_c.h"
+ #include "SDL_hints.h"
+ 
+-#define DUMMYVID_DRIVER_NAME       "dummy"
++#define DUMMYVID_DRIVER_NAME       "litebox"
+ #define DUMMYVID_DRIVER_EVDEV_NAME "evdev"
+ 
+ /* Initialization/Query functions */
+@@ -66,7 +63,7 @@ static int DUMMY_Available(void)
+ {
+     const char *envr = SDL_GetHint(SDL_HINT_VIDEODRIVER);
+     if (envr) {
+-        if (SDL_strcmp(envr, DUMMYVID_DRIVER_NAME) == 0) {
++        if (SDL_strcmp(envr, DUMMYVID_DRIVER_NAME) == 0 || SDL_strcmp(envr, "dummy") == 0) {
+             return 1;
+         }
+ #ifdef SDL_INPUT_LINUXEV
+@@ -75,8 +72,9 @@ static int DUMMY_Available(void)
+             return 1;
+         }
+ #endif
++        return 0;
+     }
+-    return 0;
++    return 1;
+ }
+ 
+ static void DUMMY_DeleteDevice(SDL_VideoDevice *device)
+@@ -119,7 +117,7 @@ static SDL_VideoDevice *DUMMY_CreateDevice(void)
+ }
+ 
+ VideoBootStrap DUMMY_bootstrap = {
+-    DUMMYVID_DRIVER_NAME, "SDL dummy video driver",
++    DUMMYVID_DRIVER_NAME, "LiteBox experimental video driver",
+     DUMMY_CreateDevice,
+     NULL /* no ShowMessageBox implementation */
+ };
+@@ -144,11 +142,11 @@ int DUMMY_VideoInit(_THIS)
+ {
+     SDL_DisplayMode mode;
+ 
+-    /* Use a fake 32-bpp desktop mode */
++    /* Use LiteBox 160x120 mode */
+     SDL_zero(mode);
+     mode.format = SDL_PIXELFORMAT_RGB888;
+-    mode.w = 1024;
+-    mode.h = 768;
++    mode.w = 160;
++    mode.h = 120;
+     mode.refresh_rate = 60;
+     mode.driverdata = NULL;
+     if (SDL_AddBasicVideoDisplay(&mode) < 0) {
+@@ -165,8 +163,10 @@ int DUMMY_VideoInit(_THIS)
+     return 0;
+ }
+ 
++void SDL_LITEBOX_CloseChannel(void);
+ void DUMMY_VideoQuit(_THIS)
+ {
++    SDL_LITEBOX_CloseChannel();
+ #ifdef SDL_INPUT_LINUXEV
+     SDL_EVDEV_Quit();
+ #endif

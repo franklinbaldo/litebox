@@ -1564,6 +1564,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_desktop_host"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "litebox_desktop_transport"
+version = "0.1.0"
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
@@ -1665,10 +1676,13 @@ dependencies = [
  "clap",
  "litebox",
  "litebox_common_linux",
+ "litebox_desktop_host",
+ "litebox_desktop_transport",
  "litebox_platform_windows_userland",
  "litebox_shim_linux",
  "litebox_util_log",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

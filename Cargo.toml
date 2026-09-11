@@ -1,7 +1,8 @@
 [workspace]
 resolver = "2"
+exclude = ["tools/litebox_desktop_transport", "tools/litebox_desktop_host"]
 members = [
-    "litebox", 
+    "litebox",
     "litebox_common_linux",
     "litebox_common_optee",
     "litebox_common_lvbs",

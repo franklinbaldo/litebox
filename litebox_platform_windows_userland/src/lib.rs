@@ -1901,13 +1901,21 @@ impl litebox::platform::StdioProvider for WindowsUserland {
         use std::io::Write as _;
         match stream {
             litebox::platform::StdioOutStream::Stdout => {
-                std::io::stdout().write(buf).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        litebox::platform::StdioWriteError::Closed
-                    } else {
-                        panic!("unhandled error {err}")
-                    }
-                })
+                // Rust stdout is line-buffered even when redirected. A guest may
+                // send a binary packet and wait for a reply without a newline.
+                let mut out = std::io::stdout().lock();
+                out.write(buf)
+                    .and_then(|written| {
+                        out.flush()?;
+                        Ok(written)
+                    })
+                    .map_err(|err| {
+                        if err.kind() == std::io::ErrorKind::BrokenPipe {
+                            litebox::platform::StdioWriteError::Closed
+                        } else {
+                            panic!("unhandled error {err}")
+                        }
+                    })
             }
             litebox::platform::StdioOutStream::Stderr => {
                 std::io::stderr().write(buf).map_err(|err| {
@@ -1933,7 +1941,10 @@ impl litebox::platform::StdioProvider for WindowsUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
+// Toolchain and game guests can contain large ELF/TAR payloads. Keep the
+// buddy allocator's maximum individual allocation at 512 MiB so a compact
+// compiler rootfs can be loaded without tripping the old 128 MiB ceiling.
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 30, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {

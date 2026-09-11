@@ -1,0 +1,56 @@
+diff --git a/src/video/dummy/SDL_nullevents.c b/src/video/dummy/SDL_nullevents.c
+index c961d19..c84d33f 100644
+--- a/src/video/dummy/SDL_nullevents.c
++++ b/src/video/dummy/SDL_nullevents.c
+@@ -29,10 +29,50 @@
+ 
+ #include "SDL_nullvideo.h"
+ #include "SDL_nullevents_c.h"
++#include "../../events/SDL_keyboard_c.h"
++#include <poll.h>
++#include <unistd.h>
++#include <errno.h>
+ 
+ void DUMMY_PumpEvents(_THIS)
+ {
+-    /* do nothing. */
++    /* LiteBox experimental input adapter: bounded, incremental framed input.
++       This changes the upstream dummy driver; only the single-session fixture
++       owns FD 3. Never block SDL event pumping on an incomplete message. */
++    static unsigned char packet[12];
++    static size_t used;
++    static int failed;
++    int batch;
++    if (failed) return;
++    if (!SDL_GetKeyboardFocus() && _this->windows) SDL_SetKeyboardFocus(_this->windows);
++    for (batch=0; batch<64; ++batch) {
++        struct pollfd p = {3,POLLIN,0};
++        int ready=poll(&p,1,0);
++        ssize_t n;
++        if (ready<0 && errno==EINTR) continue;
++        if (ready==0) return;
++        if (ready<0) { SDL_SetError("LiteBox input poll failed"); failed=1; SDL_ResetKeyboard(); return; }
++        n=read(3,packet+used,sizeof(packet)-used);
++        if(n<0 && errno==EINTR) continue;
++        if(n<=0) { SDL_SetError("LiteBox input channel closed"); failed=1; SDL_ResetKeyboard(); return; }
++        used+=(size_t)n;
++        if(used<sizeof(packet)) continue;
++        used=0;
++        if(packet[0]!=8 || packet[1] || packet[2] || packet[3]) {
++            SDL_SetError("LiteBox invalid input frame length"); failed=1; SDL_ResetKeyboard(); return;
++        }
++        if(!SDL_memcmp(packet+4,"KEY0",4)) {
++            unsigned int scan=packet[8] | ((unsigned int)packet[9]<<8);
++            if(scan==0 || scan>=SDL_NUM_SCANCODES || packet[10]>1 || packet[11]) {
++                SDL_SetError("LiteBox invalid keyboard event"); failed=1; SDL_ResetKeyboard(); return;
++            }
++            SDL_SendKeyboardKey(packet[10]?SDL_PRESSED:SDL_RELEASED,(SDL_Scancode)scan);
++        } else if(!SDL_memcmp(packet+4,"FOC0",4) && !packet[8] && !packet[9] && !packet[10] && !packet[11]) {
++            SDL_ResetKeyboard();
++        } else {
++            SDL_SetError("LiteBox unsupported input event"); failed=1; SDL_ResetKeyboard(); return;
++        }
++    }
+ }
+ 
+ #endif /* SDL_VIDEO_DRIVER_DUMMY */

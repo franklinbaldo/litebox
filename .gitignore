@@ -197,3 +197,10 @@ dev_bench/unixbench/*.zip
 ### Direnv ###
 .direnv
 .envrc
+
+# Local desktop experiments and validation artifacts
+/AGY*_RESULT.md
+/examples/sdl_probe/*.elf
+/examples/sdl_probe/*.hooked
+/examples/sdl_probe/*.tar
+/litebox_runner_linux_on_windows_userland/tests/test-bins/*.hooked

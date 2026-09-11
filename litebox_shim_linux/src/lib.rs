@@ -45,6 +45,7 @@ macro_rules! log_unsupported {
 }
 
 pub(crate) mod channel;
+pub mod host_pipe;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
