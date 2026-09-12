@@ -1,0 +1,7 @@
+--- litebox_runner_linux_on_windows_userland/examples/sdl_video_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/sdl_video_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::PIXELS;
+ use litebox_platform_windows_userland::WindowsUserland;
+ use litebox_shim_linux::linux_userland::HostWriter;
