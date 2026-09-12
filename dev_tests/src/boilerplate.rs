@@ -32,45 +32,33 @@ fn is_pr38_added_file(path: &std::path::Path) -> bool {
             .any(|exact| normalized == *exact)
 }
 
+fn extract_header_parts<'a>(text: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let rest = text.strip_prefix(prefix)?;
+    rest.split_once('\n')
+}
+
 fn is_valid_contributor_header(ext: &str, text: &str) -> bool {
-    match ext {
-        "rs" | "c" | "h" | "js" => {
-            if let Some(rest) = text.strip_prefix("// Copyright (c) ") {
-                if let Some((holder, after_holder)) = rest.split_once('\n') {
-                    let trimmed = holder.trim().trim_end_matches('.');
-                    if trimmed == "franklinbaldo"
-                        && after_holder.starts_with("// Licensed under the MIT license.\n\n")
-                    {
-                        return true;
-                    }
-                }
-            }
+    let (prefix, required_license_suffix) = match ext {
+        "rs" | "c" | "h" | "js" => (
+            "// Copyright (c) ",
+            "// Licensed under the MIT license.\n\n",
+        ),
+        "py" => (
+            "#!/usr/bin/env python3\n\n# Copyright (c) ",
+            "# Licensed under the MIT license.\n",
+        ),
+        "sh" => (
+            "#! /bin/bash\n\n# Copyright (c) ",
+            "# Licensed under the MIT license.\n\n",
+        ),
+        _ => return false,
+    };
+
+    if let Some((holder, after_holder)) = extract_header_parts(text, prefix) {
+        let trimmed = holder.trim().trim_end_matches('.');
+        if trimmed == "franklinbaldo" && after_holder.starts_with(required_license_suffix) {
+            return true;
         }
-        "py" => {
-            if let Some(rest) = text.strip_prefix("#!/usr/bin/env python3\n\n# Copyright (c) ") {
-                if let Some((holder, after_holder)) = rest.split_once('\n') {
-                    let trimmed = holder.trim().trim_end_matches('.');
-                    if trimmed == "franklinbaldo"
-                        && after_holder.starts_with("# Licensed under the MIT license.\n")
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        "sh" => {
-            if let Some(rest) = text.strip_prefix("#! /bin/bash\n\n# Copyright (c) ") {
-                if let Some((holder, after_holder)) = rest.split_once('\n') {
-                    let trimmed = holder.trim().trim_end_matches('.');
-                    if trimmed == "franklinbaldo"
-                        && after_holder.starts_with("# Licensed under the MIT license.\n\n")
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        _ => {}
     }
     false
 }
