@@ -1,4 +1,3 @@
-#![cfg(windows)]
 use litebox_desktop_host::WinMMAudio;
 pub const EXPECTED_RATE: u32 = 22050;
 pub const EXPECTED_CHANNELS: u16 = 1;
@@ -278,9 +277,10 @@ pub struct AudioStats {
 }
 
 fn main() -> anyhow::Result<()> {
+
     let tar_path = std::env::args_os().nth(1).expect("combined probe TAR path");
     let output = std::env::args_os().nth(2).expect("received frame PPM path");
-    let platform = WindowsUserland::new();
+        let platform = WindowsUserland::new();
     let builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
     let fs = builder.default_fs(
         litebox::fs::in_mem::InMem::new_initialized::<&str>([]),
@@ -480,6 +480,7 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
 
 #[cfg(not(windows))]
 fn main() {}

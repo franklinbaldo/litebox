@@ -1,0 +1,13 @@
+--- litebox_runner_linux_on_windows_userland/examples/desktop_pipe_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/desktop_pipe_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::{BreakoutHost, BreakoutServer};
+ use litebox_platform_windows_userland::WindowsUserland;
+--- litebox_runner_linux_on_windows_userland/examples/sdl_audio_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/sdl_audio_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::audio::WinMMAudio;
+ use litebox_desktop_host::EXPECTED_BITS;
+ use litebox_desktop_host::EXPECTED_CHANNELS;

@@ -1,0 +1,27 @@
+--- litebox_runner_linux_on_windows_userland/examples/desktop_pipe_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/desktop_pipe_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::{BreakoutHost, BreakoutServer};
+ use litebox_platform_windows_userland::WindowsUserland;
+--- litebox_runner_linux_on_windows_userland/examples/sdl_audio_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/sdl_audio_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::audio::WinMMAudio;
+ use litebox_desktop_host::EXPECTED_BITS;
+ use litebox_desktop_host::EXPECTED_CHANNELS;
+--- litebox_runner_linux_on_windows_userland/examples/sdl_video_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/sdl_video_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::PIXELS;
+ use litebox_platform_windows_userland::WindowsUserland;
+ use litebox_shim_linux::linux_userland::HostWriter;
+--- litebox_runner_linux_on_windows_userland/examples/sdl_combined_probe.rs
++++ litebox_runner_linux_on_windows_userland/examples/sdl_combined_probe.rs
+@@ -1,3 +1,4 @@
++#![cfg(windows)]
+ use litebox_desktop_host::{
+     WinMMAudio, EXPECTED_RATE, EXPECTED_CHANNELS, EXPECTED_BITS, MAX_PCM_BYTES,
+     PIXELS, WIDTH, HEIGHT,
