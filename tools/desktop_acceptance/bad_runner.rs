@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Deliberately invalid child used to verify the host's failure paths.
 use std::io::Write;
 

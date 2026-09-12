@@ -1,4 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
 """
 host.py - Windows Host Bridge (Display, Audio, Input) for Linux Game in LiteBox.
 

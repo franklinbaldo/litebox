@@ -1,4 +1,7 @@
-﻿/*
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
+/*
  * LiteBox Real Video Backend Probe
  *
  * This application creates a 160x120 window and renders 3 distinct frames

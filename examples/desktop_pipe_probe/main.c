@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 /* Test fixture only: Linux syscalls over dedicated guest descriptors. */
 #include <unistd.h>
 #include <stdint.h>

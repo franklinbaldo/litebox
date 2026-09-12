@@ -1,4 +1,7 @@
-﻿<#
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
+<#
 .SYNOPSIS
     Script de inicialização do Breakout Linux no LiteBox Windows Userland.
     Resolve caminhos relativos automaticamente, compila artefatos caso ausentes e inicia o jogo sem privilégios de administrador.

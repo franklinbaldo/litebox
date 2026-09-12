@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! LiteBox Desktop Host library.
 //!
 //! Provides reusable host components such as WinMM audio and desktop protocol.

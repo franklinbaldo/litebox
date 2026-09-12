@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
 """
 build_audio.py - Builds the experimental LiteBox audio probe with dedicated FDs (5/6).
 Reuses functions and configuration from examples/sdl_probe/build.py.

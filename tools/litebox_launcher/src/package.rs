@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::os::windows::fs::MetadataExt;

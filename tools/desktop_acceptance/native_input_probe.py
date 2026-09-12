@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Exercise native Breakout input, focus loss and window close on Windows.
 
 Development-only dependencies: Pillow. Captures only the test host's window.

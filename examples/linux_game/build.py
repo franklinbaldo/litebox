@@ -1,4 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
 """
 build.py - Builds the Linux game for LiteBox on Windows.
 Steps:

@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Run the SDL video integration with a process-wide timeout and captured logs."""
 import argparse
 import os

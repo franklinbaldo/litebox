@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Build SDL keyboard fixture using the verified video build and an input patch."""
 import os
 import json

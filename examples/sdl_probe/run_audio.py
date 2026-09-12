@@ -1,4 +1,7 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
 """
 run_audio.py - Integration harness for SDL2 Linux on Windows Userland Audio Probe.
 

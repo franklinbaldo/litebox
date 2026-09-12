@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 use crate::package::{no_reparse, Result};
 use std::os::windows::ffi::OsStrExt;
 use std::{

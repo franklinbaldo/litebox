@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! LiteBox Native Desktop Host (Rust/Win32)
 //!
 //! Windows-native replacement for host.py. Launches the LiteBox runner with a guest ELF TAR
@@ -53,10 +56,6 @@ const KEY_LEFT: u8 = 1;
 const KEY_RIGHT: u8 = 2;
 const KEY_SPACE: u8 = 3;
 
-// --- Atomic key state (shared between WndProc and input writer thread) -----
-/// Bitmask: bit 0=left, bit 1=right, bit 2=space
-static DESIRED_KEYS: AtomicU8 = AtomicU8::new(0);
-
 // --- Shared state accessed from multiple threads ----------------------------
 struct FrameBuffer {
     rgb: Vec<u8>,
@@ -77,6 +76,8 @@ struct AppState {
     guest_exit_code: Mutex<Option<i32>>,
     /// stdin write queue: sequences of bytes to send
     stdin_queue: Mutex<Vec<Vec<u8>>>,
+    /// Bitmask: bit 0=left, bit 1=right, bit 2=space
+    desired_keys: AtomicU8,
 }
 
 fn queue_key(state: &AppState, packet: Vec<u8>) {
@@ -107,10 +108,10 @@ unsafe extern "system" fn window_proc(
         WM_ERASEBKGND => 1, // Prevent background flicker
         WM_KILLFOCUS => {
             // Clear all desired keys on focus loss (handled in WndProc, not just PeekMessage)
-            DESIRED_KEYS.store(0, Ordering::Relaxed);
-            // Queue KEYR for any pressed keys
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
+                state.desired_keys.store(0, Ordering::Relaxed);
+                // Queue KEYR for any pressed keys
                 for key in [KEY_LEFT, KEY_RIGHT, KEY_SPACE] {
                     queue_key(state, vec![b'K', b'E', b'Y', b'R', key]);
                 }
@@ -133,11 +134,11 @@ unsafe extern "system" fn window_proc(
                 _ => None,
             };
             if let Some((mask, code)) = bit {
-                let old = DESIRED_KEYS.fetch_or(mask, Ordering::Relaxed);
-                if old & mask == 0 {
-                    // Rising edge: enqueue KEYP
-                    if !state_ptr.is_null() {
-                        let state = &*state_ptr;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+                    let old = state.desired_keys.fetch_or(mask, Ordering::Relaxed);
+                    if old & mask == 0 {
+                        // Rising edge: enqueue KEYP
                         queue_key(state, vec![b'K', b'E', b'Y', b'P', code]);
                     }
                 }
@@ -153,11 +154,11 @@ unsafe extern "system" fn window_proc(
                 _ => None,
             };
             if let Some((mask, code)) = bit {
-                let old = DESIRED_KEYS.fetch_and(!mask, Ordering::Relaxed);
-                if old & mask != 0 {
-                    // Falling edge: enqueue KEYR
-                    if !state_ptr.is_null() {
-                        let state = &*state_ptr;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+                    let old = state.desired_keys.fetch_and(!mask, Ordering::Relaxed);
+                    if old & mask != 0 {
+                        // Falling edge: enqueue KEYR
                         queue_key(state, vec![b'K', b'E', b'Y', b'R', code]);
                     }
                 }
@@ -302,6 +303,7 @@ fn main() {
         guest_exit_unexpected: AtomicBool::new(false),
         guest_exit_code: Mutex::new(None),
         stdin_queue: Mutex::new(Vec::new()),
+        desired_keys: AtomicU8::new(0),
     });
 
     // Spawn runner with CREATE_NO_WINDOW to suppress its console

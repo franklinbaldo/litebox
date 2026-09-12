@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Build externally with the Breakout toolchain; run a bounded real-guest probe."""
 from pathlib import Path
 import subprocess

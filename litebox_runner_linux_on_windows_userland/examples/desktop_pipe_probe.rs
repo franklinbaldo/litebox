@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Real ELF guest exercising dedicated pipes, independently of standard streams.
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

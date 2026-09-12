@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Native per-user package lifecycle. Runtime support is checked separately.
 mod package;
 mod shell;

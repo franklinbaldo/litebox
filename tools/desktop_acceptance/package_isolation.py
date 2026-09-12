@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Installer integration test with inert fixtures, never launched as games.
 
 All writes stay in a newly allocated target/ directory. Tests package lifecycle,

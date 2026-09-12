@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 #include <SDL2/SDL.h>
 #include <stdio.h>
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
 """
 build_video.py - Builds the experimental LiteBox video probe with dedicated FDs (3/4).
 Reuses functions and configuration from examples/sdl_probe/build.py.

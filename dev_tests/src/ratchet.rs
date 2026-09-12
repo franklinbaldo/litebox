@@ -106,7 +106,7 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
         for (prefix, _) in expected {
             if !all_rs_files
                 .iter()
-                .any(|p| p.to_string_lossy().starts_with(prefix))
+                .any(|p| p.to_string_lossy().replace('\\', "/").starts_with(prefix))
             {
                 errors.push(format!(
                     "The prefix '{prefix}' does not match any file. Please make sure all prefixes match at least one file."
@@ -115,7 +115,7 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
         }
     }
     for p in &all_rs_files {
-        let file_name = p.to_string_lossy();
+        let file_name = p.to_string_lossy().replace('\\', "/");
         if !expected
             .iter()
             .any(|(prefix, _)| file_name.starts_with(prefix))
@@ -130,7 +130,7 @@ fn ratchet(expected: &[(&str, usize)], f: impl Fn(BufReader<File>) -> Result<usi
     for (prefix, expected_count) in expected {
         let count = all_rs_files
             .iter()
-            .filter(|p| p.to_string_lossy().starts_with(prefix))
+            .filter(|p| p.to_string_lossy().replace('\\', "/").starts_with(prefix))
             .map(|p| BufReader::new(File::open(p).unwrap()))
             .map(&f)
             .sum::<Result<usize>>()?;

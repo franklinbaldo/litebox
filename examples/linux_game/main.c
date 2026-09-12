@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 /*
  * Breakout Linux Guest Game for LiteBox on Windows Userland.
  *

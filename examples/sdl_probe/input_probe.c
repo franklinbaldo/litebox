@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 /* SDL API-only input fixture: frames advance only after right down/up events. */
 #include "SDL.h"
 #include <stdio.h>

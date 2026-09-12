@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Report loopback energy on the default Windows output, without saving audio.
 
 Development only: uv run --with pyaudiowpatch python audio_probe.py --seconds 10

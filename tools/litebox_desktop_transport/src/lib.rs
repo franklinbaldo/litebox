@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Portable framing primitives for the LiteBox `desktop_fd_v1` contract.
 //!
 //! This crate intentionally has no SDL, window-system, audio or OS dependencies.

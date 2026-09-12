@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 use litebox_desktop_transport::{BoundedQueue, Handshake};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

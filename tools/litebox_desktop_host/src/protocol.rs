@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 use std::io::{self, Read};
 
 pub const WIDTH: usize = 160;

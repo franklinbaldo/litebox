@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Bounded integration fixture: real SDL guest -> dedicated pipe -> Win32 GDI.
 
 #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]

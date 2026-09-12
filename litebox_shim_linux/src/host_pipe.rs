@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Dedicated byte streams between a host and a loaded guest.
 //!
 //! Guest descriptors use normal Linux read/write/poll/close semantics. Host

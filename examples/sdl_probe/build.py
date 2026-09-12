@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
 """
 build.py - Builds and tests the minimal SDL2 probe for LiteBox on Windows.
 Reuses the recipe and tools from examples/linux_game/build.py.

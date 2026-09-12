@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+
+# Copyright (c) franklinbaldo.
+# Licensed under the MIT license.
+
 """Measure a Windows host and its descendant processes (development tool).
 
 Usage: python measure.py --pid HOST_PID --seconds 60 --output metrics.json

@@ -1,3 +1,6 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
 //! Windows Multimedia (WinMM) waveOut audio module for LiteBox.
 //!
 //! Provides a safe Rust wrapper around Windows `waveOut*` APIs for PCM audio playback.

@@ -1,3 +1,4 @@
+// Copyright (c) franklinbaldo.
 // Licensed under the MIT license.
 
 //! A binary stdout reply must reach the host before the guest reads again.
