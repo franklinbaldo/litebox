@@ -1,7 +1,12 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "tools/litebox_desktop_transport",
+    "tools/litebox_desktop_host",
+    "tools/litebox_launcher",
+]
 members = [
-    "litebox", 
+    "litebox",
     "litebox_common_linux",
     "litebox_common_optee",
     "litebox_common_lvbs",
@@ -9,7 +14,6 @@ members = [
     "litebox_platform_linux_userland",
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
-    "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_lvbs",
@@ -35,7 +39,6 @@ default-members = [
     "litebox_platform_linux_userland",
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
-    "litebox_platform_multiplex",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_shim_linux",

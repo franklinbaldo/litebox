@@ -1,0 +1,391 @@
+diff --git a/src/audio/dummy/SDL_dummyaudio.c b/src/audio/dummy/SDL_dummyaudio.c
+index a9bdd84..f9b2ac5 100644
+--- a/src/audio/dummy/SDL_dummyaudio.c
++++ b/src/audio/dummy/SDL_dummyaudio.c
+@@ -17,52 +17,339 @@
+   2. Altered source versions must be plainly marked as such, and must not be
+      misrepresented as being the original software.
+   3. This notice may not be removed or altered from any source distribution.
++
++  LiteBox experimental audio backend derivation:
++  Derived from SDL dummy audio driver by LiteBox contributors for
++  the desktop_fd_v1 audio protocol (dedicated guest input FD 5 / output FD 6).
++  Original author: Ryan C. Gordon / Sam Lantinga.
+ */
+ #include "../../SDL_internal.h"
+ 
+ #ifdef SDL_AUDIO_DRIVER_DUMMY
+ 
+-/* Output audio to nowhere... */
+-
+-#include "SDL_timer.h"
+ #include "SDL_audio.h"
+ #include "../SDL_audio_c.h"
+ #include "SDL_dummyaudio.h"
+ 
+-static int DUMMYAUDIO_OpenDevice(_THIS, const char *devname)
+-{
+-    _this->hidden = (void *)0x1; /* just something non-NULL */
++#include <unistd.h>
++#include <errno.h>
++#include <stdint.h>
+ 
+-    return 0; /* always succeeds. */
++#define LB_AUDIO_IN_FD         5
++#define LB_AUDIO_OUT_FD        6
++
++#define LB_HS_VERSION          1
++#define LB_HS_MAX_MESSAGE      1048576U
++#define LB_HS_FLAGS            0
++
++#define LB_AUDIO_RATE          22050
++#define LB_AUDIO_CHANNELS      1
++#define LB_AUDIO_BITS          16
++#define LB_MAX_PCM_BYTES       2048
++
++static inline void put_u16_le(uint8_t *p, uint16_t v)
++{
++    p[0] = (uint8_t)(v & 0xFF);
++    p[1] = (uint8_t)((v >> 8) & 0xFF);
+ }
+ 
+-static int DUMMYAUDIO_CaptureFromDevice(_THIS, void *buffer, int buflen)
++static inline void put_u32_le(uint8_t *p, uint32_t v)
+ {
+-    /* Delay to make this sort of simulate real audio input. */
+-    SDL_Delay((_this->spec.samples * 1000) / _this->spec.freq);
+-
+-    /* always return a full buffer of silence. */
+-    SDL_memset(buffer, _this->spec.silence, buflen);
+-    return buflen;
++    p[0] = (uint8_t)(v & 0xFF);
++    p[1] = (uint8_t)((v >> 8) & 0xFF);
++    p[2] = (uint8_t)((v >> 16) & 0xFF);
++    p[3] = (uint8_t)((v >> 24) & 0xFF);
+ }
+ 
+-static SDL_bool DUMMYAUDIO_Init(SDL_AudioDriverImpl *impl)
++static inline uint16_t get_u16_le(const uint8_t *p)
+ {
+-    /* Set the function pointers */
+-    impl->OpenDevice = DUMMYAUDIO_OpenDevice;
+-    impl->CaptureFromDevice = DUMMYAUDIO_CaptureFromDevice;
++    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++static inline uint32_t get_u32_le(const uint8_t *p)
++{
++    return (uint32_t)p[0]
++         | ((uint32_t)p[1] << 8)
++         | ((uint32_t)p[2] << 16)
++         | ((uint32_t)p[3] << 24);
++}
++
++static int lb_write_exact(int fd, const void *buf, size_t count)
++{
++    const uint8_t *p = (const uint8_t *)buf;
++    size_t left = count;
++    while (left > 0) {
++        ssize_t n = write(fd, p, left);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (n == 0) {
++            return -1;
++        }
++        p += n;
++        left -= (size_t)n;
++    }
++    return 0;
++}
++
++static int lb_read_exact(int fd, void *buf, size_t count)
++{
++    uint8_t *p = (uint8_t *)buf;
++    size_t left = count;
++    while (left > 0) {
++        ssize_t n = read(fd, p, left);
++        if (n < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (n == 0) {
++            return -1;
++        }
++        p += n;
++        left -= (size_t)n;
++    }
++    return 0;
++}
++
++static void LITEBOXAUDIO_CloseDevice(_THIS)
++{
++    if (_this->hidden) {
++        struct SDL_PrivateAudioData *h = _this->hidden;
++        if (h->is_open) {
++            if (h->out_fd >= 0) {
++                close(h->out_fd);
++                h->out_fd = -1;
++            }
++            if (h->in_fd >= 0) {
++                close(h->in_fd);
++                h->in_fd = -1;
++            }
++            h->is_open = 0;
++        }
++        if (h->mixbuf) {
++            SDL_free(h->mixbuf);
++            h->mixbuf = NULL;
++        }
++        SDL_free(h);
++        _this->hidden = NULL;
++    }
++}
++
++static int lb_audio_handshake(struct SDL_PrivateAudioData *h)
++{
++    uint8_t guest_hs[12];
++    uint8_t host_hs[12];
++    uint16_t host_version;
++    uint32_t host_max_message;
++
++    /* Guest handshake (12 bytes) on FD 6:
++     * [0..3]:   "LBDF" (ASCII)
++     * [4..5]:   u16LE version (1)
++     * [6..9]:   u32LE max_message (1048576)
++     * [10..11]: u16LE flags (0)
++     */
++    guest_hs[0] = 'L';
++    guest_hs[1] = 'B';
++    guest_hs[2] = 'D';
++    guest_hs[3] = 'F';
++    put_u16_le(&guest_hs[4], LB_HS_VERSION);
++    put_u32_le(&guest_hs[6], LB_HS_MAX_MESSAGE);
++    put_u16_le(&guest_hs[10], LB_HS_FLAGS);
++
++    if (lb_write_exact(h->out_fd, guest_hs, sizeof(guest_hs)) < 0) {
++        return SDL_SetError("LiteBox audio: failed to write 12-byte handshake to FD %d", h->out_fd);
++    }
++
++    if (lb_read_exact(h->in_fd, host_hs, sizeof(host_hs)) < 0) {
++        return SDL_SetError("LiteBox audio: failed to read 12-byte handshake from FD %d", h->in_fd);
++    }
++
++    if (host_hs[0] != 'L' || host_hs[1] != 'B' || host_hs[2] != 'D' || host_hs[3] != 'F') {
++        return SDL_SetError("LiteBox audio: invalid host handshake magic");
++    }
++
++    host_version = get_u16_le(&host_hs[4]);
++    if (host_version != LB_HS_VERSION) {
++        return SDL_SetError("LiteBox audio: unsupported host version %u", (unsigned int)host_version);
++    }
++
++    host_max_message = get_u32_le(&host_hs[6]);
++    if (host_max_message == 0) {
++        return SDL_SetError("LiteBox audio: host max_message is 0");
++    }
++
++    h->negotiated_max = (LB_HS_MAX_MESSAGE < host_max_message) ? LB_HS_MAX_MESSAGE : host_max_message;
++    if (h->negotiated_max < (16 + 1024)) {
++        return SDL_SetError("LiteBox audio: negotiated max_message %u too small", (unsigned int)h->negotiated_max);
++    }
++
++    return 0;
++}
++
++static int LITEBOXAUDIO_OpenDevice(_THIS, const char *devname)
++{
++    struct SDL_PrivateAudioData *h;
++    (void)devname;
++
++    if (_this->iscapture) {
++        return SDL_SetError("LiteBox audio: audio capture is unsupported");
++    }
++
++    /* Enforce / validate 22050 Hz, mono (1 channel), S16LE */
++    _this->spec.freq = LB_AUDIO_RATE;
++    _this->spec.channels = LB_AUDIO_CHANNELS;
++    _this->spec.format = AUDIO_S16LSB;
++    if (_this->spec.samples == 0 || _this->spec.samples > 1024) {
++        _this->spec.samples = 512;
++    }
++    SDL_CalculateAudioSpec(&_this->spec);
++
++    if (_this->spec.size > LB_MAX_PCM_BYTES) {
++        return SDL_SetError("LiteBox audio: buffer size %u exceeds %u byte limit",
++                            (unsigned int)_this->spec.size, (unsigned int)LB_MAX_PCM_BYTES);
++    }
++
++    h = (struct SDL_PrivateAudioData *)SDL_malloc(sizeof(*h));
++    if (!h) {
++        return SDL_OutOfMemory();
++    }
++    SDL_zerop(h);
++    h->in_fd = LB_AUDIO_IN_FD;
++    h->out_fd = LB_AUDIO_OUT_FD;
++    h->is_open = 1;
++    _this->hidden = h;
++
++    h->mixbuf = (Uint8 *)SDL_malloc(_this->spec.size);
++    if (!h->mixbuf) {
++        LITEBOXAUDIO_CloseDevice(_this);
++        return SDL_OutOfMemory();
++    }
++    SDL_memset(h->mixbuf, _this->spec.silence, _this->spec.size);
++
++    if (lb_audio_handshake(h) < 0) {
++        LITEBOXAUDIO_CloseDevice(_this);
++        return -1;
++    }
++
++    return 0;
++}
++
++static void LITEBOXAUDIO_PlayDevice(_THIS)
++{
++    struct SDL_PrivateAudioData *h = _this->hidden;
++    Uint32 pcm_len;
++    Uint32 body_len;
++    Uint32 total_len;
++    uint8_t pkt[4 + 16 + LB_MAX_PCM_BYTES];
++    uint8_t ack_hdr[4];
++    uint32_t ack_len;
++    uint8_t ack_body[4];
++
++    if (!h || !h->is_open || h->disconnected || SDL_AtomicGet(&_this->shutdown)) {
++        return;
++    }
++
++    pcm_len = _this->spec.size;
++    if (pcm_len > LB_MAX_PCM_BYTES || pcm_len == 0) {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++
++    body_len = 16 + pcm_len;
++    total_len = 4 + body_len;
++
++    if (body_len > h->negotiated_max) {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++
++    /* Framing prefix (4 bytes) */
++    put_u32_le(&pkt[0], body_len);
++
++    /* Body (16 bytes header + pcm_len bytes PCM) */
++    pkt[4] = 'A';
++    pkt[5] = 'U';
++    pkt[6] = 'D';
++    pkt[7] = '0';
++    put_u32_le(&pkt[8], (uint32_t)_this->spec.freq);          /* 22050 */
++    put_u16_le(&pkt[12], (uint16_t)_this->spec.channels);     /* 1 */
++    put_u16_le(&pkt[14], (uint16_t)LB_AUDIO_BITS);            /* 16 */
++    put_u32_le(&pkt[16], pcm_len);                            /* pcm_byte_length */
++
++    /* Copy PCM payload */
++    SDL_memcpy(&pkt[20], h->mixbuf, pcm_len);
++
++    /* Send packet to FD 6 */
++    if (lb_write_exact(h->out_fd, pkt, total_len) < 0) {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++
++    /* Wait for framed ACK0 on FD 5 */
++    /* 1. Read 4 bytes framing length */
++    if (lb_read_exact(h->in_fd, ack_hdr, 4) < 0) {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++
++    ack_len = get_u32_le(ack_hdr);
++    if (ack_len != 4) {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++
++    /* 2. Read 4 bytes body */
++    if (lb_read_exact(h->in_fd, ack_body, 4) < 0) {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++
++    if (ack_body[0] != 'A' || ack_body[1] != 'C' || ack_body[2] != 'K' || ack_body[3] != '0') {
++        h->disconnected = SDL_TRUE;
++        SDL_OpenedAudioDeviceDisconnected(_this);
++        return;
++    }
++}
++
++static void LITEBOXAUDIO_WaitDevice(_THIS)
++{
++    (void)_this;
++}
++
++static Uint8 *LITEBOXAUDIO_GetDeviceBuf(_THIS)
++{
++    return _this->hidden ? _this->hidden->mixbuf : NULL;
++}
++
++static SDL_bool LITEBOXAUDIO_Init(SDL_AudioDriverImpl *impl)
++{
++    impl->OpenDevice = LITEBOXAUDIO_OpenDevice;
++    impl->PlayDevice = LITEBOXAUDIO_PlayDevice;
++    impl->WaitDevice = LITEBOXAUDIO_WaitDevice;
++    impl->GetDeviceBuf = LITEBOXAUDIO_GetDeviceBuf;
++    impl->CloseDevice = LITEBOXAUDIO_CloseDevice;
+ 
+     impl->OnlyHasDefaultOutputDevice = SDL_TRUE;
+-    impl->OnlyHasDefaultCaptureDevice = SDL_TRUE;
+-    impl->HasCaptureSupport = SDL_TRUE;
++    impl->OnlyHasDefaultCaptureDevice = SDL_FALSE;
++    impl->HasCaptureSupport = SDL_FALSE;
++    impl->SupportsNonPow2Samples = SDL_TRUE;
+ 
+-    return SDL_TRUE; /* this audio target is available. */
++    return SDL_TRUE;
+ }
+ 
+ AudioBootStrap DUMMYAUDIO_bootstrap = {
+-    "dummy", "SDL dummy audio driver", DUMMYAUDIO_Init, SDL_TRUE
++    "litebox", "LiteBox experimental audio driver", LITEBOXAUDIO_Init, SDL_FALSE
+ };
+ 
+-#endif
+-
+-/* vi: set ts=4 sw=4 expandtab: */
++#endif /* SDL_AUDIO_DRIVER_DUMMY */
+diff --git a/src/audio/dummy/SDL_dummyaudio.h b/src/audio/dummy/SDL_dummyaudio.h
+index e0e77e5..a55c321 100644
+--- a/src/audio/dummy/SDL_dummyaudio.h
++++ b/src/audio/dummy/SDL_dummyaudio.h
+@@ -30,12 +30,12 @@
+ 
+ struct SDL_PrivateAudioData
+ {
+-    /* The file descriptor for the audio device */
++    int in_fd;
++    int out_fd;
++    int is_open;
++    SDL_bool disconnected;
++    Uint32 negotiated_max;
+     Uint8 *mixbuf;
+-    Uint32 mixlen;
+-    Uint32 write_delay;
+-    Uint32 initial_calls;
+ };
+ 
+ #endif /* SDL_dummyaudio_h_ */
+-/* vi: set ts=4 sw=4 expandtab: */

@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -18,7 +18,7 @@ use litebox::mm::linux::VmFlags;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
-use litebox::sync::Mutex;
+use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
@@ -119,7 +119,7 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     nr_threads: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Resource limits for this process.
-    pub(crate) limits: ResourceLimits,
+    pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
 }
@@ -250,7 +250,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Updates the process exit status for a thread exit.
     fn exit_thread(&self, code: i8) {
         let mut inner = self.thread.process.inner.lock();
@@ -342,7 +342,7 @@ pub(crate) struct Credentials {
     pub egid: u32,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn process(&self) -> &Arc<Process<Platform>> {
         &self.thread.process
     }
@@ -482,11 +482,9 @@ fn wake_robust_list<Platform: ShimPlatform>(
     Ok(())
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
-        self.thread.detach_from_process();
-
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -502,6 +500,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list::<Platform>(robust_list);
         }
+
+        // This must run last, after all of this task's remaining accesses to
+        // guest memory have completed. Otherwise, because this decrements the
+        // `nr_threads` counter, other tasks may assume that the memory of this
+        // task isn't referenced any more, and therefore can be de-allocated and
+        // re-used (e.g., for an `exec`d process). See
+        // https://github.com/microsoft/litebox/pull/1155.
+        self.thread.detach_from_process();
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
@@ -523,12 +529,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(target_arch = "x86_64")]
 type ThreadLocalDescriptor = UserPtrMut<u8>;
 
-struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
+struct NewThreadArgs<Platform: ShimPlatform> {
     /// Task struct that maintains all per-thread data
-    task: Task<Platform, FS>,
+    task: Task<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<Platform, FS> {
+impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(
@@ -544,7 +550,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThread
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -639,6 +645,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Err(Errno::EINVAL);
         }
 
+        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
+            return Err(Errno::EINVAL);
+        }
+
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
@@ -687,9 +697,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
         }
 
-        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
-            return Err(Errno::EINVAL);
-        }
         let sp = if stack != 0 {
             let stack: usize = stack.trunc();
             Some(stack.wrapping_add(stack_size.trunc()))
@@ -752,89 +759,59 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
-struct AtomicRlimit {
-    cur: core::sync::atomic::AtomicUsize,
-    max: core::sync::atomic::AtomicUsize,
+pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
+    limits: RwLock<
+        Platform,
+        [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+    >,
 }
 
-impl AtomicRlimit {
-    const fn new(cur: usize, max: usize) -> Self {
+impl<Platform: ShimPlatform> ResourceLimits<Platform> {
+    fn default() -> Self {
+        let mut limits = [const {
+            litebox_common_linux::Rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            }
+        }; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
+        limits[litebox_common_linux::RlimitResource::NOFILE as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: RLIMIT_NOFILE_CUR,
+                rlim_max: RLIMIT_NOFILE_MAX,
+            };
+        limits[litebox_common_linux::RlimitResource::STACK as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
+                rlim_max: litebox_common_linux::rlim_t::MAX,
+            };
         Self {
-            cur: core::sync::atomic::AtomicUsize::new(cur),
-            max: core::sync::atomic::AtomicUsize::new(max),
-        }
-    }
-}
-
-pub(crate) struct ResourceLimits {
-    limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
-}
-
-impl ResourceLimits {
-    const fn default() -> Self {
-        seq_macro::seq!(N in 0..16 {
-            let mut limits = [
-                #(
-                    AtomicRlimit::new(0, 0),
-                )*
-            ];
-        });
-        limits[litebox_common_linux::RlimitResource::NOFILE as usize] = AtomicRlimit {
-            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_CUR),
-            max: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_MAX),
-        };
-        limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
-            cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
-            max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
-        };
-        Self { limits }
-    }
-
-    pub(crate) fn get_rlimit(
-        &self,
-        resource: litebox_common_linux::RlimitResource,
-    ) -> litebox_common_linux::Rlimit {
-        let r = &self.limits[resource as usize];
-        litebox_common_linux::Rlimit {
-            rlim_cur: r.cur.load(Ordering::Relaxed),
-            rlim_max: r.max.load(Ordering::Relaxed),
+            limits: RwLock::new(limits),
         }
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
-        let r = &self.limits[resource as usize];
-        r.cur.load(Ordering::Relaxed)
-    }
-
-    fn set_rlimit(
-        &self,
-        resource: litebox_common_linux::RlimitResource,
-        new_limit: litebox_common_linux::Rlimit,
-    ) {
-        let r = &self.limits[resource as usize];
-        r.cur.store(new_limit.rlim_cur, Ordering::Relaxed);
-        r.max.store(new_limit.rlim_max, Ordering::Relaxed);
+        self.limits.read()[resource as usize].rlim_cur
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Get resource limits, and optionally set new limits.
     pub(crate) fn do_prlimit(
         &self,
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
+        match resource {
             litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
+            | litebox_common_linux::RlimitResource::STACK => {}
             _ => {
                 log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
                 return Err(Errno::EINVAL);
             }
-        };
+        }
         if let Some(new_limit) = new_limit {
+            let mut limits = self.thread.process.limits.limits.write();
+            let old_rlimit = limits[resource as usize];
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
             }
@@ -850,14 +827,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
-                    let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-                    self.thread.process.limits.set_rlimit(resource, new_limit);
-                    self.files.borrow().set_max_fd(new_max_fd);
+                    self.files.borrow().set_max_fd(new_limit.rlim_cur);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
             }
+            limits[resource as usize] = new_limit;
+            Ok(old_rlimit)
+        } else {
+            Ok(self.thread.process.limits.limits.read()[resource as usize])
         }
-        Ok(old_rlimit)
     }
 
     /// Handle syscall `prlimit64`.
@@ -1284,7 +1262,7 @@ impl CpuSet {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `sched_getaffinity`.
     ///
     /// Note this is a dummy implementation that always returns the same CPU set
@@ -1295,7 +1273,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
         /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
@@ -1404,7 +1382,7 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Resolve shebang (`#!`) chains for the given path and argv if the file starts with a shebang line.
     /// Otherwise, returns the original path and argv.
     pub(crate) fn resolve_shebang(
@@ -1553,7 +1531,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// to start executing it.
     pub(crate) fn load_program(
         &self,
-        mut loader: crate::loader::elf::ElfLoader<'_, Platform, FS>,
+        mut loader: crate::loader::elf::ElfLoader<'_, Platform>,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
@@ -1647,6 +1625,53 @@ mod tests {
     use crate::{UserPtr, UserPtrMut};
 
     extern crate std;
+
+    #[test]
+    fn resource_limit_cur_never_exceeds_max() {
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
+        use std::sync::{Arc, Barrier};
+
+        const ITERATIONS: usize = 20_000;
+
+        let task = init_platform(None);
+        let barrier = Arc::new(Barrier::new(3));
+        let writer = |offset: usize| {
+            let barrier = barrier.clone();
+            task.spawn_clone_for_test(move |task| {
+                for iteration in 0..ITERATIONS {
+                    let value = super::RLIMIT_NOFILE_MAX - (iteration * 2 + offset);
+                    barrier.wait();
+                    let result = task.do_prlimit(
+                        RlimitResource::NOFILE,
+                        Some(Rlimit {
+                            rlim_cur: value,
+                            rlim_max: value,
+                        }),
+                    );
+                    assert!(matches!(result, Ok(_) | Err(Errno::EPERM)));
+                    barrier.wait();
+                }
+            })
+        };
+        let writer_a = writer(1);
+        let writer_b = writer(2);
+
+        for _ in 0..ITERATIONS {
+            barrier.wait();
+            let limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+            assert!(
+                limit.rlim_cur <= limit.rlim_max,
+                "resource limit cur ({}) exceeds max ({})",
+                limit.rlim_cur,
+                limit.rlim_max
+            );
+            barrier.wait();
+        }
+
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]

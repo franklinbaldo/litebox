@@ -14,10 +14,10 @@ use litebox::{
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
-use crate::ShimFS;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
+use crate::syscalls::file::AnyTypedFd;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
@@ -74,7 +74,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     #[inline]
     fn do_mmap(
         &self,
@@ -118,14 +118,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
+        let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, fd, offset)
+            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
         {
             cow_result?
         } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, fd, offset)?
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
         };
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
@@ -171,31 +172,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: &ProtFlags,
         flags: &MapFlags,
-        fd: i32,
+        fd: &AnyTypedFd<Platform>,
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
         if !len.is_multiple_of(PAGE_SIZE) {
             return None;
         }
 
-        let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
-            return None;
-        };
-
         let files = self.files.borrow();
-        let raw_fd = fd;
-
-        let static_data = files
-            .run_on_raw_fd(
-                raw_fd,
-                |typed_fd| files.fs.get_static_backing_data(typed_fd),
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-                |_| None,
-            )
-            .ok()??;
+        let static_data = files.fs.get_static_backing_data(fd.as_fs()?)?;
 
         if offset > static_data.len() {
             return None;
@@ -274,7 +259,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        fd: i32,
+        fd: &AnyTypedFd<Platform>,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
@@ -287,9 +272,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let mut copied = 0;
             while copied < len {
                 let size =
-                    self.sys_read(fd, &mut buffer, Some(file_offset))
+                    self.do_read(fd, &mut buffer, Some(file_offset))
                         .map_err(|e| match e {
-                            Errno::EBADF => MappingError::BadFD(fd),
+                            // The raw fd was resolved once at syscall entry and is intentionally
+                            // not retained; this payload is discarded when converted to EBADF.
+                            Errno::EBADF => MappingError::BadFD(-1),
                             Errno::EISDIR => MappingError::NotAFile,
                             Errno::EACCES => MappingError::NotForReading,
                             _ => unimplemented!(),

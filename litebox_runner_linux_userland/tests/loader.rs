@@ -6,13 +6,14 @@ mod common;
 
 use std::ffi::CString;
 
-use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::fs::{Mode, OFlags};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 
 struct TestLauncher {
     platform: &'static Platform,
     shim_builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
     fs: litebox_shim_linux::DefaultFS<Platform>,
+    context: litebox::fs::resolver::Context,
 }
 
 impl TestLauncher {
@@ -23,28 +24,25 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new(tun_device_name);
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
-        let litebox = shim_builder.litebox();
 
-        let in_mem_fs = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::in_mem::InMem::new_initialized([(
-                "/",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                    owner: litebox::fs::UserInfo::ROOT,
-                },
-            )]),
-        );
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+            "/",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]);
         let tar_data = if tar_data.is_empty() {
             litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {
             tar_data.into()
         };
-        let fs = shim_builder.default_fs(in_mem_fs, tar_data);
+        let fs = shim_builder.default_fs(in_mem, tar_data);
         let mut this = Self {
             platform,
             shim_builder,
             fs,
+            context: litebox::fs::resolver::Context::new(),
         };
 
         for each in initial_files {
@@ -74,13 +72,15 @@ impl TestLauncher {
     }
 
     fn install_dir(&mut self, path: &str) -> Result<(), litebox::fs::errors::MkdirError> {
-        self.fs.mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        self.fs
+            .mkdir(&self.context, path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
     }
 
     fn install_file(&mut self, contents: Vec<u8>, out: &str) {
         let fd = self
             .fs
             .open(
+                &self.context,
                 out,
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXG | Mode::RWXO | Mode::RWXU,

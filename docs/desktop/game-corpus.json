@@ -1,0 +1,176 @@
+[
+  {
+    "id": "sdl-sopwith",
+    "role": "candidate_mvp_software",
+    "repo": "https://github.com/fragglet/sdl-sopwith",
+    "ref": "sdl-sopwith-2.9.0",
+    "commit": "d364bc2641043f6dc5f47e8534b2742f3efeaddb",
+    "status": "not_run_on_litebox",
+    "expected_checks": [
+      "open_window",
+      "start_game",
+      "play_10_minutes",
+      "audible_effects_and_music_if_present",
+      "close_without_orphans",
+      "save_reload_new_process",
+      "launch_from_windows_start",
+      "update_preserves_saves"
+    ],
+    "evidence_urls": [
+      "https://github.com/fragglet/sdl-sopwith/releases/tag/sdl-sopwith-2.9.0",
+      "https://github.com/fragglet/sdl-sopwith/blob/sdl-sopwith-2.9.0/configure.ac",
+      "https://github.com/fragglet/sdl-sopwith/blob/sdl-sopwith-2.9.0/src/sdl/video.c",
+      "https://github.com/fragglet/sdl-sopwith/blob/sdl-sopwith-2.9.0/src/sdl/pcsound.c",
+      "https://github.com/fragglet/sdl-sopwith/blob/sdl-sopwith-2.9.0/COPYING.md"
+    ],
+    "technical_details": {
+      "sdl_version": "SDL2 (configure.ac: sdl2 >= 2.0.7)",
+      "render": "SDL2 2D renderer com SDL_RENDERER_PRESENTVSYNC e SDL_TEXTUREACCESS_TARGET para upscaling de buffer paletizado 320x200; requer suporte a render target no driver SDL",
+      "audio": "Emulação de PC Speaker interna sintetizada via SDL Audio API (SDL_OpenAudioDevice)",
+      "save_config": "SDL_GetPrefPath('', 'sdl-sopwith') para preferências; high scores suportam path dedicado",
+      "license_code": "GNU GPL v2+",
+      "license_assets": "Source GPL notice verified; audit bundled icons and embedded graphics notices individually before redistribution.",
+      "unknowns": "PRESENTVSYNC and render-target behavior on chosen SDL software backend; persistent high-score paths."
+    },
+    "artifact_sha256": null,
+    "distribution_status": "asset_inventory_pending"
+  },
+  {
+    "id": "chocolate-doom",
+    "role": "candidate_mvp_software",
+    "repo": "https://github.com/chocolate-doom/chocolate-doom",
+    "ref": "chocolate-doom-3.1.1",
+    "commit": "410d96855b5df5410ff591a90efeafa889119224",
+    "status": "not_run_on_litebox",
+    "expected_checks": [
+      "open_window",
+      "start_game",
+      "play_10_minutes",
+      "audible_effects_and_music_if_present",
+      "close_without_orphans",
+      "save_reload_new_process",
+      "launch_from_windows_start",
+      "update_preserves_saves"
+    ],
+    "evidence_urls": [
+      "https://github.com/chocolate-doom/chocolate-doom/releases/tag/chocolate-doom-3.1.1",
+      "https://github.com/chocolate-doom/chocolate-doom/blob/chocolate-doom-3.1.1/src/i_video.c",
+      "https://github.com/chocolate-doom/chocolate-doom/blob/chocolate-doom-3.1.1/NEWS.md",
+      "https://github.com/chocolate-doom/chocolate-doom/blob/chocolate-doom-3.1.1/COPYING.md"
+    ],
+    "technical_details": {
+      "sdl_version": "SDL2; keep SDL2_mixer enabled for required sound. SDL2_net can be disabled for offline profile.",
+      "render": "Explicit SDL_RENDERER_SOFTWARE fallback and force_software_renderer configuration; -nodraw is NOT a playable rendering fallback.",
+      "audio": "SDL2_mixer sound path plus selectable music synthesis; test audible effects and music with selected Linux build.",
+      "save_config": "default.cfg e chocolate-doom.cfg no diretório de configuração do usuário ou pasta do executável; saves no formato vanilla Doom",
+      "license_code": "GNU GPL v2+",
+      "license_assets": "Game data supplied separately by pinned Freedoom; engine icons and dependencies need their own notices.",
+      "unknowns": "Latência de renderização de software pura no framebuffer virtual do Litebox e comportamento do backend de áudio padrão sem dispositivo de som físico"
+    },
+    "artifact_sha256": null,
+    "distribution_status": "asset_inventory_pending"
+  },
+  {
+    "id": "freedoom",
+    "role": "game_data_iwad",
+    "repo": "https://github.com/freedoom/freedoom",
+    "ref": "v0.13.0",
+    "commit": "cfb8644b1a8dc7d7d2177e6a892ccaa2922bdaae",
+    "status": "not_run_on_litebox",
+    "expected_checks": [
+      "open_window",
+      "start_game",
+      "play_10_minutes",
+      "audible_effects_and_music_if_present",
+      "close_without_orphans",
+      "save_reload_new_process",
+      "launch_from_windows_start",
+      "update_preserves_saves"
+    ],
+    "evidence_urls": [
+      "https://github.com/freedoom/freedoom/releases/tag/v0.13.0",
+      "https://github.com/freedoom/freedoom/blob/v0.13.0/COPYING.adoc"
+    ],
+    "technical_details": {
+      "sdl_version": "N/A (conjunto de dados / IWADs: freedoom1.wad, freedoom2.wad, freedm.wad)",
+      "render": "Data for pinned Chocolate Doom3.1.1; validate chosen levels and save/load on native Linux reference first.",
+      "audio": "Músicas e SFX embutidos nos arquivos WAD",
+      "save_config": "Definido pela engine executora (Chocolate Doom)",
+      "license_code": "N/A",
+      "license_assets": "BSD 3-Clause (explicitada em COPYING.adoc: 'Copyright 2001-2024 Contributors to the Freedoom project')",
+      "unknowns": "Consumo de memória ao descompactar e carregar o IWAD de 0.13.0 em ambientes com restrição severa de RAM"
+    },
+    "artifact_sha256": null,
+    "distribution_status": "asset_inventory_pending"
+  },
+  {
+    "id": "cdogs-sdl",
+    "role": "candidate_stage_2",
+    "repo": "https://github.com/cxong/cdogs-sdl",
+    "ref": "2.4.0",
+    "commit": "57782a74ae245d868487094d201d0e56e94a9390",
+    "status": "not_run_on_litebox",
+    "expected_checks": [
+      "open_window",
+      "start_game",
+      "play_10_minutes",
+      "audible_effects_and_music_if_present",
+      "close_without_orphans",
+      "save_reload_new_process",
+      "launch_from_windows_start",
+      "update_preserves_saves"
+    ],
+    "evidence_urls": [
+      "https://github.com/cxong/cdogs-sdl/releases/tag/2.4.0",
+      "https://github.com/cxong/cdogs-sdl/blob/2.4.0/src/cdogs/window_context.c",
+      "https://github.com/cxong/cdogs-sdl/blob/2.4.0/README.md",
+      "https://github.com/cxong/cdogs-sdl/blob/2.4.0/doc/README_DATA.md"
+    ],
+    "technical_details": {
+      "sdl_version": "SDL2 (SDL2, SDL2_mixer, enet, nanopb)",
+      "render": "SDL_CreateRenderer com SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE fixo em window_context.c sem mecanismo de fallback para software; classificado para segunda etapa (não MVP software)",
+      "audio": "SDL2_mixer (efeitos sonoros e trilhas sonoras Ogg/tracker)",
+      "save_config": "GetConfigFilePath(options.cnf / autosave / scores) usando CDOGS_CONFIG_DIR, XDG_CONFIG_HOME ou home do usuário",
+      "license_code": "GPLv2 com componentes em BSD 2-Clause",
+      "license_assets": "CC-BY para dados originais de Ronny Wester (doc/README_DATA.md); novos dados CC0/CC-BY/CC-BY-SA; atenção: README_DATA registra que alguns SFX originais foram sampleados historicamente de filmes",
+      "unknowns": "Accelerated renderer bridge and target textures required; subset of campaign assets and music must be inventoried before bundling."
+    },
+    "artifact_sha256": null,
+    "distribution_status": "asset_inventory_pending"
+  },
+  {
+    "id": "neverball",
+    "role": "candidate_stage_later_opengl",
+    "repo": "https://github.com/Neverball/neverball",
+    "ref": "neverball-1.6.0",
+    "commit": "16945b8abe77fdaf0d3b6728f7cd25819bb0a707",
+    "status": "not_run_on_litebox",
+    "expected_checks": [
+      "open_window",
+      "start_game",
+      "play_10_minutes",
+      "audible_effects_and_music_if_present",
+      "close_without_orphans",
+      "save_reload_new_process",
+      "launch_from_windows_start",
+      "update_preserves_saves"
+    ],
+    "evidence_urls": [
+      "https://github.com/Neverball/neverball/releases",
+      "https://github.com/Neverball/neverball/blob/neverball-1.6.0/Makefile",
+      "https://github.com/Neverball/neverball/blob/neverball-1.6.0/LICENSE.md",
+      "https://github.com/Neverball/neverball/blob/neverball-1.6.0/doc/authors.txt"
+    ],
+    "technical_details": {
+      "sdl_version": "SDL2 (SDL2, SDL2_ttf, libvorbisfile, libpng, libjpeg, physfs)",
+      "render": "Linux SDL2 with OpenGL (-lGL); requires actual guest GL context and command path.",
+      "audio": "SDL2 áudio e Vorbisfile para streaming de música",
+      "save_config": "Verify Linux user directory at pinned tag; Windows USERDIR is not evidence of guest Linux path.",
+      "license_code": "GNU GPL v2+",
+      "license_assets": "Per-asset notices in doc/legal and authors; full package redistribution audit pending.",
+      "unknowns": "Guest OpenGL implementation and bridge; asset inventory, Linux user-data paths and performance remain unvalidated."
+    },
+    "artifact_sha256": null,
+    "distribution_status": "asset_inventory_pending"
+  }
+]

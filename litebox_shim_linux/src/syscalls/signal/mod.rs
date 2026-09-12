@@ -12,14 +12,14 @@ use x86_64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
-use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_common_linux::signal::{
-    MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags, SigAction, SigAltStack,
-    SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
+    FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags,
+    SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
 
@@ -231,7 +231,12 @@ impl PendingSignals {
         self.queue.remove(pos).unwrap()
     }
 
-    fn push(&mut self, rlimits: &super::process::ResourceLimits, signal: Signal, siginfo: Siginfo) {
+    fn push<Platform: ShimPlatform>(
+        &mut self,
+        rlimits: &super::process::ResourceLimits<Platform>,
+        signal: Signal,
+        siginfo: Siginfo,
+    ) {
         assert_eq!(signal.as_i32(), siginfo.signo);
 
         // Don't queue duplicates for standard signals.
@@ -240,7 +245,7 @@ impl PendingSignals {
         }
 
         // Restrict maximum queued signals via rlimits when Linux would do so.
-        if signal.is_rt_signal() || (siginfo.code != SI_USER && siginfo.code != SI_KERNEL) {
+        if signal.is_rt_signal() || siginfo.code < 0 {
             let limit = rlimits.get_rlimit_cur(litebox_common_linux::RlimitResource::SIGPENDING);
             if self.queue.len() >= limit {
                 // Drop the signal.
@@ -264,10 +269,17 @@ fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
 
 /// Creates a `Siginfo` for an exception signal.
 fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
+    // TODO: Extend ExceptionInfo with architecture-specific cause details,
+    // then use them in handle_exception_request to select the precise si_code.
+    let code = match signal {
+        Signal::SIGFPE => FPE_INTDIV,
+        Signal::SIGILL => ILL_ILLOPN,
+        _ => SI_KERNEL,
+    };
     Siginfo {
         signo: signal.as_i32(),
         errno: 0,
-        code: SI_KERNEL,
+        code,
         #[cfg(target_arch = "x86_64")]
         __pad: 0,
         data: SiginfoData::new_addr(fault_address),
@@ -374,7 +386,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 /// A fault when delivering a signal.
 struct DeliverFault;
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
         let old = self.signals.blocked.get();
         self.signals.set_signal_mask(mask);
@@ -552,6 +564,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         thread | shared
     }
 
+    #[cfg(test)]
+    pub(crate) fn take_pending_siginfo(&self, signal: Signal) -> Siginfo {
+        self.signals.pending.borrow_mut().remove(signal)
+    }
+
     /// Deliver any pending signals.
     pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
         loop {
@@ -707,7 +724,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn force_signal_with_info(&self, signal: Signal, force_exit: bool, siginfo: Siginfo) {
-        assert!(matches!(signal, Signal::SIGKILL | Signal::SIGSEGV));
+        assert!(matches!(
+            signal,
+            Signal::SIGKILL | Signal::SIGSEGV | Signal::SIGFPE | Signal::SIGTRAP | Signal::SIGILL
+        ));
 
         self.signals
             .pending
@@ -738,20 +758,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    pub(crate) fn handle_exception_request(&self, info: &litebox::shim::ExceptionInfo) {
-        let signal = match info.exception {
-            Exception::DIVIDE_ERROR => Signal::SIGFPE,
-            Exception::BREAKPOINT => Signal::SIGTRAP,
-            Exception::INVALID_OPCODE => Signal::SIGILL,
+    pub(crate) fn handle_exception_request(
+        &self,
+        info: &litebox::shim::ExceptionInfo,
+        ctx: &PtRegs,
+    ) {
+        let pc = arch::pc(ctx);
+        let (signal, fault_address) = match info.exception {
+            Exception::DIVIDE_ERROR => (Signal::SIGFPE, pc),
+            Exception::BREAKPOINT => (Signal::SIGTRAP, 0),
+            Exception::INVALID_OPCODE => (Signal::SIGILL, pc),
+            Exception::PAGE_FAULT => (Signal::SIGSEGV, info.cr2),
             // Page faults and unknown exceptions map to SIGSEGV. There may be
             // more appropriate signals in some other cases (e.g., SIGBUS).
-            _ => Signal::SIGSEGV,
-        };
-        // For page faults, provide the faulting address.
-        let fault_address = if info.exception == Exception::PAGE_FAULT {
-            info.cr2
-        } else {
-            0
+            _ => (Signal::SIGSEGV, 0),
         };
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));

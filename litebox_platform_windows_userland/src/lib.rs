@@ -140,7 +140,7 @@ unsafe extern "system" fn vectored_exception_handler(
         && unsafe { litebox_common_linux::rdfsbase() } == 0
         && WindowsUserland::get_thread_fs_base() != 0
     {
-        set_context_to_interrupt_callback(tls, context);
+        set_context_to_interrupt_callback(context);
     } else {
         // Push the exception record onto the host stack.
         let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
@@ -157,6 +157,10 @@ unsafe extern "system" fn vectored_exception_handler(
         context.Rip = exception_callback as *const () as usize as u64;
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
+        // `host_sp` points at the slot where `run_thread_arch` saved its
+        // `ThreadContext` argument. Set it to `rcx` (i.e., the first argument) so
+        // that [`exception_handler`] can access it.
+        context.Rcx = unsafe { tls.host_sp.get().cast::<usize>().read() } as u64;
         context.Rdx = exception_record_ptr as u64;
     }
 
@@ -602,11 +606,14 @@ exception_callback:
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
-    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {exception_handler}
     jmp .Ldone
 
 interrupt_callback:
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     rsp, [r11 + {HOST_SP}]
+    mov     rbp, [r11 + {HOST_BP}]
     mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
@@ -661,10 +668,22 @@ interrupt_callback:
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[unsafe(naked)]
-    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs, tls: &TlsState) -> ! {
+        // Set `in_guest` now, then check if there is a pending interrupt. If
+        // so, jump to the interrupt handler.
+        //
+        // If an interrupt arrives after the check, then the signal handler will
+        // see that the IP is between `switch_to_guest_start` and
+        // `switch_to_guest_end` and will set the `interrupt` and jump to
+        // `interrupt_callback`.
         core::arch::naked_asm!(
-            // Load all registers from the guest context structure.
             "switch_to_guest_start:",
+            "mov BYTE PTR [rdx + {IS_IN_GUEST}], 1",
+            "cmp BYTE PTR [rdx + {INTERRUPT}], 0",
+            "je 2f",
+            "jmp {interrupt_callback}",
+            "2:",
+            // Load all registers from the guest context structure.
             "mov rsp, rcx",
             "pop r15",
             "pop r14",
@@ -688,6 +707,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             "pop rsp",
             "jmp rcx", // jump to the entry point of the thread
             "switch_to_guest_end:",
+            IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+            INTERRUPT = const core::mem::offset_of!(TlsState, interrupt),
+            interrupt_callback = sym interrupt_callback,
         );
     }
 
@@ -732,7 +754,19 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Ensure the context is written before we set `is_in_guest` so that
         // `ThreadHandle::interrupt` can see a consistent state.
         std::sync::atomic::compiler_fence(Ordering::Release);
-        tls.is_in_guest.set(true);
+        unsafe {
+            core::arch::asm!(
+                "mov BYTE PTR [{tls} + {IS_IN_GUEST}], 1",
+                "cmp BYTE PTR [{tls} + {INTERRUPT}], 0",
+                "je 2f",
+                "jmp {interrupt_callback}",
+                "2:",
+                tls = in(reg) tls,
+                IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+                INTERRUPT = const core::mem::offset_of!(TlsState, interrupt),
+                interrupt_callback = sym interrupt_callback,
+            );
+        }
         unsafe {
             let status = NtContinue(win_ctx, 0);
             panic!(
@@ -759,8 +793,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // This is much slower, but it is only used for things like signal handlers,
     // so it should not be on the critical path.
     if ctx.rcx == ctx.rip {
-        tls.is_in_guest.set(true);
-        switch_to_guest_sysret(ctx)
+        switch_to_guest_sysret(ctx, tls)
     } else {
         switch_to_guest_ntcontinue(tls, ctx)
     }
@@ -1166,18 +1199,18 @@ impl ThreadHandle {
             // context, since it's already saved.
             true
         } else if is_in_ntdll_or_this(context.Rip.trunc()) {
-            // Case 2/3: we can't distinguish between them. For case 2 we don't
-            // need to do anything, but for case 3 we need to update the
+            // Case 2/3: we can't distinguish between them. For case 3 we don't
+            // need to do anything, but for case 2 we need to update the
             // NtContinue context to point to the interrupt callback (the guest
             // context is already up to date).
             //
-            // In case 2, the NtContinue context is not being used, so it is
+            // In case 3, the NtContinue context is not being used, so it is
             // safe to update it anyway.
 
             // SAFETY: `continue_context` is not accessed by user-mode code
             // while `is_in_guest` is true.
             let continue_context = unsafe { &mut *target_tls.continue_context.get() };
-            set_context_to_interrupt_callback(target_tls, continue_context);
+            set_context_to_interrupt_callback(continue_context);
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
@@ -1185,7 +1218,7 @@ impl ThreadHandle {
             true
         };
         if run_interrupt_callback {
-            set_context_to_interrupt_callback(target_tls, &mut context);
+            set_context_to_interrupt_callback(&mut context);
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
                     inner.handle.as_raw_handle(),
@@ -1196,18 +1229,13 @@ impl ThreadHandle {
     }
 }
 
-/// Updates `context` to jump to the interrupt callback with the given
-/// `guest_context` pointer.
+/// Updates `context` to jump to the interrupt callback, which restores the host stack.
 fn set_context_to_interrupt_callback(
-    tls: &TlsState,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
 ) {
-    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-        | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
+    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
     assert_eq!(context.ContextFlags & required_flags, required_flags);
     context.Rip = interrupt_callback as *const () as usize as u64;
-    context.Rsp = tls.host_sp.get().addr() as u64;
-    context.Rbp = tls.host_bp.get().addr() as u64;
 }
 
 /// Returns true if the given instruction pointer is in ntdll.dll or this module.
@@ -1873,13 +1901,21 @@ impl litebox::platform::StdioProvider for WindowsUserland {
         use std::io::Write as _;
         match stream {
             litebox::platform::StdioOutStream::Stdout => {
-                std::io::stdout().write(buf).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        litebox::platform::StdioWriteError::Closed
-                    } else {
-                        panic!("unhandled error {err}")
-                    }
-                })
+                // Rust stdout is line-buffered even when redirected. A guest may
+                // send a binary packet and wait for a reply without a newline.
+                let mut out = std::io::stdout().lock();
+                out.write(buf)
+                    .and_then(|written| {
+                        out.flush()?;
+                        Ok(written)
+                    })
+                    .map_err(|err| {
+                        if err.kind() == std::io::ErrorKind::BrokenPipe {
+                            litebox::platform::StdioWriteError::Closed
+                        } else {
+                            panic!("unhandled error {err}")
+                        }
+                    })
             }
             litebox::platform::StdioOutStream::Stderr => {
                 std::io::stderr().write(buf).map_err(|err| {
@@ -1905,7 +1941,10 @@ impl litebox::platform::StdioProvider for WindowsUserland {
 }
 
 #[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
+// Toolchain and game guests can contain large ELF/TAR payloads. Keep the
+// buddy allocator's maximum individual allocation at 512 MiB so a compact
+// compiler rootfs can be loaded without tripping the old 128 MiB ceiling.
+static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 30, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {

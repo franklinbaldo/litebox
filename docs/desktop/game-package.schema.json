@@ -1,0 +1,354 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:litebox:game-package:draft-1",
+  "title": "LiteBoxGamePackage",
+  "description": "Proposed package contract; capabilities require runtime implementation and validation.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "version",
+    "package_revision",
+    "entrypoint",
+    "runtime",
+    "profile",
+    "content",
+    "assets",
+    "attribution"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "2026-09-11"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 64,
+      "description": "Unique identifier for the game package, used in CLI arguments, directory paths, shortcuts, and AppUserModelID."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Human-readable display name of the game."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"
+    },
+    "package_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonically increasing packaging revision for LiteBox distribution."
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "Brief summary of the game for search indexing and launcher UI."
+    },
+    "entrypoint": {
+      "type": "object",
+      "required": [
+        "protocol",
+        "guest_binary",
+        "guest_argv"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "demo_stdio_v1",
+            "desktop_fd_v1"
+          ],
+          "description": "Proposed transport profile; desktop_fd_v1 is not implemented."
+        },
+        "guest_binary": {
+          "type": "string",
+          "pattern": "^/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*$"
+        },
+        "guest_argv": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 1024
+          },
+          "description": "Command-line arguments passed directly to the guest binary on execution.",
+          "maxItems": 128
+        },
+        "display": {
+          "type": "object",
+          "required": [
+            "width",
+            "height",
+            "fps"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 160,
+              "maximum": 3840
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 120,
+              "maximum": 2160
+            },
+            "fps": {
+              "type": "number",
+              "minimum": 1.0,
+              "maximum": 240.0
+            },
+            "pixel_format": {
+              "type": "string",
+              "enum": [
+                "RGB24",
+                "RGBA32",
+                "BGR24",
+                "BGRA32"
+              ],
+              "default": "RGB24"
+            },
+            "default_scale": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "default": 2
+            },
+            "resizable": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        "audio": {
+          "type": "object",
+          "required": [
+            "sample_rate",
+            "channels",
+            "format"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "sample_rate": {
+              "type": "integer",
+              "enum": [
+                11025,
+                22050,
+                44100,
+                48000
+              ]
+            },
+            "channels": {
+              "type": "integer",
+              "enum": [
+                1,
+                2
+              ]
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "s16le"
+              ]
+            },
+            "buffer_frames": {
+              "type": "integer",
+              "minimum": 64,
+              "maximum": 8192
+            }
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "id",
+        "target_arch",
+        "required_features"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target_arch": {
+          "type": "string",
+          "enum": [
+            "x86_64-linux-musl",
+            "x86_64-linux-gnu"
+          ],
+          "description": "Architecture and libc target of the guest binary."
+        },
+        "required_features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "initial_files_tar",
+              "demo_stdio_v1",
+              "desktop_fd_v1",
+              "persistent_fs_v1",
+              "sdl2_abi",
+              "dynamic_elf"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "description": "Exact immutable runtime identity resolved to verified runtime manifest."
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "required": [
+        "network",
+        "guest_memory_mb",
+        "persisted_guest_paths"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "type": "string",
+          "enum": [
+            "none"
+          ],
+          "description": "Network sandbox policy. Offline games must use 'none'."
+        },
+        "guest_memory_mb": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 2048,
+          "default": 128,
+          "description": "Maximum memory limit in megabytes allotted to the guest sandbox address space."
+        },
+        "persisted_guest_paths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^/(?!\\.{1,2}(?:/|$))[A-Za-z0-9_.-]+(?:/(?!\\.{1,2}(?:/|$))[A-Za-z0-9_.-]+)*$",
+            "description": "Proposed isolated persistent guest directory. Loader must reject overlaps, root mounts and traversal after canonicalization."
+          },
+          "uniqueItems": true,
+          "description": "Paths used by the actual game for saves/config, backed by isolated host storage; not implemented by schema."
+        },
+        "read_only_rootfs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Requested policy; runtime must reject this package if it cannot enforce it."
+        }
+      }
+    },
+    "content": {
+      "type": "object",
+      "required": [
+        "container_tar",
+        "sha256",
+        "size_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "container_tar": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.-]+\\.tar$",
+          "description": "Relative filename of the USTAR archive containing the guest binary and assets."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Cryptographic SHA256 checksum of the container_tar file."
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Exact byte size of the container_tar file."
+        }
+      }
+    },
+    "assets": {
+      "type": "object",
+      "required": [
+        "icon_ico",
+        "icon_ico_sha256",
+        "icon_png",
+        "icon_png_sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "icon_ico": {
+          "type": "string",
+          "pattern": "^assets/[a-zA-Z0-9_.-]+\\.ico$",
+          "description": "Relative path to multi-resolution Windows ICO icon (16x16, 32x32, 48x48, 256x256)."
+        },
+        "icon_ico_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "icon_png": {
+          "type": "string",
+          "pattern": "^assets/[a-zA-Z0-9_.-]+\\.png$",
+          "description": "Relative path to 256x256 PNG asset for launcher UI and tiles."
+        },
+        "icon_png_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "attribution": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "component",
+          "scope",
+          "license",
+          "source_url",
+          "notice_path"
+        ],
+        "properties": {
+          "component": {
+            "type": "string",
+            "minLength": 1
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "code",
+              "data",
+              "music",
+              "icon",
+              "library"
+            ]
+          },
+          "license": {
+            "type": "string",
+            "minLength": 1,
+            "description": "SPDX expression where possible; LicenseRef requires bundled license text."
+          },
+          "source_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "notice_path": {
+            "type": "string",
+            "pattern": "^licenses/[A-Za-z0-9_-][A-Za-z0-9_.-]*\\.txt$"
+          },
+          "copyright": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

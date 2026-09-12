@@ -1564,6 +1564,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_desktop_host"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "litebox_desktop_transport"
+version = "0.1.0"
+
+[[package]]
 name = "litebox_packager"
 version = "0.1.0"
 dependencies = [
@@ -1647,19 +1658,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "litebox_platform_multiplex"
-version = "0.1.0"
-dependencies = [
- "cfg-if",
- "litebox",
- "litebox_platform_linux_kernel",
- "litebox_platform_linux_userland",
- "litebox_platform_lvbs",
- "litebox_platform_windows_userland",
- "once_cell",
-]
-
-[[package]]
 name = "litebox_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
@@ -1678,10 +1676,13 @@ dependencies = [
  "clap",
  "litebox",
  "litebox_common_linux",
+ "litebox_desktop_host",
+ "litebox_desktop_transport",
  "litebox_platform_windows_userland",
  "litebox_shim_linux",
  "litebox_util_log",
  "tracing-subscriber",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1714,11 +1715,11 @@ dependencies = [
  "litebox_common_lvbs",
  "litebox_common_optee",
  "litebox_platform_lvbs",
- "litebox_platform_multiplex",
  "litebox_service_heki",
  "litebox_shim_optee",
  "litebox_util_log",
  "log",
+ "once_cell",
  "spin 0.10.0",
  "x86_64",
 ]
@@ -1728,14 +1729,12 @@ name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrayvec",
  "base64",
  "clap",
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_platform_linux_userland",
- "litebox_platform_multiplex",
  "litebox_shim_optee",
  "litebox_syscall_rewriter",
  "litebox_util_log",
@@ -1801,7 +1800,6 @@ dependencies = [
  "object",
  "once_cell",
  "ringbuf",
- "seq-macro",
  "spin 0.9.8",
  "syscalls",
  "tempfile",
@@ -1814,7 +1812,6 @@ name = "litebox_shim_optee"
 version = "0.1.0"
 dependencies = [
  "aes",
- "arrayvec",
  "ctr",
  "elf",
  "hashbrown",
@@ -1822,7 +1819,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
- "litebox_platform_multiplex",
+ "litebox_platform_linux_userland",
  "litebox_util_log",
  "num_enum",
  "once_cell",
@@ -2700,12 +2697,6 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
-
-[[package]]
-name = "seq-macro"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bc711410fbe7399f390ca1c3b60ad0f53f80e95c5eb935e52268a0e2cd49acc"
 
 [[package]]
 name = "serde"

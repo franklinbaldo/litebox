@@ -7,6 +7,13 @@ use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
 
+#[cfg(target_arch = "x86_64")]
+use litebox::shim::{Exception, ExceptionInfo};
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::PtRegs;
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::signal::{FPE_INTDIV, ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
+
 extern crate std;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
@@ -39,24 +46,18 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
 }
 
 #[must_use]
-pub(crate) fn init_platform(
-    tun_device_name: Option<&str>,
-) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<TestPlatform> {
     let platform = test_platform(tun_device_name);
 
     let shim_builder = crate::LinuxShimBuilder::new(platform);
-    let litebox = shim_builder.litebox();
-    let in_mem_fs = litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::in_mem::InMem::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]),
-    );
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
+    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+        "/",
+        litebox::fs::in_mem::InitialNode::Directory {
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            owner: litebox::fs::UserInfo::ROOT,
+        },
+    )]);
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
     let task = shim_builder.build().0.new_test_task(fs);
 
     if tun_device_name.is_some() {
@@ -76,6 +77,50 @@ pub(crate) fn init_platform(
         });
     }
     task
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn exceptions_queue_their_corresponding_signals() {
+    const FAULT_PC: usize = 0x4444_0000;
+
+    let task = init_platform(None);
+    let ctx = PtRegs {
+        rip: FAULT_PC,
+        ..Default::default()
+    };
+
+    for (exception, signal, code, addr) in [
+        (
+            Exception::DIVIDE_ERROR,
+            Signal::SIGFPE,
+            FPE_INTDIV,
+            FAULT_PC,
+        ),
+        (Exception::BREAKPOINT, Signal::SIGTRAP, SI_KERNEL, 0),
+        (
+            Exception::INVALID_OPCODE,
+            Signal::SIGILL,
+            ILL_ILLOPN,
+            FAULT_PC,
+        ),
+    ] {
+        task.handle_exception_request(
+            &ExceptionInfo {
+                exception,
+                error_code: 0,
+                cr2: 0,
+                kernel_mode: false,
+            },
+            &ctx,
+        );
+
+        let siginfo = task.take_pending_siginfo(signal);
+        assert_eq!(siginfo.code, code);
+        let actual_data = siginfo.data.pad;
+        let expected_data = SiginfoData::new_addr(addr).pad;
+        assert_eq!(actual_data, expected_data);
+    }
 }
 
 #[test]
@@ -137,6 +182,31 @@ fn test_fcntl() {
     let duplicated = i32::try_from(duplicated).unwrap();
 
     assert_eq!(duplicated, min_fd);
+}
+
+#[test]
+fn test_pipe2_race_with_concurrent_close() {
+    let task = init_platform(None);
+    task.files.borrow().set_max_fd(4);
+
+    let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let stop_closer = stop.clone();
+    let closer = task.spawn_clone_for_test(move |task| {
+        while !stop_closer.load(core::sync::atomic::Ordering::Relaxed) {
+            let _ = task.sys_close(3);
+        }
+    });
+
+    for iter in 0..50_000 {
+        assert_eq!(
+            task.sys_pipe2(OFlags::empty()),
+            Err(Errno::EMFILE),
+            "failed at iteration {iter}"
+        );
+    }
+
+    stop.store(true, core::sync::atomic::Ordering::Relaxed);
+    closer.join().unwrap();
 }
 
 #[test]

@@ -10,14 +10,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
-    SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
+    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::inode_allocator::InodeAllocator;
+use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::path::Arg;
 use thiserror::Error;
@@ -37,7 +37,7 @@ pub struct Composer {
 /// A [`Composer`] builder.
 pub struct ComposerBuilder {
     mounts: Vec<(Option<String>, Box<dyn Backend>)>,
-    next_backend_device_id: u64,
+    allocators: InodeAllocators,
 }
 
 /// A mounted backend.
@@ -70,7 +70,7 @@ impl Composer {
     pub fn builder() -> ComposerBuilder {
         ComposerBuilder {
             mounts: vec![],
-            next_backend_device_id: 1,
+            allocators: InodeAllocators::starting_at(1),
         }
     }
 }
@@ -79,16 +79,24 @@ impl ComposerBuilder {
     /// Add a backend mounted at `path`.
     #[must_use]
     pub fn mount<B: Backend>(
-        mut self,
+        self,
         path: impl Arg,
         backend: impl FnOnce(InodeAllocator) -> B,
     ) -> Self {
-        let backend_device_id = self.next_backend_device_id;
+        self.mount_nestable(path, |allocators| backend(allocators.next()))
+    }
+
+    /// Add a backend mounted at `path`, which may draw an allocator per backend it is made of.
+    #[must_use]
+    pub fn mount_nestable<B: Backend>(
+        mut self,
+        path: impl Arg,
+        backend: impl FnOnce(&InodeAllocators) -> B,
+    ) -> Self {
         // TODO(jayb): Decide whether we need a fallible version of closure-based mount.
-        let backend = backend(InodeAllocator::for_device(backend_device_id));
+        let backend = backend(&self.allocators);
         self.mounts
             .push((path.as_rust_str().map(Into::into).ok(), Box::new(backend)));
-        self.next_backend_device_id = backend_device_id + 1;
         self
     }
 
@@ -693,7 +701,7 @@ impl Backend for Composer {
         &self,
         dir: DirHandle,
         name: &str,
-        mode: Mode,
+        metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
@@ -706,7 +714,7 @@ impl Backend for Composer {
                 self.checked_child_path(path, name, OpenError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
-                    .create_file_at(handle, name, mode)
+                    .create_file_at(handle, name, metadata)
                     .map(|handle| {
                         FileHandle::from_typed::<Self>(ComposerFileHandle {
                             mount_index,
@@ -717,7 +725,12 @@ impl Backend for Composer {
         }
     }
 
-    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        metadata: CreationMetadata,
+    ) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
             ComposerDirHandleInner::Virtual { .. } => Err(MkdirError::ReadOnlyFileSystem),
@@ -729,7 +742,7 @@ impl Backend for Composer {
                 let path = self.checked_child_path(path, name, MkdirError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
-                    .mkdir_at(handle, name, mode)
+                    .mkdir_at(handle, name, metadata)
                     .map(|handle| {
                         DirHandle::from_typed::<Self>(
                             ComposerDirHandleInner::Mounted {

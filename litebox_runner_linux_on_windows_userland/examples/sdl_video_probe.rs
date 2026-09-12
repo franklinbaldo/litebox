@@ -1,0 +1,335 @@
+// Copyright (c) franklinbaldo.
+// Licensed under the MIT license.
+
+//! Bounded integration fixture: real SDL guest -> dedicated pipe -> Win32 GDI.
+
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+const WIDTH: usize = 160;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+const HEIGHT: usize = 120;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+const PIXELS: usize = WIDTH * HEIGHT * 3;
+
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+fn parse_frame(body: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(body.len() == 8 + PIXELS, "invalid frame length");
+    anyhow::ensure!(&body[..4] == b"FRAM", "invalid frame tag");
+    anyhow::ensure!(
+        u16::from_le_bytes([body[4], body[5]]) == 160
+            && u16::from_le_bytes([body[6], body[7]]) == 120,
+        "unsupported dimensions"
+    );
+    Ok(body[8..].to_vec())
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod windows_impl {
+    use super::{HEIGHT, WIDTH, parse_frame};
+    use litebox_platform_windows_userland::WindowsUserland;
+    use litebox_shim_linux::host_pipe::{HostReader, HostWriter};
+    use std::{
+        io,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    use windows_sys::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, GetDC, ReleaseDC, SRCCOPY,
+            StretchDIBits,
+        },
+        System::LibraryLoader::GetModuleHandleW,
+        UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MSG, PM_REMOVE,
+            PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, WM_CLOSE,
+            WM_DESTROY, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        },
+    };
+
+    struct Reader(HostReader<WindowsUserland>);
+    impl io::Read for Reader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0
+                .read(buf)
+                .map_err(|e| io::Error::other(format!("{e:?}")))
+        }
+    }
+    struct Writer(HostWriter<WindowsUserland>);
+    impl io::Write for Writer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .write(buf)
+                .map_err(|e| io::Error::other(format!("{e:?}")))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        // SAFETY: called by Windows with the registered window handle.
+        unsafe {
+            match msg {
+                WM_CLOSE => {
+                    DestroyWindow(hwnd);
+                    0
+                }
+                WM_DESTROY => {
+                    PostQuitMessage(0);
+                    0
+                }
+                _ => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
+    }
+
+    fn show_frames(
+        rx: mpsc::Receiver<Vec<u8>>,
+        output: std::path::PathBuf,
+    ) -> Result<usize, String> {
+        // Uses the same top-down BGRA DIB conversion/presentation as the Breakout
+        // host; kept as a small integration fixture, not a replacement desktop host.
+        unsafe {
+            let class_name = wide("LiteBoxSdlProbe");
+            let title = wide("SDL2 Linux on LiteBox - video probe");
+            let instance = GetModuleHandleW(std::ptr::null());
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance,
+                lpszClassName: class_name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            if RegisterClassW(&raw const wc) == 0 {
+                return Err("RegisterClassW failed".into());
+            }
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                500,
+                410,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null(),
+            );
+            if hwnd.is_null() {
+                return Err("CreateWindowExW failed".into());
+            }
+            ShowWindow(hwnd, SW_SHOW);
+            let hold = std::env::var("LITEBOX_VIDEO_HOLD_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2)
+                .clamp(2, 30);
+            let started = Instant::now();
+            let mut count = 0;
+            let mut last = Vec::new();
+            let mut ended = None;
+            let mut failure = None;
+            loop {
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if msg.message == WM_QUIT {
+                        return Err("window closed before completion".into());
+                    }
+                    DispatchMessageW(&raw const msg);
+                }
+                match rx.try_recv() {
+                    Ok(rgb) => {
+                        let expected = [[255, 0, 0], [0, 255, 0], [0, 0, 255]];
+                        if count >= 3
+                            || rgb[..3] != expected[count]
+                            || rgb[(60 * WIDTH + 80) * 3..(60 * WIDTH + 80) * 3 + 3]
+                                != [255, 255, 255]
+                        {
+                            failure = Some(
+                                "SDL pixels differ from expected three-color/white-center fixture"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        count += 1;
+                        last = rgb;
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        ended.get_or_insert_with(Instant::now);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                if !last.is_empty() {
+                    let mut bgra = Vec::with_capacity(WIDTH * HEIGHT * 4);
+                    for rgb in last.as_chunks::<3>().0 {
+                        bgra.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
+                    }
+                    let mut info: BITMAPINFO = std::mem::zeroed();
+                    info.bmiHeader = BITMAPINFOHEADER {
+                        biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap(),
+                        biWidth: 160,
+                        biHeight: -120,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB,
+                        ..std::mem::zeroed()
+                    };
+                    let dc = GetDC(hwnd);
+                    if dc.is_null() {
+                        failure = Some("GetDC failed".into());
+                        break;
+                    }
+                    let rows = StretchDIBits(
+                        dc,
+                        0,
+                        0,
+                        500,
+                        410,
+                        0,
+                        0,
+                        160,
+                        120,
+                        bgra.as_ptr().cast(),
+                        &raw const info,
+                        DIB_RGB_COLORS,
+                        SRCCOPY,
+                    );
+                    ReleaseDC(hwnd, dc);
+                    if rows <= 0 {
+                        failure = Some("StretchDIBits failed".into());
+                        break;
+                    }
+                }
+                if ended.is_some_and(|t| t.elapsed() >= Duration::from_secs(hold)) {
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(hold + 12) {
+                    failure = Some("video timeout".into());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            DestroyWindow(hwnd);
+            if let Some(err) = failure {
+                return Err(err);
+            }
+            if count != 3 {
+                return Err(format!("expected 3 frames, got {count}"));
+            }
+            let mut ppm = b"P6\n160 120\n255\n".to_vec();
+            ppm.extend_from_slice(&last);
+            std::fs::write(output, ppm).map_err(|e| e.to_string())?;
+            Ok(count)
+        }
+    }
+
+    pub fn run() -> anyhow::Result<()> {
+        let tar_path = std::env::args_os().nth(1).expect("video probe TAR path");
+        let output = std::env::args_os().nth(2).expect("received frame PPM path");
+        let platform = WindowsUserland::new();
+        let builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+        let fs = builder.default_fs(
+            litebox::fs::in_mem::InMem::new_initialized::<&str>([]),
+            std::fs::read(tar_path)?.into(),
+        );
+        let shim = builder.build();
+        let mut program = shim.load_program(
+            std::sync::Arc::new(fs),
+            platform.init_task(),
+            "/bin/probe",
+            vec![std::ffi::CString::new("probe")?],
+            vec![std::ffi::CString::new("SDL_VIDEODRIVER=litebox")?],
+        )?;
+        let (input, writer) = program.attach_host_input()?;
+        let (output_fd, reader) = program.attach_host_output()?;
+        anyhow::ensure!(
+            (input, output_fd) == (3, 4),
+            "unexpected fixture descriptors"
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        let receive = std::thread::spawn(move || -> Result<(), String> {
+            let mut wire =
+                litebox_desktop_transport::Framed::new(Reader(reader), Writer(writer), 1_048_576)
+                    .map_err(|e| e.to_string())?;
+            eprintln!("host: handshake waiting");
+            wire.handshake(0).map_err(|e| e.to_string())?;
+            eprintln!("host: handshake complete");
+            let input_probe = std::env::var_os("LITEBOX_INPUT_PROBE").is_some();
+            let focus_probe = std::env::var_os("LITEBOX_FOCUS_PROBE").is_some();
+            let mut received = 0;
+            while let Some(body) = wire.recv().map_err(|e| e.to_string())? {
+                eprintln!("host: received {} bytes", body.len());
+                tx.send(parse_frame(&body).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+                received += 1;
+                if input_probe && received == 1 {
+                    wire.send(b"KEY0\x4f\x00\x01\x00")
+                        .map_err(|e| e.to_string())?;
+                } else if input_probe && received == 2 {
+                    let release = if focus_probe {
+                        b"FOC0\x00\x00\x00\x00"
+                    } else {
+                        b"KEY0\x4f\x00\x00\x00"
+                    };
+                    wire.send(release).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(())
+        });
+        let gui = std::thread::spawn(move || show_frames(rx, output.into()));
+        // SAFETY: these entrypoints and registers belong to this loaded guest.
+        unsafe {
+            litebox_platform_windows_userland::run_thread(
+                program.entrypoints,
+                &mut litebox_common_linux::PtRegs::default(),
+            );
+        }
+        eprintln!("guest: run_thread returned");
+        let exit = program.process.wait();
+        eprintln!("guest: exit {exit}");
+        receive
+            .join()
+            .expect("receiver panicked")
+            .map_err(anyhow::Error::msg)?;
+        let frames = gui
+            .join()
+            .expect("GUI panicked")
+            .map_err(anyhow::Error::msg)?;
+        anyhow::ensure!(exit == 0, "SDL guest exit {exit}");
+        println!("SDL_VIDEO_OK: {frames} verified frames presented with GDI; guest exit 0");
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn main() -> anyhow::Result<()> {
+    windows_impl::run()
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn main() {
+    eprintln!("This probe is only supported on Windows x86_64");
+    std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn reject_invalid_video_messages() {
+        assert!(parse_frame(&[]).is_err());
+        let mut b = vec![0; 8 + PIXELS];
+        b[..8].copy_from_slice(b"FRAM\xa0\x00\x78\x00");
+        assert!(parse_frame(&b).is_ok());
+        b[4] = 161;
+        assert!(parse_frame(&b).is_err());
+        b[4] = 160;
+        b[0] = 0;
+        assert!(parse_frame(&b).is_err());
+    }
+}

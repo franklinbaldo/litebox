@@ -1,0 +1,23 @@
+[package]
+name = "litebox_desktop_transport"
+version = "0.1.0"
+edition = "2021"
+description = "Portable desktop_fd_v1 framing and bounded transport primitives"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[[example]]
+name = "desktop_transport_probe"
+path = "examples/desktop_transport_probe.rs"
+
+[workspace]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 1
+debug = false
+incremental = false
+strip = true
