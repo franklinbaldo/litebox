@@ -1,40 +1,17 @@
 //! Bounded integration fixture: real SDL Linux guest -> dedicated pipes -> WinMM Windows.
 
-use std::io;
-use std::time::Duration;
-
-use litebox_desktop_host::audio::WinMMAudio;
-use litebox_platform_windows_userland::WindowsUserland;
-use litebox_shim_linux::host_pipe::{HostReader, HostWriter};
-
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 pub const AUD0_MAGIC: [u8; 4] = *b"AUD0";
-pub const ACK0_PAYLOAD: [u8; 4] = *b"ACK0";
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 pub const EXPECTED_RATE: u32 = 22050;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 pub const EXPECTED_CHANNELS: u16 = 1;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 pub const EXPECTED_BITS: u16 = 16;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 pub const MAX_PCM_BYTES: usize = 2048;
 
-struct Reader(HostReader<WindowsUserland>);
-impl io::Read for Reader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0
-            .read(buf)
-            .map_err(|e| io::Error::other(format!("{e:?}")))
-    }
-}
-
-struct Writer(HostWriter<WindowsUserland>);
-impl io::Write for Writer {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .write(buf)
-            .map_err(|e| io::Error::other(format!("{e:?}")))
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioPacket {
     pub rate: u32,
@@ -43,6 +20,7 @@ pub struct AudioPacket {
     pub pcm: Vec<u8>,
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 pub fn parse_audio_frame(body: &[u8]) -> anyhow::Result<AudioPacket> {
     anyhow::ensure!(
         body.len() >= 16,
@@ -89,181 +67,229 @@ pub fn parse_audio_frame(body: &[u8]) -> anyhow::Result<AudioPacket> {
     })
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct AudioStats {
-    pub received: usize,
-    pub submitted: usize,
-    pub completed: usize,
-    pub canceled: usize,
-    pub non_silent: usize,
-    pub errors: usize,
-    pub min_sample: i16,
-    pub max_sample: i16,
-    pub has_positive: bool,
-    pub has_negative: bool,
-}
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod windows_impl {
+    use super::parse_audio_frame;
+    use std::io;
+    use std::time::Duration;
 
-fn main() -> anyhow::Result<()> {
-    let tar_path = std::env::args_os()
-        .nth(1)
-        .expect("audio probe TAR path required as argument 1");
+    use litebox_desktop_host::audio::WinMMAudio;
+    use litebox_platform_windows_userland::WindowsUserland;
+    use litebox_shim_linux::host_pipe::{HostReader, HostWriter};
 
-    let platform = WindowsUserland::new();
-    let builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
-    let fs = builder.default_fs(
-        litebox::fs::in_mem::InMem::new_initialized::<&str>([]),
-        std::fs::read(&tar_path)?.into(),
-    );
-    let shim = builder.build();
-    let mut program = shim.load_program(
-        std::sync::Arc::new(fs),
-        platform.init_task(),
-        "/bin/probe",
-        vec![std::ffi::CString::new("probe")?],
-        vec![std::ffi::CString::new("SDL_AUDIODRIVER=litebox")?],
-    )?;
+    const ACK0_PAYLOAD: [u8; 4] = *b"ACK0";
 
-    // Reserve guest descriptors 3/4 for video without using them
-    let (v_in, _v_writer) = program.attach_host_input()?;
-    let (v_out, _v_reader) = program.attach_host_output()?;
+    #[derive(Clone, Debug, Default)]
+    struct AudioStats {
+        pub received: usize,
+        pub submitted: usize,
+        pub completed: usize,
+        pub canceled: usize,
+        pub non_silent: usize,
+        pub errors: usize,
+        pub min_sample: i16,
+        pub max_sample: i16,
+        pub has_positive: bool,
+        pub has_negative: bool,
+    }
 
-    // Attach input5 / output6 for audio
-    let (a_in, a_writer) = program.attach_host_input()?;
-    let (a_out, a_reader) = program.attach_host_output()?;
+    struct Reader(HostReader<WindowsUserland>);
+    impl io::Read for Reader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0
+                .read(buf)
+                .map_err(|e| io::Error::other(format!("{e:?}")))
+        }
+    }
 
-    anyhow::ensure!(
-        (v_in, v_out, a_in, a_out) == (3, 4, 5, 6),
-        "unexpected fixture descriptors: v_in={v_in}, v_out={v_out}, a_in={a_in}, a_out={a_out}"
-    );
+    struct Writer(HostWriter<WindowsUserland>);
+    impl io::Write for Writer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .write(buf)
+                .map_err(|e| io::Error::other(format!("{e:?}")))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
-    let audio_thread = std::thread::spawn(move || -> anyhow::Result<AudioStats> {
-        let mut wire =
-            litebox_desktop_transport::Framed::new(Reader(a_reader), Writer(a_writer), 1_048_576)
-                .map_err(|e| anyhow::anyhow!("failed to create Framed transport: {e}"))?;
+    pub fn run() -> anyhow::Result<()> {
+        let tar_path = std::env::args_os()
+            .nth(1)
+            .expect("audio probe TAR path required as argument 1");
 
-        eprintln!("host: audio handshake waiting");
-        wire.handshake(0)
-            .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
-        eprintln!("host: audio handshake complete");
+        let platform = WindowsUserland::new();
+        let builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+        let fs = builder.default_fs(
+            litebox::fs::in_mem::InMem::new_initialized::<&str>([]),
+            std::fs::read(&tar_path)?.into(),
+        );
+        let shim = builder.build();
+        let mut program = shim.load_program(
+            std::sync::Arc::new(fs),
+            platform.init_task(),
+            "/bin/probe",
+            vec![std::ffi::CString::new("probe")?],
+            vec![std::ffi::CString::new("SDL_AUDIODRIVER=litebox")?],
+        )?;
 
-        let (mut audio_device, ok) = WinMMAudio::open()
-            .ok_or_else(|| anyhow::anyhow!("failed to open WinMM waveOut device"))?;
-        anyhow::ensure!(ok, "WinMMAudio::open returned ok=false");
+        // Reserve guest descriptors 3/4 for video without using them
+        let (v_in, _v_writer) = program.attach_host_input()?;
+        let (v_out, _v_reader) = program.attach_host_output()?;
 
-        let mut received_count = 0;
-        let mut min_sample = i16::MAX;
-        let mut max_sample = i16::MIN;
-        let mut has_positive = false;
-        let mut has_negative = false;
+        // Attach input5 / output6 for audio
+        let (a_in, a_writer) = program.attach_host_input()?;
+        let (a_out, a_reader) = program.attach_host_output()?;
 
-        while let Some(body) = wire
-            .recv()
-            .map_err(|e| anyhow::anyhow!("recv error: {e}"))?
-        {
-            received_count += 1;
-            let packet = parse_audio_frame(&body)?;
+        anyhow::ensure!(
+            (v_in, v_out, a_in, a_out) == (3, 4, 5, 6),
+            "unexpected fixture descriptors: v_in={v_in}, v_out={v_out}, a_in={a_in}, a_out={a_out}"
+        );
 
-            for chunk in packet.pcm.chunks_exact(2) {
-                let s = i16::from_le_bytes([chunk[0], chunk[1]]);
-                if s > max_sample {
-                    max_sample = s;
+        let audio_thread = std::thread::spawn(move || -> anyhow::Result<AudioStats> {
+            let mut wire = litebox_desktop_transport::Framed::new(
+                Reader(a_reader),
+                Writer(a_writer),
+                1_048_576,
+            )
+            .map_err(|e| anyhow::anyhow!("failed to create Framed transport: {e}"))?;
+
+            eprintln!("host: audio handshake waiting");
+            wire.handshake(0)
+                .map_err(|e| anyhow::anyhow!("handshake failed: {e}"))?;
+            eprintln!("host: audio handshake complete");
+
+            let (mut audio_device, ok) = WinMMAudio::open()
+                .ok_or_else(|| anyhow::anyhow!("failed to open WinMM waveOut device"))?;
+            anyhow::ensure!(ok, "WinMMAudio::open returned ok=false");
+
+            let mut received_count = 0;
+            let mut min_sample = i16::MAX;
+            let mut max_sample = i16::MIN;
+            let mut has_positive = false;
+            let mut has_negative = false;
+
+            while let Some(body) = wire
+                .recv()
+                .map_err(|e| anyhow::anyhow!("recv error: {e}"))?
+            {
+                received_count += 1;
+                let packet = parse_audio_frame(&body)?;
+
+                for chunk in packet.pcm.as_chunks::<2>().0 {
+                    let s = i16::from_le_bytes([chunk[0], chunk[1]]);
+                    if s > max_sample {
+                        max_sample = s;
+                    }
+                    if s < min_sample {
+                        min_sample = s;
+                    }
+                    if s > 0 {
+                        has_positive = true;
+                    }
+                    if s < 0 {
+                        has_negative = true;
+                    }
                 }
-                if s < min_sample {
-                    min_sample = s;
-                }
-                if s > 0 {
-                    has_positive = true;
-                }
-                if s < 0 {
-                    has_negative = true;
-                }
+
+                // Play the buffer and wait for WHDR_DONE before sending ACK0
+                audio_device
+                    .play_and_wait(&packet.pcm, Duration::from_secs(2))
+                    .map_err(|e| {
+                        anyhow::anyhow!("WinMM playback error on buffer {received_count}: {e}")
+                    })?;
+
+                // Send framed ACK0 only after WHDR_DONE has completed
+                wire.send(&ACK0_PAYLOAD)
+                    .map_err(|e| anyhow::anyhow!("failed to send ACK0: {e}"))?;
             }
 
-            // Play the buffer and wait for WHDR_DONE before sending ACK0
-            audio_device
-                .play_and_wait(&packet.pcm, Duration::from_secs(2))
-                .map_err(|e| {
-                    anyhow::anyhow!("WinMM playback error on buffer {received_count}: {e}")
-                })?;
+            audio_device.close();
+            let metrics = audio_device.metrics.clone();
 
-            // Send framed ACK0 only after WHDR_DONE has completed
-            wire.send(&ACK0_PAYLOAD)
-                .map_err(|e| anyhow::anyhow!("failed to send ACK0: {e}"))?;
+            Ok(AudioStats {
+                received: received_count,
+                submitted: metrics.submitted,
+                completed: metrics.completed,
+                canceled: metrics.canceled,
+                non_silent: metrics.non_silent,
+                errors: metrics.errors.len(),
+                min_sample,
+                max_sample,
+                has_positive,
+                has_negative,
+            })
+        });
+
+        // Run guest thread
+        // SAFETY: these entrypoints and registers belong to this loaded guest.
+        unsafe {
+            litebox_platform_windows_userland::run_thread(
+                program.entrypoints,
+                &mut litebox_common_linux::PtRegs::default(),
+            );
         }
+        eprintln!("guest: run_thread returned");
+        let exit = program.process.wait();
+        eprintln!("guest: exit {exit}");
 
-        audio_device.close();
-        let metrics = audio_device.metrics.clone();
+        let stats = audio_thread.join().expect("audio thread panicked")?;
 
-        Ok(AudioStats {
-            received: received_count,
-            submitted: metrics.submitted,
-            completed: metrics.completed,
-            canceled: metrics.canceled,
-            non_silent: metrics.non_silent,
-            errors: metrics.errors.len(),
-            min_sample,
-            max_sample,
-            has_positive,
-            has_negative,
-        })
-    });
-
-    // Run guest thread
-    // SAFETY: these entrypoints and registers belong to this loaded guest.
-    unsafe {
-        litebox_platform_windows_userland::run_thread(
-            program.entrypoints,
-            &mut litebox_common_linux::PtRegs::default(),
+        anyhow::ensure!(exit == 0, "guest exited with non-zero code {exit}");
+        anyhow::ensure!(
+            stats.completed >= 8,
+            "fewer than 8 buffers completed: {}",
+            stats.completed
         );
+        anyhow::ensure!(stats.errors == 0, "audio errors occurred: {}", stats.errors);
+        anyhow::ensure!(
+            stats.received == stats.submitted && stats.submitted == stats.completed,
+            "audio buffer counts differ: received={}, submitted={}, completed={}",
+            stats.received,
+            stats.submitted,
+            stats.completed
+        );
+        anyhow::ensure!(
+            stats.canceled == 0,
+            "audio buffers canceled: {}",
+            stats.canceled
+        );
+        anyhow::ensure!(stats.has_positive, "no positive PCM samples found");
+        anyhow::ensure!(stats.has_negative, "no negative PCM samples found");
+        anyhow::ensure!(stats.non_silent > 0, "no non-silent audio buffers");
+
+        println!(
+            "SDL_AUDIO_METRICS: received={} submitted={} completed={} canceled={} non_silent={} errors={} min_sample={} max_sample={} has_pos={} has_neg={} guest_exit={exit}",
+            stats.received,
+            stats.submitted,
+            stats.completed,
+            stats.canceled,
+            stats.non_silent,
+            stats.errors,
+            stats.min_sample,
+            stats.max_sample,
+            stats.has_positive,
+            stats.has_negative
+        );
+        println!(
+            "SDL_AUDIO_OK: {} verified buffers played via WinMM; guest exit 0",
+            stats.completed
+        );
+
+        Ok(())
     }
-    eprintln!("guest: run_thread returned");
-    let exit = program.process.wait();
-    eprintln!("guest: exit {exit}");
+}
 
-    let stats = audio_thread.join().expect("audio thread panicked")?;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn main() -> anyhow::Result<()> {
+    windows_impl::run()
+}
 
-    anyhow::ensure!(exit == 0, "guest exited with non-zero code {exit}");
-    anyhow::ensure!(
-        stats.completed >= 8,
-        "fewer than 8 buffers completed: {}",
-        stats.completed
-    );
-    anyhow::ensure!(stats.errors == 0, "audio errors occurred: {}", stats.errors);
-    anyhow::ensure!(
-        stats.received == stats.submitted && stats.submitted == stats.completed,
-        "audio buffer counts differ: received={}, submitted={}, completed={}",
-        stats.received,
-        stats.submitted,
-        stats.completed
-    );
-    anyhow::ensure!(
-        stats.canceled == 0,
-        "audio buffers canceled: {}",
-        stats.canceled
-    );
-    anyhow::ensure!(stats.has_positive, "no positive PCM samples found");
-    anyhow::ensure!(stats.has_negative, "no negative PCM samples found");
-    anyhow::ensure!(stats.non_silent > 0, "no non-silent audio buffers");
-
-    println!(
-        "SDL_AUDIO_METRICS: received={} submitted={} completed={} canceled={} non_silent={} errors={} min_sample={} max_sample={} has_pos={} has_neg={} guest_exit={exit}",
-        stats.received,
-        stats.submitted,
-        stats.completed,
-        stats.canceled,
-        stats.non_silent,
-        stats.errors,
-        stats.min_sample,
-        stats.max_sample,
-        stats.has_positive,
-        stats.has_negative
-    );
-    println!(
-        "SDL_AUDIO_OK: {} verified buffers played via WinMM; guest exit 0",
-        stats.completed
-    );
-
-    Ok(())
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn main() {
+    eprintln!("This probe is only supported on Windows x86_64");
+    std::process::exit(1);
 }
 
 #[cfg(test)]

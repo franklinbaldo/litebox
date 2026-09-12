@@ -580,8 +580,13 @@ fn main() {
                         (GUEST_WIDTH * GUEST_HEIGHT * 4) as usize,
                     )
                 };
-                // Convert RGB24 ? BGRA32
-                for (s, d) in src.chunks_exact(3).zip(dst.chunks_exact_mut(4)) {
+                // Convert RGB24 -> BGRA32
+                for (s, d) in src
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+                {
                     d[0] = s[2]; // B
                     d[1] = s[1]; // G
                     d[2] = s[0]; // R

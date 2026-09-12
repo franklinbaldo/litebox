@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-exclude = ["tools/litebox_desktop_transport", "tools/litebox_desktop_host"]
+exclude = [
+    "tools/litebox_desktop_transport",
+    "tools/litebox_desktop_host",
+    "tools/litebox_launcher",
+]
 members = [
     "litebox",
     "litebox_common_linux",

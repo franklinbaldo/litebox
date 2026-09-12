@@ -128,7 +128,9 @@ impl WinMMAudio {
         }
         // unsigned_abs avoids overflow for i16::MIN (-32768)
         let non_silent = pcm
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .any(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs() > 100);
         if non_silent {
             self.metrics.non_silent += 1;
